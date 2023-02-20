@@ -1688,6 +1688,7 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
         struct zsdb_iter *tempiter = NULL;
         int newtxn = 0;
         int found = 0;
+        int cb_r = 0;
 
         assert(db);
         assert(db->priv);
@@ -1733,7 +1734,6 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
                 size_t keylen = 0, vallen = 0;
                 unsigned char *tkey = NULL;
                 size_t tkeylen = 0;
-
 
                 data = zs_iterator_get(tempiter);
                 if (!data)
@@ -1782,8 +1782,8 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
                 tkeylen = keylen;
 
                 if (!p || p(cbdata, key, keylen, val, vallen)) {
-                        if (cb(cbdata, key, keylen, val, vallen))
-                                break;
+                        cb_r = cb(cbdata, key, keylen, val, vallen);
+                        if (cb_r) break;
                 }
 
                 if (priv->dbdirty) {
@@ -1819,7 +1819,7 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
                 zs_transaction_end(txn);
         }
 
-        return ret;
+        return ret == ZS_OK ? cb_r : ret;
 }
 
 int zsdb_forone(struct zsdb *db, const unsigned char *key, size_t keylen,
