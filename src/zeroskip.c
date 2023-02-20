@@ -1783,7 +1783,6 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
 
                 if (!p || p(cbdata, key, keylen, val, vallen)) {
                         cb_r = cb(cbdata, key, keylen, val, vallen);
-                        if (cb_r) break;
                 }
 
                 if (priv->dbdirty) {
@@ -1806,6 +1805,7 @@ int zsdb_foreach(struct zsdb *db, const unsigned char *prefix, size_t prefixlen,
 
                 free(tkey);
                 tkey = NULL;
+                if (cb_r) break;
 
          } while (zs_iterator_next(tempiter, data));
 
