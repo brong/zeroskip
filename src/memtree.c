@@ -444,6 +444,7 @@ int memtree_begin(struct memtree *memtree, memtree_iter_t iter)
                 return 1;
         }
 
+        iter->record = NULL;
         return 0;
 }
 
@@ -611,7 +612,7 @@ int memtree_find(struct memtree *memtree, const unsigned char *key, size_t keyle
 
         iter->node = node;
         iter->pos = pos;
-        if (!found)
+        if (!found && iter->pos < node->count)
                 iter->record = iter->node->recs[iter->pos];
 
         return found;
