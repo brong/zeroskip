@@ -154,19 +154,18 @@ static int count_fe_p(void *data _unused_,
 
 START_TEST(test_abort_transaction)
 {
-        struct zsdb_txn *txn;
+        struct zsdb_txn *txn = NULL;
         size_t i;
         int ret;
 
-        txn = NULL;
         record_count = 0;
+
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
 
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecsgen); i++) {
                 ret = zsdb_add(db, kvrecsgen[i].k, kvrecsgen[i].klen,
@@ -186,13 +185,13 @@ START_TEST(test_abort_transaction)
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(record_count, ARRAY_SIZE(kvrecsgen));
 
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
+
         /* Add more records, but don't commit  */
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecs2); i++) {
                 ret = zsdb_add(db, kvrecs2[i].k, kvrecs2[i].klen,
@@ -244,13 +243,13 @@ START_TEST(test_delete)
 
         txn = NULL;
 
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
+
         /** ADD RECORDS **/
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecsdel); i++) {
                 ret = zsdb_add(db, kvrecsdel[i].k, kvrecsdel[i].klen,
@@ -270,12 +269,14 @@ START_TEST(test_delete)
         /* Acquire write lock */
         zsdb_write_lock_acquire(db, 0);
 
+        /** ADD RECORDS **/
+        /* Begin transaction */
+        ret = zsdb_transaction_begin(db, &txn);
+        ck_assert_int_eq(ret, ZS_OK);
+
         /* Delete a record */
         ret = zsdb_remove(db, kvrecsdel[1].k, kvrecsdel[1].klen, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Release write lock */
-        zsdb_write_lock_release(db);
 
         /* Fetch key2  - should not be found*/
         ret = zsdb_fetch(db, kvrecsdel[1].k, kvrecsdel[1].klen,
@@ -296,20 +297,23 @@ START_TEST(test_delete)
         zsdb_commit(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
 
+        /* Release write lock */
+        zsdb_write_lock_release(db);
+
 
         /* After committing, key2  - should not be found
          * key and key3 should be found.
          */
         ret = zsdb_fetch(db, kvrecsdel[1].k, kvrecsdel[1].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_NOTFOUND);
 
         ret = zsdb_fetch(db, kvrecsdel[0].k, kvrecsdel[0].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_OK);
 
         ret = zsdb_fetch(db, kvrecsdel[2].k, kvrecsdel[2].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_OK);
 
 
@@ -329,15 +333,15 @@ START_TEST(test_delete)
          * key and key3 should be found.
          */
         ret = zsdb_fetch(db, kvrecsdel[1].k, kvrecsdel[1].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_NOTFOUND);
 
         ret = zsdb_fetch(db, kvrecsdel[0].k, kvrecsdel[0].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_OK);
 
         ret = zsdb_fetch(db, kvrecsdel[2].k, kvrecsdel[2].klen,
-                         &value, &vallen, &txn);
+                         &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_OK);
 
 
@@ -347,7 +351,6 @@ END_TEST
 
 START_TEST(test_multiopen)
 {
-        struct zsdb_txn *txn = NULL;
         struct zsdb *db2 = NULL;
         int ret;
 
@@ -423,7 +426,7 @@ START_TEST(test_multiopen)
 
         /** COUNT RECORDS **/
         record_count = 0;
-        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
+        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, NULL);
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(record_count, ARRAY_SIZE(kvmultiopen));
 }
@@ -431,20 +434,18 @@ END_TEST
 
 START_TEST(test_many_records)
 {
-        struct zsdb_txn *txn;
+        struct zsdb_txn *txn = NULL;
         size_t i, NUM_RECS;
         int ret;
 
         NUM_RECS = 4096;
 
-        txn = NULL;
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
 
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         /* Add 4096 records */
         for (i = 0; i < NUM_RECS; i++) {
@@ -465,12 +466,10 @@ START_TEST(test_many_records)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
-
         /* Count records */
         record_count = 0;
         txn = NULL;
-        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
+        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, NULL);
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(record_count, NUM_RECS);
 }
@@ -497,11 +496,9 @@ static int fe_cb_foreach_changes(void *data,
                 break;
         case 1:
                 ck_assert_mem_eq(key, K2, keylen);
-                zsdb_write_lock_acquire(fr->db, 0);
                 r = zsdb_add(fr->db, (const unsigned char *)K0, strlen(K0),
                              (const unsigned char *)"", 0, fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
-                zsdb_write_lock_release(fr->db);
                 fr->state = 2;
                 break;
         case 2:
@@ -513,29 +510,23 @@ static int fe_cb_foreach_changes(void *data,
                 break;
         case 3:
                 ck_assert_mem_eq(key, K4, keylen);
-                zsdb_write_lock_acquire(fr->db, 0);
                 r = zsdb_add(fr->db, (const unsigned char *)K4A, strlen(K4A),
                              (const unsigned char *)"", 0, fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
-                zsdb_write_lock_release(fr->db);
                 fr->state = 4;
                 break;
         case 4:
                 ck_assert_mem_eq(key, K4A, keylen);
-                zsdb_write_lock_acquire(fr->db, 0);
                 r = zsdb_add(fr->db, (const unsigned char *)K4A, strlen(K4A),
                              (const unsigned char *)"another", 7, fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
-                zsdb_write_lock_release(fr->db);
                 fr->state = 5;
                 break;
         case 5:
                 ck_assert_mem_eq(key, K5, keylen);
-                zsdb_write_lock_acquire(fr->db, 0);
                 r = zsdb_remove(fr->db, (const unsigned char *)K5,
                                 strlen(K5), fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
-                zsdb_write_lock_release(fr->db);
                 fr->state = 6;
                 break;
         case 6:
@@ -544,7 +535,6 @@ static int fe_cb_foreach_changes(void *data,
                 break;
         case 7:
                 ck_assert_mem_eq(key, K7, keylen);
-                zsdb_write_lock_acquire(fr->db, 0);
                 r = zsdb_add(fr->db, (const unsigned char *)K7, strlen(K7),
                              (const unsigned char *)"newval", 6, fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
@@ -566,7 +556,6 @@ static int fe_cb_foreach_changes(void *data,
                                 strlen(K7D), fr->tid);
                 ck_assert_int_eq(r, ZS_OK);
 
-                zsdb_write_lock_release(fr->db);
                 fr->state = 8;
                 break;
         case 8:
@@ -596,13 +585,13 @@ START_TEST(test_foreach_changes)
         int ret;
         struct ffrock rock;
 
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
+
         /** ADD RECORDS **/
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvforeachchanges); i++) {
                 ret = zsdb_add(db, kvforeachchanges[i].k, kvforeachchanges[i].klen,
@@ -617,9 +606,12 @@ START_TEST(test_foreach_changes)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
 
-        txn = NULL;
+        /* Begin transaction */
+        ret = zsdb_transaction_begin(db, &txn);
+        ck_assert_int_eq(ret, ZS_OK);
 
         /** Process Records **/
         rock.db = db;
@@ -631,14 +623,10 @@ START_TEST(test_foreach_changes)
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(rock.state, 7);
 
-        /* Commit the transaction */
-        zsdb_write_lock_acquire(db, 0);
-
         zsdb_commit(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
 
         zsdb_write_lock_release(db);
-        zsdb_transaction_end(&txn);
 
         txn = NULL;
 }
@@ -646,17 +634,17 @@ END_TEST
 
 START_TEST(test_foreach_count)
 {
-        struct zsdb_txn *txn;
+        struct zsdb_txn *txn = NULL;
         size_t i;
         int ret;
+
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
 
         /** ADD RECORDS **/
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecsgen); i++) {
                 ret = zsdb_add(db, kvrecsgen[i].k, kvrecsgen[i].klen,
@@ -671,13 +659,15 @@ START_TEST(test_foreach_count)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
-
         txn = NULL;
 
         /* DELETE A RECORD */
         /* Acquire write lock */
         zsdb_write_lock_acquire(db, 0);
+
+        /* Begin transaction */
+        ret = zsdb_transaction_begin(db, &txn);
+        ck_assert_int_eq(ret, ZS_OK);
 
         /* Delete a record */
         ret = zsdb_remove(db, (const unsigned char *)"foo", 3, &txn);
@@ -691,7 +681,7 @@ START_TEST(test_foreach_count)
 
         /* Count records */
         record_count = 0;
-        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
+        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, NULL);
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(record_count, ARRAY_SIZE(kvrecsgen) - 1);
 }
@@ -699,18 +689,18 @@ END_TEST
 
 START_TEST(test_foreach_heirarchy)
 {
-        struct zsdb_txn *txn;
+        struct zsdb_txn *txn = NULL;
         size_t i;
         int ret;
         const unsigned char *key = (const unsigned char *)"abc.";
+
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
 
         /** ADD RECORDS **/
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecsgen); i++) {
                 ret = zsdb_add(db, kvrecsgen[i].k, kvrecsgen[i].klen,
@@ -725,18 +715,13 @@ START_TEST(test_foreach_heirarchy)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
-
-        txn = NULL;
-
         /* Count records */
         record_count = 0;
-        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
+        ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, NULL);
         ck_assert_int_eq(ret, ZS_OK);
         ck_assert_int_eq(record_count, ARRAY_SIZE(kvrecsgen));
 
         /* Count heirarchical records */
-        txn = NULL;
         record_count = 0;
 
         ret = zsdb_transaction_begin(db, &txn);
@@ -756,19 +741,19 @@ END_TEST
 
 START_TEST(test_fetchnext_simple)
 {
-        struct zsdb_txn *txn;
+        struct zsdb_txn *txn = NULL;
         size_t i;
         int ret;
         const unsigned char *found, *value;
         size_t foundlen = 0, vallen = 0;
 
+        /* Acquire write lock */
+        zsdb_write_lock_acquire(db, 0);
+
         /** ADD RECORDS **/
         /* Begin transaction */
         ret = zsdb_transaction_begin(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
-
-        /* Acquire write lock */
-        zsdb_write_lock_acquire(db, 0);
 
         for (i = 0; i < ARRAY_SIZE(kvrecsgen); i++) {
                 ret = zsdb_add(db, kvrecsgen[i].k, kvrecsgen[i].klen,
@@ -783,13 +768,9 @@ START_TEST(test_fetchnext_simple)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
-
-        txn = NULL;
-
         ret = zsdb_fetchnext(db, (const unsigned char *)"key",
                              strlen("key"), &found, &foundlen,
-                             &value, &vallen, &txn);
+                             &value, &vallen, NULL);
         ck_assert_int_eq(ret, ZS_OK);
 
         ck_assert_mem_eq(found, "nokia", foundlen);
