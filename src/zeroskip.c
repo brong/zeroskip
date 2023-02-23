@@ -1016,6 +1016,12 @@ int zsdb_commit(struct zsdb *db, struct zsdb_txn **txn)
         if (!priv->dbfiles.factive.is_open)
                 return ZS_NOT_OPEN;
 
+        if (!zsdb_write_lock_is_locked(db)) {
+                zslog(LOGDEBUG, "Need a write lock to commit.\n");
+                ret = ZS_ERROR;
+                goto done;
+        }
+
         if (!priv->dbfiles.factive.mf->crc32_data_len &&
             !priv->dbfiles.factive.dirty) {
                 goto done;
@@ -1357,6 +1363,12 @@ int zsdb_abort(struct zsdb *db, struct zsdb_txn **txn _unused_)
                 return ZS_NOT_OPEN;
         }
 
+        if (!zsdb_write_lock_is_locked(db)) {
+                zslog(LOGDEBUG, "Need a write lock to abort.\n");
+                ret = ZS_ERROR;
+                goto done;
+        }
+
         zslog(LOGDEBUG, "Aborting transaction!\n");
 
         /* Truncate the active file until the last known valid offset as
@@ -1378,18 +1390,11 @@ int zsdb_abort(struct zsdb *db, struct zsdb_txn **txn _unused_)
         if (txn && *txn && (*txn)->alloced)
                 zs_transaction_end(txn);
 
-        /* Need to reload the DB, since the in-memory tree has changed. */
-        ret = zsdb_write_lock_acquire(db, 0);
-        assert(ret == ZS_OK);
-
         ret = zsdb_reload(priv);
         if (ret != ZS_OK) {
                 zslog(LOGWARNING, "Failed reloading DB during abort!\n");
                 goto done;
         }
-
-        ret = zsdb_write_lock_release(db);
-        assert(ret == ZS_OK);
 
         ret = ZS_OK;
 done:
