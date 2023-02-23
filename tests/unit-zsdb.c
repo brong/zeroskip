@@ -181,8 +181,6 @@ START_TEST(test_abort_transaction)
         /* Release write lock */
         zsdb_write_lock_release(db);
 
-        zsdb_transaction_end(&txn);
-
         /* Count records */
         ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
         ck_assert_int_eq(ret, ZS_OK);
@@ -202,12 +200,6 @@ START_TEST(test_abort_transaction)
                 ck_assert_int_eq(ret, ZS_OK);
         }
 
-        /* Release write lock */
-        zsdb_write_lock_release(db);
-
-        /* End transaction */
-        zsdb_transaction_end(&txn);
-
         /* Count records, again */
         record_count = 0;
         ret = zsdb_foreach(db, NULL, 0, count_fe_p, NULL, NULL, &txn);
@@ -217,6 +209,9 @@ START_TEST(test_abort_transaction)
         /* Abort transaction */
         ret = zsdb_abort(db, &txn);
         ck_assert_int_eq(ret, ZS_OK);
+
+        /* Release write lock */
+        zsdb_write_lock_release(db);
 
         /* Now close the DB and open again, and the db should contain only
          * records from `kvrecsgen`.
