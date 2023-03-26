@@ -80,7 +80,7 @@ int cmd_set(int argc, char **argv, const char *progname)
         }
 
         if (zsdb_add(db, (unsigned char *)key, strlen(key),
-                     (unsigned char *)value, strlen(value), NULL) != ZS_OK) {
+                     (unsigned char *)value, strlen(value)) != ZS_OK) {
                 fprintf(stderr, "ERROR: Cannot add record to %s\n", dbname);
                 ret = EXIT_FAILURE;
                 goto done;
