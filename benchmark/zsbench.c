@@ -191,7 +191,7 @@ static size_t do_write(int txnmode, int insmode)
                 }
 
                 ret = zsdb_add(db, (unsigned char *)key, keylen,
-                               (unsigned char *)val, vallen, &txn);
+                               (unsigned char *)val, vallen);
 
                 assert(ret == ZS_OK);
                 bytes += (keylen + vallen);

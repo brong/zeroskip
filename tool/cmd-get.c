@@ -38,7 +38,6 @@ int cmd_get(int argc, char **argv, const char *progname)
         const unsigned char *value = NULL;
         size_t vallen = 0, i;
         int ret;
-        struct zsdb_txn *txn;
 
         while((option = getopt_long(argc, argv, "c:h?", long_options,
                                     &option_index)) != -1) {
@@ -75,7 +74,7 @@ int cmd_get(int argc, char **argv, const char *progname)
         }
 
         if (zsdb_fetch(db, (const unsigned char *)key, strlen(key),
-                       &value, &vallen, &txn)) {
+                       &value, &vallen)) {
                 fprintf(stderr, "ERROR: Cannot find record with key %s in %s\n",
                       key, dbname);
                 ret = EXIT_FAILURE;

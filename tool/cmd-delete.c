@@ -77,7 +77,7 @@ int cmd_delete(int argc, char **argv, const char *progname)
                 goto done;
         }
 
-        if (zsdb_remove(db, (unsigned char *)key, strlen(key), NULL) != ZS_OK) {
+        if (zsdb_remove(db, (unsigned char *)key, strlen(key)) != ZS_OK) {
                 fprintf(stderr, "ERROR: Cannot delete record from %s\n", dbname);
                 ret = EXIT_FAILURE;
                 goto done;

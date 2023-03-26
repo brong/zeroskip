@@ -91,28 +91,23 @@ extern void zsdb_final(struct zsdb **pdb);
 extern int zsdb_open(struct zsdb *db, const char *dbdir, int mode);
 extern int zsdb_close(struct zsdb *db);
 extern int zsdb_add(struct zsdb *db, const unsigned char *key, size_t keylen,
-                    const unsigned char *value, size_t vallen,
-                    struct zsdb_txn **txn);
+                    const unsigned char *value, size_t vallen);
 extern int zsdb_remove(struct zsdb *db, const unsigned char *key,
-                       size_t keylen, struct zsdb_txn **txn);
+                       size_t keylen);
 extern int zsdb_commit(struct zsdb *db, struct zsdb_txn **txn);
 extern int zsdb_fetch(struct zsdb *db, const unsigned char *key, size_t keylen,
-                      const unsigned char **value, size_t *vallen,
-                      struct zsdb_txn **txn);
+                      const unsigned char **value, size_t *vallen);
 extern int zsdb_fetchnext(struct zsdb *db,
                           const unsigned char *key, size_t keylen,
                           const unsigned char **found, size_t *foundlen,
-                          const unsigned char **value, size_t *vallen,
-                          struct zsdb_txn **txn);
+                          const unsigned char **value, size_t *vallen);
 extern int zsdb_foreach(struct zsdb *db, const unsigned char *prefix,
                         size_t prefixlen,
-                        zsdb_foreach_p *p, zsdb_foreach_cb *cb, void *cbdata,
-                        struct zsdb_txn **txn);
+                        zsdb_foreach_p *p, zsdb_foreach_cb *cb, void *cbdata);
 extern int zsdb_forone(struct zsdb *db, const unsigned char *key, size_t keylen,
-                       zsdb_foreach_p *p, zsdb_foreach_cb *cb, void *cbdata,
-                       struct zsdb_txn **txn);
+                       zsdb_foreach_p *p, zsdb_foreach_cb *cb, void *cbdata);
 extern int zsdb_abort(struct zsdb *db, struct zsdb_txn **txn);
-extern int zsdb_consistent(struct zsdb *db, struct zsdb_txn **txn);
+extern int zsdb_consistent(struct zsdb *db);
 extern int zsdb_dump(struct zsdb *db, DBDumpLevel level);
 extern int zsdb_repack(struct zsdb *db);
 extern int zsdb_info(struct zsdb *db);

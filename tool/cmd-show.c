@@ -55,8 +55,8 @@ int cmd_show(int argc, char **argv, const char *progname)
         char *dbname = NULL;
         char *prefix = NULL;
         size_t prefixlen = 0;
-        int ret;
         struct zsdb_txn *txn = NULL;
+        int ret;
 
         while((option = getopt_long(argc, argv, "c:h?", long_options,
                                     &option_index)) != -1) {
@@ -100,7 +100,7 @@ int cmd_show(int argc, char **argv, const char *progname)
         }
 
         ret = zsdb_forone(db, (const unsigned char *)prefix,
-                          prefixlen, NULL, print_cb, NULL, &txn);
+                          prefixlen, NULL, print_cb, NULL);
         if (ret == ZS_NOTFOUND) {
                 fprintf(stderr, "key %s not found\n", prefix);
                 ret = EXIT_FAILURE;
@@ -112,7 +112,7 @@ int cmd_show(int argc, char **argv, const char *progname)
         }
 
         if (zsdb_foreach(db, (const unsigned char *)prefix,
-                         prefixlen, NULL, print_cb, NULL, &txn) != ZS_OK) {
+                         prefixlen, NULL, print_cb, NULL) != ZS_OK) {
                 fprintf(stderr, "ERROR: forone failed!\n");
                 ret = EXIT_FAILURE;
                 goto fail1;
