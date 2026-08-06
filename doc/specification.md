@@ -1007,6 +1007,39 @@ The per-file cursors are held in an array kept sorted by:
 - **C-1d Lock ordering.** Acquisition is always write → remove or
   repack → remove. Nothing acquires write or repack while holding remove, and
   nothing holds both write and repack, so no cycle exists.
+- **C-1h Why not a named primitive.** The UUID would happily name a lock in a
+  global namespace, but naming is not the hard part — **release on process death**
+  is, and that is what rules the alternatives out:
+
+  | Primitive | Named by UUID | Dies with the process | Verdict |
+  |---|---|---|---|
+  | `fcntl` record lock on a file | no, by path | **yes**, kernel-released | chosen |
+  | `open(O_CREAT\|O_EXCL)` lock file | by path | **no** | this is the original zeroskip's unrecoverable-after-crash bug |
+  | POSIX named semaphore (`sem_open`) | yes | **no** — a killed holder leaves it decremented forever | rejected |
+  | SysV semaphore with `SEM_UNDO` | via `key_t` | yes | rejected: `key_t` is 32 bits, so a key derived from a 128-bit UUID collides, and two unrelated databases would silently share one lock |
+  | robust `pthread_mutex` in shared memory | yes | yes, via `EOWNERDEAD` | rejected: **macOS has no `PTHREAD_MUTEX_ROBUST`**, and it is a target platform |
+  | `flock` | by path | yes | rejected: does not conflict with `fcntl` locks (C-1e) |
+
+  A global-namespace object is also worse in kind: it outlives the directory it
+  describes, needs its own cleanup, and can be orphaned by a database that was
+  simply deleted. A file inside the directory is disposed of with the database.
+- **C-1i Open file description locks.** `F_OFD_SETLK` is a strict improvement
+  where it exists — present on Linux and, verified in its SDK headers, on macOS.
+  It is released when the last descriptor for that open file description closes,
+  so it keeps the death-release property, and because it is scoped to a
+  description rather than a process it **removes the C-1g footgun entirely**:
+  closing some unrelated descriptor for the lock file no longer drops the lock.
+  That matters most in a language that closes files during garbage collection.
+- **C-1j** Classic `F_SETLK` is nonetheless **normative**, because it is the one
+  form available everywhere including the older BSDs. An implementation MAY use
+  `F_OFD_SETLK` instead **only** where it has verified that OFD and classic record
+  locks conflict with each other on that platform — documented on Linux, and what
+  T-13's third-observer check exists to prove. Mixing two lock spaces that do not
+  conflict is the `flock` failure, and it is silent, so this may not be assumed
+  from the API's presence alone.
+- **C-1k** OFD locks do not remove the need for an in-process mutex (C-1f) unless
+  every writing thread holds its own descriptor. Two threads sharing one
+  description still do not exclude each other.
 - **C-2** Readers take **no lock**.
 - **C-3** A file is published by writing it under a staging name, then
   `rename`ing it to its final name. Readers see it only once complete, and the
