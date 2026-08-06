@@ -309,7 +309,7 @@ BIGDELETION_ANC (0x08)
   | key updated again later in the same file | the file holding what it superseded is this one | omitted |
   | key last written in an older file | that file's `start`, which is lower | stored |
   | repack output, chain begins inside the output range | the output's `start` | omitted |
-  | repack output, chain begins earlier | the earliest ancestor, which is lower | stored |
+  | repack output, chain begins earlier | V1's ancestor, which is lower | stored |
 
 - **F-17a** The two conditions "this is a later occurrence in the file" and
   "the ancestor equals this file's `start`" coincide, because a later
@@ -548,26 +548,30 @@ directory scan against a repack.
 - **D-17** The output holds **exactly one record per key**, built from the live
   records of all inputs, skipping rolled-back spans. Where the inputs hold
   versions V1, V2, V3 of a key from oldest to newest, the emitted record
-  carries **V3's value** — possibly a deletion — and **V1's ancestor**, the
-  earliest parent generation among them.
+  carries **V3's value** — possibly a deletion — and **V1's ancestor**.
 - **D-17a** Ancestors are copied verbatim; nothing is renumbered and no
   ancestor is recalculated (F-16c).
-- **D-17b** "V1's ancestor" is simply the **minimum ancestor across every
-  version of the key in the inputs**, each decoded per F-17. No first-occurrence
-  determination is needed: a later occurrence decodes to its file's `start`,
-  and the first occurrence's ancestor is always less than or equal to that, so
-  the minimum is V1's. The computation is therefore order-independent, which
-  matters because a k-way merge sees versions interleaved across files.
+- **D-17b** A repack MUST consider the versions of a key in a **total order**,
+  oldest to newest:
+
+  1. across files, by increasing `start` generation — the tiling invariant
+     (D-8) means ranges never overlap, so this is total;
+  2. within one unordered file, by increasing offset among committed spans;
+  3. an in-order file holds one record per key, so there is nothing to order.
+
+  V1 is the first version in that order and V3 the last. The emitted record
+  takes **V3's value** and **V1's ancestor** — from those records specifically,
+  and by no other route.
 - **D-18** Per key:
 
-  | earliest ancestor | latest version | emit |
+  | V1's ancestor | V3's value | emit |
   |---|---|---|
-  | `>= output start` | deletion | **nothing** — drop the key |
-  | `>= output start` | value | a **create**, implicit ancestor |
-  | `< output start` | either | an **update or deletion**, explicit ancestor = earliest |
+  | `>= output start` | a deletion | **nothing** — drop the key |
+  | `>= output start` | a value | the **ancestor-omitting** form |
+  | `< output start` | either | the **ancestor-storing** form, ancestor = V1's |
 
 - **D-19** A key is removed entirely if and only if its latest version is a
-  deletion **and** its earliest ancestor lies inside the output range — its
+  deletion **and** V1's ancestor lies inside the output range — its
   whole lifespan from create through update to delete is contained. Otherwise
   the tombstone MUST be retained, because an older file may still hold the key
   and dropping it would resurrect the value.
@@ -722,6 +726,14 @@ int  zs_cursor_commit(struct zs_cursor **curp);
 int  zs_cursor_abort(struct zs_cursor **curp);
 void zs_cursor_fini(struct zs_cursor **curp);
 
+/* deletion is a store of a NULL value; these are macros, not functions */
+#define zs_db_delete(db, key, keylen, flags) \
+        zs_db_store((db), (key), (keylen), NULL, 0, (flags))
+#define zs_txn_delete(txn, key, keylen, flags) \
+        zs_txn_store((txn), (key), (keylen), NULL, 0, (flags))
+#define zs_cursor_delete(cur, flags) \
+        zs_cursor_replace((cur), NULL, 0, (flags))
+
 int  zs_db_repack(struct zs_db *);
 bool zs_db_should_repack(struct zs_db *);
 int  zs_db_check_consistency(struct zs_db *);
@@ -753,7 +765,12 @@ different calls, though not every flag is meaningful everywhere:
   not another.
 
 - **A-1** `store` with `val == NULL` writes a deletion; with a non-NULL
-  zero-length value it stores an empty value. These are distinct states.
+  zero-length value it stores an empty value. These are distinct states. This
+  matches the convention of the other Cyrus database backends.
+- **A-1b** The `*_delete` forms are **macros** over `store` and
+  `cursor_replace`, not separate entry points, so there is exactly one write
+  path to implement and test. `ZS_IFEXIST` composes with them naturally to mean
+  "delete only if present".
 - **A-1a** A write inside a transaction is visible to subsequent reads on that
   same transaction, and to nothing else until commit. `zs_txn_fetch` and
   `zs_txn_foreach` therefore consult the transaction's own uncommitted records
@@ -819,6 +836,15 @@ as non-canonical) is reported by `zs_db_check_consistency`.
 delete spread across generations: chains stay unbroken (F-16), D-17 preserves
 V1's ancestor with V3's value, exactly one record per key is emitted, D-18's
 table is followed, and D-19 drops a key only when its whole lifespan is inside
+the output. Version ordering (D-17b) is tested directly, since getting it wrong
+silently emits the wrong value or the wrong ancestor: several versions of one
+key at increasing offsets within an unordered file, several across files with
+different `start` generations, and both at once — asserting the emitted value
+comes from V3 and the emitted ancestor from V1 under that total order, not from
+whichever record the merge's internal iteration happened to touch first or last.
+Then D-19a's resurrection is constructed directly, asserting both that the key
+stays absent and that dropping the retained record *does* produce the bug.
+Coverage continues with
 the output. The D-19a resurrection is constructed directly, asserting both that
 the key stays absent and that dropping the retained record *does* produce the
 bug — so the test fails if the rule is ever removed as an optimisation. Also
