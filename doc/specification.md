@@ -20,10 +20,11 @@ No code path may depend on a CPU feature: the library MUST build and run on
 any conforming POSIX platform, and every on-disk value MUST be bit-identical
 across them.
 
-The design rests on one invariant: **nothing is ever written except by
-appending to a file or by creating a new file.** No data file is ever
-modified in place, renamed, or truncated. The manifest is the one mutable
-object, and it is replaced atomically by `rename`.
+The design rests on one invariant, without exception: **nothing is ever written
+except by appending to a file or by creating a new file.** No file is ever
+modified in place or truncated, and there is no mutable object of any kind — no
+manifest, no shared cache. Files are created, appended to, and eventually
+removed once something else holds their data.
 
 Its sibling library `twom` is a mutable single-file skiplist. zeroskip suits
 workloads that are append-heavy, want readers that never take a lock, and
@@ -67,10 +68,10 @@ whether a pointer section must be present.
   lock. Because the kernel releases `fcntl` locks on process death, a killed
   writer never blocks the next one; no lock state can outlive a process.
 - **G-6 No shared mutable state.** Nothing a reader may be reading is ever
-  rewritten beneath it: data files are append-only, the manifest is replaced by
-  `rename`, and every index is private to the process that built it. Correctness
-  therefore never depends on any cache, and nothing needs cleaning up when a
-  process dies.
+  rewritten beneath it: files are append-only, a new file is published by
+  `rename`, and every index is private to the process that built it. There is no
+  manifest and no shared cache, so correctness cannot depend on one, and nothing
+  needs cleaning up when a process dies.
 - **G-7 Read paths agree.** Point lookups and range scans resolve visibility
   through one shared rule (D-14), so they cannot disagree about whether a key
   exists.
@@ -174,9 +175,9 @@ Each part earns its place, following the reasoning behind the PNG signature:
   generations *i*..*j* has `start == i` and `end == j`.
 - **F-11** Every file of a database MUST carry the same UUID and the same
   comparator name. The comparator determines key order and hence the meaning
-  of the pointer section, so storing it per file is what makes the manifest
-  reconstructible (D-4). Opening a database whose files disagree, or whose
-  comparator differs from the caller's, is an error.
+  of the pointer section, so it must be recorded per file — there is no manifest
+  to hold it (§5.2). Opening a database whose files disagree, or whose comparator
+  differs from the caller's, is an error.
 
 ### 4.4 Record types
 
@@ -516,8 +517,7 @@ filesize-4    4   checksum of the pointer section
 |---|---|---|
 | `zeroskip-<uuid>-<gen>` | append-only | unordered file, one generation |
 | `zeroskip-<uuid>-<start>-<end>` | immutable | in-order file |
-| `zeroskip.manifest` | replaced atomically | published file set |
-| `zeroskip.tmp.<pid>.<n>` | transient | repack output and manifest staging |
+| `zeroskip.tmp.<pid>.<n>` | transient | staging for a repack or conversion output |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
 
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
@@ -529,48 +529,37 @@ filesize-4    4   checksum of the pointer section
 - **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable.
 - **D-3** `zeroskip.lock` MUST be a distinct file that is never replaced.
-  `fcntl` locks attach to an inode, so locking the manifest — whose inode
-  changes on every publish — would silently lose mutual exclusion.
+  `fcntl` locks attach to an inode, so locking a file that is replaced by
+  `rename` would silently lose mutual exclusion.
 
-### 5.2 Manifest
+### 5.2 The file set
 
-The manifest publishes a consistent file set so a reader need not race a
-directory scan against a repack.
+There is no manifest. **The directory is the file set.** Filenames carry each
+file's generation range (D-1), so one `readdir` yields the set and every range
+without opening a single file.
 
-| Off | Size | Field |
-|---|---|---|
-| 0 | 16 | magic (§4.2) |
-| 16 | 16 | database UUID |
-| 32 | 8 | publish sequence, incremented on every publish |
-| 40 | 4 | generation counter — highest generation ever allocated |
-| 44 | 4 | file count |
-| 48 | 16 × N | `(start, end, size)` per file |
-| . | 4 | checksum over all preceding bytes |
-
-- **D-3a** The manifest's checksum always uses xxHash, whatever engine the data
-  files use. It is not part of the data format, and a failure merely triggers
-  reconstruction (R-5), so it costs nothing to protect unconditionally.
-- **D-4** The manifest MUST be fully **reconstructible** from the directory,
-  because every fact in it is derivable: the file set from the listing, each
-  file's range from its own header, the active file as the highest-generation
-  unordered file, and the comparator and UUID from any header (F-11). It is a
-  cache and a publication point, never a source of truth.
-- **D-5** It is written to `zeroskip.tmp.<pid>.<n>` and `rename`d into place,
-  so a crash yields either the old manifest or the new one, never a partial
-  one.
-- **D-6** The manifest records no offset into the active file. An earlier draft
-  cached one as a floor to shorten a reader's scan, but a reader must replay the
-  active file **from its start** to index it at all (D-13a), so a floor would
-  save nothing. The manifest is rewritten only on structural change — a new
-  active file, a conversion, or a completed repack — never per commit.
-- **D-7** A data file not referenced by the manifest MUST be ignored by
-  readers.
-- **D-8** Reconstruction MUST reject a set whose ranges do not **tile a
-  contiguous interval of generations** — no overlaps, no gaps. One exception is
-  expected and resolvable: a repack interrupted after renaming its output but
-  before removing its inputs leaves an in-order file whose range *encloses*
-  other files. The enclosing file supersedes those it contains, which are
-  treated as unreferenced debris (D-7, D-11).
+- **D-4** A file participates if its name matches `zeroskip-<uuid>-*` for this
+  database's UUID. Staging files and other databases' files are ignored by
+  construction.
+- **D-5 Enclosure resolution.** A repack renames its output into place before
+  removing its inputs, so a scan may legitimately see both. Where one file's
+  range **encloses** another's, the enclosing file supersedes what it contains —
+  it holds that data already — so the contained files MUST be ignored for
+  reading and MAY be removed (D-23).
+- **D-6 Completeness.** A set is complete if and only if, after enclosure
+  resolution, the ranges **tile a contiguous interval of generations**: no
+  overlaps, no gaps, from the oldest surviving generation through the active
+  file's. This is the whole test. No sequence number, timestamp or publication
+  record is required, because tiling means every generation is accounted for, and
+  therefore nothing committed is missing.
+- **D-7** `readdir` is not atomic, so a scan may miss an entry and produce a set
+  that does not tile. That MUST be retried. A set that is *stale* but tiles is
+  not an error — it is simply an older snapshot, and every snapshot is an older
+  snapshot of something.
+- **D-8** Creating a file **is** publishing it, since the directory is the truth.
+  There is no window in which a generation has been allocated but is invisible,
+  which is what makes the high-water mark of D-9b unable to regress and no-reuse
+  hold by construction rather than by bookkeeping.
 
 ### 5.3 Writing
 
@@ -583,10 +572,11 @@ directory scan against a repack.
 - **D-9a** A writer moves to a new file when the active file is not clean, or
   when it exceeds `rollover_size` (default 2MB). Rollover is cheap: a new
   header and nothing else, since no pointers are written (D-11).
-- **D-9b** The manifest's generation counter is a high-water mark of every
-  generation ever allocated, so reconstruction after files have been removed
-  cannot reissue one. A writer allocates `active + 1` and MUST advance the
-  counter to at least that.
+- **D-9b** The next generation is one above the highest present in the directory.
+  No counter is stored, and none is needed: a file is visible the moment it is
+  created (D-8), and is only removed once an enclosing file covers its
+  generation (D-23), so the highest generation present never regresses and a
+  generation can never be reissued.
 - **D-9c** Generations are never reused and never reset, not even by a repack
   that collapses the whole database into one file — the next new file is
   `end + 1`. Allocating past `0xFFFFFFFF` MUST fail with `ZS_FULL` rather than
@@ -614,12 +604,16 @@ directory scan against a repack.
   rollover and the next writer's conversion, or after a crash left an unclean
   file behind (D-10). Several can accumulate only across several crashes, and
   each is converted in turn.
-- **D-12b** Conversion writes a new file and then publishes and removes the
-  input, so it needs the packer lock (C-1). The writer MUST take it
-  **non-blocking** and skip the conversion if it is unavailable: a repack may
-  hold it for a long time (open item 1), and a write must never wait on one. The
-  work is deferred to the next writer, not lost.
-- **D-12c** Each conversion is bounded by `rollover_size` — sort the keys, write
+- **D-12b** A writer MUST convert **oldest first**. That keeps the generation
+  range split into a prefix of in-order files followed by a suffix of unordered
+  ones, the last of which is the active file. Converting out of order would leave
+  an unordered file stranded between in-order ones, and since only adjacent files
+  may be merged (D-19), that hole would block the repacker's cascade until it was
+  filled.
+- **D-12c** Conversion never takes the repack lock. It renames its output in
+  without any lock, and takes the remove lock only momentarily to retire the
+  input, so a writer never waits on a repack.
+- **D-12d** Each conversion is bounded by `rollover_size` — sort the keys, write
   the records in order, append the pointer section and trailer — so a writer's
   extra cost is bounded and predictable rather than proportional to the database.
 
@@ -643,8 +637,8 @@ own index, in private memory, for each unordered file in its snapshot.
   writing.
 - **D-13c** Making the index private is what allows the design to hold a much
   stronger property than "the cache is validated before use": **no shared state
-  is ever mutated in place, anywhere.** Data files are append-only, the manifest
-  is replaced by `rename`, superseded files are reclaimed by the kernel. Nothing
+  is ever mutated in place, anywhere.** Files are append-only, a new file is
+  published by `rename`, superseded files are reclaimed by the kernel. Nothing
   a reader may be reading is ever rewritten beneath it, so there is no sequence
   counter, no stability protocol, no reclamation dance, and no starvation under
   a hot writer.
@@ -759,11 +753,13 @@ The per-file cursors are held in an array kept sorted by:
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
-- **D-16a** Splitting the two jobs this way gives each a bounded or unbounded
-  character rather than mixing them: a writer's conversion is bounded by
-  `rollover_size` and happens inline (D-12c), while the repacker's cascade is
-  unbounded and runs out of band. Neither blocks the other, since they take
-  different locks.
+- **D-16a** Splitting the two jobs by whether a file has an `end` is what makes
+  them independent (C-1a). It also gives each a distinct character: a writer's
+  conversion is bounded by `rollover_size` and happens inline (D-12d), while the
+  repacker's cascade is unbounded and runs out of band.
+- **D-16c** Because D-12b keeps in-order files as a contiguous prefix, the
+  repacker's inputs are always adjacent (D-19) and the cascade is never blocked
+  by an unordered file sitting between two candidates.
 - **D-16b** Steps 1 to 3 cascade rather than merging two files per invocation.
   Both converge to the same steady state, since a cascade is simply several
   pairwise steps run back to back, but the cascade does strictly less total
@@ -782,7 +778,7 @@ The per-file cursors are held in an array kept sorted by:
   oldest to newest:
 
   1. across files, by increasing `start` generation — the tiling invariant
-     (D-8) means ranges never overlap, so this is total;
+     (D-6) means ranges never overlap, so this is total;
   2. within one unordered file, by increasing offset among committed spans;
   3. an in-order file holds one record per key, so there is nothing to order.
 
@@ -822,10 +818,11 @@ The per-file cursors are held in an array kept sorted by:
   if every record in the database was deleted and all files were then
   repacked, or if generation *X* created one record and *X+1* deleted it and
   those two were repacked together. The file MUST still be written, so the
-  generation range stays tiled (D-8). It is cheap and short-lived: an empty
+  generation range stays tiled (D-6). It is cheap and short-lived: an empty
   file violates D-16's size relation maximally, so the next repack absorbs it.
-- **D-23** Removing a data file — repack inputs, or debris from an interrupted
-  repack — MUST be done **holding the packer lock**, and only after verifying
+- **D-23** Removing a data file — a converted unordered file, repack inputs, or
+  the contained files left by an interrupted repack — MUST be done **holding the
+  remove lock**, and only after verifying
   that a complete set of files exists without it (D-8). Verification and
   removal MUST happen under one unbroken hold of the lock, so the set cannot
   change in between. If verification fails the file MUST be left alone:
@@ -834,60 +831,73 @@ The per-file cursors are held in an array kept sorted by:
 
 ## 6. Concurrency and durability
 
-- **C-1** Two `fcntl` byte-range locks on `zeroskip.lock`:
+- **C-1** Three `fcntl` byte-range locks on `zeroskip.lock`:
 
-  | Byte | Lock | Covers |
-  |---|---|---|
-  | 0 | write | appending to the active file, creating a new active file |
-  | 1 | packer | repacking, rewriting the manifest, removing files |
+  | Byte | Lock | Held for | Covers |
+  |---|---|---|---|
+  | 0 | write | a write transaction | appending, creating a new active file, converting an unordered file |
+  | 1 | repack | a whole repack, possibly long | merging in-order files |
+  | 2 | remove | momentarily | verify completeness, then unlink |
 
-  Appending needs only the write lock, so writing and repacking proceed
-  concurrently.
-- **C-1a** Grouping publish and removal under the packer lock is what makes
-  both safe: the file set cannot change between reading it and acting on it.
-- **C-1b Lock ordering.** A writer holding the write lock MAY acquire the
-  packer lock, which it needs briefly to publish. A packer MUST NOT acquire
-  the write lock. Acquisition is always write → packer, so the two cannot
-  deadlock.
+- **C-1a** The write and repack locks never contend, because the two jobs
+  consume **disjoint sets of files**: a writer only ever converts files with
+  `end == 0`, and the repacker only ever merges files with `end != 0` (D-16). A
+  file becomes visible to the repacker precisely when the writer has finished
+  with it. Neither ever waits for the other, and a writer therefore never waits
+  on a repack — which matters because a repack may run for a long time (open
+  item 1).
+- **C-1b** Publishing a new file needs **no lock at all**: `rename` into the
+  directory is atomic, and a repack's output `[a..b]` and a conversion's output
+  `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order.
+  This is why a repack stays valid even when a new in-order file appears above it
+  midway through.
+- **C-1c** The **remove** lock exists solely so that verifying completeness and
+  unlinking happen as one step (D-23). Without it two processes could each
+  conclude a different file was expendable and remove both.
+- **C-1d Lock ordering.** Acquisition is always write → remove or
+  repack → remove. Nothing acquires write or repack while holding remove, and
+  nothing holds both write and repack, so no cycle exists.
 - **C-2** Readers take **no lock**.
-- **C-3** A publisher MUST hold the packer lock, re-read the current manifest,
-  merge its change into it, then write and rename — a compare-and-publish.
+- **C-3** A file is published by writing it under a staging name, then
+  `rename`ing it to its final name. Readers see it only once complete, and the
+  rename is the instant it joins the file set (D-8).
 **C-4 Taking a snapshot.** The protocol is:
 
-1. Read the manifest, noting its publish sequence *S*.
-2. `open` and `mmap` every file it lists.
-3. Re-read the manifest. If the sequence is no longer *S*, or if any `open` in
-   step 2 failed with `ENOENT`, discard everything and restart from 1.
+1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*`
+   and parsing each generation range from its name.
+2. Resolve enclosures (D-5) and check the result tiles a contiguous interval
+   (D-6). If it does not, restart from 1.
+3. `open` and `mmap` every file in the resolved set. If any `open` fails with
+   `ENOENT`, restart from 1.
 4. Build a private index for each unordered file by replaying its spans, taking
    its snapshot boundary to be the end of its last valid span.
 
-Everything the snapshot will read is immutable from here on, for the reasons
-below. No lock is taken at any point.
+Everything the snapshot will read is immutable from here on. No lock is taken at
+any point.
 
-- **C-4a Completeness.** Step 3 is a verify-after-read, and it is sound because
-  a file is only ever removed under the packer lock *after* a publish (D-23), so
-  a removal always advances the sequence. Observing an unchanged sequence across
-  step 2 therefore proves no file was removed during it, and the opened set is
-  exactly the published one. Conversely an `ENOENT` proves a publish happened, so
-  the retry will see a higher sequence and a different set.
-- **C-4b Manifest atomicity.** Reading the manifest needs no lock because it is
-  replaced by `rename` (D-5): an `open` binds one inode, and the reader reads
-  that version whole even if it is replaced meanwhile.
+- **C-4a Completeness.** Step 2's tiling check *is* the completeness proof: every
+  generation in the interval is covered by exactly one file, so no committed data
+  is missing. Nothing needs to be compared against a published record, and a set
+  that is stale rather than current is simply an older snapshot.
+- **C-4b Why a retry suffices.** `readdir` may miss entries, and a file may be
+  removed between steps 2 and 3. Both show up as a failure — a set that does not
+  tile, or an `ENOENT` — never as a set that looks complete but is not, because
+  removal is only ever permitted when the remaining files still tile (D-23).
+  Retrying re-scans and converges, and each attempt costs only a directory read
+  and a few opens.
 - **C-4c Immutability of what was opened.** In-order files are never modified.
   An unordered file that is not the active one is never appended to again. The
   active file *is* appended to, but only ever appended to (G-1), so every byte
   below the snapshot boundary is immutable — a prefix of an append-only file is
   stable by construction. Growth beyond the boundary is invisible: the mapping
   covers the prefix and the reader never looks past it.
-- **C-4d The index needs no protocol at all.** Because it is private (D-13c),
-  there is nothing shared to synchronise against: no sequence counter, no
-  copy-then-validate, no bounds-checking a length read from concurrently written
-  memory, and no possibility of starvation under a hot writer. An earlier draft
-  shared a mutable sorted array between processes; that cannot be made safe by a
-  sequence counter alone, because the writer's `memmove`, reallocation and file
-  growth can move the array or invalidate a reader's mapping, and a counter tells
-  a reader only afterwards that what it read was rubbish — it cannot un-fault a
-  page.
+- **C-4d Nothing shared needs synchronising.** Every index is private (D-13c),
+  so there is no sequence counter, no copy-then-validate, and no starvation under
+  a hot writer. An earlier draft shared a mutable sorted array between processes;
+  that cannot be made safe by a sequence counter alone, because the writer's
+  `memmove`, reallocation and file growth can move the array or invalidate a
+  reader's mapping, and a counter tells a reader only afterwards that what it
+  read was rubbish — it cannot un-fault a page.
 - **C-4f Concurrent visibility.** A reader scanning the active file may meet a
   span the writer is still writing. The terminator's checksum covers the span's
   data (F-19), so a terminator whose data is not yet fully visible fails
@@ -900,18 +910,18 @@ below. No lock is taken at any point.
   D-23) `unlink` superseded files immediately: the kernel keeps each inode alive
   until the last descriptor *and mapping* is gone. There is no reference table
   and nothing to clean up when a process dies.
-- **C-4h Termination.** Steps 1–3 retry only when a publish intervenes, and step
-  4 only when the writer touches that entry. Both are structural events, not
-  per-operation ones, so retries are rare; each costs only the `open` calls or
-  one array copy. An implementation SHOULD bound the retry count and report
-  `ZS_AGAIN` rather than spin indefinitely, so a pathological publish rate
-  surfaces as an error instead of a livelock.
+- **C-4h Termination.** A retry happens only when the file set changed during
+  the scan, which is a structural event rather than a per-operation one, so
+  retries are rare and each costs one directory read plus a few opens. An
+  implementation SHOULD bound the retry count and report `ZS_AGAIN` rather than
+  spin indefinitely, so a pathological rate of structural change surfaces as an
+  error instead of a livelock.
 - **C-5** The accepted cost of C-4g is that disk space is held until the last
   reader holding an old snapshot exits.
 - **C-6 Directory durability.** After creating a **data file** (a new active
-  file, or a repack output) and after renaming a repack output or the manifest,
-  the implementation MUST `fdatasync` the **directory**, otherwise the name may
-  be absent after a crash even though the file's contents are durable.
+  file) and after renaming a repack or conversion output into place, the
+  implementation MUST `fdatasync` the **directory**, otherwise the name may be
+  absent after a crash even though the file's contents are durable.
 - **C-6a** A directory sync is **not** required after `unlink`. If a removed
   name reappears after a crash the file is unreferenced debris, which readers
   ignore (D-7) and a later repack removes again (D-23).
@@ -926,27 +936,27 @@ below. No lock is taken at any point.
 
 Opening is recovery; there is no separate pass.
 
-- **R-1** Open reads the manifest, opens and maps the listed files, then replays
-  each unordered file's spans from its start — building the private index as it
-  goes (D-13a) and stopping at the first record or terminator that fails to
-  validate, which establishes that file's end.
+- **R-1** Open is C-4: scan the directory, resolve enclosures, check the tiling,
+  map the files, then replay each unordered file's spans from its start —
+  building the private index as it goes (D-13a) and stopping at the first record
+  or terminator that fails to validate, which establishes that file's end.
 - **R-2** Live data is the union of records in spans with `COMMIT` terminators;
   rolled-back spans contribute nothing.
 - **R-3** A reader MUST NOT write. Opening a damaged database read-only is
-  side-effect-free: no conversion, no repack, no new active file, no manifest
-  publish. There is no shared cache for it to update (D-13c).
+  side-effect-free: no conversion, no repack, no new active file, no removal.
+  There is no shared cache for it to update (D-13c).
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
   validate, so a spurious terminator in trailing garbage — which a checksum
   can never wholly exclude — cannot become the foundation of a later chain.
   Generations are cheap.
-- **R-5** If the manifest is missing or fails validation it MUST be
-  reconstructed by scanning the directory (D-4, D-8). A read-only open does so
-  in memory without publishing. This is also how a new database begins.
-- **R-6** A crash during a repack leaves an unreferenced or enclosing file,
-  resolved by D-8 and removable under D-23. A crash during publish leaves
-  either manifest intact (D-5).
+- **R-5** A crash during a repack or conversion leaves either a staging file,
+  which is ignored because its name does not match (D-4), or an output already
+  renamed in whose range encloses its inputs, which D-5 resolves in favour of the
+  output. Either way the surviving set tiles and the contained files may be
+  removed (D-23). There is no separate reconstruction path, because discovery by
+  directory scan is the only path.
 
 ## 8. Public API
 
@@ -1197,12 +1207,15 @@ generation rather than appending (R-4, D-9). Both durability modes. Separately,
 with directory syncs suppressed, that a crash can lose a *name* — the test that
 justifies C-6.
 
-**T-9 Manifest reconstruction.** The manifest deleted, truncated and
-bit-flipped, asserting reconstruction from the directory yields identical
-logical contents (R-5), and that a read-only open reconstructs without writing
-(A-5). A directory seeded with an interrupted repack — an in-order file
-enclosing files it superseded — asserting D-8 resolves it. Files disagreeing on
-UUID or comparator rejected (F-11).
+**T-9 File set discovery.** That the set and every range are derived from
+filenames alone, without opening a file. Enclosure resolution (D-5) driven by a
+directory seeded as an interrupted repack — output present alongside its inputs —
+asserting the output wins and the contained files are ignored for reading. Sets
+that do **not** tile rejected and retried (D-7): a missing middle generation, a
+gap at the bottom, two files claiming overlapping ranges that are not nested.
+Files disagreeing on UUID or comparator rejected (F-11). Foreign names and
+staging files ignored (D-4). And that the next generation is one above the
+highest present, including after files have been removed (D-9b).
 
 **T-10 Multi-process.** Real forked processes. A writer plus *N* readers
 asserting snapshot stability across commits and that a fresh open sees them.
@@ -1220,10 +1233,10 @@ by a repack, asserting it skips rather than waits and that the next writer
 performs it (D-12b).
 
 **T-10b The snapshot protocol.** Each step of C-4 attacked directly, since these
-fail only under concurrency. A reader interrupted between reading the manifest
+fail only under concurrency. A reader interrupted between scanning the directory
 and opening files, with a repack completing in the gap, asserting the retry
-observes a higher sequence and succeeds (C-4a). A file unlinked between steps 2
-and 3, asserting `ENOENT` triggers a retry rather than a partial snapshot. A
+converges on a tiling set (C-4a, C-4b). A file unlinked between steps 2 and 3,
+asserting `ENOENT` triggers a retry rather than a partial snapshot. A
 reader holding a snapshot while the writer commits repeatedly, asserting bytes
 below its boundary never change and growth above it is invisible (C-4c). And a
 writer killed mid-span while a reader scans, asserting the reader stops at the
