@@ -34,12 +34,12 @@ tolerate compaction happening out of band.
 | Term | Meaning |
 |---|---|
 | generation | 32-bit counter, starting at 1, incremented for each new data file |
-| unordered file | holds exactly **one** generation; records in append order; **no** `[Pointers]`; `end == 0` |
-| in-order file | holds a **range** of generations; records in key order; **has** `[Pointers]`; `end != 0` |
+| unordered file | holds exactly **one** generation; records in append order; **no** pointer section; `end == 0` |
+| in-order file | holds a **range** of generations; records in key order; **has** a pointer section; `end != 0` |
 | active file | the highest-generation unordered file — the only file a writer appends to |
 | span | zero or more data records followed by one terminator |
-| terminator | a commit, final-commit, or rollback record |
-| complete | a file whose content ends at its last valid span |
+| terminator | a commit or rollback record, ending a span |
+| complete | an unordered file whose content ends at its last valid span |
 | clean | an active file that is complete *and* has nothing after that last valid span |
 | ancestor | the absolute generation at which the shadow cast by a record hits the previous record for that key |
 | shadowed | a record superseded by a later record for the same key, anywhere |
@@ -47,7 +47,7 @@ tolerate compaction happening out of band.
 The two file kinds are exhaustive and distinguishable from the header alone:
 **`end == 0` means unordered with no pointers; `end != 0` means in-order with
 pointers.** A reader therefore always knows, before reading anything else,
-whether a terminating pointers block must be present.
+whether a pointer section must be present.
 
 ## 3. Guarantees
 
@@ -164,7 +164,7 @@ Each part earns its place, following the reasoning behind the PNG signature:
   generations *i*..*j* has `start == i` and `end == j`.
 - **F-11** Every file of a database MUST carry the same UUID and the same
   comparator name. The comparator determines key order and hence the meaning
-  of `[Pointers]`, so storing it per file is what makes the manifest
+  of the pointer section, so storing it per file is what makes the manifest
   reconstructible (D-4). Opening a database whose files disagree, or whose
   comparator differs from the caller's, is an error.
 
@@ -189,27 +189,12 @@ A 32-bit ancestor fits inside the padding the big forms already carry, so
 than 16.
 | `0x10` | `COMMIT` | 8 | |
 | `0x11` | `COMMIT_LONG` | 24 | |
-| `0x13` | `FINAL32` | 8 | 32-bit pointers |
-| `0x14` | `FINAL32_LONG` | 24 | 32-bit pointers |
-| `0x16` | `FINAL64` | 8 | 64-bit pointers |
-| `0x17` | `FINAL64_LONG` | 24 | 64-bit pointers |
-| `0x19` | `ROLLBACK` | 8 | |
-| `0x1A` | `ROLLBACK_LONG` | 24 | |
+| `0x12` | `ROLLBACK` | 8 | |
+| `0x13` | `ROLLBACK_LONG` | 24 | |
+| `0x20` | `PTRS32` | 8 | narrow pointer section (§4.9) |
+| `0x21` | `PTRS64` | 16 | wide pointer section (§4.9) |
 
-A long terminator carries a **second type byte** at `+16` (§4.7), whose value is
-the corresponding `_2ND` code. These are field values inside a long terminator,
-not records in their own right, and never appear at the start of one:
-
-| Long terminator | `_2ND` value at `+16` |
-|---|---|
-| `COMMIT_LONG` | `0x12` |
-| `FINAL32_LONG` | `0x15` |
-| `FINAL64_LONG` | `0x18` |
-| `ROLLBACK_LONG` | `0x1B` |
-
-- **F-12** Any other type byte, including `0x00`, is invalid. A `_2ND` code is
-  invalid at the start of a record: it only ever appears at `+16` of a long
-  terminator.
+- **F-12** Any other type byte, including `0x00`, is invalid.
 - **F-12a** Each record shape has exactly two forms: one storing an ancestor
   and one omitting it. Nothing distinguishes a "create" at the record level,
   because nothing needs to (F-17).
@@ -339,41 +324,25 @@ BIGDELETION_ANC (0x08)
 ### 4.7 Terminators
 
 ```
-short (8 bytes)                       COMMIT / FINAL32 / FINAL64 / ROLLBACK
+short (8 bytes)                       COMMIT / ROLLBACK
   +0   1  type
   +1   3  span length
   +4   4  checksum
 
-long (24 bytes)                       *_LONG
+long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
   +0   1  type
   +1   7  pad
   +8   8  span length
-  +16  1  type2  (this form's _2ND code -- see F-20)
-  +17  3  pad
+  +16  4  pad
   +20  4  checksum
 ```
 
 - **F-19** The checksum covers the span's data bytes followed by the
   terminator's own bytes up to the checksum field.
-- **F-20** `type2` exists to make the trailing terminator locatable by reading
-  **backwards**, which is how an in-order file is opened: its `[Pointers]` block
-  can only be found via the terminator that covers it. A reader takes the file's
-  last 8 bytes and inspects the first byte:
-
-  | First of the last 8 bytes | Meaning |
-  |---|---|
-  | a short terminator code | an 8-byte terminator starting there |
-  | a `_2ND` code | the tail of a 24-byte terminator starting 16 bytes earlier |
-  | anything else | no valid trailing terminator |
-
-  Those 8 bytes therefore yield the terminator's extent and, for a `FINAL`, the
-  pointer width — everything needed to interpret the index before reading it.
-- **F-20a** `_2ND` codes are disjoint from the codes that may begin a
-  terminator, so the two cases above can never be confused. Zero would have
-  served as a "this is a tail" marker since `0x00` is invalid as a type (F-12),
-  but a distinct code per long form also confirms *which* terminator the tail
-  belongs to, catching a mismatched pair rather than trusting the checksum
-  alone.
+- **F-20** Terminators are only ever found by scanning **forward** from the
+  header. Nothing reads them backwards, because the pointer section is located
+  by its own trailer (§4.9), so a long terminator needs no marker in its second
+  half.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
   that says "ignore the records in this span", voiding them. An aborted
   transaction appends a `ROLLBACK`; without one, a later commit's span would
@@ -385,51 +354,97 @@ long (24 bytes)                       *_LONG
 
 ### 4.8 The span chain
 
-- **F-23** From the end of the header onwards, a file is a flat sequence of
-  spans. Each span is zero or more data records followed by exactly one
-  terminator whose span length equals the span's data byte count and whose
-  checksum validates. Every byte belongs to exactly one span or terminator:
-  no gaps, no nesting.
-- **F-24** A file is **complete** at its last valid span, whether that is the
-  end of the file or the point where a record or terminator fails to validate.
-  Content beyond it is not part of the database.
+Spans exist only in **unordered** files. An in-order file has none (§4.9).
+
+- **F-23** From the end of an unordered file's header onwards, the file is a flat
+  sequence of spans. Each span is zero or more data records followed by exactly
+  one terminator whose span length equals the span's data byte count and whose
+  checksum validates. Every byte belongs to exactly one span or terminator: no
+  gaps, no nesting.
+- **F-24** An unordered file is **complete** at its last valid span, whether
+  that is the end of the file or the point where a record or terminator fails to
+  validate. Content beyond it is not part of the database.
+- **F-24a** An in-order file has no equivalent notion, because it is written
+  whole under a temporary name and renamed only once finished (D-21). A partial
+  one is never referenced, so it is debris rather than a file that is complete
+  early.
 - **F-25** Visibility is per span, not a watermark: a rolled-back span may sit
   between two live ones, so a reader MUST replay spans in order and skip
   rolled-back ones.
 
-### 4.9 Pointers
+### 4.9 The pointer section
 
-Present in in-order files only, written once, immediately before a `FINAL32` or
-`FINAL64` terminator covering the block.
-
-The block carries a count; the terminator's type carries the width.
+An in-order file always ends with a pointer section followed by a 16-byte
+trailer; an unordered file never has either. So the whole layout is:
 
 ```
-+0    8      NumPointers
-+8    4×N    record offsets (uint32)   -- FINAL32
-      8×N    record offsets (uint64)   -- FINAL64
-pad to a multiple of 8
+in-order   [header][records][pointer section][trailer]
+unordered  [header](span)*
+```
+
+An in-order file has no spans and no terminators. Every record in it is live by
+construction, and it is written whole under a temporary name and renamed only
+once finished (D-21), so a commit record would assert nothing that is not
+already guaranteed.
+
+The section is self-describing — its own type states whether it is narrow or
+wide, and the count matches that width:
+
+```
+PTRS32 (0x20)                         narrow
+  +0    1      type
+  +1    3      pad
+  +4    4      count (uint32)
+  +8    4×N    record offsets (uint32)
+        .      pad with zeroes to a multiple of 8
+
+PTRS64 (0x21)                         wide
+  +0    1      type
+  +1    7      pad
+  +8    8      count (uint64)
+  +16   8×N    record offsets (uint64)
+```
+
+The trailer is a **fixed 16 bytes**, always, so it can be read without knowing
+anything else about the file:
+
+```
+filesize-16   8   offset of the start of the pointer section
+filesize-8    4   checksum of the records region
+filesize-4    4   checksum of the pointer section
 ```
 
 - **F-26** Pointers reference every record in the file, sorted by key
   ascending. Because a repack emits exactly one record per key (D-17), keys in
   an in-order file are unique and the array is a strict ordering.
-- **F-26a** The pointer width is **stated by the terminator type**: `FINAL32`
-  means 32-bit offsets, `FINAL64` means 64-bit. The pointers block is therefore
-  interpretable from itself and its terminator alone, with no reference to the
-  file's length — which matters because a truncated file has a different length
-  but must not have a differently-interpreted index. The terminator is written
-  last, so unlike a header flag it can state the width without any rewrite
-  (G-1).
-- **F-26b** Encoding is canonical: `FINAL32` MUST be used when every record
-  offset fits in 32 bits, and `FINAL64` otherwise. Since all records precede the
-  pointers block, that is equivalent to the block's own offset fitting in 32
-  bits.
-- **F-26c** The block is padded with zeroes to a multiple of 8 so the terminator
-  begins 8-aligned (F-2). The pad is 0 or 4 bytes and is covered by the
-  terminator's checksum like any other span byte.
+- **F-26a** The trailer's back pointer is what locates the section, so nothing
+  needs to be found by scanning backwards through records. The trailer's size is
+  fixed and its back pointer is always 8 bytes wide even in a narrow file,
+  because a variable-size trailer could not be read without first knowing which
+  size it was.
+- **F-26b** The pointer-section checksum covers everything from the start of the
+  section up to the checksum field itself — the section, its padding, the back
+  pointer, and the records checksum — following F-4 with no special case. The
+  back pointer is read as plain data first, so there is no circularity.
+- **F-26e** The records checksum covers the region from the end of the header to
+  the start of the pointer section. A commit record would have carried this, and
+  the commit record itself is redundant, but the coverage is not: without it a
+  record body corrupted in place would go undetected, whereas the equivalent
+  region of an unordered file is covered by its span terminator. Placing it in
+  the trailer's otherwise-unused four bytes costs nothing, and F-26b means it is
+  itself protected.
+- **F-26f** The records checksum is verified lazily — by
+  `zs_db_check_consistency`, or by a caller that chooses to — never on open,
+  which stays O(1) (F-31). The pointer-section checksum *is* verified on open,
+  because everything the file's structure depends on lives inside it.
+- **F-26c** Encoding is canonical: `PTRS32` MUST be used when every record
+  offset fits in 32 bits, and `PTRS64` otherwise. Since all records precede the
+  section, that is equivalent to the section's own offset fitting in 32 bits.
+- **F-26d** The narrow section is padded with zeroes to a multiple of 8 so the
+  trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
+  covers it.
 - **F-27** Every pointer MUST be 8-aligned and lie between the header and the
-  pointers block.
+  pointer section.
 - **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
   pointer array is strictly increasing by key, which both confirms the sort and
   catches a repack that emitted a key twice (D-17).
@@ -442,9 +457,10 @@ pad to a multiple of 8
   point (F-24). Non-termination is impossible by construction.
 - **F-30** Every length, offset and pointer MUST be bounds-checked against the
   file size before any dereference.
-- **F-31** Opening an in-order file is O(1): validate the header, locate the
-  trailing terminator, validate it over the pointers block, use the pointers.
-  Records are bounds-checked on access, not on open.
+- **F-31** Opening an in-order file is O(1): validate the header, read the
+  16-byte trailer, verify the pointer-section checksum, use the pointers.
+  Records are bounds-checked on access, and their checksum is verified only on
+  demand (F-26f).
 
 ## 5. Database layout
 
@@ -541,7 +557,7 @@ directory scan against a repack.
   (`ZS_BADFORMAT`): its records cannot be recovered and silently skipping the
   generation would lose committed data. Discarding it requires an explicit
   tool action.
-- **D-11** The writer never appends `[Pointers]` to an unordered file. When it
+- **D-11** The writer never appends a pointer section to an unordered file. When it
   moves on, the previous file simply stays unordered until a repack rewrites
   it. Key order for such a file lives in the shared index until then.
 - **D-12** A writer MAY repack, so it may rewrite the file it has just left as
@@ -550,7 +566,7 @@ directory scan against a repack.
 ### 5.4 Shared index
 
 - **D-13** `zeroskip.index` is a regular file `mmap`'d `MAP_SHARED`, holding
-  key order for files that lack `[Pointers]` — the active file and any
+  key order for files that lack a pointer section — the active file and any
   unordered file not yet repacked — keyed by generation and stamped with the
   database UUID, the generation, and the offset it is valid to.
 - **D-13a** It is a pure cache and MUST NOT be authoritative. Any process MAY
@@ -636,7 +652,7 @@ directory scan against a repack.
   the lifespan is contained and drops K — resurrecting it, because the create
   was really in generation 3. The retained record is the only surviving
   evidence of how far back the chain reaches.
-- **D-20** Inputs are iterated in key order: from `[Pointers]` where present,
+- **D-20** Inputs are iterated in key order: from the pointer section where present,
   otherwise from the same index any reader of a pointerless file must build.
   There is nothing repack-specific about this.
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
@@ -856,13 +872,15 @@ to catch — eighth bit stripped, `0D 0A` collapsed to `0A`, `0A` expanded to
 `0D 0A` — each rejected. Read and write versions above the library's rejected
 appropriately, and a file readable-but-not-writable accepted read-only (F-7).
 
-**T-2a Backward terminator location.** Both branches of F-20's table, since
-opening an in-order file depends on them: files ending in each short terminator
-and in each long one, asserting the terminator's start and extent are found
-correctly and that a `FINAL`'s pointer width is read from it. Negatively, a file
-whose last 8 bytes begin with a `_2ND` code but which is too short to hold the
-24-byte terminator, and one where the `_2ND` code at `+16` does not match the
-type at `+0` (F-20a) — both rejected rather than read.
+**T-2a The trailer.** Opening an in-order file depends entirely on it, so: the
+16-byte trailer read without prior knowledge of the file, the back pointer
+locating the section, and the checksum verified over section-through-back-pointer
+(F-26b). Negatively — a back pointer past the end of the file, before the
+header, not 8-aligned, or pointing at a byte that is not a `PTRS32`/`PTRS64`
+type; a file shorter than header plus trailer; and a corrupted pad byte — each
+rejected rather than read. The records checksum verified on demand and asserted
+to catch a record body corrupted in place (F-26e), which nothing else would
+detect in an in-order file.
 
 **T-3 Malformed input.** Every golden file truncated at *every byte offset*,
 not merely record boundaries, and systematically bit-flipped. Each case asserts
@@ -886,10 +904,10 @@ scan, cross-checked against each other — the direct test for G-7.
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
 when `end != 0`; that an in-order file's pointers are strictly increasing by key
-(F-28); that `FINAL32` and `FINAL64` are each honoured for the width they state,
-including a hand-constructed `FINAL64` file so the wide form is covered without
+(F-28); that `PTRS32` and `PTRS64` are each honoured for the width they state,
+including a hand-constructed `PTRS64` file so the wide form is covered without
 writing 4GB of real data, and that a file whose offsets all fit is written as
-`FINAL32` (F-26a, F-26b), plus the 0-and-4-byte padding cases (F-26c); and that
+`PTRS32` (F-26c), plus the 0-and-4-byte padding cases (F-26d); and that
 every row of F-17's table round-trips — in particular that
 repeated writes to one key in a file store the ancestor at most once, and that a
 record with no stored ancestor decodes to its file's `start`. Negatively, a
@@ -923,7 +941,7 @@ workload. Each case asserts reopen terminates within a timeout, exactly a
 prefix of committed transactions is visible, nothing acknowledged is lost under
 default durability, and a writer can then continue. Targeted: crash between
 records and terminator; after terminator before `fsync`; mid-publish rename;
-mid-repack; after `[Pointers]` but before the `FINAL` terminator; leaving a non-8-aligned file
+mid-repack; after the pointer section but before the trailer; leaving a non-8-aligned file
 length; and after an invalid terminator, asserting the writer moves to a new
 generation rather than appending (R-4, D-9). Both durability modes. Separately,
 with directory syncs suppressed, that a crash can lose a *name* — the test that
