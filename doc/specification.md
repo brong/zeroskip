@@ -280,7 +280,8 @@ BIGDELETION_ANC (0x08)
 - **F-15** Encoding is canonical: an implementation MUST use the short form
   whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
   whenever the span is `<= 0xFFFFFF` bytes; and MUST select between the
-  ancestor-storing and ancestor-omitting forms exactly as F-17 requires. Output
+  ancestor-storing and ancestor-omitting forms exactly as F-17 requires; and
+  MUST choose the pointer width by F-26a. Output
   bytes are therefore determined by the logical contents together with what
   the file already holds. The big form is chosen by key or value length only,
   never by the ancestor, which is always 8 bytes when present.
@@ -373,14 +374,37 @@ long (24 bytes)                       *_LONG
 Present in in-order files only, written once, immediately before a `FINAL`
 terminator covering the block.
 
-| Off | Size | Field |
-|---|---|---|
-| 0 | 8 | `NumPointers` |
-| 8 | 8 × N | record offsets |
+Pointers are 32-bit in a file of `0xFFFFFFFF` bytes or fewer, and 64-bit
+otherwise:
+
+```
+32-bit form
+  +0    8    NumPointers
+  +8    4×N  record offsets (uint32)
+  pad to a multiple of 8
+
+64-bit form
+  +0    8    NumPointers
+  +8    8×N  record offsets (uint64)
+```
 
 - **F-26** Pointers reference every record in the file, sorted by key
   ascending. Because a repack emits exactly one record per key (D-17), keys in
   an in-order file are unique and the array is a strict ordering.
+- **F-26a** The pointer width is **derived from the file size**: 32-bit if the
+  file is `0xFFFFFFFF` bytes or fewer, 64-bit otherwise. Nothing records it.
+  A header flag could not: the header is written before the file's eventual
+  size is known, so setting one correctly would require rewriting the header
+  afterwards, which G-1 forbids. The `FINAL` terminator is written last and
+  could have carried it, but derivation needs no state at all, and the size is
+  known as soon as the file is mapped.
+- **F-26b** Because every record lies before the pointers block, a file within
+  `0xFFFFFFFF` bytes has every record offset inside 32 bits, so the narrow form
+  is always sufficient when selected. The rule is canonical: a file over the
+  bound uses 64-bit pointers even if every offset would have fitted.
+- **F-26c** The block is padded with zeroes to a multiple of 8 so the `FINAL`
+  terminator begins 8-aligned (F-2). The pad is 0 or 4 bytes and is covered by
+  the terminator's checksum like any other span byte.
 - **F-27** Every pointer MUST be 8-aligned and lie between the header and the
   pointers block.
 - **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
@@ -831,7 +855,11 @@ scan, cross-checked against each other — the direct test for G-7.
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
 when `end != 0`; that an in-order file's pointers are strictly increasing by key
-(F-28); and that every row of F-17's table round-trips — in particular that
+(F-28); that the pointer width follows the file size, including a
+hand-constructed file just over `0xFFFFFFFF` bytes so the 64-bit form is covered
+without writing 4GB of real data, and one just under it (F-26a), plus the
+0-and-4-byte padding cases (F-26c); and that every row of F-17's table
+round-trips — in particular that
 repeated writes to one key in a file store the ancestor at most once, and that a
 record with no stored ancestor decodes to its file's `start`. Negatively, a
 hand-built file storing an ancestor equal to its own `start` (which F-15 forbids
