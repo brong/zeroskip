@@ -574,17 +574,85 @@ directory scan against a repack.
   stamps before use and discard it on any inconsistency.
 - **D-13b** Its internal layout is not part of this specification and may
   change without a format version bump. Only its invariants are specified.
+- **D-13c** Those invariants are that, for one file, the index supports all
+  three of:
 
-### 5.5 Lookup order
+  1. **point lookup** — given a key, the offset of its newest committed record,
+     or absent;
+  2. **lower-bound seek** — given a key, a position from which ordered
+     traversal begins at the first key greater than or equal to it;
+  3. **ordered traversal** — successive keys in comparator order, each with the
+     offset of its newest committed record.
 
-- **D-14** Resolution order is: the current write transaction's own
-  uncommitted records; then all data files by `start` **descending**. Within a
-  file the newest version of a key wins — the highest offset among committed
-  spans. The first record found wins; if it is a deletion, the key does not
-  exist.
+  A hash table satisfies only the first, so the index MUST be an ordered
+  structure. Requirement 3 is what makes an unordered file usable as a merge
+  source (D-14e).
+- **D-13d** The index reflects **committed spans only**, and for each key only
+  its newest committed record. Building it therefore means replaying spans and
+  skipping rolled-back ones (F-25), not simply walking every record in the file.
+  An index built by naively scanning records would resurrect aborted writes.
+
+### 5.5 Reading
+
+Every read draws on the same set of **sources**, ordered newest to oldest:
+
+| Priority | Source | Search primitive |
+|---|---|---|
+| highest | the current write transaction's uncommitted records | its private in-memory map |
+| then | data files by `start` **descending** | see D-14b |
+| lowest | the oldest file | |
+
+- **D-14** Within a file the newest version of a key wins — the highest offset
+  among committed spans. Across sources, the first record found in the order
+  above wins. If that record is a deletion, the key does not exist.
 - **D-14a** Point lookups, cursors and range scans MUST all resolve visibility
-  by D-14. Range scans are a k-way merge over the same per-file sources,
-  deduplicating by key with newest-wins.
+  by D-14, which is what makes it impossible for them to disagree (G-7).
+- **D-14b** Searching one file for a key:
+
+  | File kind | Method | Cost |
+  |---|---|---|
+  | in-order | binary search the pointer array, comparing the key at each probe | O(log n) comparisons |
+  | unordered | point lookup in the index (D-13c) | as the index provides |
+
+- **D-14c** Ancestors are **not** consulted by any read. They exist solely for
+  repacking (F-16), so a lookup never follows a chain.
+
+**Point lookup (D-14d).** Walk the sources in priority order; in each, search
+for the key by D-14b; stop at the first source that has it. That record decides
+the answer — its value, or absence if it is a deletion. A source that does not
+have the key is skipped, and no source may be skipped for any other reason.
+
+An implementation MAY skip a file without searching it when the key falls
+outside the file's key range, since an in-order file's first and last pointers
+bound its contents. This is an optimisation only: it MUST NOT change the answer,
+and it MUST NOT be applied to a source whose range is unknown.
+
+The cost is therefore proportional to the **number of files**, which is why
+keeping that count low is the point of the repack policy (D-16).
+
+**Iteration (D-14e).** A cursor or range scan is a k-way merge over the same
+sources, each of which MUST be traversable in comparator order — for an in-order
+file by walking its pointer array, for an unordered file by ordered traversal of
+its index (D-13c), and for the write transaction by its own ordered map.
+
+1. **Seek.** Position every source at the lower bound of the start key, or at
+   its beginning for a full scan.
+2. **Merge.** Keep the current key of each source in a heap of size *k*. The
+   smallest is the next candidate.
+3. **Resolve ties.** Where several sources hold the same key, the winner is the
+   one from the highest-priority source. All the others MUST be advanced past
+   that key as well, or a stale version would surface later as a duplicate.
+4. **Filter.** If the winner is a deletion, emit nothing and continue. The key
+   is consumed either way.
+5. **Bound.** For a prefix scan, stop when the winning key leaves the prefix.
+
+Each emitted record costs O(log k), and the sources are fixed for the
+iterator's lifetime, so no file can appear or vanish mid-scan (C-4).
+
+- **D-14f** Step 3 is the step to get right: advancing only the winning source
+  leaves the same key at the head of another, which then emits an older version
+  of a record already returned. That is the same class of bug as a point lookup
+  and a scan disagreeing, and T-5's cross-check is what catches it.
 
 ### 5.6 Repacking
 
@@ -899,7 +967,21 @@ values, a 16MB span forcing a long terminator, a record landing exactly on
 
 **T-5 Model-based.** Randomised operation sequences against an in-memory
 reference model, checked after every step by both a point lookup and a full
-scan, cross-checked against each other — the direct test for G-7.
+scan, cross-checked against each other — the direct test for G-7 and for D-14f.
+The generator MUST produce the shapes that stress the merge: the same key live in
+several files at once, a key deleted in a newer file and present in older ones, a
+key whose only version is in the oldest file, and keys adjacent in comparator
+order but split across files. Runs are repeated with the file set arranged so
+sources hold overlapping key ranges, since a merge that mishandles ties only
+fails when ties occur.
+
+**T-5a Read paths under every file arrangement.** The same assertions driven
+against a database deliberately arranged as: one unordered file only; several
+unordered files; one in-order file only; a mixture; and after a repack that
+collapsed some but not all files. Each arrangement exercises a different
+combination of D-14b search primitives, and the answers MUST be identical
+throughout. Includes the key-range skip in D-14d asserted to be a pure
+optimisation, by running with it disabled and comparing.
 
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
