@@ -170,16 +170,14 @@ terminator.
 
 | Value | Type | Header | Ancestor |
 |---|---|---|---|
-| `0x01` | `KEYVALUE` | 4 | implicit — a create |
-| `0x02` | `KEYVALUE_PRIOR` | 4 | on an earlier record in this same file |
-| `0x03` | `KEYVALUE_ANC` | 8 | explicit |
-| `0x04` | `BIGKEYVALUE` | 24 | implicit — a create |
-| `0x05` | `BIGKEYVALUE_PRIOR` | 24 | on an earlier record in this same file |
-| `0x06` | `BIGKEYVALUE_ANC` | 24 | explicit |
-| `0x07` | `DELETION_PRIOR` | 4 | on an earlier record in this same file |
-| `0x08` | `DELETION_ANC` | 8 | explicit |
-| `0x09` | `BIGDELETION_PRIOR` | 16 | on an earlier record in this same file |
-| `0x0A` | `BIGDELETION_ANC` | 16 | explicit |
+| `0x01` | `KEYVALUE` | 4 | omitted — the file's `start` |
+| `0x02` | `KEYVALUE_ANC` | 8 | explicit |
+| `0x03` | `BIGKEYVALUE` | 24 | omitted — the file's `start` |
+| `0x04` | `BIGKEYVALUE_ANC` | 24 | explicit |
+| `0x05` | `DELETION` | 4 | omitted — the file's `start` |
+| `0x06` | `DELETION_ANC` | 8 | explicit |
+| `0x07` | `BIGDELETION` | 16 | omitted — the file's `start` |
+| `0x08` | `BIGDELETION_ANC` | 16 | explicit |
 
 A 32-bit ancestor fits inside the padding the big forms already carry, so
 `_ANC` costs **nothing** there, and the short `_ANC` forms are 8 bytes rather
@@ -195,8 +193,9 @@ than 16.
 | `0x18` | `ROLLBACK_LONG_2ND` | (tail of `0x17`) | |
 
 - **F-12** Any other type byte, including `0x00`, is invalid.
-- **F-12a** There is no create form of a deletion: a deletion always
-  supersedes something, so it is only ever `_PRIOR` or `_ANC`.
+- **F-12a** Each record shape has exactly two forms: one storing an ancestor
+  and one omitting it. Nothing distinguishes a "create" at the record level,
+  because nothing needs to (F-17).
 
 ### 4.5 Data records
 
@@ -210,17 +209,18 @@ in place as C strings.
   from an absent key.
 
 The ancestor is an **absolute 32-bit generation**, never relative to the
-containing file. Only the first occurrence of a key within a file stores one.
+containing file, and is stored only when it differs from the containing file's
+`start` (F-17).
 
 ```
-KEYVALUE (0x01) / KEYVALUE_PRIOR (0x02)
+KEYVALUE (0x01)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
   +4   .  key NUL value NUL pad->8
   len = roundup8(4 + keylen + 1 + vallen + 1)
 
-KEYVALUE_ANC (0x03)
+KEYVALUE_ANC (0x02)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
@@ -228,14 +228,14 @@ KEYVALUE_ANC (0x03)
   +8   .  key NUL value NUL pad->8
   len = roundup8(8 + keylen + 1 + vallen + 1)
 
-DELETION_PRIOR (0x07)
+DELETION (0x05)
   +0   1  type
   +1   1  keylen
   +2   2  pad
   +4   .  key NUL pad->8
   len = roundup8(4 + keylen + 1)
 
-DELETION_ANC (0x08)
+DELETION_ANC (0x06)
   +0   1  type
   +1   1  keylen
   +2   2  pad
@@ -243,14 +243,14 @@ DELETION_ANC (0x08)
   +8   .  key NUL pad->8
   len = roundup8(8 + keylen + 1)
 
-BIGKEYVALUE (0x04) / BIGKEYVALUE_PRIOR (0x05)
+BIGKEYVALUE (0x03)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  8  vallen
   +24  .  key NUL value NUL pad->8
 
-BIGKEYVALUE_ANC (0x06)
+BIGKEYVALUE_ANC (0x04)
   +0   1  type
   +1   3  pad
   +4   4  ancestor generation
@@ -258,13 +258,13 @@ BIGKEYVALUE_ANC (0x06)
   +16  8  vallen
   +24  .  key NUL value NUL pad->8
 
-BIGDELETION_PRIOR (0x09)
+BIGDELETION (0x07)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  .  key NUL pad->8
 
-BIGDELETION_ANC (0x0A)
+BIGDELETION_ANC (0x08)
   +0   1  type
   +1   3  pad
   +4   4  ancestor generation
@@ -275,7 +275,7 @@ BIGDELETION_ANC (0x0A)
 - **F-15** Encoding is canonical: an implementation MUST use the short form
   whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
   whenever the span is `<= 0xFFFFFF` bytes; and MUST select between the
-  create, `_PRIOR` and `_ANC` forms exactly as F-17 and F-18 require. Output
+  ancestor-storing and ancestor-omitting forms exactly as F-17 requires. Output
   bytes are therefore determined by the logical contents together with what
   the file already holds. The big form is chosen by key or value length only,
   never by the ancestor, which is always 8 bytes when present.
@@ -299,20 +299,24 @@ BIGDELETION_ANC (0x0A)
   recalculating. A repack copies ancestors through verbatim, and the generation
   named may since have been absorbed into a file covering a range — harmless,
   because D-19 compares the absolute ancestor against a generation range.
-- **F-17** Only the **first occurrence of a key within a file** stores an
-  ancestor. Where a file holds versions V1, V2, V3 of a key, V1 carries the
-  ancestor and V2 and V3 use a `_PRIOR` form, because nothing reads their
-  ancestor: a lookup wants only the newest version, and a repack takes V1's
-  ancestor with V3's value (D-17). A repeated update within one file therefore
-  costs a 4-byte header instead of 16.
-- **F-18** A `_PRIOR` record asserts "an earlier record for this key exists in
-  this same file". An implementation MUST NOT write a create form for a record
-  that supersedes something, and MUST NOT write a `_PRIOR` form where no
-  earlier occurrence exists. Keeping them distinct is what stops a repack
-  mistaking a mid-file update for a create, concluding the chain starts there,
-  and dropping a tombstone it should have kept (D-18). A `_PRIOR` with no
-  earlier occurrence is a detectable inconsistency rather than a silent wrong
-  answer.
+- **F-17** The ancestor is **omitted exactly when it equals the containing
+  file's `start` generation**, and a record with no stored ancestor is read as
+  having that value. This one rule covers every case:
+
+  | Situation | Ancestor | Encoding |
+  |---|---|---|
+  | new key written into the active file | its own generation = the file's `start` | omitted |
+  | key updated again later in the same file | the file holding what it superseded is this one | omitted |
+  | key last written in an older file | that file's `start`, which is lower | stored |
+  | repack output, chain begins inside the output range | the output's `start` | omitted |
+  | repack output, chain begins earlier | the earliest ancestor, which is lower | stored |
+
+- **F-17a** The two conditions "this is a later occurrence in the file" and
+  "the ancestor equals this file's `start`" coincide, because a later
+  occurrence by definition supersedes a record in this same file. Decoding
+  therefore never needs to establish whether a record is the first occurrence
+  of its key. A repeated update within one file costs a 4-byte header rather
+  than 8.
 
 ### 4.7 Terminators
 
@@ -374,8 +378,9 @@ terminator covering the block.
   an in-order file are unique and the array is a strict ordering.
 - **F-27** Every pointer MUST be 8-aligned and lie between the header and the
   pointers block.
-- **F-28** An in-order file MUST NOT contain a `_PRIOR` record, since a repack
-  collapses each key to one record. This is a cheap consistency check.
+- **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
+  pointer array is strictly increasing by key, which both confirms the sort and
+  catches a repack that emitted a key twice (D-17).
 
 ### 4.10 Validation
 
@@ -547,10 +552,12 @@ directory scan against a repack.
   earliest parent generation among them.
 - **D-17a** Ancestors are copied verbatim; nothing is renumbered and no
   ancestor is recalculated (F-16c).
-- **D-17b** Finding V1's ancestor means finding the **first occurrence** of the
-  key, since later occurrences omit theirs (F-17). A repack MUST resolve each
-  key's earliest ancestor before applying D-18, and MUST NOT read the ancestor
-  of a `_PRIOR` record, which has none.
+- **D-17b** "V1's ancestor" is simply the **minimum ancestor across every
+  version of the key in the inputs**, each decoded per F-17. No first-occurrence
+  determination is needed: a later occurrence decodes to its file's `start`,
+  and the first occurrence's ancestor is always less than or equal to that, so
+  the minimum is V1's. The computation is therefore order-independent, which
+  matters because a k-way merge sees versions interleaved across files.
 - **D-18** Per key:
 
   | earliest ancestor | latest version | emit |
@@ -688,19 +695,32 @@ int  zs_db_store(struct zs_db *, const char *key, size_t keylen,
 int  zs_db_foreach(struct zs_db *, const char *prefix, size_t prefixlen,
                    zs_cb *p, zs_cb *cb, void *rock, int flags);
 
-int  zs_db_begin_txn(struct zs_db *, int shared, struct zs_txn **);
-int  zs_txn_commit(struct zs_txn **);
-int  zs_txn_abort(struct zs_txn **);
-int  zs_txn_fetch / zs_txn_store / zs_txn_foreach(...);
+/* transactions */
+int  zs_db_begin_txn(struct zs_db *db, int shared, struct zs_txn **txnp);
+int  zs_txn_commit(struct zs_txn **txnp);
+int  zs_txn_abort(struct zs_txn **txnp);
 
-int  zs_db_begin_cursor(struct zs_db *, const char *key, size_t keylen,
-                        struct zs_cursor **, int flags);
-int  zs_txn_begin_cursor(struct zs_txn *, ...);
-int  zs_cursor_next(struct zs_cursor *, const char **keyp, size_t *keylenp,
+int  zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
+                  const char **keyp, size_t *keylenp,
+                  const char **valp, size_t *vallenp, int flags);
+int  zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
+                  const char *val, size_t vallen, int flags);
+int  zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
+                    zs_cb *p, zs_cb *cb, void *rock, int flags);
+
+/* cursors, from a db (implicit transaction) or inside one */
+int  zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
+                        struct zs_cursor **curp, int flags);
+int  zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
+                         struct zs_cursor **curp, int flags);
+int  zs_cursor_next(struct zs_cursor *cur,
+                    const char **keyp, size_t *keylenp,
                     const char **valp, size_t *vallenp);
-int  zs_cursor_replace(struct zs_cursor *, const char *val, size_t vallen, int flags);
-int  zs_cursor_commit(struct zs_cursor **);
-int  zs_cursor_abort(struct zs_cursor **);
+int  zs_cursor_replace(struct zs_cursor *cur,
+                       const char *val, size_t vallen, int flags);
+int  zs_cursor_commit(struct zs_cursor **curp);
+int  zs_cursor_abort(struct zs_cursor **curp);
+void zs_cursor_fini(struct zs_cursor **curp);
 
 int  zs_db_repack(struct zs_db *);
 bool zs_db_should_repack(struct zs_db *);
@@ -710,12 +730,34 @@ int  zs_db_sync(struct zs_db *);
 const char *zs_strerror(int r);
 ```
 
-Flags occupy one space and are not reused across operations: `ZS_CREATE`,
-`ZS_SHARED`, `ZS_NOCSUM`, `ZS_NOSYNC`, `ZS_NONBLOCKING`, `ZS_IFNOTEXIST`,
-`ZS_IFEXIST`, `ZS_FETCHNEXT`, `ZS_SKIPROOT`, `ZS_CURSOR_PREFIX`.
+Flags occupy one 32-bit space and are never reused for different meanings in
+different calls, though not every flag is meaningful everywhere:
+
+| Flag | Where | Meaning |
+|---|---|---|
+| `ZS_CREATE` | open | create the database if absent |
+| `ZS_SHARED` | open, txn | read-only (A-5) |
+| `ZS_NOCSUM` | open | do not verify checksums on read (F-5e) |
+| `ZS_NOSYNC` | open | do not `fsync` on commit (C-7) |
+| `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
+| `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
+| `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
+| `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
+| `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
+| `ZS_CURSOR_PREFIX` | foreach, cursor | stop when the key leaves the prefix |
+
+- **A-0** Every read and write entry point exists in three forms — on the
+  database, on a transaction, and via a cursor — and all three take `flags`.
+  The `zs_db_*` forms are convenience wrappers that open an implicit
+  single-operation transaction, so there is no operation reachable one way but
+  not another.
 
 - **A-1** `store` with `val == NULL` writes a deletion; with a non-NULL
   zero-length value it stores an empty value. These are distinct states.
+- **A-1a** A write inside a transaction is visible to subsequent reads on that
+  same transaction, and to nothing else until commit. `zs_txn_fetch` and
+  `zs_txn_foreach` therefore consult the transaction's own uncommitted records
+  first, per D-14.
 - **A-2** There is no `yield` call and no yield flags: readers hold no lock, so
   there is nothing to yield.
 - **A-3** There is no MVCC flag. Snapshot isolation is the only read mode,
@@ -752,7 +794,10 @@ Under ASan and UBSan with a per-case wall-clock timeout, the timeout being the
 detector for F-29.
 
 **T-4 Behavioural.** Ordering, prefix scans, cursor replace,
-`IFEXIST`/`IFNOTEXIST`/`FETCHNEXT`/`SKIPROOT`, empty-value versus absent key
+`IFEXIST`/`IFNOTEXIST`/`FETCHNEXT`/`SKIPROOT`/`CURSOR_PREFIX`, every flag
+exercised through all three entry points — database, transaction and cursor —
+and asserted to behave identically (A-0), read-your-own-writes inside a
+transaction and invisibility outside it (A-1a), empty-value versus absent key
 (A-1), and the encoding boundaries: 255↔256-byte keys, 65535↔65536-byte
 values, a 16MB span forcing a long terminator, a record landing exactly on
 8-byte alignment, and keys containing embedded NULs (F-13).
@@ -763,13 +808,12 @@ scan, cross-checked against each other — the direct test for G-7.
 
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
-when `end != 0`; that an in-order file never contains a `_PRIOR` record (F-28);
-that repeated writes to one key in a file produce one ancestor-bearing record
-followed by `_PRIOR` records (F-17). Negatively, hand-built files whose first
-occurrence of a key is `_PRIOR`, and where a mid-file update is written as a
-create, are reported by `zs_db_check_consistency` rather than silently
-mis-repacked (F-18), and a repack of the latter is asserted **not** to drop the
-tombstone.
+when `end != 0`; that an in-order file's pointers are strictly increasing by key
+(F-28); and that every row of F-17's table round-trips — in particular that
+repeated writes to one key in a file store the ancestor at most once, and that a
+record with no stored ancestor decodes to its file's `start`. Negatively, a
+hand-built file storing an ancestor equal to its own `start` (which F-15 forbids
+as non-canonical) is reported by `zs_db_check_consistency`.
 
 **T-7 Ancestors and repacking.** For every arrangement of create, update and
 delete spread across generations: chains stay unbroken (F-16), D-17 preserves
