@@ -517,7 +517,7 @@ filesize-4    4   checksum of the pointer section
 | `zeroskip.manifest` | replaced atomically | published file set |
 | `zeroskip.tmp.<pid>.<n>` | transient | repack output and manifest staging |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
-| `zeroskip.index` | pure cache | key order for files without pointers |
+| `zeroskip.index` | pure cache | key order for files without a pointer section; location not normative (D-13b1) |
 
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
@@ -609,7 +609,7 @@ directory scan against a repack.
 
 ### 5.4 Shared index
 
-- **D-13** `zeroskip.index` is a regular file `mmap`'d `MAP_SHARED`, holding
+- **D-13** `zeroskip.index` is `mmap`'d `MAP_SHARED`, holding
   key order for files that lack a pointer section — the active file and any
   unordered file not yet repacked — keyed by generation and stamped with the
   database UUID, the generation, and the offset it is valid to.
@@ -618,6 +618,37 @@ directory scan against a repack.
   stamps before use and discard it on any inconsistency.
 - **D-13b** Its internal layout is not part of this specification and may
   change without a format version bump. Only its invariants are specified.
+- **D-13b1** Nor is its **location** normative. A regular file in the database
+  directory is the portable default: it works identically on Linux, macOS and
+  the BSDs, needs no configuration, occupies no global namespace, and is removed
+  along with the database. Since it is never `fsync`ed (C-6b), its pages are
+  written back lazily or not at all.
+- **D-13b2** An implementation MAY place it on a **tmpfs** or in a POSIX shared
+  memory object instead, which suits a pure cache — RAM-backed, no writeback,
+  cleared by a reboot. Neither can be the *default*: there is no portable tmpfs
+  path, macOS having no `/dev/shm`.
+- **D-13b2a** For `shm_open` the database UUID supplies the name, and macOS's
+  31-character `PSHMNAMLEN` is not an obstacle provided the UUID is encoded
+  compactly: `/zs-` followed by base64url of the 16 raw bytes is 26 characters,
+  and base32 is 30. Only the 36-character textual form fails to fit. The UUID also
+  makes the global namespace collision-free. What remains is cleanup — an
+  `shm_unlink` is needed when a database is destroyed, and an orphaned segment
+  survives until the next reboot.
+- **D-13b2b** Wherever the index lives, three things MUST hold:
+
+  1. the staging file for a rebuild is on the **same filesystem**, or `rename`
+     cannot switch it atomically (D-13i);
+  2. the stamps of D-13a are sufficient to reject a **foreign or stale** index,
+     since a location outside the database directory can outlive the database or
+     be shared by unrelated ones;
+  3. an index on a filesystem local to one host is **per-host**, so a database on
+     shared storage may have several independent caches. That is harmless
+     precisely because it is a cache, and it is the stamps that keep it so.
+
+- **D-13b3** Anonymous shared memory is **not** an option for the shared index:
+  `MAP_ANONYMOUS|MAP_SHARED` is shareable only by descendants of the process that
+  created it, and the processes using one database are typically unrelated. It is
+  the right choice for the **private** copy D-13g requires.
 - **D-13c** Those invariants are that, for one file, the index supports all
   three of:
 
@@ -657,6 +688,39 @@ directory scan against a repack.
   the same reason they are for data files. That handles growth and rebuilds but
   not incremental updates to the active file, so it does not remove the need for
   D-13g.
+
+**Reclaiming entries for repacked files (D-13i).** When a repack turns unordered
+files into an in-order one, their index entries become garbage. The protocol is:
+
+1. The repack publishes a manifest that no longer lists those generations, and
+   removes the files (D-23). **It does not touch the index.**
+2. Their entries are now **dead**. A reader MUST ignore any index entry whose
+   generation is not in its own manifest snapshot, so dead entries are inert —
+   they waste space and nothing else.
+3. The **writer**, holding the write lock, rebuilds the index when dead entries
+   or total size pass a threshold: write a fresh index containing entries only
+   for generations in the current manifest, then `rename` it into place. No
+   `fsync` and no directory sync (C-6b) — the rename is for atomic visibility,
+   not durability.
+4. Readers holding the old index mapped are unaffected (D-13h), and the kernel
+   reclaims the old inode once the last mapping closes.
+
+- **D-13j** The repack cannot perform step 3 itself, even though it creates the
+  garbage. Rebuilding means copying the active file's array, which is being
+  mutated concurrently, and the repacker is forbidden from taking the write lock
+  (C-1b). Deferring to the writer is not a stylistic choice: the writer is the
+  only party that can safely read that array.
+- **D-13k** Only a writer ever writes the index file, since a read-only open must
+  have no side effects (R-3). Two consequences worth stating: rebuilds are
+  serialised for free by the write lock, needing no additional lock; and a
+  database that is only ever read never has its index populated, so every reader
+  scans privately. That is the correct trade — a reader that wrote to shared
+  state would no longer be read-only — and it costs nothing for a database with
+  any write traffic at all.
+- **D-13l** No step above requires reference counting or liveness detection. Dead
+  entries are recognised by comparing against the manifest, and superseded index
+  files are reclaimed by the kernel, so nothing has to be cleaned up when a
+  process dies.
 
 The layout is not normative (D-13b), but the shape that works best is worth
 recording. Begin the file with a map from generation to an
@@ -700,12 +764,12 @@ for the key by D-14b; stop at the first source that has it. That record decides
 the answer — its value, or absence if it is a deletion. A source that does not
 have the key is skipped, and no source may be skipped for any other reason.
 
-An implementation MAY skip a file without searching it when the key falls
-outside the file's key range, since an in-order file's first and last pointers
-bound its contents. This is an optimisation only: it MUST NOT change the answer,
-and it MUST NOT be applied to a source whose range is unknown. A file with no
-records has **no** such range and so cannot be bounds-checked — but it can be
-skipped unconditionally, since it contains nothing (F-26g).
+An implementation MAY probe the first and last pointers before the rest, which
+rejects an out-of-range key in two comparisons rather than the log₂n a plain
+binary search would take to walk to an end. This is a search *strategy*, not a
+way of avoiding the search: those two pointers still have to be dereferenced and
+their keys compared, so it is the same kind of work, just less of it. It needs no
+cached metadata and cannot change the answer.
 
 The cost is therefore proportional to the **number of files**, which is why
 keeping that count low is the point of the repack policy (D-16).
@@ -874,13 +938,26 @@ The per-file cursors are held in an array kept sorted by:
   table and nothing to clean up when a process dies.
 - **C-5** The accepted cost of C-4 is that disk space is held until the last
   reader holding an old snapshot exits.
-- **C-6 Directory durability.** After creating a file (a new active file, or a
-  repack output) and after any `rename`, the implementation MUST `fdatasync`
-  the **directory**, otherwise the name may be absent after a crash even
-  though the file's contents are durable.
+- **C-6 Directory durability.** After creating a **data file** (a new active
+  file, or a repack output) and after renaming a repack output or the manifest,
+  the implementation MUST `fdatasync` the **directory**, otherwise the name may
+  be absent after a crash even though the file's contents are durable.
 - **C-6a** A directory sync is **not** required after `unlink`. If a removed
   name reappears after a crash the file is unreferenced debris, which readers
   ignore (D-7) and a later repack removes again (D-23).
+- **C-6b** The **index** is never `fsync`ed and its rename needs no directory
+  sync, because it is a pure cache (D-13a): a crash that loses it, or leaves it
+  torn or absent, costs a rebuild and nothing else. Syncing it would buy nothing
+  — there is no state in it worth preserving that cannot be recomputed from the
+  data files.
+- **C-6c** What replaces that durability is **validation**. Because a torn index
+  is now a state the design deliberately permits, an implementation MUST be able
+  to detect one: the stamps of D-13a are not merely a version check but the
+  mechanism that makes skipping `fsync` safe, and they MUST be strong enough to
+  reject a partially written or partially visible index rather than read it as
+  valid. `rename` remains necessary for a different reason — it gives readers an
+  atomic switch between whole index files — but atomicity here is about
+  visibility, not durability.
 - **C-7** Default durability `fsync`s after each commit terminator.
   `ZS_NOSYNC` omits it, trading crash survival for throughput while retaining
   atomicity.
@@ -1109,8 +1186,9 @@ some but not all files; **and with an empty in-order file among populated ones**
 since a zero-pointer source is where a binary search or a cursor seek is most
 likely to go wrong (F-26g). Each arrangement exercises a different
 combination of D-14b search primitives, and the answers MUST be identical
-throughout. Includes the key-range skip in D-14d asserted to be a pure
-optimisation, by running with it disabled and comparing.
+throughout. If the first-and-last probe of D-14d is implemented, results are
+compared with it disabled to confirm it changes nothing — including for keys
+below the first and above the last.
 
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
@@ -1180,7 +1258,12 @@ half-finished repacks over overlapping ranges, where naive independent cleanup
 would remove both and lose a generation; removal attempted without the packer
 lock, asserting refusal (D-23). The shared index deleted, truncated and
 bit-flipped mid-run, asserting identical results (G-6). Concurrent repack and
-writer both proceeding, with publish serialised.
+writer both proceeding, with publish serialised. Index reclamation (D-13i): after
+a repack, dead entries asserted inert and ignored; a rebuild asserted to drop
+exactly them; a reader mapping the pre-rebuild index asserted unaffected; and,
+since the index is never synced (C-6b), an index truncated or garbled at a random
+offset asserted to be rejected and rebuilt rather than read — the case that would
+otherwise have justified an `fsync`.
 
 **T-10a Index stability under a writing writer.** A reader mid-scan while a
 writer commits repeatedly to the active file, asserting the reader's results are
@@ -1213,6 +1296,7 @@ backend is a thin separate adapter, out of scope.
    If it ever needs bounding, two mitigations preserve the same steady state:
    merge pairwise, one step per invocation, or cap the cascade at a projected
    output size and resume next time.
-2. **Shared index growth.** D-13 fixes the invariants but not the growth policy
-   for `zeroskip.index`, which must cover the active file and any unordered
-   files awaiting repack without unbounded growth.
+2. **Index rebuild threshold.** D-13i specifies how the index is reclaimed but
+   not when: the dead-entry or size threshold that triggers a writer-side
+   rebuild is a tuning constant, and picking it wants a measurement rather than
+   an argument.
