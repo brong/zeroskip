@@ -630,29 +630,53 @@ and it MUST NOT be applied to a source whose range is unknown.
 The cost is therefore proportional to the **number of files**, which is why
 keeping that count low is the point of the repack policy (D-16).
 
-**Iteration (D-14e).** A cursor or range scan is a k-way merge over the same
-sources, each of which MUST be traversable in comparator order — for an in-order
-file by walking its pointer array, for an unordered file by ordered traversal of
-its index (D-13c), and for the write transaction by its own ordered map.
+**Iteration (D-14e).** A cursor holds one **per-file cursor** per source, each
+traversable in comparator order — for an in-order file by walking its pointer
+array, for an unordered file by ordered traversal of its index (D-13c), and for
+the write transaction by its own ordered map.
 
-1. **Seek.** Position every source at the lower bound of the start key, or at
-   its beginning for a full scan.
-2. **Merge.** Keep the current key of each source in a heap of size *k*. The
-   smallest is the next candidate.
-3. **Resolve ties.** Where several sources hold the same key, the winner is the
-   one from the highest-priority source. All the others MUST be advanced past
-   that key as well, or a stale version would surface later as a duplicate.
-4. **Filter.** If the winner is a deletion, emit nothing and continue. The key
-   is consumed either way.
-5. **Bound.** For a prefix scan, stop when the winning key leaves the prefix.
+The per-file cursors are held in an array kept sorted by:
 
-Each emitted record costs O(log k), and the sources are fixed for the
-iterator's lifetime, so no file can appear or vanish mid-scan (C-4).
+> **current key ascending, then generation descending.**
 
-- **D-14f** Step 3 is the step to get right: advancing only the winning source
-  leaves the same key at the head of another, which then emits an older version
-  of a record already returned. That is the same class of bug as a point lookup
-  and a scan disagreeing, and T-5's cross-check is what catches it.
+1. **Seek.** Seek every per-file cursor to the start point, so its current
+   record is the first with key `>=` the start key — or mark it exhausted. A
+   binary search yields either an exact match or the preceding position, in
+   which case one step forward gives this. A full scan seeks to the beginning.
+   Then sort the array.
+2. **Take.** The next record to emit is always **element 0**: O(1), with no
+   comparison needed to find it.
+3. **Skip stale duplicates.** Because equal keys sort by generation descending,
+   every cursor positioned on the emitted key is **contiguous from the front**
+   of the array, and element 0 is the newest. Advance elements 1, 2, … for as
+   long as their current key equals the emitted one.
+4. **Filter.** If element 0's record is a deletion, emit nothing. The key is
+   consumed either way.
+5. **Advance and re-sort.** Advance element 0, then move it down the array to
+   its new position — its key only ever increases, so this is a single insertion
+   into an already-sorted array, and it stops as soon as it is no longer greater
+   than its neighbour.
+6. **Bound.** For a prefix scan, stop when the emitted key leaves the prefix.
+
+- **D-14f** Folding the tie-break into the sort is what makes step 3 safe.
+  Advancing only the winning cursor would leave the same key at the head of
+  another, which then emits an older version of a record already returned — the
+  same class of bug as a point lookup and a scan disagreeing. Because equal keys
+  are adjacent and newest-first, "advance while the next cursor's key matches"
+  is both the complete fix and cheap.
+- **D-14g** The write transaction's own records sort as though they had a
+  generation above every file's, giving them highest priority for equal keys
+  without a special case in the comparator.
+- **D-14h** A per-file cursor never yields the same key twice: an in-order file
+  holds one record per key (D-17), and an unordered file's index exposes only
+  the newest committed record per key (D-13d). Duplicates therefore arise only
+  *across* sources, which is exactly what step 3 handles.
+- **D-14i** Picking the next record is O(1) and re-sorting one cursor is O(k)
+  worst case, where *k* is the number of sources. A sorted array rather than a
+  heap is the right shape because *k* is small by design (D-16) and usually the
+  advanced cursor stays at or near the front, so the insertion terminates
+  immediately. The sources are fixed for the cursor's lifetime, so no file can
+  appear or vanish mid-scan (C-4).
 
 ### 5.6 Repacking
 
@@ -974,6 +998,17 @@ key whose only version is in the oldest file, and keys adjacent in comparator
 order but split across files. Runs are repeated with the file set arranged so
 sources hold overlapping key ranges, since a merge that mishandles ties only
 fails when ties occur.
+
+**T-5b Cursor mechanics.** The sorted-array invariant of D-14e asserted after
+every step: that the array is ordered by key ascending then generation
+descending, that cursors on equal keys are contiguous from the front with the
+newest first, and that element 0 is always the correct next record. Then the
+failure D-14f describes, constructed directly — the same key present in three
+files at once, asserting it is emitted once from the newest and that advancing
+only element 0 would have emitted it three times. Plus exhaustion handling: a
+source exhausted at seek, one exhausted mid-scan, and every source exhausted; a
+cursor seeked past every key; and a start key that exactly matches a record in
+some sources but not others (D-14e step 1).
 
 **T-5a Read paths under every file arrangement.** The same assertions driven
 against a database deliberately arranged as: one unordered file only; several
