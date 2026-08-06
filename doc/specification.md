@@ -518,7 +518,8 @@ directory scan against a repack.
 - **D-15** The repacker **never touches the active file**. It runs
   periodically, or whenever a non-active unordered file exists.
 - **D-16** Input selection:
-  1. Take **all** non-active unordered files.
+  1. Take **all** non-active unordered files, which collapse together into a
+     **single** ordered file rather than one ordered file each.
   2. If the resulting file would be larger than the next lowest in-order file,
      include that file too and repeat.
   3. Stop when every file is included or the next lowest in-order file is
@@ -526,6 +527,19 @@ directory scan against a repack.
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
+- **D-16a** Step 1 collapses all unordered files at once because the cost of a
+  read scales with the number of files that must be consulted, so minimising
+  the resulting file count is the point. Where only one non-active unordered
+  file exists — the common case, since a writer converts the file it has just
+  left (D-12) — this is the same thing as converting it alone.
+- **D-16b** Steps 2 and 3 cascade rather than merging two files per invocation.
+  Both converge to the same steady state, since a cascade is simply several
+  pairwise steps run back to back, but the cascade does strictly less total
+  I/O: merging *A*, *B*, *C* in one pass writes `a+b+c`, whereas *A*+*B* then
+  (*A*+*B*)+*C* writes `2a+2b+c`. Pairwise also leaves a higher file count
+  between invocations, which reads pay for. The cost of the cascade is that a
+  single invocation is unbounded in duration; that is accepted (see open
+  items).
 - **D-17** The output holds **exactly one record per key**, built from the live
   records of all inputs, skipping rolled-back spans. Where the inputs hold
   versions V1, V2, V3 of a key from oldest to newest, the emitted record
@@ -764,8 +778,10 @@ table is followed, and D-19 drops a key only when its whole lifespan is inside
 the output. The D-19a resurrection is constructed directly, asserting both that
 the key stays absent and that dropping the retained record *does* produce the
 bug — so the test fails if the rule is ever removed as an optimisation. Also
-that D-16 selects inputs correctly, reaching the geometric size relation after
-many rollovers, and that an empty output is still written (D-22).
+that D-16 selects inputs correctly — several unordered files collapsing into
+one ordered file rather than one each (D-16a), and the cascade reaching the
+geometric size relation after many rollovers — and that an empty output is
+still written (D-22).
 
 **T-8 Crash injection.** A test build interposes `write`, `fsync`, `rename` and
 `unlink`, counts calls, and aborts at call *N* for every *N* over a scripted
@@ -816,7 +832,11 @@ backend is a thin separate adapter, out of scope.
 1. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
    database while the writer continues appending. The packer lock permits one
    repack at a time, but nothing bounds how long one runs or lets it be
-   interrupted and resumed.
+   interrupted and resumed. This is a deliberate trade for lower total I/O and
+   a smaller file count (D-16b), and writing continues throughout regardless.
+   If it ever needs bounding, two mitigations preserve the same steady state:
+   merge pairwise, one step per invocation, or cap the cascade at a projected
+   output size and resume next time.
 2. **Shared index growth.** D-13 fixes the invariants but not the growth policy
    for `zeroskip.index`, which must cover the active file and any unordered
    files awaiting repack without unbounded growth.
