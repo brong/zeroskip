@@ -40,8 +40,8 @@ tolerate compaction happening out of band.
 | active file | the highest-generation unordered file — the only file a writer appends to |
 | span | zero or more data records followed by one terminator |
 | terminator | a commit or rollback record, ending a span |
-| complete | an unordered file whose content ends at its last valid span |
-| clean | an active file that is complete *and* has nothing after that last valid span |
+| complete at *n* | the logical end of an unordered file: the offset after its last valid span, which may be short of the file's physical end |
+| clean | an unordered file whose complete point *is* its physical end — nothing follows the last valid span |
 | ancestor | the absolute generation at which the shadow cast by a record hits the previous record for that key |
 | shadowed | a record superseded by a later record for the same key, anywhere |
 
@@ -52,8 +52,10 @@ whether a pointer section must be present.
 
 ## 3. Guarantees
 
-- **G-1 Append-only.** No committed byte is ever mutated; no data file is ever
-  renamed or truncated.
+- **G-1 Append-only.** No committed byte is ever mutated and no file is ever
+  truncated. A file is renamed exactly once, from its staging name to its final
+  name, which is the instant it joins the file set (C-3); once named, it is never
+  renamed again.
 - **G-2 Commit atomicity.** Once `zs_txn_commit` returns `ZS_OK`, the whole
   transaction is visible to new readers and, under default durability,
   survives a crash. A crash exposes exactly a prefix of committed
@@ -101,12 +103,17 @@ whether a pointer section must be present.
   self-describing. The field is plain data read before any verification, so
   there is no bootstrapping problem, and files written under different engines
   may coexist.
-- **F-5b** xxHash is used through its vendored reference implementation, whose
+- **F-5b** Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the
+  stored checksum is the **low 32 bits** of the 64-bit result — that is,
+  `(uint32_t)(h & 0xFFFFFFFF)` — written little-endian like every other integer
+  (F-1). Both the seed and which half is kept must be pinned or two
+  implementations would produce different bytes from the same input.
+- **F-5b1** xxHash is used through its vendored reference implementation, whose
   scalar path is portable C; any SIMD acceleration within it is an internal
   optimisation of the same function, not a separate code path that could be
   absent on a given platform. The resulting value MUST be bit-identical
   everywhere, which the golden corpus pins (T-1).
-- **F-5c** Engine 0 weakens G-2 and G-3, because F-16's property — that a
+- **F-5c** Engine 0 weakens G-2 and G-3, because F-22's property — that a
   terminator reaching disk without its data fails validation — depends on a
   real checksum. With engine 0 a torn tail is undetectable. It exists for
   testing and for callers with durability guarantees elsewhere.
@@ -178,6 +185,18 @@ Each part earns its place, following the reasoning behind the PNG signature:
   of the pointer section, so it must be recorded per file — there is no manifest
   to hold it (§5.2). Opening a database whose files disagree, or whose comparator
   differs from the caller's, is an error.
+- **F-11a The default comparator.** Compare `min(alen, blen)` bytes as
+  **unsigned** octets; if they differ, that decides. If they are equal, the
+  **shorter key sorts first**. Equal length and equal bytes means equal keys.
+  Nothing here may be left to the C library: `memcmp` is only guaranteed to
+  return a sign, and `char` signedness varies by platform, so a comparator that
+  compares `char` directly orders keys differently on ARM than on x86 and
+  produces incompatible pointer sections.
+- **F-11b** The default comparator's recorded name is the ASCII string
+  `memcmp`, NUL-padded to 16 bytes. A caller supplying its own comparator MUST
+  supply a name; names are compared byte-for-byte, and an empty name is invalid.
+  Two implementations must agree on this string or neither will open the other's
+  database.
 
 ### 4.4 Record types
 
@@ -307,11 +326,11 @@ BIGDELETION_ANC (0x0F)
 - **F-15** Encoding is canonical: an implementation MUST use the short form
   whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
   whenever the span is `<= 0xFFFFFF` bytes; and MUST select between the
-  ancestor-storing and ancestor-omitting forms exactly as F-17 requires; and
-  MUST choose the pointer width by F-26a. Output
-  bytes are therefore determined by the logical contents together with what
-  the file already holds. The big form is chosen by key or value length only,
-  never by the ancestor, which is always 8 bytes when present.
+  ancestor-storing and ancestor-omitting forms exactly as F-17 requires; and MUST
+  choose the pointer width by F-26c. Output bytes are therefore determined by the
+  logical contents together with what the file already holds. The big form is
+  chosen by key or value length only, never by the ancestor, which is 4 bytes
+  whenever it is present.
 
 ### 4.6 Ancestors
 
@@ -456,6 +475,12 @@ filesize-4    4   checksum of the pointer section
   section up to the checksum field itself — the section, its padding, the back
   pointer, and the records checksum — following F-4 with no special case. The
   back pointer is read as plain data first, so there is no circularity.
+- **F-26c** Encoding is canonical: `PTRS32` MUST be used when every record
+  offset fits in 32 bits, and `PTRS64` otherwise. Since all records precede the
+  section, that is equivalent to the section's own offset fitting in 32 bits.
+- **F-26d** The narrow section is padded with zeroes to a multiple of 8 so the
+  trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
+  covers it.
 - **F-26e** The records checksum covers the region from the end of the header to
   the start of the pointer section. A commit record would have carried this, and
   the commit record itself is redundant, but the coverage is not: without it a
@@ -467,12 +492,6 @@ filesize-4    4   checksum of the pointer section
   `zs_db_check_consistency`, or by a caller that chooses to — never on open,
   which stays O(1) (F-31). The pointer-section checksum *is* verified on open,
   because everything the file's structure depends on lives inside it.
-- **F-26c** Encoding is canonical: `PTRS32` MUST be used when every record
-  offset fits in 32 bits, and `PTRS64` otherwise. Since all records precede the
-  section, that is equivalent to the section's own offset fitting in 32 bits.
-- **F-26d** The narrow section is padded with zeroes to a multiple of 8 so the
-  trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
-  covers it.
 - **F-26g** `count` MAY be **zero**. An in-order file with no records is legal
   and expected — a repack that drops every key produces one (D-22) — and its
   layout is simply `[header][pointer section][trailer]` with an empty records
@@ -520,6 +539,12 @@ filesize-4    4   checksum of the pointer section
 | `zeroskip.tmp.<pid>.<n>` | transient | staging for a repack or conversion output |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
 
+- **D-0** The `<uuid>` in a filename is the **36-character lowercase hyphenated
+  RFC 4122 form** of the header's 16-byte UUID, for example
+  `4941da54-9406-4faa-a457-c4b65beae3eb`. Case and layout must be pinned or two
+  implementations would generate different names for the same database. Lowercase
+  here against uppercase generations (D-1) is deliberate: the two fields stay
+  visually distinct in a directory listing.
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
   `zeroskip-<uuid>-00000001-0000000A`. Eight hex digits is exactly the range of
@@ -556,6 +581,12 @@ without opening a single file.
   that does not tile. That MUST be retried. A set that is *stale* but tiles is
   not an error — it is simply an older snapshot, and every snapshot is an older
   snapshot of something.
+- **D-8a Creating a database.** With `ZS_CREATE` and no existing directory, or a
+  directory holding no data files, an implementation creates the directory,
+  generates a UUID, and creates generation 1 as the active file — a 72-byte header
+  and no spans, which F-26h makes a legal empty file. Without `ZS_CREATE` this is
+  `ZS_NOTFOUND`. The UUID's value is arbitrary and opaque; only its 16-byte
+  encoding (F-11) and its textual form in filenames (D-0) are fixed.
 - **D-8** Creating a file **is** publishing it, since the directory is the truth.
   There is no window in which a generation has been allocated but is invisible,
   which is what makes the high-water mark of D-9b unable to regress and no-reuse
@@ -653,8 +684,7 @@ Every read draws on the same set of **sources**, ordered newest to oldest:
 | Priority | Source | Search primitive |
 |---|---|---|
 | highest | the current write transaction's uncommitted records | its private in-memory map |
-| then | data files by `start` **descending** | see D-14b |
-| lowest | the oldest file | |
+| then, newest to oldest | each data file, by `start` **descending** | see D-14b |
 
 - **D-14** Within a file the newest version of a key wins — the highest offset
   among committed spans. Across sources, the first record found in the order
@@ -729,8 +759,8 @@ The per-file cursors are held in an array kept sorted by:
   generation above every file's, giving them highest priority for equal keys
   without a special case in the comparator.
 - **D-14h** A per-file cursor never yields the same key twice: an in-order file
-  holds one record per key (D-17), and an unordered file's private index exposes only
-  the newest committed record per key (D-13d). Duplicates therefore arise only
+  holds one record per key (D-17), and an unordered file's private index exposes
+  only the newest committed record per key (D-13a). Duplicates therefore arise only
   *across* sources, which is exactly what step 3 handles.
 - **D-14i** Picking the next record is O(1) and re-sorting one cursor is O(k)
   worst case, where *k* is the number of sources. A sorted array rather than a
@@ -741,8 +771,9 @@ The per-file cursors are held in an array kept sorted by:
 
 ### 5.6 Repacking
 
-- **D-15** The repacker **never touches the active file**. It runs
-  periodically, or whenever a non-active unordered file exists.
+- **D-15** The repacker **never touches the active file**, and never touches an
+  unordered file at all (D-16). It runs periodically, or whenever D-24 reports
+  work.
 - **D-16** The repacker works **only on in-order files**; converting unordered
   files is the writer's job (D-12). Input selection:
   1. Start from the newest in-order file.
@@ -757,9 +788,6 @@ The per-file cursors are held in an array kept sorted by:
   them independent (C-1a). It also gives each a distinct character: a writer's
   conversion is bounded by `rollover_size` and happens inline (D-12d), while the
   repacker's cascade is unbounded and runs out of band.
-- **D-16c** Because D-12b keeps in-order files as a contiguous prefix, the
-  repacker's inputs are always adjacent (D-19) and the cascade is never blocked
-  by an unordered file sitting between two candidates.
 - **D-16b** Steps 1 to 3 cascade rather than merging two files per invocation.
   Both converge to the same steady state, since a cascade is simply several
   pairwise steps run back to back, but the cascade does strictly less total
@@ -768,6 +796,9 @@ The per-file cursors are held in an array kept sorted by:
   between invocations, which reads pay for. The cost of the cascade is that a
   single invocation is unbounded in duration; that is accepted (see open
   items).
+- **D-16c** Because D-12b keeps in-order files as a contiguous prefix, the
+  repacker's inputs are always adjacent (D-19) and the cascade is never blocked
+  by an unordered file sitting between two candidates.
 - **D-17** The output holds **exactly one record per key**, built from the live
   records of all inputs, skipping rolled-back spans. Where the inputs hold
   versions V1, V2, V3 of a key from oldest to newest, the emitted record
@@ -823,7 +854,7 @@ The per-file cursors are held in an array kept sorted by:
 - **D-23** Removing a data file — a converted unordered file, repack inputs, or
   the contained files left by an interrupted repack — MUST be done **holding the
   remove lock**, and only after verifying
-  that a complete set of files exists without it (D-8). Verification and
+  that a complete set of files exists without it (D-6). Verification and
   removal MUST happen under one unbroken hold of the lock, so the set cannot
   change in between. If verification fails the file MUST be left alone:
   leaking a file costs disk space, removing a needed one costs the database.
@@ -861,6 +892,7 @@ The per-file cursors are held in an array kept sorted by:
 - **C-3** A file is published by writing it under a staging name, then
   `rename`ing it to its final name. Readers see it only once complete, and the
   rename is the instant it joins the file set (D-8).
+
 **C-4 Taking a snapshot.** The protocol is:
 
 1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*`
@@ -922,9 +954,9 @@ any point.
   file) and after renaming a repack or conversion output into place, the
   implementation MUST `fdatasync` the **directory**, otherwise the name may be
   absent after a crash even though the file's contents are durable.
-- **C-6a** A directory sync is **not** required after `unlink`. If a removed
-  name reappears after a crash the file is unreferenced debris, which readers
-  ignore (D-7) and a later repack removes again (D-23).
+- **C-6a** A directory sync is **not** required after `unlink`. If a removed name
+  reappears after a crash it is a file an enclosing range already supersedes,
+  which readers ignore (D-5) and a later pass removes again (D-23).
 - **C-7** Default durability `fsync`s after each commit terminator.
   `ZS_NOSYNC` omits it, trading crash survival for throughput while retaining
   atomicity.
@@ -966,6 +998,12 @@ Opaque types, one 32-bit flag space, output through pointer parameters, and
 `ZS_AGAIN`, …).
 
 ```c
+typedef int      zs_cb(void *rock, const char *key, size_t keylen,
+                       const char *val, size_t vallen);
+typedef int      zs_compar(const char *a, size_t alen,
+                           const char *b, size_t blen);
+typedef uint32_t zs_csum(const char *buf, size_t len);
+
 struct zs_open_data {
     uint32_t     flags;
     zs_compar   *compar;         /* NULL = byte order */
@@ -1044,6 +1082,9 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
 | `ZS_CURSOR_PREFIX` | foreach, cursor | stop when the key leaves the prefix |
+| `ZS_CSUM_NONE` | open | write engine 0 into files this handle creates |
+| `ZS_CSUM_XXHASH` | open | engine 1, the default if no `ZS_CSUM_*` is given |
+| `ZS_CSUM_EXTERNAL` | open | engine 2; `zs_open_data.csum` MUST be supplied |
 
 - **A-0** Every read and write entry point exists in three forms — on the
   database, on a transaction, and via a cursor — and all three take `flags`.
@@ -1070,6 +1111,13 @@ different calls, though not every flag is meaningful everywhere:
   transaction or cursor that produced them; for the non-transactional
   `zs_db_*` calls, until the next call on that `struct zs_db`.
 - **A-5** `ZS_SHARED` is read-only and MUST NOT write (R-3).
+- **A-6** A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**;
+  it never overrides what an existing file records, since each file's engine comes
+  from its own header (F-5a). Opening a database whose files use engine 2 without
+  supplying `csum` is an error, as those files cannot be verified.
+- **A-7** `zs_compar` returns negative, zero or positive like `memcmp`, but MUST
+  implement F-11a's total order rather than delegating to `memcmp` alone, which
+  says nothing about keys of differing length.
 
 ## 9. Conformance suite
 
@@ -1090,8 +1138,9 @@ single-byte mutation rejected; the specific corruptions the magic is designed
 to catch — eighth bit stripped, `0D 0A` collapsed to `0A`, `0A` expanded to
 `0D 0A`, and byte 0 replaced by the UTF-8 substitution character's encoding
 `EF BF BD` (F-6a) — each rejected. Also that the 16 bytes fail a UTF-8 validity
-check, so the property is asserted rather than merely believed. Read and write versions above the library's rejected
-appropriately, and a file readable-but-not-writable accepted read-only (F-7).
+check, so the property is asserted rather than merely believed. Read and write
+versions above the library's own rejected appropriately, and a file that is
+readable but not writable accepted read-only (F-7).
 
 **T-2a The trailer.** Opening an in-order file depends entirely on it, so: the
 16-byte trailer read without prior knowledge of the file, the back pointer
@@ -1102,6 +1151,16 @@ type; a file shorter than header plus trailer; and a corrupted pad byte — each
 rejected rather than read. The records checksum verified on demand and asserted
 to catch a record body corrupted in place (F-26e), which nothing else would
 detect in an in-order file.
+
+**T-2c Interoperability constants.** The values two implementations must agree on
+bit-for-bit, each asserted against a literal rather than against the
+implementation's own computation: `XXH3_64bits` with seed 0 over known inputs,
+truncated low-32 and little-endian (F-5b), including the empty input that F-26g
+needs; the default comparator's total order over a table that includes a key and
+its own prefix, keys differing only above `0x7F` — which a signed-`char` compare
+gets wrong — and the empty-versus-one-byte case (F-11a); the exact bytes of the
+`memcmp` comparator name field (F-11b); and a generated filename for a known UUID
+and generation range, character for character (D-0, D-1).
 
 **T-2b Type byte validity.** All 256 byte values fed as a record type, asserting
 exactly the 14 in F-12's table are accepted and the other 242 rejected. A
