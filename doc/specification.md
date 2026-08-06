@@ -98,8 +98,13 @@ tolerate compaction happening out of band.
 | 44 | 4 | checksum of bytes `[0, 44)` |
 
 - **F-6** File numbers start at 1, so `end == 0` is never legitimate and
-  means "records are not in key order; this file has no `[Pointers]`
-  block".
+  means "records are not in key order".
+- **F-6a** Whether a file carries a `[Pointers]` block is a **separate,
+  independently self-describing** property: a file has pointers if and only
+  if its trailing terminator is a `FINAL` variant, since `FINAL` by
+  definition marks the commit following `[Pointers]` (F-17 makes that
+  terminator locatable by reading the last 8 bytes). A file may therefore
+  have a durable index without being in key order.
 - **F-7** A file created fresh has `start == its own number` and `end == 0`.
   A file produced by merging inputs spanning numbers *i*..*j* has
   `start == i`, `end == j`.
@@ -237,8 +242,9 @@ long (24 bytes)                       *_LONG
 
 ### 4.7 Pointers
 
-Present only in in-order files (`end != 0`), written once, immediately
-before a `FINAL` terminator that covers the block.
+Written once, immediately before a `FINAL` terminator that covers the block.
+Present in any file that has been closed — both in-order files and closed
+unsorted files (F-6a).
 
 | Off | Size | Field |
 |---|---|---|
@@ -255,7 +261,10 @@ before a `FINAL` terminator that covers the block.
   oldest.
 - **F-23** `NumShadowedRecords` and `NumShadowedBytes` count records
   superseded by a later record for the same key **within the same file**,
-  and the bytes those records occupy. See §11 open items.
+  and the bytes those records occupy. They are non-zero in a closed unsorted
+  file, which retains every version it was written, and zero in an in-order
+  file, which retains only the newest version of each key (D-17). They are
+  the measure of what merging this file would reclaim.
 - **F-24** Every pointer MUST be 8-aligned and within
   `[48, pointers_offset)`.
 
@@ -268,9 +277,10 @@ before a `FINAL` terminator that covers the block.
   construction.
 - **F-26** Every length, offset and pointer MUST be bounds-checked against
   the file size before any dereference.
-- **F-27** Opening an in-order file is O(1): validate the header, locate
-  the trailing terminator, validate it over the pointers block, and use the
-  pointers. Individual records are bounds-checked on access, not on open.
+- **F-27** Opening any file with a `[Pointers]` block — closed or in-order
+  (F-6a) — is O(1): validate the header, locate the trailing terminator,
+  validate it over the pointers block, and use the pointers. Individual
+  records are bounds-checked on access, not on open.
 
 ## 5. Database layout
 
@@ -334,29 +344,43 @@ before a `FINAL` terminator that covers the block.
 
 ### 5.3 File lifecycle
 
-```
-create ──> active (unsorted, end=0) ──> closed (unsorted, end=0) ──┐
-                     │                                            │
-                     └── damaged ──> sealed (unsorted, read-only) ─┤
-                                                                   v
-                              in-order file (end=N) <── merge ─────┘
-```
+Four states, each distinguishable from the file itself plus the manifest:
+
+| State | `end` | trailing `FINAL` | records | searched via |
+|---|---|---|---|---|
+| active | 0 | no | append order | shared index |
+| closed | 0 | yes | append order | own `[Pointers]` |
+| sealed | 0 | no | append order | shared index or scan |
+| in-order | N | yes | key order | own `[Pointers]` |
+
+The active file is the one the manifest names; a non-active `end == 0` file
+without a trailing `FINAL` is therefore sealed.
 
 - **D-9** When the active file exceeds `rollover_size` (default 2 MB), the
-  writer creates a new active file and publishes. The closed file remains
-  unsorted; it is not rewritten at rollover, so rollover is cheap and off
-  the latency path.
-- **D-10** Several unsorted files MAY exist at once. Repacking is a
-  separate, deferrable decision.
-- **D-11** Merging *k* input files produces one in-order file covering
-  their combined range, with `[Pointers]` and a `FINAL` terminator.
+  writer **closes** it — appending `[Pointers]` and a `FINAL` terminator —
+  then creates a new active file and publishes. Closing does not reorder
+  records, so it costs one sort of keys the writer already has in memory
+  plus one `8 × NumPointers` append, keeping rollover off the latency path.
+- **D-9a** Closing gives every rolled-over file a durable index, so the
+  shared index is only ever needed for the active file and for sealed
+  files, and losing it can never force a rescan of a closed file.
+- **D-9b** A **sealed** file cannot be closed, because appending
+  `[Pointers]` would mean appending past an untrustworthy terminator
+  boundary (R-4). Sealed files are searched via the shared index or a scan
+  until a merge absorbs them. This is the only case where index loss costs
+  a rescan.
+- **D-10** Several unsorted files MAY exist at once; putting records into
+  key order is a separate, deferrable decision made by merging.
+- **D-11** Merging *k* input files produces one in-order file covering their
+  combined range, with `[Pointers]` and a `FINAL` terminator.
 
 ### 5.4 Shared index
 
 - **D-12** `zeroskip.index` is a regular file, `mmap`'d `MAP_SHARED`,
-  holding one index per unsorted file keyed by file number, each stamped
-  with the database UUID, the file number, and the offset it is valid up
-  to.
+  holding one index per file that lacks a `[Pointers]` block — that is, the
+  active file and any sealed files (D-9a) — keyed by file number and each
+  stamped with the database UUID, the file number, and the offset it is
+  valid up to.
 - **D-13** It is a pure cache and MUST NOT be authoritative. Any process
   MAY discard it and rebuild by scanning. An implementation MUST validate
   its stamps before use and MUST discard it on any inconsistency.
@@ -387,8 +411,35 @@ create ──> active (unsorted, end=0) ──> closed (unsorted, end=0) ──�
   through update to delete is contained in the merge. Otherwise the
   tombstone MUST be retained, because an older unmerged file may still hold
   the key and dropping it would resurrect the value.
-- **D-19** `zs_db_should_repack` reports on accumulated reclaimable space
-  and file count.
+- **D-19** Only **adjacent** files in the `start` ordering may be merged.
+  Merging non-adjacent files would produce an output range enclosing a file
+  that was not merged, violating the non-overlap invariant (F-8). Adjacency
+  also makes D-18 sound: because ranges are contiguous and non-overlapping,
+  an output range `[S, E]` accounts for every file number it spans, so
+  `ancestor >= S` really does prove the create was merged.
+
+**Merge policy (D-20).** Order the closed files oldest to newest — oldest
+first, and by construction largest first. The target invariant is that each
+file is at least as big as its next-newer neighbour, giving geometrically
+decreasing sizes:
+
+> If a file is as big as its parent, merge it into its parent. Repeat as
+> needed.
+
+Concretely, after a rollover adds a new newest closed file, walk from newest
+towards oldest: while `size(file) >= size(parent)`, merge the two and
+re-test the result against *its* parent, cascading until the invariant holds
+or the oldest file is reached. "Size" is bytes on disk; `NumShadowedBytes`
+is what makes the merge worth doing, but the trigger is plain size so it can
+be evaluated from `stat` alone.
+
+- **D-21** This yields O(log(total ÷ `rollover_size`)) files with
+  geometrically increasing sizes, and amortised O(log n) rewrites per
+  record. A lookup miss therefore touches a logarithmic number of files.
+- **D-22** The active file never participates; it becomes a merge candidate
+  only once closed. Sealed files participate normally.
+- **D-23** `zs_db_should_repack` reports whether D-20 currently has any
+  merge to do.
 
 ## 6. Concurrency and durability
 
@@ -556,7 +607,18 @@ scan, and cross-checked against each other — the direct test for G-7.
 update and delete spread across file boundaries: that chains stay unbroken
 (F-15), that D-17 rewrites ancestors correctly, that D-18 drops a key only
 when its whole lifespan is inside the merge, and that a key deleted in a
-newer file is never resurrected by merging older ones.
+newer file is never resurrected by merging older ones. Also that only
+adjacent files are ever merged (D-19), and that the D-20 cascade reaches the
+geometric size invariant — driven by appending enough data to force many
+rollovers and asserting the resulting file count and size distribution.
+
+**T-5a File states.** All four states of §5.3 round-trip and are correctly
+identified from the file plus manifest: that a closed file is searched via
+its own `[Pointers]` and an in-order file likewise, that both are recognised
+by their trailing `FINAL` (F-6a) independently of `end`, that a closed
+unsorted file reports non-zero `NumShadowedRecords`/`Bytes` and an in-order
+file reports zero (F-23), and that a sealed file is never closed or appended
+to (D-9b).
 
 **T-6 Crash injection.** A test build interposes `write`, `fsync` and
 `rename`, counts calls, and aborts at call *N* for every *N* across a
@@ -596,15 +658,16 @@ out of scope here.
 
 ## 11. Open items
 
-1. **`NumShadowedRecords` / `NumShadowedBytes` are unpopulated.** Per F-23
-   they count within-file supersession, but `[Pointers]` appears only in
-   in-order files (F-6), and merging collapses each key to its newest
-   version (D-17), so both are structurally always 0. Resolve by either
-   (a) dropping the fields, (b) redefining them as reclamation statistics
-   about the merge inputs, or (c) permitting `[Pointers]` on unsorted files,
-   which would make them meaningful and give closed unsorted files a
-   durable index — at the cost of a fourth file state.
-2. **Merge input selection policy** (which files, how many at a time, what
-   triggers it) is unspecified; D-19 only exposes the signal.
-3. **`zs_db_repair`** is omitted pending a decision on whether sealing
-   (R-4) makes an explicit repair entry point unnecessary.
+1. **`zs_db_repair`** is omitted pending a decision on whether sealing
+   (R-4) makes an explicit repair entry point unnecessary. A plausible
+   remaining use is forcing a merge that absorbs sealed files, since that is
+   the only way to recover their space and give their records a durable
+   index (D-9b).
+2. **Merge concurrency limit.** D-20 can cascade into a large merge (the
+   oldest file is the biggest) while the writer continues appending. The
+   packer lock permits exactly one merge at a time, but nothing bounds how
+   long one may run or lets it be interrupted and resumed. Deferred until
+   there is a measurement to argue from.
+3. **Shared index sizing.** D-14 fixes the invariants but not the growth
+   policy for `zeroskip.index`, which must hold an index for the active file
+   and any sealed files without unbounded growth.
