@@ -33,10 +33,8 @@ language SHOULD express the same semantics idiomatically.
   requires. Only §8's zero-copy pointer lifetimes (A-4) assume it, and that is a
   binding-level promise a copying implementation simply makes differently.
 - **G-0a** Every integer in every structure is little-endian (F-1), including
-  lengths, counts, generations and offsets. This is worth stating twice because
-  several languages default the other way — a JVM `DataOutputStream` or a naive
-  network-order habit produces files nothing else can read, and the header
-  checksum will not catch it, because it is computed over whatever was written.
+  lengths, counts, generations and offsets. A header checksum will not catch a
+  wrong byte order, since it is computed over whatever was written.
 - **G-0b** Any arithmetic on a length, count or offset **read from a file** MUST
   be overflow-checked before use. `keylen + vallen + 2` and
   `offset + record_length` are attacker- and corruption-controlled; wrapping them
@@ -262,11 +260,10 @@ Every legal combination, and no others:
   family; `HasAncestor` appears only with `HasKey`; `IsDelete` appears with
   `HasKey` or `SpanTerminator` but never with `Pointers`; `IsBig` may appear
   with any family; and bits `0x40` and `0x80` are reserved and always zero.
-- **F-12a** The bits are meaningful in isolation, which is the point of
-  encoding them this way. `type & IsBig` selects the wide layout in all three
-  families, `type & HasAncestor` says whether the ancestor field is present, and
-  `type & IsDelete` means negation whether the subject is a key or a span. A
-  decoder reads the shape from the bits rather than from a lookup table.
+- **F-12a** Each bit is meaningful in isolation: `type & IsBig` selects the wide
+  layout in all three families, `type & HasAncestor` says whether the ancestor
+  field is present, and `type & IsDelete` means negation, whether of a key or of a
+  span. A decoder reads a record's shape from the bits.
 - **F-12b** Each data shape has exactly two forms, one storing an ancestor and
   one omitting it. Nothing distinguishes a "create" at the record level, because
   nothing needs to (F-17).
@@ -365,11 +362,10 @@ BIGDELETION_ANC (0x0F)
   or an earlier one. An update or deletion stores it; a create stores nothing,
   its ancestor being implicitly its own generation.
 - **F-16a** The stored value is the **`start` of the range of the file holding
-  the superseded record** when the shadow was cast. Referencing `start` rather
-  than `end` is deliberately conservative: since `start <= end` it points at or
-  further back than strictly necessary, so D-19's containment test errs toward
-  "the create lies outside this range" and therefore toward **retaining** a
-  tombstone. Wrong answers cost disk space, never correctness.
+  the superseded record** when the shadow was cast — not its `end`. Since
+  `start <= end`, D-19's containment test then errs toward retaining a tombstone
+  rather than dropping one, so an imprecise ancestor costs disk space and not
+  correctness.
 - **F-16b** There is **no guarantee the ancestor is numerically close**: a key
   untouched for a long time and then updated casts its shadow far back. A
   record in generation 20 may legitimately reference generation 5.
@@ -424,10 +420,9 @@ long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
   enclose the aborted records and make them live.
 - **F-22** Because the checksum covers the span **and** the terminator, a
   terminator that reaches disk without its data fails validation and reads as
-  absent. This makes a torn tail **detectable**, which is what recovery (F-24) and
-  concurrent reading (C-4f) rest on. It does **not** follow that one sync
-  suffices: detectability is a different question from durability ordering and
-  from noticing an I/O error, and C-7 requires two gates for those.
+  absent. A torn tail is therefore always detectable, which recovery (F-24) and
+  concurrent reading (C-4f) both depend on. Durability is separate, and requires
+  the two gates of C-7.
 
 ### 4.8 The span chain
 
@@ -510,12 +505,8 @@ filesize-4    4   checksum of the pointer section
   trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
   covers it.
 - **F-26e** The records checksum covers the region from the end of the header to
-  the start of the pointer section. A commit record would have carried this, and
-  the commit record itself is redundant, but the coverage is not: without it a
-  record body corrupted in place would go undetected, whereas the equivalent
-  region of an unordered file is covered by its span terminator. Placing it in
-  the trailer's otherwise-unused four bytes costs nothing, and F-26b means it is
-  itself protected.
+  the start of the pointer section, so a record body corrupted in place is
+  detectable. F-26b covers the field itself.
 - **F-26f** The records checksum is verified lazily — by
   `zs_db_check_consistency`, or by a caller that chooses to — never on open,
   which stays O(1) (F-31). The pointer-section checksum *is* verified on open,
@@ -569,22 +560,18 @@ filesize-4    4   checksum of the pointer section
 
 - **D-0** The `<uuid>` in a filename is the **36-character lowercase hyphenated
   RFC 4122 form** of the header's 16-byte UUID, for example
-  `4941da54-9406-4faa-a457-c4b65beae3eb`. Case and layout must be pinned or two
-  implementations would generate different names for the same database. Lowercase
-  here against uppercase generations (D-1) is deliberate: the two fields stay
-  visually distinct in a directory listing.
+  `4941da54-9406-4faa-a457-c4b65beae3eb`. Lowercase, against the uppercase
+  generations of D-1.
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
   `zeroskip-<uuid>-00000001-0000000A`. Eight hex digits is exactly the range of
   a 32-bit generation, so every representable generation has a name and the
   width never needs to change. Fixed width also keeps lexical and numeric order
   identical, and hexadecimal keeps names short.
-- **D-1a** Data files carry **no extension**, and that is load-bearing rather
-  than stylistic. An unordered file's name is a strict **prefix** of the in-order
-  name covering the same generation — `...-00000005` against
-  `...-00000005-00000005` — so it sorts first, which is precisely what makes D-5's
-  resolution rule work. Any suffix sorting after `-` reverses that pair and breaks
-  the rule; see D-5c.
+- **D-1a** Data files carry **no extension**. An unordered file's name is
+  therefore a strict **prefix** of the in-order name covering the same generation —
+  `...-00000005` against `...-00000005-00000005` — and so sorts before it, which
+  D-5's rule requires. Any suffix sorting after `-` would reverse that pair.
 - **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable. Staging
   names begin `zeroskip.` and therefore never match the data-file pattern.
@@ -643,26 +630,11 @@ without opening a single file.
   | conversion output present with its input | `00000005`, `00000005-00000005` | the in-order file — the unordered name is a prefix, so it sorts first |
   | both at once: unordered *N*, `N-N`, and a wider `N-M` | `00000005`, `00000005-00000005`, `00000005-00000009` | `[5-9]`, the widest |
 
-- **D-5b** Taking the **first** rather than the last would be wrong, and not
-  merely suboptimal: it selects a repack *input* over the output, and since inputs
-  are unlinked one at a time, as soon as `[1-1]` goes the set has a gap at
-  generation 1 and stops tiling — readers would retry until removal finished.
-- **D-5c** The rule depends on the unordered name being a strict prefix of the
-  in-order name (D-1a). Appending an extension that sorts after `-` reverses that
-  pair, so the scan would take the *unordered* file over the conversion output —
-  and in the three-file case above, over a wider in-order file, discarding
-  generations 6 to 9 from the set and forcing a retry. This is why data files have
-  no extension.
-- **D-5d** A **partial** overlap, where neither range contains the other, cannot
-  arise from any legal sequence: a repack merges adjacent files so its output is a
-  union of adjacent ranges, concurrent repacks are excluded by the repack lock, and
-  a repack and a conversion produce disjoint ranges (C-1a). The scan surfaces it as
-  a gap, which MUST be reported rather than worked around. Implementations must
-  agree here, or one would read a database another rejects.
-- **D-5e** Getting this wrong is not transient. Every conversion passes through
-  the equal-range state, so it is the common path; and if a writer dies between
-  the `rename` and the `unlink`, the state persists until another writer cleans
-  up. A reader that rejects overlaps instead of resolving them retries **forever**.
+- **D-5b** The rule requires an unordered file's name to sort before the in-order
+  name for the same generation, which D-1a's naming provides.
+- **D-5c** A **partial** overlap, where neither range contains the other, cannot
+  arise from any legal sequence and MUST be reported as corruption rather than
+  resolved.
 - **D-6 Completeness.** A set is complete if and only if the scan of D-5 consumes
   every generation from the lowest present through the active file's, leaving no
   gap. The resolved ranges therefore **tile a contiguous interval**, from the oldest surviving generation through the active
@@ -680,9 +652,8 @@ without opening a single file.
   `ZS_NOTFOUND`. The UUID's value is arbitrary and opaque; only its 16-byte
   encoding (F-11) and its textual form in filenames (D-0) are fixed.
 - **D-8** Creating a file **is** publishing it, since the directory is the truth.
-  There is no window in which a generation has been allocated but is invisible,
-  which is what makes the high-water mark of D-9b unable to regress and no-reuse
-  hold by construction rather than by bookkeeping.
+  There is no window in which a generation has been allocated but is invisible, so
+  the highest generation present cannot regress (D-9b).
 
 ### 5.3 Writing
 
@@ -758,13 +729,9 @@ own index, in private memory, for each unordered file in its snapshot.
   incrementally.** It already knows every record it appends, so it folds them in
   at commit and discards them on rollback, and never rescans a file it is
   writing.
-- **D-13c** Making the index private is what allows the design to hold a much
-  stronger property than "the cache is validated before use": **no shared state
-  is ever mutated in place, anywhere.** Files are append-only, a new file is
-  published by `rename`, superseded files are reclaimed by the kernel. Nothing
-  a reader may be reading is ever rewritten beneath it, so there is no sequence
-  counter, no stability protocol, no reclamation dance, and no starvation under
-  a hot writer.
+- **D-13c** No shared state is mutated in place anywhere in the design: files are
+  append-only, a new file is published by `rename`, and superseded files are
+  reclaimed by the kernel when the last reader closes.
 - **D-13d** The cost is that each snapshot replays the unordered files it
   includes. That is bounded twice over: each such file is at most
   `rollover_size`, and D-12 keeps their number at one in the steady state.
@@ -841,12 +808,10 @@ The per-file cursors are held in an array kept sorted by:
    than its neighbour.
 6. **Bound.** For a prefix scan, stop when the emitted key leaves the prefix.
 
-- **D-14f** Folding the tie-break into the sort is what makes step 3 safe.
-  Advancing only the winning cursor would leave the same key at the head of
-  another, which then emits an older version of a record already returned — the
-  same class of bug as a point lookup and a scan disagreeing. Because equal keys
-  are adjacent and newest-first, "advance while the next cursor's key matches"
-  is both the complete fix and cheap.
+- **D-14f** Because the tie-break is part of the sort, cursors on the emitted key
+  are adjacent and newest-first, so advancing while the next cursor's key matches
+  is a complete treatment of step 3. Advancing only element 0 would leave the same
+  key at another cursor's head, to be emitted again from an older version.
 - **D-14g** The write transaction's own records sort as though they had a
   generation above every file's, giving them highest priority for equal keys
   without a special case in the comparator.
@@ -876,18 +841,12 @@ The per-file cursors are held in an array kept sorted by:
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
-- **D-16a** Splitting the two jobs by whether a file has an `end` is what makes
-  them independent (C-1a). It also gives each a distinct character: a writer's
-  conversion is bounded by `rollover_size` and happens inline (D-12d), while the
-  repacker's cascade is unbounded and runs out of band.
-- **D-16b** Steps 1 to 3 cascade rather than merging two files per invocation.
-  Both converge to the same steady state, since a cascade is simply several
-  pairwise steps run back to back, but the cascade does strictly less total
-  I/O: merging *A*, *B*, *C* in one pass writes `a+b+c`, whereas *A*+*B* then
-  (*A*+*B*)+*C* writes `2a+2b+c`. Pairwise also leaves a higher file count
-  between invocations, which reads pay for. The cost of the cascade is that a
-  single invocation is unbounded in duration; that is accepted (see open
-  items).
+- **D-16a** The two jobs divide by whether a file has an `end`, which is what
+  makes them independent (C-1a): a writer's conversion is bounded by
+  `rollover_size` and runs inline (D-12d), the repacker's cascade is unbounded and
+  runs out of band.
+- **D-16b** A cascade writes one output for the whole selected set, not one per
+  pair. A single invocation is therefore unbounded in duration (see open items).
 - **D-16c** Because D-12b keeps in-order files as a contiguous prefix, the
   repacker's inputs are always adjacent (D-19) and the cascade is never blocked
   by an unordered file sitting between two candidates.
@@ -922,14 +881,9 @@ The per-file cursors are held in an array kept sorted by:
   the tombstone MUST be retained, because an older file may still hold the key
   and dropping it would resurrect the value.
 - **D-19a** The emitted record MUST be written even when a newer file already
-  shadows the key. Being shadowed is **not** a licence to drop a record.
-  Concretely: K is created in generation 3, updated in 7, updated again in 9.
-  Repacking `[5, 7]` emits one record for K carrying ancestor 3. Drop it, and a
-  later repack of `[5, 9]` sees only generation 9's record, whose ancestor
-  points at the `[5, 7]` file and so reads as 5; since `5 >= 5` it concludes
-  the lifespan is contained and drops K — resurrecting it, because the create
-  was really in generation 3. The retained record is the only surviving
-  evidence of how far back the chain reaches.
+  shadows the key: being shadowed does not permit dropping a record. Only D-19
+  does. The retained record carries the chain's reach, which no other file
+  records. T-7 constructs the resurrection that follows from dropping it.
 - **D-20** Inputs are iterated in key order: from the pointer section where present,
   otherwise from the same private index any reader of a pointerless file builds.
   There is nothing repack-specific about this.
@@ -971,101 +925,40 @@ The per-file cursors are held in an array kept sorted by:
   with `l_type = F_WRLCK`, `l_whence = SEEK_SET`, `l_start` the byte above, and
   `l_len = 1`. This is part of the interoperability surface, not an
   implementation choice — see C-1e.
-- **C-1e Locking is an interop surface.** Implementations in different languages
-  must exclude *each other*, so the primitive and the byte offsets are normative.
-  In particular an implementation MUST NOT use `flock`: on Linux `flock` and
-  `fcntl` locks occupy **separate spaces and do not exclude one another**, so a
-  `flock`-based writer and an `fcntl`-based writer would each believe it held the
-  write lock and would append to the same file concurrently. Nothing detects this
-  — the two would interleave records and destroy the span chain. `flock` is also
-  a no-op over some network filesystems.
-- **C-1f `fcntl` locks are per-process, not per-thread.** Two threads in one
-  process both "acquire" the write lock successfully, because the kernel sees one
-  owner. G-5 therefore requires an **in-process mutex as well**, held across the
-  same region as the file lock. A single-threaded process never notices this; a
-  runtime with a thread pool or green threads — Go, Java, Rust with tokio — will
-  corrupt the active file without it.
-- **C-1g** `fcntl` locks are also released by closing **any** descriptor for the
-  file in that process, not just the one used to acquire them. An implementation
-  MUST keep exactly one descriptor for `zeroskip.lock` open for the handle's
-  lifetime and MUST NOT open or close a second one, which is easy to do
-  accidentally in a language whose file objects close on garbage collection.
+- **C-1e** The primitive and the byte offsets are normative, because
+  implementations in different languages must exclude each other. An
+  implementation MUST NOT use `flock`, which occupies a separate lock space from
+  `fcntl` on Linux and does not exclude it, and is a no-op over some network
+  filesystems.
+- **C-1f** `fcntl` locks are per-process, not per-thread: two threads of one
+  process both acquire the same lock successfully. G-5 therefore requires an
+  in-process mutex as well, held across the same region as the file lock.
+- **C-1g** `fcntl` locks are released by closing **any** descriptor for the file
+  in that process. An implementation MUST hold exactly one descriptor for
+  `zeroskip.lock` for the handle's lifetime, and MUST NOT open a second.
 
 - **C-1a** The write and repack locks never contend, because the two jobs
   consume **disjoint sets of files**: a writer only ever converts files with
   `end == 0`, and the repacker only ever merges files with `end != 0` (D-16). A
   file becomes visible to the repacker precisely when the writer has finished
-  with it. Neither ever waits for the other, and a writer therefore never waits
-  on a repack — which matters because a repack may run for a long time (open
-  item 1).
+  with it, so a writer never waits on a repack.
 - **C-1b** Publishing a new file needs **no lock at all**: `rename` into the
   directory is atomic, and a repack's output `[a..b]` and a conversion's output
-  `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order.
-  This is why a repack stays valid even when a new in-order file appears above it
-  midway through.
-- **C-1c** The **remove** lock exists solely so that verifying completeness and
-  unlinking happen as one step (D-23). Without it two processes could each
-  conclude a different file was expendable and remove both.
+  `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order,
+  and a repack stays valid when a new in-order file appears above it midway
+  through.
+- **C-1c** The **remove** lock makes verifying completeness and unlinking one
+  step (D-23).
 - **C-1d Lock ordering.** Acquisition is always write → remove or
   repack → remove. Nothing acquires write or repack while holding remove, and
   nothing holds both write and repack, so no cycle exists.
-- **C-1h Why not a named primitive.** The UUID would happily name a lock in a
-  global namespace, but naming is not the hard part — **release on process death**
-  is, and that is what rules the alternatives out:
-
-  | Primitive | Named by UUID | Dies with the process | Verdict |
-  |---|---|---|---|
-  | `fcntl` record lock on a file | no, by path | **yes**, kernel-released | chosen |
-  | `open(O_CREAT\|O_EXCL)` lock file | by path | **no** | this is the original zeroskip's unrecoverable-after-crash bug |
-  | POSIX named semaphore (`sem_open`) | yes | **no** — a killed holder leaves it decremented forever | rejected |
-  | SysV semaphore with `SEM_UNDO` | via `key_t` | yes | rejected — but see C-1h1; the decisive reason is the lock space, not the key width |
-  | robust `pthread_mutex` in shared memory | yes | yes, via `EOWNERDEAD` | rejected: **macOS has no `PTHREAD_MUTEX_ROBUST`**, and it is a target platform |
-  | `flock` | by path | yes | rejected: does not conflict with `fcntl` locks (C-1e) |
-
-  A global-namespace object is also worse in kind: it outlives the directory it
-  describes, needs its own cleanup, and can be orphaned by a database that was
-  simply deleted. A file inside the directory is disposed of with the database.
-- **C-1h1 On SysV semaphores specifically.** `SEM_UNDO` genuinely does give
-  release on death, so this one fails on interoperability rather than on its own
-  merits: a semaphore is a **different lock space from `fcntl`**, so an
-  implementation using it would not exclude one using record locks. That is the
-  `flock` failure (C-1e) with a different spelling, and it disqualifies the
-  primitive whatever its other properties.
-- **C-1h2** Its `key_t` collision is a lesser problem than it first appears, and
-  worth stating accurately. `key_t` is 32 bits, so a key derived from a 128-bit
-  UUID collides at a rate that is not remote — about a 1% chance across 9,000
-  concurrently-keyed databases and even odds by 77,000, which a deployment holding
-  per-user databases can reach. But a collision causes **over**-exclusion, not
-  under-exclusion: each database still has exclusive access, it is merely
-  serialised against an unrelated one. That costs concurrency, not correctness.
-- **C-1h3** The exception is deadlock, and its sharp form needs only **one**
-  process: if a process holds the write lock on database *A* and then opens *B*,
-  whose key collides, it blocks on the semaphore it already holds and deadlocks
-  against itself. No second process is required, the trigger is a hash collision
-  between two UUIDs, and it is therefore data-dependent and silent. `fcntl` on
-  distinct paths cannot collide at all, so it has no equivalent.
-- **C-1h4 Locks across databases are the caller's problem.** C-1d orders the
-  locks *within* one database; the library cannot see across two, so a caller
-  that writes to several while holding locks MUST impose its own consistent order
-  or it can deadlock — with any primitive, collision or not. Cyrus does open
-  several databases at once, so this is worth stating rather than assuming.
-- **C-1i Open file description locks.** `F_OFD_SETLK` is a strict improvement
-  where it exists — present on Linux and, verified in its SDK headers, on macOS.
-  It is released when the last descriptor for that open file description closes,
-  so it keeps the death-release property, and because it is scoped to a
-  description rather than a process it **removes the C-1g footgun entirely**:
-  closing some unrelated descriptor for the lock file no longer drops the lock.
-  That matters most in a language that closes files during garbage collection.
-- **C-1j** Classic `F_SETLK` is nonetheless **normative**, because it is the one
-  form available everywhere including the older BSDs. An implementation MAY use
-  `F_OFD_SETLK` instead **only** where it has verified that OFD and classic record
-  locks conflict with each other on that platform — documented on Linux, and what
-  T-13's third-observer check exists to prove. Mixing two lock spaces that do not
-  conflict is the `flock` failure, and it is silent, so this may not be assumed
-  from the API's presence alone.
-- **C-1k** OFD locks do not remove the need for an in-process mutex (C-1f) unless
-  every writing thread holds its own descriptor. Two threads sharing one
-  description still do not exclude each other.
+- **C-1h Locks across databases.** C-1d orders the locks within one database.
+  The library cannot see across two, so a caller that holds locks on several
+  while writing MUST impose its own consistent order.
+- **C-1i** An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only
+  where it has verified that the two conflict with each other on that platform.
+  `F_OFD_SETLK` is scoped to an open file description, so C-1g does not apply to
+  it; C-1f still does, unless every writing thread holds its own descriptor.
 - **C-2** Readers take **no lock**.
 - **C-3** A file is published by writing it under a staging name, then
   `rename`ing it to its final name. Readers see it only once complete, and the
@@ -1076,7 +969,7 @@ The per-file cursors are held in an array kept sorted by:
 1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*`
    and parsing each generation range from its name.
 2. Run D-5's scan over the sorted names. If it leaves a gap the set is
-   incomplete (D-6) — either a torn `readdir` or corruption (D-5d) — so restart
+   incomplete (D-6) — either a torn `readdir` or corruption (D-5c) — so restart
    from 1.
 3. `open` and `mmap` every file in the resolved set. If any `open` fails with
    `ENOENT`, restart from 1.
@@ -1102,21 +995,15 @@ any point.
   below the snapshot boundary is immutable — a prefix of an append-only file is
   stable by construction. Growth beyond the boundary is invisible: the mapping
   covers the prefix and the reader never looks past it.
-- **C-4d Nothing shared needs synchronising.** Every index is private (D-13c),
-  so there is no sequence counter, no copy-then-validate, and no starvation under
-  a hot writer. An earlier draft shared a mutable sorted array between processes;
-  that cannot be made safe by a sequence counter alone, because the writer's
-  `memmove`, reallocation and file growth can move the array or invalidate a
-  reader's mapping, and a counter tells a reader only afterwards that what it
-  read was rubbish — it cannot un-fault a page.
+- **C-4d** Every index is private (D-13c), so a snapshot needs no synchronisation
+  against a writer beyond what C-4c already provides.
 - **C-4f Concurrent visibility.** A reader scanning the active file may meet a
   span the writer is still writing. The terminator's checksum covers the span's
   data (F-19), so a terminator whose data is not yet fully visible fails
   validation and reads as absent — the reader stops there, exactly as it would
-  after a crash. This is what makes lock-free reading of a live file safe, not
-  merely crash recovery: the checksum supplies the ordering guarantee that no
-  memory barrier is available to provide across independent processes sharing a
-  mapping.
+  after a crash. The checksum therefore supplies the ordering guarantee that no
+  memory barrier can provide between independent processes sharing a mapping,
+  which is what permits reading a live file without a lock.
 - **C-4g Lifetime.** Once its descriptors are open a packer may (subject to
   D-23) `unlink` superseded files immediately: the kernel keeps each inode alive
   until the last descriptor *and mapping* is gone. There is no reference table
@@ -1143,20 +1030,16 @@ any point.
 
   `fdatasync` rather than `fsync` because appending changes only the metadata
   needed to read the data back, which `fdatasync` is required to flush.
-- **C-7a Why the first gate.** It makes "a valid terminator implies its data is
-  durable" a **guarantee of the filesystem** rather than an inference from a
-  32-bit checksum, and it is what makes a failure of the second gate harmless.
-  Consider each failure:
+- **C-7a** Together the gates make "a valid terminator implies its data is
+  durable" a guarantee of the filesystem. Handling for each failure:
 
-  | Failure | State | Outcome |
+  | Failure | State | Required behaviour |
   |---|---|---|
-  | gate 1 fails | no terminator was written | the transaction did not happen; report the error |
-  | gate 2 fails | terminator may or may not be durable | **either is correct** — if it reached disk the commit stands and its data is durable by gate 1; if not, the span reads as absent |
+  | gate 1 fails | no terminator was written | report the error; the transaction did not happen |
+  | gate 2 fails | terminator may or may not be durable | either outcome is correct, so report the error and do nothing else |
 
-  With a single sync after the terminator there is a third, unrecoverable state:
-  a durable terminator over data that never reached disk. A failed `fsync` on
-  Linux may already have discarded the dirty pages, and a retry can return
-  success, so the writer cannot even determine which state it is in.
+  An implementation MUST NOT retry a failed sync and treat success as evidence the
+  data survived: a second call can succeed after the dirty pages were discarded.
 - **C-7b** The cost is two syncs per commit rather than one. It is paid per
   *transaction*, not per record, so a caller that batches many operations into one
   transaction amortises it — which is the reason `zs_txn_*` exists alongside the
@@ -1524,10 +1407,10 @@ over each overlap shape in D-5a's table: a repack output with its inputs, assert
 the widest wins; the same with some inputs already unlinked, asserting the set
 still tiles; a directory seeded mid-conversion, asserting the in-order file wins,
 the set is judged complete, and leaving it that way indefinitely — as a writer
-death would — does not make readers retry forever (D-5e); and all three files
+death would — does not make readers retry forever; and all three files
 sharing a `start` at once. Taking the *first* file instead asserted to fail, so
 D-5b's error is caught rather than rediscovered. A partial overlap reported rather
-than worked around (D-5d). And the prefix property D-1a depends on, asserted
+than worked around (D-5c). And the prefix property D-1a depends on, asserted
 directly on generated names, so adding an extension later breaks a test rather
 than the database (D-5c). Sets
 that do **not** tile rejected and retried (D-7): a missing middle generation, a
@@ -1617,10 +1500,9 @@ single-threaded implementation — so it MUST be run per implementation rather t
 assumed from the C one passing.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
-here to the test enforcing it. A requirement with no test is a gap to close;
-this mapping is what makes the suite a conformance suite rather than a test
-suite. Each implementation records which requirements it passes, so partial
-conformance is visible rather than implied.
+here to the test enforcing it. A requirement with no test is a gap to close. Each
+implementation records which requirements it passes, so partial conformance is
+visible.
 
 ## 10. Non-goals
 
