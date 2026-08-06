@@ -143,25 +143,33 @@ tolerate compaction happening out of band.
 
 The type byte is an enumeration, not a bitfield.
 
-| Value | Type | Header size |
-|---|---|---|
-| `0x01` | `KEYVALUE` | 4 |
-| `0x02` | `KEYVALUE_ANC` | 16 |
-| `0x03` | `BIGKEYVALUE` | 24 |
-| `0x04` | `BIGKEYVALUE_ANC` | 32 |
-| `0x05` | `DELETION` | 16 |
-| `0x06` | `BIGDELETION` | 24 |
-| `0x07` | `COMMIT` | 8 |
-| `0x08` | `COMMIT_LONG` | 24 |
-| `0x09` | `COMMIT_LONG_2ND` | (tail of `0x08`) |
-| `0x0A` | `FINAL` | 8 |
-| `0x0B` | `FINAL_LONG` | 24 |
-| `0x0C` | `FINAL_LONG_2ND` | (tail of `0x0B`) |
-| `0x0D` | `ROLLBACK` | 8 |
-| `0x0E` | `ROLLBACK_LONG` | 24 |
-| `0x0F` | `ROLLBACK_LONG_2ND` | (tail of `0x0E`) |
+High nibble `0` is a data record, `1` a terminator.
+
+| Value | Type | Header | Ancestor |
+|---|---|---|---|
+| `0x01` | `KEYVALUE` | 4 | implicit — a create |
+| `0x02` | `KEYVALUE_PRIOR` | 4 | on an earlier record in this same file |
+| `0x03` | `KEYVALUE_ANC` | 16 | explicit |
+| `0x04` | `BIGKEYVALUE` | 24 | implicit — a create |
+| `0x05` | `BIGKEYVALUE_PRIOR` | 24 | on an earlier record in this same file |
+| `0x06` | `BIGKEYVALUE_ANC` | 32 | explicit |
+| `0x07` | `DELETION_PRIOR` | 4 | on an earlier record in this same file |
+| `0x08` | `DELETION_ANC` | 16 | explicit |
+| `0x09` | `BIGDELETION_PRIOR` | 16 | on an earlier record in this same file |
+| `0x0A` | `BIGDELETION_ANC` | 24 | explicit |
+| `0x10` | `COMMIT` | 8 | |
+| `0x11` | `COMMIT_LONG` | 24 | |
+| `0x12` | `COMMIT_LONG_2ND` | (tail of `0x11`) | |
+| `0x13` | `FINAL` | 8 | |
+| `0x14` | `FINAL_LONG` | 24 | |
+| `0x15` | `FINAL_LONG_2ND` | (tail of `0x14`) | |
+| `0x16` | `ROLLBACK` | 8 | |
+| `0x17` | `ROLLBACK_LONG` | 24 | |
+| `0x18` | `ROLLBACK_LONG_2ND` | (tail of `0x17`) | |
 
 - **F-10** Any other type byte, including `0x00`, is invalid.
+- **F-10a** There is no create form of a deletion: a deletion always
+  supersedes something, so it is only ever `_PRIOR` or `_ANC`.
 
 ### 4.4 Data records
 
@@ -172,18 +180,19 @@ authoritative; keys and values MAY contain NUL bytes, and the stored
 lengths MUST NOT include the terminators.
 
 The ancestor is stored as an **absolute 64-bit generation**, never as a delta
-or any other value relative to the containing file. A create stores no
-ancestor at all; its ancestor is implicitly its own generation.
+or any other value relative to the containing file. Only the **first
+occurrence of a key within a file** stores one: later occurrences use a
+`_PRIOR` form and omit it, because nothing ever reads their ancestor (F-15d).
 
 ```
-KEYVALUE (0x01)                       -- a create
+KEYVALUE (0x01) / KEYVALUE_PRIOR (0x02)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
   +4   .  key NUL value NUL pad->8
   len = roundup8(4 + keylen + 1 + vallen + 1)
 
-KEYVALUE_ANC (0x02)                   -- an update
+KEYVALUE_ANC (0x03)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
@@ -192,7 +201,14 @@ KEYVALUE_ANC (0x02)                   -- an update
   +16  .  key NUL value NUL pad->8
   len = roundup8(16 + keylen + 1 + vallen + 1)
 
-DELETION (0x05)                       -- always supersedes something
+DELETION_PRIOR (0x07)
+  +0   1  type
+  +1   1  keylen
+  +2   2  pad
+  +4   .  key NUL pad->8
+  len = roundup8(4 + keylen + 1)
+
+DELETION_ANC (0x08)
   +0   1  type
   +1   1  keylen
   +2   6  pad
@@ -200,30 +216,31 @@ DELETION (0x05)                       -- always supersedes something
   +16  .  key NUL pad->8
   len = roundup8(16 + keylen + 1)
 
-BIGKEYVALUE (0x03) / BIGKEYVALUE_ANC (0x04)
+BIGKEYVALUE (0x04) / BIGKEYVALUE_PRIOR (0x05) / BIGKEYVALUE_ANC (0x06)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  8  vallen
-  [+24 8  ancestor generation]        -- 0x04 only
+  [+24 8  ancestor generation]        -- 0x06 only
   +24/32  key NUL value NUL pad->8
 
-BIGDELETION (0x06)
+BIGDELETION_PRIOR (0x09) / BIGDELETION_ANC (0x0A)
   +0   1  type
   +1   7  pad
   +8   8  keylen
-  +16  8  ancestor generation
-  +24  .  key NUL pad->8
+  [+16 8  ancestor generation]        -- 0x0A only
+  +16/24  key NUL pad->8
 ```
 
 - **F-12** All 8-byte fields are 8-byte aligned within the file.
 - **F-13** Encoding is canonical: an implementation MUST use the short form
-  whenever `keylen <= 255` and `vallen <= 65535`, MUST omit the ancestor
-  field exactly when the record is a create, and MUST use the short
-  terminator whenever the span is `<= 0xFFFFFF` bytes. Byte-for-byte output
-  is therefore determined by the logical contents. The big form is selected
-  by key or value length only — never by the ancestor, which is always 8
-  bytes when present.
+  whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short
+  terminator whenever the span is `<= 0xFFFFFF` bytes; and MUST select
+  between the create, `_PRIOR` and `_ANC` forms exactly as F-15d and F-15e
+  require. Byte-for-byte output is therefore determined by the logical
+  contents together with what the file already holds. The big form is
+  selected by key or value length only — never by the ancestor, which is
+  always 8 bytes when present.
 - **F-14** A key MUST be at least 1 byte. An empty value is legal and is
   distinct from an absent key.
 - **F-15** Every record that casts a shadow MUST know the generation at
@@ -250,6 +267,21 @@ BIGDELETION (0x06)
   names may since have been absorbed into a file covering a range of
   generations — which is harmless, because D-18 compares the absolute
   ancestor against the merge output's generation range.
+- **F-15d** Only the **first occurrence of a key within a file** stores an
+  ancestor. Where a file holds versions V1, V2, V3 of a key, V1 carries the
+  ancestor and V2 and V3 use a `_PRIOR` form, because nothing ever reads
+  their ancestor: a lookup wants only the newest version, and a merge takes
+  V1's ancestor with V3's value (D-17). This makes a repeated update within
+  one file cost a 4-byte header instead of 16.
+- **F-15e** A `_PRIOR` record therefore asserts "an earlier record for this
+  key exists in this same file". An implementation MUST NOT write a plain
+  create form for a record that supersedes something, and MUST NOT write a
+  `_PRIOR` form where no earlier occurrence exists in the file. Keeping the
+  two distinct is what stops a merge mistaking a mid-file update for a
+  create, concluding the chain starts there, and dropping a tombstone that
+  should have been retained — the resurrection of D-17c. A `_PRIOR` record
+  with no earlier occurrence in its file is a detectable inconsistency
+  rather than a silent wrong answer.
 
 ### 4.5 Terminators
 
@@ -460,7 +492,13 @@ without a trailing `FINAL` is therefore sealed.
   carries **V3's value** — which may be a deletion — and **V1's ancestor**,
   that being the earliest parent generation among the merged versions.
   Intermediate versions disappear, so no within-file shadowing survives a
-  merge.
+  merge, and consequently an in-order file never contains a `_PRIOR` record.
+- **D-17d** Finding V1's ancestor means finding the **first occurrence** of
+  the key, since later occurrences within a file omit theirs (F-15d). In an
+  unsorted file that is the lowest offset for the key; in an in-order file
+  there is only one record per key, which carries it. A merge scanning its
+  inputs MUST therefore resolve each key's earliest ancestor before deciding
+  D-17b, and MUST NOT read the ancestor of a `_PRIOR` record, which has none.
 - **D-17a** Ancestors are copied through **verbatim**. Nothing is ever
   renumbered and no ancestor is ever recalculated: generations are absolute
   (F-15c), and a merge only changes which file a generation lives in, never
@@ -707,6 +745,15 @@ for chains whose create lies outside every merge performed. Also asserts the
 D-17b decision table directly: that V1's ancestor and V3's value survive a
 merge, that exactly one record per key is emitted, and that the create/update
 form of the emitted record follows from where the earliest ancestor falls.
+
+**T-5c `_PRIOR` encoding.** That repeated writes to one key within a file
+produce one ancestor-bearing record followed by `_PRIOR` records (F-15d), that
+byte-exact output matches the golden corpus for that shape, and that an
+in-order file never contains a `_PRIOR` record (D-17). Negatively: a
+hand-built file whose first occurrence of a key is `_PRIOR`, and one where a
+mid-file update is written as a create, are both reported by
+`zs_db_check_consistency` rather than silently mis-merged (F-15e) — and a
+merge of the latter is asserted *not* to drop the tombstone.
 
 **T-5a File states.** All four states of §5.3 round-trip and are correctly
 identified from the file plus manifest: that a closed file is searched via
