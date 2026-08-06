@@ -190,12 +190,15 @@ than 16.
 | `0x10` | `COMMIT` | 8 | |
 | `0x11` | `COMMIT_LONG` | 24 | |
 | `0x12` | `COMMIT_LONG_2ND` | (tail of `0x11`) | |
-| `0x13` | `FINAL` | 8 | |
-| `0x14` | `FINAL_LONG` | 24 | |
-| `0x15` | `FINAL_LONG_2ND` | (tail of `0x14`) | |
-| `0x16` | `ROLLBACK` | 8 | |
-| `0x17` | `ROLLBACK_LONG` | 24 | |
-| `0x18` | `ROLLBACK_LONG_2ND` | (tail of `0x17`) | |
+| `0x13` | `FINAL32` | 8 | 32-bit pointers |
+| `0x14` | `FINAL32_LONG` | 24 | 32-bit pointers |
+| `0x15` | `FINAL32_LONG_2ND` | (tail of `0x14`) | |
+| `0x16` | `FINAL64` | 8 | 64-bit pointers |
+| `0x17` | `FINAL64_LONG` | 24 | 64-bit pointers |
+| `0x18` | `FINAL64_LONG_2ND` | (tail of `0x17`) | |
+| `0x19` | `ROLLBACK` | 8 | |
+| `0x1A` | `ROLLBACK_LONG` | 24 | |
+| `0x1B` | `ROLLBACK_LONG_2ND` | (tail of `0x1A`) | |
 
 - **F-12** Any other type byte, including `0x00`, is invalid.
 - **F-12a** Each record shape has exactly two forms: one storing an ancestor
@@ -327,7 +330,7 @@ BIGDELETION_ANC (0x08)
 ### 4.7 Terminators
 
 ```
-short (8 bytes)                       COMMIT / FINAL / ROLLBACK
+short (8 bytes)                       COMMIT / FINAL32 / FINAL64 / ROLLBACK
   +0   1  type
   +1   3  span length
   +4   4  checksum
@@ -344,8 +347,10 @@ long (24 bytes)                       *_LONG
 - **F-19** The checksum covers the span's data bytes followed by the
   terminator's own bytes up to the checksum field.
 - **F-20** `type2` exists so the last 8 bytes of a file reveal whether the
-  trailing terminator is short or the tail of a long one, making it locatable
-  by reading backwards.
+  trailing terminator is short or the tail of a long one, making it locatable by
+  reading backwards. Reading those 8 bytes therefore yields both the
+  terminator's extent and, for a `FINAL`, the pointer width — everything needed
+  to interpret the index.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
   that says "ignore the records in this span", voiding them. An aborted
   transaction appends a `ROLLBACK`; without one, a later commit's span would
@@ -371,40 +376,35 @@ long (24 bytes)                       *_LONG
 
 ### 4.9 Pointers
 
-Present in in-order files only, written once, immediately before a `FINAL`
-terminator covering the block.
+Present in in-order files only, written once, immediately before a `FINAL32` or
+`FINAL64` terminator covering the block.
 
-Pointers are 32-bit in a file of `0xFFFFFFFF` bytes or fewer, and 64-bit
-otherwise:
+The block carries a count; the terminator's type carries the width.
 
 ```
-32-bit form
-  +0    8    NumPointers
-  +8    4×N  record offsets (uint32)
-  pad to a multiple of 8
-
-64-bit form
-  +0    8    NumPointers
-  +8    8×N  record offsets (uint64)
++0    8      NumPointers
++8    4×N    record offsets (uint32)   -- FINAL32
+      8×N    record offsets (uint64)   -- FINAL64
+pad to a multiple of 8
 ```
 
 - **F-26** Pointers reference every record in the file, sorted by key
   ascending. Because a repack emits exactly one record per key (D-17), keys in
   an in-order file are unique and the array is a strict ordering.
-- **F-26a** The pointer width is **derived from the file size**: 32-bit if the
-  file is `0xFFFFFFFF` bytes or fewer, 64-bit otherwise. Nothing records it.
-  A header flag could not: the header is written before the file's eventual
-  size is known, so setting one correctly would require rewriting the header
-  afterwards, which G-1 forbids. The `FINAL` terminator is written last and
-  could have carried it, but derivation needs no state at all, and the size is
-  known as soon as the file is mapped.
-- **F-26b** Because every record lies before the pointers block, a file within
-  `0xFFFFFFFF` bytes has every record offset inside 32 bits, so the narrow form
-  is always sufficient when selected. The rule is canonical: a file over the
-  bound uses 64-bit pointers even if every offset would have fitted.
-- **F-26c** The block is padded with zeroes to a multiple of 8 so the `FINAL`
-  terminator begins 8-aligned (F-2). The pad is 0 or 4 bytes and is covered by
-  the terminator's checksum like any other span byte.
+- **F-26a** The pointer width is **stated by the terminator type**: `FINAL32`
+  means 32-bit offsets, `FINAL64` means 64-bit. The pointers block is therefore
+  interpretable from itself and its terminator alone, with no reference to the
+  file's length — which matters because a truncated file has a different length
+  but must not have a differently-interpreted index. The terminator is written
+  last, so unlike a header flag it can state the width without any rewrite
+  (G-1).
+- **F-26b** Encoding is canonical: `FINAL32` MUST be used when every record
+  offset fits in 32 bits, and `FINAL64` otherwise. Since all records precede the
+  pointers block, that is equivalent to the block's own offset fitting in 32
+  bits.
+- **F-26c** The block is padded with zeroes to a multiple of 8 so the terminator
+  begins 8-aligned (F-2). The pad is 0 or 4 bytes and is covered by the
+  terminator's checksum like any other span byte.
 - **F-27** Every pointer MUST be 8-aligned and lie between the header and the
   pointers block.
 - **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
@@ -855,11 +855,11 @@ scan, cross-checked against each other — the direct test for G-7.
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
 when `end != 0`; that an in-order file's pointers are strictly increasing by key
-(F-28); that the pointer width follows the file size, including a
-hand-constructed file just over `0xFFFFFFFF` bytes so the 64-bit form is covered
-without writing 4GB of real data, and one just under it (F-26a), plus the
-0-and-4-byte padding cases (F-26c); and that every row of F-17's table
-round-trips — in particular that
+(F-28); that `FINAL32` and `FINAL64` are each honoured for the width they state,
+including a hand-constructed `FINAL64` file so the wide form is covered without
+writing 4GB of real data, and that a file whose offsets all fit is written as
+`FINAL32` (F-26a, F-26b), plus the 0-and-4-byte padding cases (F-26c); and that
+every row of F-17's table round-trips — in particular that
 repeated writes to one key in a file store the ancestor at most once, and that a
 record with no stored ancestor decodes to its file's `start`. Negatively, a
 hand-built file storing an ancestor equal to its own `start` (which F-15 forbids
@@ -892,7 +892,7 @@ workload. Each case asserts reopen terminates within a timeout, exactly a
 prefix of committed transactions is visible, nothing acknowledged is lost under
 default durability, and a writer can then continue. Targeted: crash between
 records and terminator; after terminator before `fsync`; mid-publish rename;
-mid-repack; after `[Pointers]` but before `FINAL`; leaving a non-8-aligned file
+mid-repack; after `[Pointers]` but before the `FINAL` terminator; leaving a non-8-aligned file
 length; and after an invalid terminator, asserting the writer moves to a new
 generation rather than appending (R-4, D-9). Both durability modes. Separately,
 with directory syncs suppressed, that a crash can lose a *name* — the test that
