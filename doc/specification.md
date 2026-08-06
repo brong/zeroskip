@@ -30,7 +30,7 @@ tolerate compaction happening out of band.
 
 | Term | Meaning |
 |---|---|
-| file number | 64-bit identifier assigned to each data file, starting at 1 |
+| generation | 64-bit counter, starting at 1, incremented for each new data file. A file covers a **range** of generations `[start, end]`: one generation when freshly created, several once it has absorbed others by merging |
 | active file | the one file the writer is currently appending to |
 | in-order file | a file whose records are in key order and which has a `[Pointers]` block |
 | unsorted file | a file without a `[Pointers]` block; records in append order |
@@ -38,7 +38,7 @@ tolerate compaction happening out of band.
 | span | data records terminated by one commit or rollback record |
 | terminator | a commit, final-commit, or rollback record |
 | `append_end` | offset just past the last valid terminator in a file |
-| ancestor | file number in which the record a given record supersedes was created |
+| ancestor | the absolute generation at which the shadow cast by a record hits the previous record for that key — either the record's own generation, or an earlier one (F-15) |
 | shadowed | a record superseded by a later record for the same key, anywhere — later in the same file, or in any newer file |
 
 ## 3. Guarantees
@@ -76,28 +76,52 @@ tolerate compaction happening out of band.
   occupies a whole multiple of 8 bytes. Padding bytes MUST be zero.
 - **F-3** Offsets and pointers are absolute byte offsets from the start of
   the file.
-- **F-4** The checksum is XXH3-64 truncated to its low 32 bits. The
-  checksum field is always the **last 4 bytes** of the structure it
-  protects and covers every byte from the start of the protected region up
-  to (not including) the field itself. There is no field-zeroing anywhere
+- **F-4** The checksum field is always the **last 4 bytes** of the structure
+  it protects, and covers every byte from the start of the protected region
+  up to (not including) the field itself. There is no field-zeroing anywhere
   in this format.
-- **F-5** An implementation MUST select its checksum implementation at
-  runtime, with a portable C fallback. Hardware acceleration MUST NOT be a
-  build-time-only path (a library that fails to link or run on a platform
-  lacking a given CPU feature does not conform).
+- **F-5** Exactly three checksum engines are permitted:
 
-### 4.2 File header (48 bytes)
+  | Id | Engine | Behaviour |
+  |---|---|---|
+  | 0 | none | write zeros, never verify |
+  | 1 | xxHash | XXH3-64 truncated to its low 32 bits (default) |
+  | 2 | external | a function supplied by the caller at open time |
+
+- **F-5a** The engine id is recorded in the **file header flags**, so every
+  file is self-describing. The flags field is plain data, read before any
+  checksum is verified, so there is no bootstrapping problem: a reader learns
+  the engine and then validates the header with it. Files written under
+  different engines may therefore coexist in one database.
+- **F-5b** An implementation MUST select its checksum implementation at
+  runtime, with a portable C fallback. Hardware acceleration MUST NOT be a
+  build-time-only path — a library that fails to link or run on a platform
+  lacking a given CPU feature does not conform.
+- **F-5c** Engine 0 weakens G-2 and G-3: F-19's property, that a terminator
+  reaching disk without its data fails validation, depends on a real
+  checksum. With engine 0 a torn tail cannot be detected, so atomicity is no
+  longer enforced by the format. Engine 0 is for testing and for callers who
+  have durability guarantees elsewhere.
+- **F-5d** Engine 2 makes a file readable only by a caller supplying the same
+  function. The conformance corpus therefore covers engines 0 and 1 only.
+- **F-5e** `ZS_NOCSUM` is distinct from engine 0: it is a runtime open flag
+  that skips verification of checksums that are nonetheless present and
+  written.
+
+### 4.2 File header (56 bytes)
 
 | Off | Size | Field |
 |---|---|---|
 | 0 | 8 | magic, ASCII `zeroskip`, no NUL |
 | 8 | 4 | version, `1` |
-| 12 | 16 | database UUID, binary RFC 4122 — identical in every file of a DB |
-| 28 | 8 | start file number |
-| 36 | 8 | end file number, or `0` |
-| 44 | 4 | checksum of bytes `[0, 44)` |
+| 12 | 4 | flags — bits 0..3 checksum engine id (F-5), rest reserved and MUST be zero |
+| 16 | 16 | database UUID, binary RFC 4122 — identical in every file of a DB |
+| 32 | 8 | start generation |
+| 40 | 8 | end generation, or `0` |
+| 48 | 4 | padding, MUST be zero |
+| 52 | 4 | checksum of bytes `[0, 52)` |
 
-- **F-6** File numbers start at 1, so `end == 0` is never legitimate and
+- **F-6** Generations start at 1, so `end == 0` is never legitimate and
   means "records are not in key order".
 - **F-6a** Whether a file carries a `[Pointers]` block is a **separate,
   independently self-describing** property: a file has pointers if and only
@@ -105,9 +129,9 @@ tolerate compaction happening out of band.
   definition marks the commit following `[Pointers]` (F-17 makes that
   terminator locatable by reading the last 8 bytes). A file may therefore
   have a durable index without being in key order.
-- **F-7** A file created fresh has `start == its own number` and `end == 0`.
-  A file produced by merging inputs spanning numbers *i*..*j* has
-  `start == i`, `end == j`.
+- **F-7** A freshly created file occupies a single generation: `start` is that
+  generation and `end == 0`. A file produced by merging inputs spanning
+  generations *i*..*j* has `start == i` and `end == j`.
 - **F-8** The `[start, end]` ranges of the files listed in one manifest
   MUST NOT overlap. Ordering files by `start` descending is therefore total
   and ranks them newest to oldest.
@@ -147,8 +171,12 @@ and value are therefore usable in place as C strings. **F-11** Lengths are
 authoritative; keys and values MAY contain NUL bytes, and the stored
 lengths MUST NOT include the terminators.
 
+The ancestor is stored as an **absolute 64-bit generation**, never as a delta
+or any other value relative to the containing file. A create stores no
+ancestor at all; its ancestor is implicitly its own generation.
+
 ```
-KEYVALUE (0x01)                       -- a create; ancestor is this file
+KEYVALUE (0x01)                       -- a create
   +0   1  type
   +1   1  keylen
   +2   2  vallen
@@ -160,30 +188,31 @@ KEYVALUE_ANC (0x02)                   -- an update
   +1   1  keylen
   +2   2  vallen
   +4   4  pad
-  +8   8  ancestor file number
+  +8   8  ancestor generation
   +16  .  key NUL value NUL pad->8
   len = roundup8(16 + keylen + 1 + vallen + 1)
+
+DELETION (0x05)                       -- always supersedes something
+  +0   1  type
+  +1   1  keylen
+  +2   6  pad
+  +8   8  ancestor generation
+  +16  .  key NUL pad->8
+  len = roundup8(16 + keylen + 1)
 
 BIGKEYVALUE (0x03) / BIGKEYVALUE_ANC (0x04)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  8  vallen
-  [+24 8  ancestor file number]       -- 0x04 only
+  [+24 8  ancestor generation]        -- 0x04 only
   +24/32  key NUL value NUL pad->8
-
-DELETION (0x05)                       -- always supersedes something
-  +0   1  type
-  +1   1  keylen
-  +2   6  pad
-  +8   8  ancestor file number
-  +16  .  key NUL pad->8
 
 BIGDELETION (0x06)
   +0   1  type
   +1   7  pad
   +8   8  keylen
-  +16  8  ancestor file number
+  +16  8  ancestor generation
   +24  .  key NUL pad->8
 ```
 
@@ -192,13 +221,35 @@ BIGDELETION (0x06)
   whenever `keylen <= 255` and `vallen <= 65535`, MUST omit the ancestor
   field exactly when the record is a create, and MUST use the short
   terminator whenever the span is `<= 0xFFFFFF` bytes. Byte-for-byte output
-  is therefore determined by the logical contents.
+  is therefore determined by the logical contents. The big form is selected
+  by key or value length only — never by the ancestor, which is always 8
+  bytes when present.
 - **F-14** A key MUST be at least 1 byte. An empty value is legal and is
   distinct from an absent key.
-- **F-15** A create's ancestor is implicitly its own file number. An update
-  or deletion's ancestor MUST be the file number in which the record it
-  supersedes was created. This makes the per-key version chain unbroken and
-  followable across files.
+- **F-15** Every record that casts a shadow MUST know the generation at
+  which that shadow hits the previous record for its key. That generation is
+  either the record's own, or an earlier one. An update or deletion stores it
+  explicitly; a create stores nothing, its ancestor being implicitly its own
+  generation. Together these make the per-key version chain unbroken and
+  followable.
+- **F-15a** The stored value is the **`start` of the range of the file that
+  held the superseded record at the time the shadow was cast**. Referencing
+  `start` rather than `end` is deliberately conservative: since
+  `start <= end`, it points at or further back than strictly necessary, so
+  D-18's containment test errs toward "the create lies outside this range" —
+  that is, toward **retaining** a tombstone. A wrong answer costs disk space,
+  never correctness, and the rule stays sound if file boundaries shift under
+  a partial or abandoned repack.
+- **F-15b** There is **no guarantee the ancestor is numerically close** to
+  the generation of the record holding it: a key untouched for a long time
+  and then updated casts its shadow far back. A record in generation 20 may
+  legitimately reference generation 5.
+- **F-15c** The ancestor is stored **absolutely**, not relative to the
+  containing file, precisely so that it never has to be recalculated. A
+  merge copies ancestors through unchanged, and a generation the ancestor
+  names may since have been absorbed into a file covering a range of
+  generations — which is harmless, because D-18 compares the absolute
+  ancestor against the merge output's generation range.
 
 ### 4.5 Terminators
 
@@ -231,10 +282,10 @@ long (24 bytes)                       *_LONG
 
 ### 4.6 The span chain
 
-- **F-20** From offset 48 to `append_end`, a file is a flat sequence of
+- **F-20** From offset 56 to `append_end`, a file is a flat sequence of
   spans. Each span is zero or more data records followed by exactly one
   terminator whose span length equals the span's data byte count and whose
-  checksum validates. Every byte in `[48, append_end)` belongs to exactly
+  checksum validates. Every byte in `[56, append_end)` belongs to exactly
   one span or terminator: **no gaps and no nesting.**
 - **F-21** Visibility is per span, not a watermark: a voided span may sit
   between two live ones, so a reader MUST replay spans in order and skip
@@ -268,7 +319,7 @@ unsorted files (F-6a).
   `zs_db_dump` MAY compute shadowing live by walking the current file set,
   which is both accurate and more useful than a stale stored count.
 - **F-24** Every pointer MUST be 8-aligned and within
-  `[48, pointers_offset)`.
+  `[56, pointers_offset)`.
 
 ### 4.8 Validation
 
@@ -317,7 +368,7 @@ unsorted files (F-6a).
 | 8 | 4 | version, `1` |
 | 12 | 16 | database UUID |
 | 28 | 8 | generation, incremented on every publish |
-| 36 | 8 | active file number |
+| 36 | 8 | active file generation |
 | 44 | 4 | file count |
 | 48 | 4 | comparator name length |
 | 52 | . | comparator name, then pad to 8 |
@@ -380,8 +431,8 @@ without a trailing `FINAL` is therefore sealed.
 
 - **D-12** `zeroskip.index` is a regular file, `mmap`'d `MAP_SHARED`,
   holding one index per file that lacks a `[Pointers]` block — that is, the
-  active file and any sealed files (D-9a) — keyed by file number and each
-  stamped with the database UUID, the file number, and the offset it is
+  active file and any sealed files (D-9a) — keyed by generation and each
+  stamped with the database UUID, the generation, and the offset it is
   valid up to.
 - **D-13** It is a pure cache and MUST NOT be authoritative. Any process
   MAY discard it and rebuild by scanning. An implementation MUST validate
@@ -404,29 +455,48 @@ without a trailing `FINAL` is therefore sealed.
 
 ### 5.6 Merging
 
-- **D-17** For each key in the input set, keep only the newest version *among
-  the inputs*, and set its ancestor to the **oldest merged version's**
-  ancestor, preserving the chain past the merge boundary.
-- **D-17a** That retained record MUST be written even if it is itself
-  shadowed by a newer, unmerged file (F-23). Being shadowed is **not** a
-  licence to drop a record; only D-18 permits removal. The reason is that a
-  record's ancestor names the file of the record it *immediately superseded*,
-  not the chain's create. If a shadowed record is dropped, a later merge sees
-  only the newer version, reads its ancestor as though it identified the
-  create, and may wrongly conclude the whole lifespan is contained —
-  resurrecting a deleted key. Retaining shadowed records is what keeps the
-  chain resolvable across merge boundaries.
-- **D-18** A key may be removed entirely if and only if its newest version
-  is a deletion **and** the chain's create lies inside the merged range
-  (`ancestor >= output start`) — that is, its whole lifespan from create
-  through update to delete is contained in the merge. Otherwise the
+- **D-17** A merge emits **exactly one record per key**. Where the inputs hold
+  versions V1, V2, V3 of a key from oldest to newest, the emitted record
+  carries **V3's value** — which may be a deletion — and **V1's ancestor**,
+  that being the earliest parent generation among the merged versions.
+  Intermediate versions disappear, so no within-file shadowing survives a
+  merge.
+- **D-17a** Ancestors are copied through **verbatim**. Nothing is ever
+  renumbered and no ancestor is ever recalculated: generations are absolute
+  (F-15c), and a merge only changes which file a generation lives in, never
+  the generation itself. That is the whole reason the value is absolute.
+- **D-17b** Whether the emitted record is written as a create or as an
+  update follows from where the earliest ancestor falls, giving one decision
+  table per key:
+
+  | earliest ancestor | latest version | emit |
+  |---|---|---|
+  | `>= output start` | deletion | **nothing** — drop the key (D-18) |
+  | `>= output start` | value | a **create**, implicit ancestor |
+  | `< output start` | either | an **update or deletion**, explicit ancestor = earliest |
+
+- **D-17c** The emitted record MUST be written even when a newer, unmerged
+  file already shadows the key (F-23). Being shadowed is **not** a licence to
+  drop a record; only D-18 permits removal. Concretely: key K is created in
+  generation 3, updated in generation 7, and updated again in generation 9.
+  Merging `[5, 7]` emits one record for K carrying ancestor 3. Drop that
+  record and a later merge of `[5, 9]` sees only generation 9's record, whose
+  ancestor points at the `[5, 7]` file and so reads as 5; since `5 >= 5` it
+  concludes the whole lifespan is contained and drops K — resurrecting it,
+  because the create was really in generation 3. The retained record carrying
+  ancestor 3 is the only surviving evidence of how far back the chain
+  reaches.
+- **D-18** A key is removed entirely if and only if its latest version is a
+  deletion **and** its earliest ancestor lies inside the merged range
+  (`earliest ancestor >= output start`) — that is, its whole lifespan from
+  create through update to delete is contained in the merge. Otherwise the
   tombstone MUST be retained, because an older unmerged file may still hold
   the key and dropping it would resurrect the value.
 - **D-19** Only **adjacent** files in the `start` ordering may be merged.
   Merging non-adjacent files would produce an output range enclosing a file
   that was not merged, violating the non-overlap invariant (F-8). Adjacency
   also makes D-18 sound: because ranges are contiguous and non-overlapping,
-  an output range `[S, E]` accounts for every file number it spans, so
+  an output range `[S, E]` accounts for every generation it spans, so
   `ancestor >= S` really does prove the create was merged.
 
 **Merge policy (D-20).** Order the closed files oldest to newest — oldest
@@ -498,7 +568,7 @@ There is no separate recovery pass; opening is recovery.
 - **R-5** The rationale for R-4 is that trailing garbage could in principle
   checksum as a valid terminator. Appending after a suspect boundary would
   build the chain on a possibly-false foundation and compound the error.
-  Sealing bounds the damage to one file, and 64-bit file numbers make files
+  Sealing bounds the damage to one file, and 64-bit generations make files
   effectively free.
 - **R-6** `ROLLBACK` records exist for explicit aborts, where the writer
   knows exactly which span it wrote. They are not a repair mechanism.
@@ -509,7 +579,7 @@ There is no separate recovery pass; opening is recovery.
   by scanning the directory: adopt every well-formed data file whose UUID
   matches, reject the set if any two ranges overlap (F-8), treat the
   unsorted file with the highest `start` as the active file, derive each
-  `end_offset` by replaying spans from offset 48, and publish. A read-only
+  `end_offset` by replaying spans from offset 56, and publish. A read-only
   open performs this reconstruction in memory without publishing (A-5).
   This is also how a brand-new database with `ZS_CREATE` begins.
 
@@ -596,7 +666,10 @@ against checked-in `.zs` files, deterministic because F-13 makes encoding
 canonical, with `zstool` accepting an explicit UUID so corpus generation is
 reproducible without a test-only hook in the library. Decode assertions
 driven by a corpus manifest. `doc/conformance.md` plus this corpus is what
-an independent implementation validates against.
+an independent implementation validates against. The corpus is generated for
+engines 0 and 1 (F-5d), which also pins that a file's engine is honoured from
+its own header flags rather than from the reader's configuration, and that
+files written under different engines coexist in one database.
 
 **T-2 Malformed input.** Every golden file truncated at *every byte offset*
 — not merely record boundaries — and systematically bit-flipped. Each case
@@ -624,15 +697,16 @@ adjacent files are ever merged (D-19), and that the D-20 cascade reaches the
 geometric size invariant — driven by appending enough data to force many
 rollovers and asserting the resulting file count and size distribution.
 
-**T-5b Shadowed record retention.** The specific resurrection D-17a guards
-against, constructed directly: create a key in file *a*, update it in *b*,
-delete it in a newer file *c*, merge a range covering *a* and *b* but not
-*c*, then merge a range covering the result and *c*. Assert the key stays
-absent, and assert that a merge which drops the shadowed record from the
-first merge instead produces the resurrection — so the test fails if the
-retention rule is ever removed. Repeated for update-instead-of-delete, for
-chains longer than three links, and for chains whose create lies outside
-every merge performed.
+**T-5b Shadowed record retention.** The specific resurrection D-17c guards
+against, constructed directly as the generations 3/7/9 case in that
+requirement: assert the key stays absent after both merges, and assert that
+dropping the retained record instead *does* produce the resurrection — so the
+test fails if the retention rule is ever removed as a space optimisation.
+Repeated for update-instead-of-delete, for chains longer than three links, and
+for chains whose create lies outside every merge performed. Also asserts the
+D-17b decision table directly: that V1's ancestor and V3's value survive a
+merge, that exactly one record per key is emitted, and that the create/update
+form of the emitted record follows from where the earliest ancestor falls.
 
 **T-5a File states.** All four states of §5.3 round-trip and are correctly
 identified from the file plus manifest: that a closed file is searched via
@@ -684,14 +758,14 @@ For anyone comparing this against the notes in `doc/zeroskip.txt`:
 
 | Change | Reason |
 |---|---|
-| Header 48 bytes, not 40 | file numbers are 64-bit, so sealing a damaged file is cheap (R-5) |
+| Header 56 bytes, not 40 | generations are 64-bit, and a checksum-engine field is needed so a file is self-describing (F-5a) |
 | Type byte is an enum, not a bitfield | bit-packing was premature optimisation; 255 values is ample |
-| XXH3-64→32, not CRC32 | consistency with `twom` |
+| Selectable checksum engine — none, xxHash, or external — not a fixed CRC32 | consistency with `twom`; the engine id lives in the header flags so each file is self-describing (F-5a) |
 | Checksum always the last field, covering everything before it | one rule everywhere, and no field-zeroing dance |
 | `keylen` 8 bits in **both** data records | notes had 8 for KeyValue and 24 for Deletion, so a key could be deleted but not stored; Big variants of both cover the rest |
 | `key NUL value NUL`, then pad | both usable in place as C strings; lengths remain authoritative (F-11) |
 | `ROLLBACK` record added | aborts must void their span, or a later commit would fold the aborted records in and make them live (F-18) |
-| Ancestor file number on data records | gives unbroken per-key chains, so a tombstone is droppable exactly when its whole lifespan is inside a merge (D-18) |
+| Absolute ancestor generation on data records | gives unbroken per-key chains, so a tombstone is droppable exactly when its whole lifespan is inside a merge (D-18); absolute so it never needs recalculating on repack (F-15c) |
 | `NumShadowedRecords`/`NumShadowedBytes` removed | any stored value decays into a lower bound and nothing consumes it (F-23a) |
 | Little-endian | notes were silent; the older document said network order, `twom` uses little-endian |
 | `[Pointers]` also in closed unsorted files | gives a durable index without reordering records, so rollover stays off the latency path (D-9) |
