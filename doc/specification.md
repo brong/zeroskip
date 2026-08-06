@@ -470,8 +470,25 @@ filesize-4    4   checksum of the pointer section
 - **F-26d** The narrow section is padded with zeroes to a multiple of 8 so the
   trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
   covers it.
+- **F-26g** `count` MAY be **zero**. An in-order file with no records is legal
+  and expected — a repack that drops every key produces one (D-22) — and its
+  layout is simply `[header][pointer section][trailer]` with an empty records
+  region. Specifically:
+
+  - the smallest valid in-order file is **96 bytes**: a 72-byte header, an
+    8-byte `PTRS32` section with `count == 0`, and the 16-byte trailer. A file
+    shorter than that cannot be a valid in-order file;
+  - the width is `PTRS32`, since F-26c's condition holds vacuously when there
+    are no offsets. An empty file is therefore byte-identical every time it is
+    produced;
+  - the records checksum covers zero bytes, so it takes the engine's value for
+    empty input, not zero. Engine 0 writes zeros as always.
+- **F-26h** An **unordered** file may equally hold no records: an active file
+  that is only a header, or one whose every span was rolled back. Neither is an
+  error.
 - **F-27** Every pointer MUST be 8-aligned and lie between the header and the
-  pointer section.
+  pointer section. With `count == 0` there are no pointers and the requirement is
+  vacuous.
 - **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
   pointer array is strictly increasing by key, which both confirms the sort and
   catches a repack that emitted a key twice (D-17).
@@ -641,6 +658,10 @@ Every read draws on the same set of **sources**, ordered newest to oldest:
   | in-order | binary search the pointer array, comparing the key at each probe | O(log n) comparisons |
   | unordered | point lookup in the index (D-13c) | as the index provides |
 
+  Both MUST report "absent" for an empty source rather than misbehaving: a
+  binary search over a zero-length array, and an index for a file with no
+  committed records, are both ordinary cases (F-26g, F-26h).
+
 - **D-14c** Ancestors are **not** consulted by any read. They exist solely for
   repacking (F-16), so a lookup never follows a chain.
 
@@ -652,7 +673,9 @@ have the key is skipped, and no source may be skipped for any other reason.
 An implementation MAY skip a file without searching it when the key falls
 outside the file's key range, since an in-order file's first and last pointers
 bound its contents. This is an optimisation only: it MUST NOT change the answer,
-and it MUST NOT be applied to a source whose range is unknown.
+and it MUST NOT be applied to a source whose range is unknown. A file with no
+records has **no** such range and so cannot be bounds-checked — but it can be
+skipped unconditionally, since it contains nothing (F-26g).
 
 The cost is therefore proportional to the **number of files**, which is why
 keeping that count low is the point of the repack policy (D-16).
@@ -667,7 +690,8 @@ The per-file cursors are held in an array kept sorted by:
 > **current key ascending, then generation descending.**
 
 1. **Seek.** Seek every per-file cursor to the start point, so its current
-   record is the first with key `>=` the start key — or mark it exhausted. A
+   record is the first with key `>=` the start key — or mark it exhausted, which
+   is immediately the case for a source holding no records (F-26g, F-26h). A
    binary search yields either an exact match or the preceding position, in
    which case one step forward gives this. A full scan seeks to the beginning.
    Then sort the array.
@@ -777,7 +801,8 @@ The per-file cursors are held in an array kept sorted by:
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
   `zeroskip-<uuid>-<start>-<end>` covering the entire range of every input,
   only once complete.
-- **D-22** The output may legitimately contain **zero records** — for instance
+- **D-22** The output may legitimately contain **zero records**, in the form
+  F-26g specifies — for instance
   if every record in the database was deleted and all files were then
   repacked, or if generation *X* created one record and *X+1* deleted it and
   those two were repacked together. The file MUST still be written, so the
@@ -1049,8 +1074,10 @@ some sources but not others (D-14e step 1).
 
 **T-5a Read paths under every file arrangement.** The same assertions driven
 against a database deliberately arranged as: one unordered file only; several
-unordered files; one in-order file only; a mixture; and after a repack that
-collapsed some but not all files. Each arrangement exercises a different
+unordered files; one in-order file only; a mixture; after a repack that collapsed
+some but not all files; **and with an empty in-order file among populated ones**,
+since a zero-pointer source is where a binary search or a cursor seek is most
+likely to go wrong (F-26g). Each arrangement exercises a different
 combination of D-14b search primitives, and the answers MUST be identical
 throughout. Includes the key-range skip in D-14d asserted to be a pure
 optimisation, by running with it disabled and comparing.
@@ -1061,8 +1088,11 @@ when `end != 0`; that an in-order file's pointers are strictly increasing by key
 (F-28); that `PTRS32` and `PTRS64` are each honoured for the width they state,
 including a hand-constructed `PTRS64` file so the wide form is covered without
 writing 4GB of real data, and that a file whose offsets all fit is written as
-`PTRS32` (F-26c), plus the 0-and-4-byte padding cases (F-26d); and that
-every row of F-17's table round-trips — in particular that
+`PTRS32` (F-26c), plus the 0-and-4-byte padding cases (F-26d); that a zero-record
+in-order file round-trips as exactly 96 bytes, is written as `PTRS32`, and
+carries the engine's empty-input checksum for its records region (F-26g); that a
+database consisting only of such a file reads as empty and iterates to zero
+records; and that every row of F-17's table round-trips — in particular that
 repeated writes to one key in a file store the ancestor at most once, and that a
 record with no stored ancestor decodes to its file's `start`. Negatively, a
 hand-built file storing an ancestor equal to its own `start` (which F-15 forbids
