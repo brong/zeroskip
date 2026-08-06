@@ -132,9 +132,16 @@ tolerate compaction happening out of band.
 - **F-7** A freshly created file occupies a single generation: `start` is that
   generation and `end == 0`. A file produced by merging inputs spanning
   generations *i*..*j* has `start == i` and `end == j`.
-- **F-8** The `[start, end]` ranges of the files listed in one manifest
-  MUST NOT overlap. Ordering files by `start` descending is therefore total
-  and ranks them newest to oldest.
+- **F-8** The `[start, end]` ranges of the files listed in one manifest MUST
+  **tile a contiguous interval of generations**: no overlaps and no gaps,
+  from the oldest surviving generation through the active file's. Ordering
+  files by `start` descending is therefore total and ranks them newest to
+  oldest, and "is this set of files complete?" is a decidable question — which
+  D-4 depends on.
+- **F-8a** A merge whose output would contain no records at all — every key
+  dropped by D-18 — MUST still write the file, as a header plus an empty
+  `[Pointers]` block and a `FINAL` terminator. Omitting it would leave a gap
+  in the tiling and make the set undecidable. The cost is a few dozen bytes.
 - **F-9** A reader MUST reject a file whose magic, version or header
   checksum fails to validate, or whose UUID does not match the database it
   is being opened as part of.
@@ -389,8 +396,24 @@ unsorted files (F-6a).
   `fcntl` locks attach to an inode, so locking the manifest — whose inode
   changes on every publish — would silently lose mutual exclusion.
 - **D-4** A data file not referenced by the manifest MUST be ignored by
-  readers. A packer MAY remove it (it is the debris of an interrupted
-  merge).
+  readers.
+- **D-4a** Removing a data file — whether debris from an interrupted merge or
+  an input a completed merge has superseded — MUST be done **holding the
+  write lock**, and only after verifying that **a complete set of files exists
+  without it**: that the remaining files still tile a contiguous generation
+  interval per F-8. Verification and removal MUST happen under the same
+  unbroken hold of the lock.
+- **D-4b** The write lock, not the packer lock, is what serialises this. Two
+  processes each scanning for expendable files could otherwise each conclude
+  that a *different* file is redundant and remove both, destroying a file the
+  surviving set needs — two half-finished merges of overlapping ranges leave
+  exactly that ambiguity. Since only one writer exists at a time (G-5),
+  requiring the write lock makes removal decisions mutually exclusive without
+  adding a fourth lock byte. A packer therefore takes the write lock briefly
+  to retire its inputs, which is cheap: the work is a few `unlink` calls,
+  and by C-4 readers holding those files open are unaffected.
+- **D-4c** If verification fails, the file MUST be left alone. Leaking a file
+  costs disk space; removing a needed one costs the database.
 
 ### 5.2 Manifest
 
@@ -572,7 +595,8 @@ trigger (F-23a).
   compare-and-publish.
 - **C-4 Snapshot lifetime.** A reader reads the manifest, opens and `mmap`s
   every listed file, then re-reads the manifest; if the generation changed
-  it retries, bounded. Once its descriptors are open, a packer MAY `unlink`
+  it retries, bounded. Once its descriptors are open, a packer may (subject to
+  D-4a) `unlink`
   superseded files immediately: the kernel keeps the inodes alive until the
   last descriptor closes. There is no reference table, and nothing to clean
   up when a process dies.
@@ -610,8 +634,9 @@ There is no separate recovery pass; opening is recovery.
   effectively free.
 - **R-6** `ROLLBACK` records exist for explicit aborts, where the writer
   knows exactly which span it wrote. They are not a repair mechanism.
-- **R-7** A crash during a merge leaves an unreferenced file (D-4). A crash
-  during publish leaves either manifest intact (D-5).
+- **R-7** A crash during a merge leaves an unreferenced file, which readers
+  ignore (D-4) and which may be removed only under D-4a. A crash during
+  publish leaves either manifest intact (D-5).
 - **R-8 Missing manifest.** Data files are self-describing, so if the
   manifest is absent or fails validation the database MUST be reconstructed
   by scanning the directory: adopt every well-formed data file whose UUID
@@ -783,7 +808,14 @@ them. Two writers, exactly one proceeding, `ZS_LOCKED` under
 `ZS_NONBLOCKING`. **A writer `SIGKILL`ed while holding the lock, asserting
 the next writer proceeds with no manual intervention** (G-5). A reader
 holding a snapshot across a merge, asserting its data stays readable while
-the inputs are unlinked (C-4). The shared index deleted, truncated and
+the inputs are unlinked (C-4). **File removal:** two processes racing to clean
+up debris, asserting the surviving set still tiles contiguously (F-8) and that
+no file the set needs is ever removed; a directory seeded with the debris of
+two half-finished merges over overlapping ranges, where naive independent
+cleanup would remove both and lose a generation; removal attempted without the
+write lock, asserting refusal (D-4a); and a merge output containing zero live
+records, asserting the file is still written so the tiling holds (F-8a). The
+shared index deleted, truncated and
 bit-flipped mid-run, asserting identical results (G-6). Concurrent merge
 and writer both proceeding with publish serialised.
 
