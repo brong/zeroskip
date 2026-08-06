@@ -676,9 +676,10 @@ directory scan against a repack.
   problem is therefore bounded to one file, whose size is bounded by
   `rollover_size`.
 - **D-13g** An implementation SHOULD satisfy D-13e by **copying the active
-  file's array into private memory** when a transaction takes its snapshot. That
-  costs one bounded copy, requires no cooperation from the writer, and adds no
-  shared mutable state. The alternative — having the writer publish a fresh copy
+  file's array into private memory** when a transaction takes its snapshot,
+  through the sequence counter of C-4d. That costs one bounded copy, requires no
+  cooperation from the writer beyond maintaining the counter, and adds no shared
+  mutable state that a reader must modify. The alternative — having the writer publish a fresh copy
   elsewhere in the index and leave the old one for readers — needs a scheme for
   reclaiming superseded copies, which is precisely the class of problem avoided
   for data files by relying on POSIX `unlink` semantics (C-4). There is no
@@ -930,13 +931,68 @@ The per-file cursors are held in an array kept sorted by:
 - **C-2** Readers take **no lock**.
 - **C-3** A publisher MUST hold the packer lock, re-read the current manifest,
   merge its change into it, then write and rename — a compare-and-publish.
-- **C-4 Snapshot lifetime.** A reader reads the manifest, opens and `mmap`s
-  every listed file, then re-reads the manifest; if the publish sequence
-  changed it retries, bounded. Once its descriptors are open a packer may
-  (subject to D-23) `unlink` superseded files immediately: the kernel keeps
-  the inodes alive until the last descriptor closes. There is no reference
-  table and nothing to clean up when a process dies.
-- **C-5** The accepted cost of C-4 is that disk space is held until the last
+**C-4 Taking a snapshot.** The protocol is:
+
+1. Read the manifest, noting its publish sequence *S*.
+2. `open` and `mmap` every file it lists.
+3. Re-read the manifest. If the sequence is no longer *S*, or if any `open` in
+   step 2 failed with `ENOENT`, discard everything and restart from 1.
+4. For each unordered file, obtain a stable view of its index entry by C-4d.
+5. Set the active file's snapshot boundary per C-4e.
+
+Everything the snapshot will read is immutable from here on, for the reasons
+below. No lock is taken at any point.
+
+- **C-4a Completeness.** Step 3 is a verify-after-read, and it is sound because
+  a file is only ever removed under the packer lock *after* a publish (D-23), so
+  a removal always advances the sequence. Observing an unchanged sequence across
+  step 2 therefore proves no file was removed during it, and the opened set is
+  exactly the published one. Conversely an `ENOENT` proves a publish happened, so
+  the retry will see a higher sequence and a different set.
+- **C-4b Manifest atomicity.** Reading the manifest needs no lock because it is
+  replaced by `rename` (D-5): an `open` binds one inode, and the reader reads
+  that version whole even if it is replaced meanwhile.
+- **C-4c Immutability of what was opened.** In-order files are never modified.
+  An unordered file that is not the active one is never appended to again. The
+  active file *is* appended to, but only ever appended to (G-1), so every byte
+  below the snapshot boundary is immutable — a prefix of an append-only file is
+  stable by construction. Growth beyond the boundary is invisible: the mapping
+  covers the prefix and the reader never looks past it.
+- **C-4d Index entry stability.** An index entry for the active file changes
+  under the reader (D-13f), so it MUST be read through a **sequence counter**:
+  read the entry's sequence, read `valid_to` and copy the array, then re-read the
+  sequence and retry if it changed. The writer increments the counter before and
+  after mutating. This is the same verify-after-read shape as step 3, and like it
+  requires no lock — only that the reader be willing to retry.
+- **C-4e The boundary, and why the index cannot simply be clamped.** The index
+  holds only the *newest* offset per key (D-13d). If a reader chose a boundary
+  earlier than the index's `valid_to` and then ignored entries pointing past it,
+  a key updated after that boundary would appear **absent** — its newer offset
+  discarded and its older version unreachable, because the index never recorded
+  it. Clamping is therefore wrong. Instead the reader **adopts** the index's
+  `valid_to` as its boundary and scans forward from there to the last valid
+  terminator, merging anything newer into its private view. Both are commit
+  boundaries, so adopting the later one is a consistent snapshot; it is simply a
+  slightly newer one than the reader might have taken.
+- **C-4f Concurrent visibility.** A reader scanning the active file may meet a
+  span the writer is still writing. The terminator's checksum covers the span's
+  data (F-19), so a terminator whose data is not yet fully visible fails
+  validation and reads as absent — the reader stops there, exactly as it would
+  after a crash. This is what makes lock-free reading of a live file safe, not
+  merely crash recovery: the checksum supplies the ordering guarantee that no
+  memory barrier is available to provide across independent processes sharing a
+  mapping.
+- **C-4g Lifetime.** Once its descriptors are open a packer may (subject to
+  D-23) `unlink` superseded files immediately: the kernel keeps each inode alive
+  until the last descriptor *and mapping* is gone. There is no reference table
+  and nothing to clean up when a process dies.
+- **C-4h Termination.** Steps 1–3 retry only when a publish intervenes, and step
+  4 only when the writer touches that entry. Both are structural events, not
+  per-operation ones, so retries are rare; each costs only the `open` calls or
+  one array copy. An implementation SHOULD bound the retry count and report
+  `ZS_AGAIN` rather than spin indefinitely, so a pathological publish rate
+  surfaces as an error instead of a livelock.
+- **C-5** The accepted cost of C-4g is that disk space is held until the last
   reader holding an old snapshot exits.
 - **C-6 Directory durability.** After creating a **data file** (a new active
   file, or a repack output) and after renaming a repack output or the manifest,
@@ -995,7 +1051,8 @@ Opening is recovery; there is no separate pass.
 
 Opaque types, one 32-bit flag space, output through pointer parameters, and
 `enum zs_ret` with `ZS_OK = 0`, `ZS_DONE = 1`, negatives for errors
-(`ZS_NOTFOUND = -5`, `ZS_LOCKED = -4`, `ZS_BADFORMAT = -7`, `ZS_FULL`, …).
+(`ZS_NOTFOUND = -5`, `ZS_LOCKED = -4`, `ZS_BADFORMAT = -7`, `ZS_FULL`,
+`ZS_AGAIN`, …).
 
 ```c
 struct zs_open_data {
@@ -1264,6 +1321,21 @@ exactly them; a reader mapping the pre-rebuild index asserted unaffected; and,
 since the index is never synced (C-6b), an index truncated or garbled at a random
 offset asserted to be rejected and rebuilt rather than read — the case that would
 otherwise have justified an `fsync`.
+
+**T-10b The snapshot protocol.** Each step of C-4 attacked directly, since these
+fail only under concurrency. A reader interrupted between reading the manifest
+and opening files, with a repack completing in the gap, asserting the retry
+observes a higher sequence and succeeds (C-4a). A file unlinked between steps 2
+and 3, asserting `ENOENT` triggers a retry rather than a partial snapshot. A
+reader holding a snapshot while the writer commits repeatedly, asserting bytes
+below its boundary never change and growth above it is invisible (C-4c). A writer
+committing while a reader copies an index entry, asserting the sequence counter
+forces a retry and the copy is never torn (C-4d). A reader whose index `valid_to`
+is ahead of where it would otherwise have stopped, asserting it adopts the later
+boundary and that a key updated past an earlier boundary is **not** reported
+absent — the clamping bug C-4e describes, constructed to fail if clamping is ever
+implemented. And a writer killed mid-span while a reader scans, asserting the
+reader stops at the last valid terminator (C-4f).
 
 **T-10a Index stability under a writing writer.** A reader mid-scan while a
 writer commits repeatedly to the active file, asserting the reader's results are
