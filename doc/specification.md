@@ -560,8 +560,8 @@ filesize-4    4   checksum of the pointer section
 
 | Name | Mutability | Purpose |
 |---|---|---|
-| `zeroskip-<uuid>-<gen>` | append-only | unordered file, one generation |
-| `zeroskip-<uuid>-<start>-<end>` | immutable | in-order file |
+| `zeroskip-<uuid>-<gen>.zs` | append-only | unordered file, one generation |
+| `zeroskip-<uuid>-<start>-<end>.zs` | immutable | in-order file |
 | `zeroskip.tmp.<pid>.<n>` | transient | staging for a repack or conversion output |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
 
@@ -573,12 +573,27 @@ filesize-4    4   checksum of the pointer section
   visually distinct in a directory listing.
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
-  `zeroskip-<uuid>-00000001-0000000A`. Eight hex digits is exactly the range of
+  `zeroskip-<uuid>-00000001-0000000A.zs`. Eight hex digits is exactly the range of
   a 32-bit generation, so every representable generation has a name and the
   width never needs to change. Fixed width also keeps lexical and numeric order
   identical, and hexadecimal keeps names short.
-- **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
-  metadata, so both sets are prefix-globbable and shell-completable.
+- **D-1a** Every data file ends `.zs`. Besides being a recognisable extension,
+  it fixes the sort order in the one place it matters. Comparing an unordered
+  file against the in-order file covering the same generation, the unordered name
+  is otherwise a **prefix** of the other and sorts first:
+
+  ```
+  without .zs            with .zs
+    ...-00000005           ...-00000005-00000005.zs
+    ...-00000005-00000005  ...-00000005.zs
+  ```
+
+  because `.` is `0x2E` and `-` is `0x2D`. With the suffix a lexical listing puts
+  the in-order file first, which is also the one D-5a says to prefer — so
+  "first wins" over a sorted listing gives the correct answer for free.
+- **D-2** `zeroskip-*.zs` matches data files only and `zeroskip.*` matches
+  metadata, so both sets are prefix-globbable and shell-completable. Staging
+  names begin `zeroskip.` and therefore never match the data-file pattern.
 - **D-3** `zeroskip.lock` MUST be a distinct file that is never replaced.
   `fcntl` locks attach to an inode, so locking a file that is replaced by
   `rename` would silently lose mutual exclusion.
@@ -589,7 +604,7 @@ There is no manifest. **The directory is the file set.** Filenames carry each
 file's generation range (D-1), so one `readdir` yields the set and every range
 without opening a single file.
 
-- **D-4** A file participates if its name matches `zeroskip-<uuid>-*` for this
+- **D-4** A file participates if its name matches `zeroskip-<uuid>-*.zs` for this
   database's UUID. Staging files and other databases' files are ignored by
   construction.
 - **D-5 Enclosure resolution.** A repack renames its output into place before
@@ -597,6 +612,19 @@ without opening a single file.
   range **encloses** another's, the enclosing file supersedes what it contains —
   it holds that data already — so the contained files MUST be ignored for
   reading and MAY be removed (D-23).
+- **D-5a Equal ranges.** Two files may also cover **exactly the same** range,
+  which is not enclosure and so needs its own rule. A conversion produces
+  precisely this: `<uuid>-N.zs` becomes `<uuid>-N-N.zs`, and both cover
+  generation *N* until the input is removed. **The in-order file wins** — it is
+  the output, it holds the same records in sorted form, and preferring it is
+  deterministic. The unordered file is then treated exactly as a contained file:
+  ignored for reading, removable under D-23.
+- **D-5b** Without D-5a the window would be worse than transient. Two files
+  claiming generation *N* is an overlap, so the tiling check (D-6) fails and every
+  reader retries; if the writer dies between the `rename` and the `unlink`,
+  readers retry **forever** until another writer happens to clean up. Since every
+  conversion passes through this state, it is the common path, not an edge
+  case.
 - **D-6 Completeness.** A set is complete if and only if, after enclosure
   resolution, the ranges **tile a contiguous interval of generations**: no
   overlaps, no gaps, from the oldest surviving generation through the active
@@ -652,7 +680,7 @@ without opening a single file.
   it moves on, the previous file simply stays unordered until it is converted.
 - **D-12 Immediate conversion.** A writer that finds a **non-active unordered
   file** MUST convert it to its single-generation in-order form —
-  `<uuid>-N` becomes `<uuid>-N-N` — before it finishes, oldest first, and MUST
+  `<uuid>-N.zs` becomes `<uuid>-N-N.zs` — before it finishes, oldest first, and MUST
   NOT go further: it does not merge in-order files, which is the repacker's job
   (D-16).
 - **D-12a** This is what keeps the steady state at **exactly one unordered file,
@@ -868,7 +896,7 @@ The per-file cursors are held in an array kept sorted by:
   otherwise from the same private index any reader of a pointerless file builds.
   There is nothing repack-specific about this.
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
-  `zeroskip-<uuid>-<start>-<end>` covering the entire range of every input,
+  `zeroskip-<uuid>-<start>-<end>.zs` covering the entire range of every input,
   only once complete.
 - **D-22** The output may legitimately contain **zero records**, in the form
   F-26g specifies — for instance
@@ -945,7 +973,7 @@ The per-file cursors are held in an array kept sorted by:
 
 **C-4 Taking a snapshot.** The protocol is:
 
-1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*`
+1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*.zs`
    and parsing each generation range from its name.
 2. Resolve enclosures (D-5) and check the result tiles a contiguous interval
    (D-6). If it does not, restart from 1.
@@ -1035,8 +1063,8 @@ Opening is recovery; there is no separate pass.
   Generations are cheap.
 - **R-5** A crash during a repack or conversion leaves either a staging file,
   which is ignored because its name does not match (D-4), or an output already
-  renamed in whose range encloses its inputs, which D-5 resolves in favour of the
-  output. Either way the surviving set tiles and the contained files may be
+  renamed in — whose range either encloses its inputs (D-5) or, for a conversion,
+  equals its input's (D-5a). Both resolve in favour of the output. Either way the surviving set tiles and the contained files may be
   removed (D-23). There is no separate reconstruction path, because discovery by
   directory scan is the only path.
 
@@ -1350,7 +1378,13 @@ justifies C-6.
 **T-9 File set discovery.** That the set and every range are derived from
 filenames alone, without opening a file. Enclosure resolution (D-5) driven by a
 directory seeded as an interrupted repack — output present alongside its inputs —
-asserting the output wins and the contained files are ignored for reading. Sets
+asserting the output wins and the contained files are ignored for reading. The
+**equal-range** case separately (D-5a): a directory seeded mid-conversion with
+both `<uuid>-N.zs` and `<uuid>-N-N.zs`, asserting the in-order file wins, the set
+is judged complete rather than overlapping, and reads succeed — and that leaving
+the directory in that state indefinitely, as a writer death would, does not make
+readers retry forever (D-5b). Also that `.zs` gives the sort order D-1a claims,
+by comparing generated names directly. Sets
 that do **not** tile rejected and retried (D-7): a missing middle generation, a
 gap at the bottom, two files claiming overlapping ranges that are not nested.
 Files disagreeing on UUID or comparator rejected (F-11). Foreign names and
