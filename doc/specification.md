@@ -170,34 +170,53 @@ Each part earns its place, following the reasoning behind the PNG signature:
 
 ### 4.4 Record types
 
-The type byte is an enumeration. High nibble `0` is a data record, `1` a
-terminator.
+The type byte is a bitfield of six independent properties:
 
-| Value | Type | Header | Ancestor |
+| Bit | Name | Meaning |
+|---|---|---|
+| `0x01` | `HasKey` | a data record: carries a key |
+| `0x02` | `IsDelete` | negation — of a key, or of a span |
+| `0x04` | `IsBig` | wide length fields |
+| `0x08` | `HasAncestor` | an ancestor generation is stored |
+| `0x10` | `SpanTerminator` | ends a span |
+| `0x20` | `Pointers` | begins a pointer section |
+
+Every legal combination, and no others:
+
+| Value | Type | Header | Bits |
 |---|---|---|---|
-| `0x01` | `KEYVALUE` | 4 | omitted — the file's `start` |
-| `0x02` | `KEYVALUE_ANC` | 8 | explicit |
-| `0x03` | `BIGKEYVALUE` | 24 | omitted — the file's `start` |
-| `0x04` | `BIGKEYVALUE_ANC` | 24 | explicit |
-| `0x05` | `DELETION` | 4 | omitted — the file's `start` |
-| `0x06` | `DELETION_ANC` | 8 | explicit |
-| `0x07` | `BIGDELETION` | 16 | omitted — the file's `start` |
-| `0x08` | `BIGDELETION_ANC` | 16 | explicit |
+| `0x01` | `KEYVALUE` | 4 | `HasKey` |
+| `0x09` | `KEYVALUE_ANC` | 8 | `HasKey HasAncestor` |
+| `0x05` | `BIGKEYVALUE` | 24 | `HasKey IsBig` |
+| `0x0D` | `BIGKEYVALUE_ANC` | 24 | `HasKey IsBig HasAncestor` |
+| `0x03` | `DELETION` | 4 | `HasKey IsDelete` |
+| `0x0B` | `DELETION_ANC` | 8 | `HasKey IsDelete HasAncestor` |
+| `0x07` | `BIGDELETION` | 16 | `HasKey IsDelete IsBig` |
+| `0x0F` | `BIGDELETION_ANC` | 16 | `HasKey IsDelete IsBig HasAncestor` |
+| `0x10` | `COMMIT` | 8 | `SpanTerminator` |
+| `0x14` | `COMMIT_LONG` | 24 | `SpanTerminator IsBig` |
+| `0x12` | `ROLLBACK` | 8 | `SpanTerminator IsDelete` |
+| `0x16` | `ROLLBACK_LONG` | 24 | `SpanTerminator IsDelete IsBig` |
+| `0x20` | `PTRS32` | 8 | `Pointers` |
+| `0x24` | `PTRS64` | 16 | `Pointers IsBig` |
 
-A 32-bit ancestor fits inside the padding the big forms already carry, so
-`_ANC` costs **nothing** there, and the short `_ANC` forms are 8 bytes rather
-than 16.
-| `0x10` | `COMMIT` | 8 | |
-| `0x11` | `COMMIT_LONG` | 24 | |
-| `0x12` | `ROLLBACK` | 8 | |
-| `0x13` | `ROLLBACK_LONG` | 24 | |
-| `0x20` | `PTRS32` | 8 | narrow pointer section (§4.9) |
-| `0x21` | `PTRS64` | 16 | wide pointer section (§4.9) |
-
-- **F-12** Any other type byte, including `0x00`, is invalid.
-- **F-12a** Each record shape has exactly two forms: one storing an ancestor
-  and one omitting it. Nothing distinguishes a "create" at the record level,
-  because nothing needs to (F-17).
+- **F-12** The table above is normative: any byte not in it is invalid,
+  including `0x00`. It is structured rather than arbitrary — exactly one of
+  `HasKey`, `SpanTerminator` and `Pointers` is set, since they select the
+  family; `HasAncestor` appears only with `HasKey`; `IsDelete` appears with
+  `HasKey` or `SpanTerminator` but never with `Pointers`; `IsBig` may appear
+  with any family; and bits `0x40` and `0x80` are reserved and always zero.
+- **F-12a** The bits are meaningful in isolation, which is the point of
+  encoding them this way. `type & IsBig` selects the wide layout in all three
+  families, `type & HasAncestor` says whether the ancestor field is present, and
+  `type & IsDelete` means negation whether the subject is a key or a span. A
+  decoder reads the shape from the bits rather than from a lookup table.
+- **F-12b** Each data shape has exactly two forms, one storing an ancestor and
+  one omitting it. Nothing distinguishes a "create" at the record level, because
+  nothing needs to (F-17).
+- **F-12c** A 32-bit ancestor fits inside the padding the big forms already
+  carry, so `HasAncestor` costs **nothing** there; in the short forms it adds 4
+  bytes.
 
 ### 4.5 Data records
 
@@ -222,7 +241,7 @@ KEYVALUE (0x01)
   +4   .  key NUL value NUL pad->8
   len = roundup8(4 + keylen + 1 + vallen + 1)
 
-KEYVALUE_ANC (0x02)
+KEYVALUE_ANC (0x09)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
@@ -230,14 +249,14 @@ KEYVALUE_ANC (0x02)
   +8   .  key NUL value NUL pad->8
   len = roundup8(8 + keylen + 1 + vallen + 1)
 
-DELETION (0x05)
+DELETION (0x03)
   +0   1  type
   +1   1  keylen
   +2   2  pad
   +4   .  key NUL pad->8
   len = roundup8(4 + keylen + 1)
 
-DELETION_ANC (0x06)
+DELETION_ANC (0x0B)
   +0   1  type
   +1   1  keylen
   +2   2  pad
@@ -245,14 +264,14 @@ DELETION_ANC (0x06)
   +8   .  key NUL pad->8
   len = roundup8(8 + keylen + 1)
 
-BIGKEYVALUE (0x03)
+BIGKEYVALUE (0x05)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  8  vallen
   +24  .  key NUL value NUL pad->8
 
-BIGKEYVALUE_ANC (0x04)
+BIGKEYVALUE_ANC (0x0D)
   +0   1  type
   +1   3  pad
   +4   4  ancestor generation
@@ -266,7 +285,7 @@ BIGDELETION (0x07)
   +8   8  keylen
   +16  .  key NUL pad->8
 
-BIGDELETION_ANC (0x08)
+BIGDELETION_ANC (0x0F)
   +0   1  type
   +1   3  pad
   +4   4  ancestor generation
@@ -398,7 +417,7 @@ PTRS32 (0x20)                         narrow
   +8    4×N    record offsets (uint32)
         .      pad with zeroes to a multiple of 8
 
-PTRS64 (0x21)                         wide
+PTRS64 (0x24)                         wide
   +0    1      type
   +1    7      pad
   +8    8      count (uint64)
@@ -973,6 +992,14 @@ type; a file shorter than header plus trailer; and a corrupted pad byte — each
 rejected rather than read. The records checksum verified on demand and asserted
 to catch a record body corrupted in place (F-26e), which nothing else would
 detect in an in-order file.
+
+**T-2b Type byte validity.** All 256 byte values fed as a record type, asserting
+exactly the 14 in F-12's table are accepted and the other 242 rejected. A
+bitfield admits far more values than it defines, so the near-misses matter most:
+two family bits set at once, `HasAncestor` without `HasKey`, `IsDelete` with
+`Pointers`, and either reserved bit set. Each is a plausible result of a single
+flipped bit in a valid type, and each MUST be rejected rather than
+half-interpreted.
 
 **T-3 Malformed input.** Every golden file truncated at *every byte offset*,
 not merely record boundaries, and systematically bit-flipped. Each case asserts
