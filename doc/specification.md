@@ -39,7 +39,7 @@ tolerate compaction happening out of band.
 | terminator | a commit, final-commit, or rollback record |
 | `append_end` | offset just past the last valid terminator in a file |
 | ancestor | file number in which the record a given record supersedes was created |
-| shadowed | a record superseded by a later record for the same key *in the same file* |
+| shadowed | a record superseded by a later record for the same key, anywhere — later in the same file, or in any newer file |
 
 ## 3. Guarantees
 
@@ -259,12 +259,20 @@ unsorted files (F-6a).
   The first entry of an equal-key range is therefore the newest version,
   and walking forward through that range walks the key's history newest to
   oldest.
-- **F-23** `NumShadowedRecords` and `NumShadowedBytes` count records
-  superseded by a later record for the same key **within the same file**,
-  and the bytes those records occupy. They are non-zero in a closed unsorted
-  file, which retains every version it was written, and zero in an in-order
-  file, which retains only the newest version of each key (D-17). They are
-  the measure of what merging this file would reclaim.
+- **F-23** A record is **shadowed** when a later record for the same key
+  supersedes it — whether that later record is further on in the same file
+  or in any newer file. `NumShadowedRecords` and `NumShadowedBytes` count
+  the shadowed records in this file and the bytes they occupy.
+- **F-23a** Shadowing is therefore not a static property of a file: a
+  subsequent write elsewhere can shadow a record here. The stored counts are
+  a **snapshot taken when the block was written**, and are a lower bound
+  thereafter. For a closed file, which is the newest file at the moment it
+  is closed, the snapshot necessarily counts only within-file supersession;
+  for a merged file it also counts records already superseded by newer
+  unmerged files, so it is non-zero there too.
+- **F-23b** The counts are diagnostic — surfaced by `zs_db_dump` and
+  checkable by `zs_db_check_consistency` — and are **not** an input to the
+  merge policy, which triggers on file size alone (D-20).
 - **F-24** Every pointer MUST be 8-aligned and within
   `[48, pointers_offset)`.
 
@@ -402,9 +410,18 @@ without a trailing `FINAL` is therefore sealed.
 
 ### 5.6 Merging
 
-- **D-17** For each key in the input set, keep only the newest version, and
-  set its ancestor to the **oldest merged version's** ancestor, preserving
-  the chain past the merge boundary.
+- **D-17** For each key in the input set, keep only the newest version *among
+  the inputs*, and set its ancestor to the **oldest merged version's**
+  ancestor, preserving the chain past the merge boundary.
+- **D-17a** That retained record MUST be written even if it is itself
+  shadowed by a newer, unmerged file (F-23). Being shadowed is **not** a
+  licence to drop a record; only D-18 permits removal. The reason is that a
+  record's ancestor names the file of the record it *immediately superseded*,
+  not the chain's create. If a shadowed record is dropped, a later merge sees
+  only the newer version, reads its ancestor as though it identified the
+  create, and may wrongly conclude the whole lifespan is contained —
+  resurrecting a deleted key. Retaining shadowed records is what keeps the
+  chain resolvable across merge boundaries.
 - **D-18** A key may be removed entirely if and only if its newest version
   is a deletion **and** the chain's create lies inside the merged range
   (`ancestor >= output start`) — that is, its whole lifespan from create
@@ -429,9 +446,10 @@ decreasing sizes:
 Concretely, after a rollover adds a new newest closed file, walk from newest
 towards oldest: while `size(file) >= size(parent)`, merge the two and
 re-test the result against *its* parent, cascading until the invariant holds
-or the oldest file is reached. "Size" is bytes on disk; `NumShadowedBytes`
-is what makes the merge worth doing, but the trigger is plain size so it can
-be evaluated from `stat` alone.
+or the oldest file is reached. "Size" is bytes on disk, so the trigger is
+evaluable from `stat` alone and needs no knowledge of how much of a file is
+dead. Reclaiming shadowed bytes is a consequence of merging rather than its
+trigger (F-23b).
 
 - **D-21** This yields O(log(total ÷ `rollover_size`)) files with
   geometrically increasing sizes, and amortised O(log n) rewrites per
@@ -612,13 +630,23 @@ adjacent files are ever merged (D-19), and that the D-20 cascade reaches the
 geometric size invariant — driven by appending enough data to force many
 rollovers and asserting the resulting file count and size distribution.
 
+**T-5b Shadowed record retention.** The specific resurrection D-17a guards
+against, constructed directly: create a key in file *a*, update it in *b*,
+delete it in a newer file *c*, merge a range covering *a* and *b* but not
+*c*, then merge a range covering the result and *c*. Assert the key stays
+absent, and assert that a merge which drops the shadowed record from the
+first merge instead produces the resurrection — so the test fails if the
+retention rule is ever removed. Repeated for update-instead-of-delete, for
+chains longer than three links, and for chains whose create lies outside
+every merge performed.
+
 **T-5a File states.** All four states of §5.3 round-trip and are correctly
 identified from the file plus manifest: that a closed file is searched via
 its own `[Pointers]` and an in-order file likewise, that both are recognised
-by their trailing `FINAL` (F-6a) independently of `end`, that a closed
-unsorted file reports non-zero `NumShadowedRecords`/`Bytes` and an in-order
-file reports zero (F-23), and that a sealed file is never closed or appended
-to (D-9b).
+by their trailing `FINAL` (F-6a) independently of `end`, that the
+`NumShadowedRecords`/`Bytes` snapshot matches an independently computed count
+at the moment the block is written for both closed and merged files (F-23a),
+and that a sealed file is never closed or appended to (D-9b).
 
 **T-6 Crash injection.** A test build interposes `write`, `fsync` and
 `rename`, counts calls, and aborts at call *N* for every *N* across a
