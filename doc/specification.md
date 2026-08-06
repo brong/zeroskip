@@ -12,13 +12,37 @@ them. **MUST** and **MUST NOT** are normative.
 
 ## 1. Purpose and scope
 
-C11 over POSIX only — `mmap`, `fcntl`, no external libraries — building on
-Linux, macOS and the BSDs. Keys are ordered by a comparator, byte order by
-default.
+This document specifies zeroskip so that **independent implementations, in
+different languages, interoperate on the same database concurrently**. Keys are
+ordered by a comparator, byte order by default.
 
-No code path may depend on a CPU feature: the library MUST build and run on
-any conforming POSIX platform, and every on-disk value MUST be bit-identical
-across them.
+**What is normative for every implementation:** the on-disk format (§4), the
+database layout and its algorithms (§5), the concurrency and durability
+protocol (§6), and open and recovery (§7). Two implementations that agree on
+these can share a directory, read each other's files, and lock against each
+other.
+
+**What is a binding, not a contract:** §8 gives a C API. Its *semantics* are
+normative — what `store` with no value means, what a transaction makes visible,
+what each flag does — but its spelling is not. An implementation in another
+language SHOULD express the same semantics idiomatically.
+
+- **G-0** Nothing in the format depends on `mmap`, on pointer-sized integers,
+  or on any CPU feature. An implementation MAY read files with ordinary reads
+  and copy data out; `mmap` is an optimisation the format permits, not one it
+  requires. Only §8's zero-copy pointer lifetimes (A-4) assume it, and that is a
+  binding-level promise a copying implementation simply makes differently.
+- **G-0a** Every integer in every structure is little-endian (F-1), including
+  lengths, counts, generations and offsets. This is worth stating twice because
+  several languages default the other way — a JVM `DataOutputStream` or a naive
+  network-order habit produces files nothing else can read, and the header
+  checksum will not catch it, because it is computed over whatever was written.
+- **G-0b** Any arithmetic on a length, count or offset **read from a file** MUST
+  be overflow-checked before use. `keylen + vallen + 2` and
+  `offset + record_length` are attacker- and corruption-controlled; wrapping them
+  turns a bounds check into a bypass. Languages differ here — C is undefined,
+  Rust wraps in release and panics in debug, Go wraps silently — so the
+  requirement is on the implementation, not on the language.
 
 The design rests on one invariant, without exception: **nothing is ever written
 except by appending to a file or by creating a new file.** No file is ever
@@ -67,8 +91,10 @@ whether a pointer section must be present.
   snapshot and takes no lock. Readers never block a writer; a writer never
   blocks readers.
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
-  lock. Because the kernel releases `fcntl` locks on process death, a killed
-  writer never blocks the next one; no lock state can outlive a process.
+  byte-range lock *plus* an in-process mutex, since `fcntl` locks do not exclude
+  threads of the same process (C-1f). Because the kernel releases `fcntl` locks
+  on process death, a killed writer never blocks the next one; no lock state can
+  outlive a process.
 - **G-6 No shared mutable state.** Nothing a reader may be reading is ever
   rewritten beneath it: files are append-only, a new file is published by
   `rename`, and every index is private to the process that built it. There is no
@@ -862,13 +888,37 @@ The per-file cursors are held in an array kept sorted by:
 
 ## 6. Concurrency and durability
 
-- **C-1** Three `fcntl` byte-range locks on `zeroskip.lock`:
+- **C-1** Three byte-range locks on `zeroskip.lock`:
 
   | Byte | Lock | Held for | Covers |
   |---|---|---|---|
   | 0 | write | a write transaction | appending, creating a new active file, converting an unordered file |
   | 1 | repack | a whole repack, possibly long | merging in-order files |
   | 2 | remove | momentarily | verify completeness, then unlink |
+
+  The mechanism is **exactly** `fcntl` record locking: `F_SETLK` or `F_SETLKW`
+  with `l_type = F_WRLCK`, `l_whence = SEEK_SET`, `l_start` the byte above, and
+  `l_len = 1`. This is part of the interoperability surface, not an
+  implementation choice — see C-1e.
+- **C-1e Locking is an interop surface.** Implementations in different languages
+  must exclude *each other*, so the primitive and the byte offsets are normative.
+  In particular an implementation MUST NOT use `flock`: on Linux `flock` and
+  `fcntl` locks occupy **separate spaces and do not exclude one another**, so a
+  `flock`-based writer and an `fcntl`-based writer would each believe it held the
+  write lock and would append to the same file concurrently. Nothing detects this
+  — the two would interleave records and destroy the span chain. `flock` is also
+  a no-op over some network filesystems.
+- **C-1f `fcntl` locks are per-process, not per-thread.** Two threads in one
+  process both "acquire" the write lock successfully, because the kernel sees one
+  owner. G-5 therefore requires an **in-process mutex as well**, held across the
+  same region as the file lock. A single-threaded process never notices this; a
+  runtime with a thread pool or green threads — Go, Java, Rust with tokio — will
+  corrupt the active file without it.
+- **C-1g** `fcntl` locks are also released by closing **any** descriptor for the
+  file in that process, not just the one used to acquire them. An implementation
+  MUST keep exactly one descriptor for `zeroskip.lock` open for the handle's
+  lifetime and MUST NOT open or close a second one, which is easy to do
+  accidentally in a language whose file objects close on garbage collection.
 
 - **C-1a** The write and repack locks never contend, because the two jobs
   consume **disjoint sets of files**: a writer only ever converts files with
@@ -990,8 +1040,9 @@ Opening is recovery; there is no separate pass.
   removed (D-23). There is no separate reconstruction path, because discovery by
   directory scan is the only path.
 
-## 8. Public API
+## 8. C binding
 
+The semantics below are normative; the spelling is a C binding (§1).
 Opaque types, one 32-bit flag space, output through pointer parameters, and
 `enum zs_ret` with `ZS_OK = 0`, `ZS_DONE = 1`, negatives for errors
 (`ZS_NOTFOUND = -5`, `ZS_LOCKED = -4`, `ZS_BADFORMAT = -7`, `ZS_FULL`,
@@ -1121,14 +1172,44 @@ different calls, though not every flag is meaningful everywhere:
 
 ## 9. Conformance suite
 
-`zstest`: one binary, substring filter, fresh temp directory per test,
-`ASSERT_*` macros. Flat layout: `zeroskip.h`, `zeroskip.c`, `xxhash.h`,
-`zstest.c`, `zstool.c`, `Makefile`, plus `doc/` and `tests/corpus/`.
+The suite has two halves. **T-1 to T-11 are per-implementation tests**, run
+inside one implementation in whatever harness suits it — for the C
+implementation, `zstest`: one binary, substring filter, fresh temp directory per
+test, `ASSERT_*` macros, alongside `zeroskip.h`, `zeroskip.c`, `xxhash.h`,
+`zstool.c` and a `Makefile`. **T-12 to T-14 are cross-implementation tests**,
+run by a shared language-neutral runner over every implementation.
+
+### 9.1 The interop harness
+
+- **T-0 The corpus is language-neutral.** `tests/corpus/` holds `.zs` files
+  alongside a description of each in a portable text format, not in any
+  implementation's source. Every implementation validates against the same
+  bytes, and any implementation may generate the corpus — a corpus that only one
+  can produce proves nothing.
+- **T-0a Driver contract.** Each implementation MUST provide a small executable
+  exposing a fixed set of subcommands over a database directory, so one runner
+  can drive all of them:
+
+  | Subcommand | Behaviour |
+  |---|---|
+  | `create --uuid U` | create a database with a given UUID, so output is reproducible |
+  | `store K V` / `delete K` | one transaction, one operation |
+  | `batch < script` | a sequence of operations in one transaction, so multi-record spans are testable |
+  | `get K` | print the value, or a defined not-found marker |
+  | `scan [--prefix P]` | print every visible pair in comparator order |
+  | `dump` | print structure — files, generations, spans, record types, offsets |
+  | `check` | run the consistency checks (F-28, F-26f) and report |
+  | `convert` / `repack` | force one conversion or one repack |
+  | `hold-write --for MS` | take the write lock and hold it, for lock-contention tests |
+
+  Output is a defined line format so the runner compares text, not internals.
+  Without this each language reimplements the suite and they drift apart, which
+  is the failure mode the whole exercise exists to prevent.
 
 **T-1 Golden vectors.** Byte-exact encode assertions against checked-in files,
 deterministic because F-15 makes encoding canonical, with `zstool` accepting an
 explicit UUID so corpus generation needs no test hook in the library. Decode
-assertions from a corpus manifest. Generated for engines 0 and 1 (F-5d), which
+assertions from the corpus description (T-0). Generated for engines 0 and 1 (F-5d), which
 also pins that a file's engine comes from its own header rather than the
 reader's configuration. `doc/conformance.md` plus this corpus is what an
 independent implementation validates against.
@@ -1308,10 +1389,52 @@ that exactly one unordered file remains and the rest are in-order (D-12a). Then 
 backlog: several crashes each leaving an unclean active file, asserting successive
 writers convert them oldest first and the count drains to one.
 
+**T-12 Write-here-read-there.** For every ordered pair of implementations *(A,
+B)*: *A* creates a database and performs a workload; *B* opens it and its `scan`
+output MUST match *A*'s byte for byte. Then *B* writes further and *A* reads
+back. Repeated with the workload arranged to exercise each structural state —
+records still in the active file, a converted single-generation in-order file, a
+merged multi-generation file, a rolled-back span, a tombstone whose chain leaves
+the file, an empty in-order file, keys spanning the short/big encoding boundary,
+and keys containing NUL bytes.
+
+**T-12a Byte-for-byte agreement.** Given the same UUID and the same operation
+sequence, every implementation MUST produce **identical files**, since encoding
+is canonical (F-15, F-26c) and no timestamps or nondeterminism enter the format.
+The runner diffs the directories. This is a much sharper test than reading each
+other's output, because it catches divergence in padding, in ancestor omission,
+in the choice of short versus big form, and in checksum seeding — before that
+divergence has a chance to become a compatibility rule nobody meant to make.
+
+**T-13 Cross-implementation concurrency.** The tests most likely to find real
+bugs, since they exercise the locking interop surface (C-1e):
+
+- *A* holds the write lock via `hold-write` while *B* attempts a write:
+  *B* MUST block, or return `ZS_LOCKED` under its non-blocking option. **A pass
+  here where either side used `flock` would be a false pass on Linux**, so the
+  runner also asserts the lock is visible to a third observer using `fcntl`
+  directly.
+- *A* writes continuously while *B* scans repeatedly: every *B* snapshot MUST be
+  a consistent prefix of *A*'s commits, never a mixture.
+- *A* repacks while *B* writes, and the reverse, asserting both complete and the
+  resulting set tiles (D-6) — the concrete test of C-1a's disjointness claim.
+- *A* is `SIGKILL`ed holding the write lock; *B* MUST proceed with no manual
+  intervention (G-5).
+- *A* and *B* both attempt to remove files concurrently, asserting the surviving
+  set still tiles (D-23).
+
+**T-14 Multi-threaded exclusion.** For any implementation whose language exposes
+threads: two threads of **one process** writing concurrently, asserting they
+exclude each other. This fails for an implementation that relies on `fcntl`
+alone, since the kernel sees a single owner (C-1f), and it is invisible to a
+single-threaded implementation — so it MUST be run per implementation rather than
+assumed from the C one passing.
+
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close;
 this mapping is what makes the suite a conformance suite rather than a test
-suite.
+suite. Each implementation records which requirements it passes, so partial
+conformance is visible rather than implied.
 
 ## 10. Non-goals
 
