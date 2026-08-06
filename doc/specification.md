@@ -16,6 +16,10 @@ C11 over POSIX only — `mmap`, `fcntl`, no external libraries — building on
 Linux, macOS and the BSDs. Keys are ordered by a comparator, byte order by
 default.
 
+No code path may depend on a CPU feature: the library MUST build and run on
+any conforming POSIX platform, and every on-disk value MUST be bit-identical
+across them.
+
 The design rests on one invariant: **nothing is ever written except by
 appending to a file or by creating a new file.** No data file is ever
 modified in place, renamed, or truncated. The manifest is the one mutable
@@ -94,10 +98,11 @@ whether a terminating pointers block must be present.
   self-describing. The field is plain data read before any verification, so
   there is no bootstrapping problem, and files written under different engines
   may coexist.
-- **F-5b** An implementation MUST choose its checksum implementation at
-  runtime with a portable C fallback. Hardware acceleration MUST NOT be a
-  build-time-only path: a library that fails to build or run on a platform
-  lacking a CPU feature does not conform.
+- **F-5b** xxHash is used through its vendored reference implementation, whose
+  scalar path is portable C; any SIMD acceleration within it is an internal
+  optimisation of the same function, not a separate code path that could be
+  absent on a given platform. The resulting value MUST be bit-identical
+  everywhere, which the golden corpus pins (T-1).
 - **F-5c** Engine 0 weakens G-2 and G-3, because F-16's property — that a
   terminator reaching disk without its data fails validation — depends on a
   real checksum. With engine 0 a torn tail is undetectable. It exists for
