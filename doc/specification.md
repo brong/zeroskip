@@ -1016,13 +1016,37 @@ The per-file cursors are held in an array kept sorted by:
   | `fcntl` record lock on a file | no, by path | **yes**, kernel-released | chosen |
   | `open(O_CREAT\|O_EXCL)` lock file | by path | **no** | this is the original zeroskip's unrecoverable-after-crash bug |
   | POSIX named semaphore (`sem_open`) | yes | **no** — a killed holder leaves it decremented forever | rejected |
-  | SysV semaphore with `SEM_UNDO` | via `key_t` | yes | rejected: `key_t` is 32 bits, so a key derived from a 128-bit UUID collides, and two unrelated databases would silently share one lock |
+  | SysV semaphore with `SEM_UNDO` | via `key_t` | yes | rejected — but see C-1h1; the decisive reason is the lock space, not the key width |
   | robust `pthread_mutex` in shared memory | yes | yes, via `EOWNERDEAD` | rejected: **macOS has no `PTHREAD_MUTEX_ROBUST`**, and it is a target platform |
   | `flock` | by path | yes | rejected: does not conflict with `fcntl` locks (C-1e) |
 
   A global-namespace object is also worse in kind: it outlives the directory it
   describes, needs its own cleanup, and can be orphaned by a database that was
   simply deleted. A file inside the directory is disposed of with the database.
+- **C-1h1 On SysV semaphores specifically.** `SEM_UNDO` genuinely does give
+  release on death, so this one fails on interoperability rather than on its own
+  merits: a semaphore is a **different lock space from `fcntl`**, so an
+  implementation using it would not exclude one using record locks. That is the
+  `flock` failure (C-1e) with a different spelling, and it disqualifies the
+  primitive whatever its other properties.
+- **C-1h2** Its `key_t` collision is a lesser problem than it first appears, and
+  worth stating accurately. `key_t` is 32 bits, so a key derived from a 128-bit
+  UUID collides at a rate that is not remote — about a 1% chance across 9,000
+  concurrently-keyed databases and even odds by 77,000, which a deployment holding
+  per-user databases can reach. But a collision causes **over**-exclusion, not
+  under-exclusion: each database still has exclusive access, it is merely
+  serialised against an unrelated one. That costs concurrency, not correctness.
+- **C-1h3** The exception is deadlock, and its sharp form needs only **one**
+  process: if a process holds the write lock on database *A* and then opens *B*,
+  whose key collides, it blocks on the semaphore it already holds and deadlocks
+  against itself. No second process is required, the trigger is a hash collision
+  between two UUIDs, and it is therefore data-dependent and silent. `fcntl` on
+  distinct paths cannot collide at all, so it has no equivalent.
+- **C-1h4 Locks across databases are the caller's problem.** C-1d orders the
+  locks *within* one database; the library cannot see across two, so a caller
+  that writes to several while holding locks MUST impose its own consistent order
+  or it can deadlock — with any primitive, collision or not. Cyrus does open
+  several databases at once, so this is worth stating rather than assuming.
 - **C-1i Open file description locks.** `F_OFD_SETLK` is a strict improvement
   where it exists — present on Linux and, verified in its SDK headers, on macOS.
   It is released when the last descriptor for that open file description closes,
