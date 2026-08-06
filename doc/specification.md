@@ -29,7 +29,7 @@ tolerate compaction happening out of band.
 
 | Term | Meaning |
 |---|---|
-| generation | counter, starting at 1, incremented for each new data file |
+| generation | 32-bit counter, starting at 1, incremented for each new data file |
 | unordered file | holds exactly **one** generation; records in append order; **no** `[Pointers]`; `end == 0` |
 | in-order file | holds a **range** of generations; records in key order; **has** `[Pointers]`; `end != 0` |
 | active file | the highest-generation unordered file — the only file a writer appends to |
@@ -75,7 +75,9 @@ whether a terminating pointers block must be present.
 
 - **F-1** Integers are little-endian.
 - **F-2** Every record begins at an offset that is a multiple of 8 and
-  occupies a whole multiple of 8 bytes. Padding bytes MUST be zero.
+  occupies a whole multiple of 8 bytes. Padding bytes MUST be zero. Fields are
+  naturally aligned: 8-byte fields on 8-byte boundaries, 4-byte fields on
+  4-byte boundaries.
 - **F-3** Offsets and pointers are absolute byte offsets from the file start.
 - **F-4** The checksum field is always the **last 4 bytes** of the structure
   it protects, covering every byte from the start of the protected region up
@@ -128,7 +130,7 @@ Each part earns its place, following the reasoning behind the PNG signature:
 
 - **F-6** A reader MUST validate all 16 bytes, not a prefix.
 
-### 4.3 File header (80 bytes)
+### 4.3 File header (72 bytes)
 
 | Off | Size | Field |
 |---|---|---|
@@ -138,11 +140,11 @@ Each part earns its place, following the reasoning behind the PNG signature:
 | 18 | 2 | flags; low 4 bits are the checksum engine id (F-5) |
 | 20 | 4 | reserved, written as zero |
 | 24 | 16 | database UUID, binary RFC 4122 |
-| 40 | 8 | start generation |
-| 48 | 8 | end generation, or `0` for an unordered file |
-| 56 | 16 | comparator name, NUL-padded |
-| 72 | 4 | reserved, written as zero |
-| 76 | 4 | checksum of bytes `[0, 76)` |
+| 40 | 4 | start generation |
+| 44 | 4 | end generation, or `0` for an unordered file |
+| 48 | 16 | comparator name, NUL-padded |
+| 64 | 4 | reserved, written as zero |
+| 68 | 4 | checksum of bytes `[0, 68)` |
 
 - **F-7** Split read and write versions let an older library determine that it
   may still read a newer file even when it must not write to it. A reader MUST
@@ -170,14 +172,18 @@ terminator.
 |---|---|---|---|
 | `0x01` | `KEYVALUE` | 4 | implicit — a create |
 | `0x02` | `KEYVALUE_PRIOR` | 4 | on an earlier record in this same file |
-| `0x03` | `KEYVALUE_ANC` | 16 | explicit |
+| `0x03` | `KEYVALUE_ANC` | 8 | explicit |
 | `0x04` | `BIGKEYVALUE` | 24 | implicit — a create |
 | `0x05` | `BIGKEYVALUE_PRIOR` | 24 | on an earlier record in this same file |
-| `0x06` | `BIGKEYVALUE_ANC` | 32 | explicit |
+| `0x06` | `BIGKEYVALUE_ANC` | 24 | explicit |
 | `0x07` | `DELETION_PRIOR` | 4 | on an earlier record in this same file |
-| `0x08` | `DELETION_ANC` | 16 | explicit |
+| `0x08` | `DELETION_ANC` | 8 | explicit |
 | `0x09` | `BIGDELETION_PRIOR` | 16 | on an earlier record in this same file |
-| `0x0A` | `BIGDELETION_ANC` | 24 | explicit |
+| `0x0A` | `BIGDELETION_ANC` | 16 | explicit |
+
+A 32-bit ancestor fits inside the padding the big forms already carry, so
+`_ANC` costs **nothing** there, and the short `_ANC` forms are 8 bytes rather
+than 16.
 | `0x10` | `COMMIT` | 8 | |
 | `0x11` | `COMMIT_LONG` | 24 | |
 | `0x12` | `COMMIT_LONG_2ND` | (tail of `0x11`) | |
@@ -203,7 +209,7 @@ in place as C strings.
 - **F-14** A key MUST be at least 1 byte. An empty value is legal and distinct
   from an absent key.
 
-The ancestor is an **absolute 64-bit generation**, never relative to the
+The ancestor is an **absolute 32-bit generation**, never relative to the
 containing file. Only the first occurrence of a key within a file stores one.
 
 ```
@@ -218,37 +224,52 @@ KEYVALUE_ANC (0x03)
   +0   1  type
   +1   1  keylen
   +2   2  vallen
-  +4   4  pad
-  +8   8  ancestor generation
-  +16  .  key NUL value NUL pad->8
+  +4   4  ancestor generation
+  +8   .  key NUL value NUL pad->8
+  len = roundup8(8 + keylen + 1 + vallen + 1)
 
 DELETION_PRIOR (0x07)
   +0   1  type
   +1   1  keylen
   +2   2  pad
   +4   .  key NUL pad->8
+  len = roundup8(4 + keylen + 1)
 
 DELETION_ANC (0x08)
   +0   1  type
   +1   1  keylen
-  +2   6  pad
-  +8   8  ancestor generation
-  +16  .  key NUL pad->8
+  +2   2  pad
+  +4   4  ancestor generation
+  +8   .  key NUL pad->8
+  len = roundup8(8 + keylen + 1)
 
-BIGKEYVALUE (0x04) / BIGKEYVALUE_PRIOR (0x05) / BIGKEYVALUE_ANC (0x06)
+BIGKEYVALUE (0x04) / BIGKEYVALUE_PRIOR (0x05)
   +0   1  type
   +1   7  pad
   +8   8  keylen
   +16  8  vallen
-  [+24 8  ancestor generation]        -- 0x06 only
-  +24/32  key NUL value NUL pad->8
+  +24  .  key NUL value NUL pad->8
 
-BIGDELETION_PRIOR (0x09) / BIGDELETION_ANC (0x0A)
+BIGKEYVALUE_ANC (0x06)
+  +0   1  type
+  +1   3  pad
+  +4   4  ancestor generation
+  +8   8  keylen
+  +16  8  vallen
+  +24  .  key NUL value NUL pad->8
+
+BIGDELETION_PRIOR (0x09)
   +0   1  type
   +1   7  pad
   +8   8  keylen
-  [+16 8  ancestor generation]        -- 0x0A only
-  +16/24  key NUL pad->8
+  +16  .  key NUL pad->8
+
+BIGDELETION_ANC (0x0A)
+  +0   1  type
+  +1   3  pad
+  +4   4  ancestor generation
+  +8   8  keylen
+  +16  .  key NUL pad->8
 ```
 
 - **F-15** Encoding is canonical: an implementation MUST use the short form
@@ -383,8 +404,10 @@ terminator covering the block.
 
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
-  `zeroskip-<uuid>-00000001-0000000A`. Fixed width keeps lexical and numeric
-  order identical; hexadecimal keeps names short.
+  `zeroskip-<uuid>-00000001-0000000A`. Eight hex digits is exactly the range of
+  a 32-bit generation, so every representable generation has a name and the
+  width never needs to change. Fixed width also keeps lexical and numeric order
+  identical, and hexadecimal keeps names short.
 - **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable.
 - **D-3** `zeroskip.lock` MUST be a distinct file that is never replaced.
@@ -399,13 +422,12 @@ directory scan against a repack.
 | Off | Size | Field |
 |---|---|---|
 | 0 | 16 | magic (§4.2) |
-| 16 | 8 | generation counter — highest generation ever allocated |
-| 24 | 16 | database UUID |
-| 40 | 8 | publish sequence, incremented on every publish |
-| 48 | 8 | active file's `append_end` as of this publish |
-| 56 | 4 | file count |
-| 60 | 4 | reserved, zero |
-| 64 | 24 × N | `(start, end, size)` per file |
+| 16 | 16 | database UUID |
+| 32 | 8 | publish sequence, incremented on every publish |
+| 40 | 8 | active file's `append_end` as of this publish |
+| 48 | 4 | generation counter — highest generation ever allocated |
+| 52 | 4 | file count |
+| 56 | 16 × N | `(start, end, size)` per file |
 | . | 4 | checksum over all preceding bytes |
 
 - **D-3a** The manifest's checksum always uses xxHash, whatever engine the data
@@ -448,6 +470,11 @@ directory scan against a repack.
   generation ever allocated, so reconstruction after files have been removed
   cannot reissue one. A writer allocates `active + 1` and MUST advance the
   counter to at least that.
+- **D-9c** Generations are never reused and never reset, not even by a repack
+  that collapses the whole database into one file — the next new file is
+  `end + 1`. Allocating past `0xFFFFFFFF` MUST fail with `ZS_FULL` rather than
+  wrap. At the 2MB default that bound is around 8PB of cumulative writes, and
+  the remedy is to dump and reload into a fresh database.
 - **D-10** An active file with a corrupt header or zero length is treated as a
   **complete file with zero spans**. It is not an error and its generation is
   taken from its filename. Because it is not clean, a writer moves to a new
@@ -624,7 +651,7 @@ Opening is recovery; there is no separate pass.
 
 Opaque types, one 32-bit flag space, output through pointer parameters, and
 `enum zs_ret` with `ZS_OK = 0`, `ZS_DONE = 1`, negatives for errors
-(`ZS_NOTFOUND = -5`, `ZS_LOCKED = -4`, `ZS_BADFORMAT = -7`, …).
+(`ZS_NOTFOUND = -5`, `ZS_LOCKED = -4`, `ZS_BADFORMAT = -7`, `ZS_FULL`, …).
 
 ```c
 struct zs_open_data {
@@ -786,16 +813,10 @@ backend is a thin separate adapter, out of scope.
 
 ## 11. Open items
 
-1. **Filename width bounds generations at 2³²−1.** D-1 specifies 8 hex digits,
-   but the header field is 64-bit, so a database could in principle allocate a
-   generation it cannot name. Either widen filenames to 16 hex digits, or
-   narrow the header fields to 32 bits and cap generations explicitly. At 2MB
-   per file, 2³² generations is around 8PB of writes, so this is a
-   tidiness question rather than an urgent one — but the two should agree.
-2. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
+1. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
    database while the writer continues appending. The packer lock permits one
    repack at a time, but nothing bounds how long one runs or lets it be
    interrupted and resumed.
-3. **Shared index growth.** D-13 fixes the invariants but not the growth policy
+2. **Shared index growth.** D-13 fixes the invariants but not the growth policy
    for `zeroskip.index`, which must cover the active file and any unordered
    files awaiting repack without unbounded growth.
