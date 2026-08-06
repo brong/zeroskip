@@ -125,7 +125,7 @@ Each part earns its place, following the reasoning behind the PNG signature:
 
 | Bytes | Purpose |
 |---|---|
-| `89` | high bit set, so no text file can be mistaken for a database and a transfer that strips the eighth bit is detected |
+| `89` | high bit set, so no text file can be mistaken for a database and a transfer that strips the eighth bit is detected; also **invalid UTF-8** (F-6a) |
 | `zeroskip` | human-readable in a hex dump and to `file(1)` |
 | `1` | major format version *in the magic*, so an incompatible future format is distinguishable without parsing |
 | `0D 0A` | CR-LF trap: newline translation in either direction alters it |
@@ -134,6 +134,14 @@ Each part earns its place, following the reasoning behind the PNG signature:
 | `00 00` | NUL-terminates the printable part and pads to 16 |
 
 - **F-6** A reader MUST validate all 16 bytes, not a prefix.
+- **F-6a** The magic is **not valid UTF-8**: `0x89` lies in the continuation-byte
+  range `0x80`–`0xBF`, and a continuation byte cannot begin a sequence. Anything
+  that validates the file as text fails at the first byte rather than part-way
+  through, and anything that sanitises invalid UTF-8 by substitution replaces
+  `0x89` with U+FFFD, destroying the magic detectably instead of silently
+  corrupting the body. This is the modern counterpart of the eighth-bit and
+  newline traps, and it costs nothing: every byte after the first is ASCII, so
+  byte 0 alone carries the property.
 
 ### 4.3 File header (72 bytes)
 
@@ -980,7 +988,9 @@ independent implementation validates against.
 **T-2 Magic and versions.** All 16 magic bytes required (F-6); each
 single-byte mutation rejected; the specific corruptions the magic is designed
 to catch — eighth bit stripped, `0D 0A` collapsed to `0A`, `0A` expanded to
-`0D 0A` — each rejected. Read and write versions above the library's rejected
+`0D 0A`, and byte 0 replaced by the UTF-8 substitution character's encoding
+`EF BF BD` (F-6a) — each rejected. Also that the 16 bytes fail a UTF-8 validity
+check, so the property is asserted rather than merely believed. Read and write versions above the library's rejected
 appropriately, and a file readable-but-not-writable accepted read-only (F-7).
 
 **T-2a The trailer.** Opening an in-order file depends entirely on it, so: the
