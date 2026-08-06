@@ -249,9 +249,7 @@ unsorted files (F-6a).
 | Off | Size | Field |
 |---|---|---|
 | 0 | 8 | `NumPointers` |
-| 8 | 8 | `NumShadowedRecords` |
-| 16 | 8 | `NumShadowedBytes` |
-| 24 | 8 × N | record offsets |
+| 8 | 8 × N | record offsets |
 
 - **F-22** Pointers reference every record present in a committed span
   (records in rolled-back spans are void and MUST NOT be indexed), sorted
@@ -261,18 +259,14 @@ unsorted files (F-6a).
   oldest.
 - **F-23** A record is **shadowed** when a later record for the same key
   supersedes it — whether that later record is further on in the same file
-  or in any newer file. `NumShadowedRecords` and `NumShadowedBytes` count
-  the shadowed records in this file and the bytes they occupy.
-- **F-23a** Shadowing is therefore not a static property of a file: a
-  subsequent write elsewhere can shadow a record here. The stored counts are
-  a **snapshot taken when the block was written**, and are a lower bound
-  thereafter. For a closed file, which is the newest file at the moment it
-  is closed, the snapshot necessarily counts only within-file supersession;
-  for a merged file it also counts records already superseded by newer
-  unmerged files, so it is non-zero there too.
-- **F-23b** The counts are diagnostic — surfaced by `zs_db_dump` and
-  checkable by `zs_db_check_consistency` — and are **not** an input to the
-  merge policy, which triggers on file size alone (D-20).
+  or in any newer file. Shadowing is a property of the database as a whole,
+  not of a file: a subsequent write elsewhere can shadow a record here.
+- **F-23a** For that reason the format stores **no** shadowed-record counts.
+  Any value written into a file would be a snapshot that decays into a lower
+  bound as soon as the next write lands, and nothing consumes it: the merge
+  policy triggers on file size (D-20). `zs_db_check_consistency` and
+  `zs_db_dump` MAY compute shadowing live by walking the current file set,
+  which is both accurate and more useful than a stale stored count.
 - **F-24** Every pointer MUST be 8-aligned and within
   `[48, pointers_offset)`.
 
@@ -449,7 +443,7 @@ re-test the result against *its* parent, cascading until the invariant holds
 or the oldest file is reached. "Size" is bytes on disk, so the trigger is
 evaluable from `stat` alone and needs no knowledge of how much of a file is
 dead. Reclaiming shadowed bytes is a consequence of merging rather than its
-trigger (F-23b).
+trigger (F-23a).
 
 - **D-21** This yields O(log(total ÷ `rollover_size`)) files with
   geometrically increasing sizes, and amortised O(log n) rewrites per
@@ -643,10 +637,10 @@ every merge performed.
 **T-5a File states.** All four states of §5.3 round-trip and are correctly
 identified from the file plus manifest: that a closed file is searched via
 its own `[Pointers]` and an in-order file likewise, that both are recognised
-by their trailing `FINAL` (F-6a) independently of `end`, that the
-`NumShadowedRecords`/`Bytes` snapshot matches an independently computed count
-at the moment the block is written for both closed and merged files (F-23a),
-and that a sealed file is never closed or appended to (D-9b).
+by their trailing `FINAL` (F-6a) independently of `end`, and that a sealed
+file is never closed or appended to (D-9b). Also that a live shadowing
+computation over the current file set (F-23a) agrees with the reference
+model about which records are dead.
 
 **T-6 Crash injection.** A test build interposes `write`, `fsync` and
 `rename`, counts calls, and aborts at call *N* for every *N* across a
@@ -684,7 +678,25 @@ compression; network access; in-place value mutation; Cyrus-specific types
 in the public API. A Cyrus `cyrusdb` backend is a thin separate adapter,
 out of scope here.
 
-## 11. Open items
+## 11. Divergences from the original format notes
+
+For anyone comparing this against the notes in `doc/zeroskip.txt`:
+
+| Change | Reason |
+|---|---|
+| Header 48 bytes, not 40 | file numbers are 64-bit, so sealing a damaged file is cheap (R-5) |
+| Type byte is an enum, not a bitfield | bit-packing was premature optimisation; 255 values is ample |
+| XXH3-64→32, not CRC32 | consistency with `twom` |
+| Checksum always the last field, covering everything before it | one rule everywhere, and no field-zeroing dance |
+| `keylen` 8 bits in **both** data records | notes had 8 for KeyValue and 24 for Deletion, so a key could be deleted but not stored; Big variants of both cover the rest |
+| `key NUL value NUL`, then pad | both usable in place as C strings; lengths remain authoritative (F-11) |
+| `ROLLBACK` record added | aborts must void their span, or a later commit would fold the aborted records in and make them live (F-18) |
+| Ancestor file number on data records | gives unbroken per-key chains, so a tombstone is droppable exactly when its whole lifespan is inside a merge (D-18) |
+| `NumShadowedRecords`/`NumShadowedBytes` removed | any stored value decays into a lower bound and nothing consumes it (F-23a) |
+| Little-endian | notes were silent; the older document said network order, `twom` uses little-endian |
+| `[Pointers]` also in closed unsorted files | gives a durable index without reordering records, so rollover stays off the latency path (D-9) |
+
+## 12. Open items
 
 1. **`zs_db_repair`** is omitted pending a decision on whether sealing
    (R-4) makes an explicit repair entry point unnecessary. A plausible
