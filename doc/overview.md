@@ -44,10 +44,8 @@ files are then **merged** into fewer, larger ones in the background. Merging is
 what reclaims space: a key written ten times occupies ten records until a merge
 collapses them to one.
 
-Each file's name carries the range of **generation** numbers it holds, so a
-database describes itself — to see what it contains, read the directory listing.
-There is no catalogue file that can disagree with the directory, and none to
-rebuild after a crash.
+Each file's name carries the range of **generation** numbers it holds, so the
+directory listing is the whole story: to see what a database contains, list it.
 
 ## Deletions
 
@@ -64,7 +62,7 @@ and the deleted value reappears.
 | Crash safety | An interrupted write costs the interrupted change and nothing else. The database always opens. |
 | Reads never block | No lock and no waiting, however busy the writer is. A reader sees a consistent snapshot from the moment it opened. |
 | One writer | Enforced by a lock the operating system releases when the process dies, so a crash never leaves the database locked against the next writer. |
-| Nothing shared but files | No shared memory, no cache, no coordination state, and so nothing to clean up after a crash. |
+| A database is only files | Nothing is kept outside the directory, so nothing needs cleaning up after a crash. |
 | Identical output everywhere | The same operations produce byte-identical files on any machine and in any implementation, which is what allows independent implementations to be checked against each other. |
 | Self-describing files | Every file states its own format version and how to read it, so files written by different versions sit side by side. |
 
