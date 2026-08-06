@@ -588,9 +588,10 @@ filesize-4    4   checksum of the pointer section
     ...-00000005-00000005  ...-00000005.zs
   ```
 
-  because `.` is `0x2E` and `-` is `0x2D`. With the suffix a lexical listing puts
-  the in-order file first, which is also the one D-5a says to prefer — so
-  "first wins" over a sorted listing gives the correct answer for free.
+  because `.` is `0x2E` and `-` is `0x2D`. So a lexical listing shows compacted
+  history first and the live tail last, with the active file at the end. Note this
+  is a presentation convenience only — sort order is **not** the resolution rule,
+  and D-5b shows where relying on it would go wrong.
 - **D-2** `zeroskip-*.zs` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable. Staging
   names begin `zeroskip.` and therefore never match the data-file pattern.
@@ -607,27 +608,44 @@ without opening a single file.
 - **D-4** A file participates if its name matches `zeroskip-<uuid>-*.zs` for this
   database's UUID. Staging files and other databases' files are ignored by
   construction.
-- **D-5 Enclosure resolution.** A repack renames its output into place before
-  removing its inputs, so a scan may legitimately see both. Where one file's
-  range **encloses** another's, the enclosing file supersedes what it contains —
-  it holds that data already — so the contained files MUST be ignored for
-  reading and MAY be removed (D-23).
-- **D-5a Equal ranges.** Two files may also cover **exactly the same** range,
-  which is not enclosure and so needs its own rule. A conversion produces
-  precisely this: `<uuid>-N.zs` becomes `<uuid>-N-N.zs`, and both cover
-  generation *N* until the input is removed. **The in-order file wins** — it is
-  the output, it holds the same records in sorted form, and preferring it is
-  deterministic. The unordered file is then treated exactly as a contained file:
-  ignored for reading, removable under D-23.
-- **D-5b** Without D-5a the window would be worse than transient. Two files
-  claiming generation *N* is an overlap, so the tiling check (D-6) fails and every
-  reader retries; if the writer dies between the `rename` and the `unlink`,
-  readers retry **forever** until another writer happens to clean up. Since every
-  conversion passes through this state, it is the common path, not an edge
-  case.
-- **D-6 Completeness.** A set is complete if and only if, after enclosure
-  resolution, the ranges **tile a contiguous interval of generations**: no
-  overlaps, no gaps, from the oldest surviving generation through the active
+- **D-5 Overlap resolution.** An output is renamed into place before its inputs
+  are removed, so a scan legitimately sees both. **An overlap is never an error —
+  it is resolved, not rejected.** One rule covers every case that can occur:
+
+  > Of two files whose ranges overlap, the one covering **more generations**
+  > wins. If they cover exactly the same range, the **in-order** file wins.
+
+  The loser is treated as superseded: ignored for reading, and removable under
+  D-23. Resolution happens *before* the completeness check (D-6), so a set
+  containing an output and its inputs is complete, not broken.
+- **D-5a** Both halves of the rule are needed, and each covers a case the other
+  cannot:
+
+  | Situation | Overlap kind | Winner |
+  |---|---|---|
+  | repack output `[1-4]` present with inputs `[1-1]`…`[4-4]` | enclosure | `[1-4]`, covering more |
+  | conversion output `<uuid>-N-N.zs` present with input `<uuid>-N.zs` | equal ranges | the in-order file |
+
+- **D-5b** "Prefer whichever sorts earlier" is **not** a valid substitute, even
+  though the `.zs` suffix makes it give the right answer for a conversion.
+  `00000001-00000001.zs` sorts before `00000001-00000004.zs`, so it would select a
+  repack *input* over the output. That is not merely inelegant: inputs are removed
+  one at a time, so as soon as `[1-1]` is unlinked, preferring inputs leaves a gap
+  at generation 1 and the set stops tiling — readers would retry until removal
+  finished. Preferring the wider range always tiles.
+- **D-5c** A **partial** overlap, where neither range contains the other, cannot
+  arise from any legal sequence: a repack merges adjacent files so its output is a
+  union of adjacent ranges, concurrent repacks are excluded by the repack lock, and
+  a repack and a conversion produce disjoint ranges (C-1a). It is therefore
+  unresolvable and MUST be reported as corruption rather than guessed at.
+  Implementations must agree here, or one would read a database another rejects.
+- **D-5d** Getting this wrong is not transient. Every conversion passes through
+  the equal-range state, so it is the common path; and if a writer dies between
+  the `rename` and the `unlink`, the state persists until another writer cleans
+  up. A reader that treats it as an overlap to reject retries **forever**.
+- **D-6 Completeness.** A set is complete if and only if, after overlap
+  resolution (D-5), the surviving ranges **tile a contiguous interval of
+  generations**: no gaps and — resolution having removed them — no overlaps, from the oldest surviving generation through the active
   file's. This is the whole test. No sequence number, timestamp or publication
   record is required, because tiling means every generation is accounted for, and
   therefore nothing committed is missing.
@@ -975,8 +993,9 @@ The per-file cursors are held in an array kept sorted by:
 
 1. `readdir` the database directory, keeping names matching `zeroskip-<uuid>-*.zs`
    and parsing each generation range from its name.
-2. Resolve enclosures (D-5) and check the result tiles a contiguous interval
-   (D-6). If it does not, restart from 1.
+2. Resolve overlaps (D-5) and check the survivors tile a contiguous interval
+   (D-6). A gap means the scan was torn, so restart from 1; a partial overlap
+   means corruption (D-5c).
 3. `open` and `mmap` every file in the resolved set. If any `open` fails with
    `ENOENT`, restart from 1.
 4. Build a private index for each unordered file by replaying its spans, taking
@@ -1376,15 +1395,17 @@ with directory syncs suppressed, that a crash can lose a *name* — the test tha
 justifies C-6.
 
 **T-9 File set discovery.** That the set and every range are derived from
-filenames alone, without opening a file. Enclosure resolution (D-5) driven by a
+filenames alone, without opening a file. Overlap resolution (D-5) driven by a
 directory seeded as an interrupted repack — output present alongside its inputs —
-asserting the output wins and the contained files are ignored for reading. The
-**equal-range** case separately (D-5a): a directory seeded mid-conversion with
-both `<uuid>-N.zs` and `<uuid>-N-N.zs`, asserting the in-order file wins, the set
-is judged complete rather than overlapping, and reads succeed — and that leaving
-the directory in that state indefinitely, as a writer death would, does not make
-readers retry forever (D-5b). Also that `.zs` gives the sort order D-1a claims,
-by comparing generated names directly. Sets
+asserting the output wins and the contained files are ignored for reading. Both
+halves of D-5's rule, each on the case the other cannot handle: a repack output
+present with its inputs, asserting the wider range wins; the same with some inputs
+already unlinked, asserting the set still tiles (D-5b); and a directory seeded
+mid-conversion with both `<uuid>-N.zs` and `<uuid>-N-N.zs`, asserting the in-order
+file wins, the set is judged complete, and leaving it that way indefinitely — as a
+writer death would — does not make readers retry forever (D-5d). A partial overlap
+reported as corruption rather than resolved (D-5c). And that `.zs` gives the sort
+order D-1a claims, by comparing generated names directly. Sets
 that do **not** tile rejected and retried (D-7): a missing middle generation, a
 gap at the bottom, two files claiming overlapping ranges that are not nested.
 Files disagreeing on UUID or comparator rejected (F-11). Foreign names and
