@@ -66,9 +66,11 @@ whether a pointer section must be present.
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
   lock. Because the kernel releases `fcntl` locks on process death, a killed
   writer never blocks the next one; no lock state can outlive a process.
-- **G-6 No process-lifetime state.** Correctness never depends on the shared
-  index or on the manifest, both of which are reconstructible. Deleting or
-  corrupting either costs performance, not data.
+- **G-6 No shared mutable state.** Nothing a reader may be reading is ever
+  rewritten beneath it: data files are append-only, the manifest is replaced by
+  `rename`, and every index is private to the process that built it. Correctness
+  therefore never depends on any cache, and nothing needs cleaning up when a
+  process dies.
 - **G-7 Read paths agree.** Point lookups and range scans resolve visibility
   through one shared rule (D-14), so they cannot disagree about whether a key
   exists.
@@ -517,7 +519,6 @@ filesize-4    4   checksum of the pointer section
 | `zeroskip.manifest` | replaced atomically | published file set |
 | `zeroskip.tmp.<pid>.<n>` | transient | repack output and manifest staging |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
-| `zeroskip.index` | pure cache | key order for files without a pointer section; location not normative (D-13b1) |
 
 - **D-1** Generations in filenames are **uppercase hexadecimal, zero-padded to
   8 digits**, so a file holding the first ten generations is
@@ -541,10 +542,9 @@ directory scan against a repack.
 | 0 | 16 | magic (§4.2) |
 | 16 | 16 | database UUID |
 | 32 | 8 | publish sequence, incremented on every publish |
-| 40 | 8 | active file's `append_end` as of this publish |
-| 48 | 4 | generation counter — highest generation ever allocated |
-| 52 | 4 | file count |
-| 56 | 16 × N | `(start, end, size)` per file |
+| 40 | 4 | generation counter — highest generation ever allocated |
+| 44 | 4 | file count |
+| 48 | 16 × N | `(start, end, size)` per file |
 | . | 4 | checksum over all preceding bytes |
 
 - **D-3a** The manifest's checksum always uses xxHash, whatever engine the data
@@ -558,11 +558,11 @@ directory scan against a repack.
 - **D-5** It is written to `zeroskip.tmp.<pid>.<n>` and `rename`d into place,
   so a crash yields either the old manifest or the new one, never a partial
   one.
-- **D-6** The recorded `append_end` is a **floor, not a truth**: a reader scans
-  the active file forward from it. The floor only advances past committed data,
-  so a stale floor costs a short scan and can never discard committed data.
-  The manifest is therefore rewritten only on structural change — a new active
-  file or a completed repack — never per commit.
+- **D-6** The manifest records no offset into the active file. An earlier draft
+  cached one as a floor to shorten a reader's scan, but a reader must replay the
+  active file **from its start** to index it at all (D-13a), so a floor would
+  save nothing. The manifest is rewritten only on structural change — a new
+  active file, a conversion, or a completed repack — never per commit.
 - **D-7** A data file not referenced by the manifest MUST be ignored by
   readers.
 - **D-8** Reconstruction MUST reject a set whose ranges do not **tile a
@@ -601,135 +601,56 @@ directory scan against a repack.
   (`ZS_BADFORMAT`): its records cannot be recovered and silently skipping the
   generation would lose committed data. Discarding it requires an explicit
   tool action.
-- **D-11** The writer never appends a pointer section to an unordered file. When it
-  moves on, the previous file simply stays unordered until a repack rewrites
-  it. Key order for such a file lives in the shared index until then.
-- **D-12** A writer MAY repack, so it may rewrite the file it has just left as
-  its single-generation in-order form before exiting.
+- **D-11** The writer never appends a pointer section to an unordered file. When
+  it moves on, the previous file simply stays unordered until it is converted.
+- **D-12 Immediate conversion.** A writer that finds a **non-active unordered
+  file** MUST convert it to its single-generation in-order form —
+  `<uuid>-N` becomes `<uuid>-N-N` — before it finishes, oldest first, and MUST
+  NOT go further: it does not merge in-order files, which is the repacker's job
+  (D-16).
+- **D-12a** This is what keeps the steady state at **exactly one unordered file,
+  the active one**, so a snapshot normally replays only that file and nothing
+  else (D-13d). A non-active unordered file exists only transiently — between a
+  rollover and the next writer's conversion, or after a crash left an unclean
+  file behind (D-10). Several can accumulate only across several crashes, and
+  each is converted in turn.
+- **D-12b** Conversion writes a new file and then publishes and removes the
+  input, so it needs the packer lock (C-1). The writer MUST take it
+  **non-blocking** and skip the conversion if it is unavailable: a repack may
+  hold it for a long time (open item 1), and a write must never wait on one. The
+  work is deferred to the next writer, not lost.
+- **D-12c** Each conversion is bounded by `rollover_size` — sort the keys, write
+  the records in order, append the pointer section and trailer — so a writer's
+  extra cost is bounded and predictable rather than proportional to the database.
 
-### 5.4 Shared index
+### 5.4 Indexing unordered files
 
-- **D-13** `zeroskip.index` is `mmap`'d `MAP_SHARED`, holding
-  key order for files that lack a pointer section — the active file and any
-  unordered file not yet repacked — keyed by generation and stamped with the
-  database UUID, the generation, and the offset it is valid to.
-- **D-13a** It is a pure cache and MUST NOT be authoritative. Any process MAY
-  discard it and rebuild by scanning. An implementation MUST validate its
-  stamps before use and discard it on any inconsistency.
-- **D-13b** Its internal layout is not part of this specification and may
-  change without a format version bump. Only its invariants are specified.
-- **D-13b1** Nor is its **location** normative. A regular file in the database
-  directory is the portable default: it works identically on Linux, macOS and
-  the BSDs, needs no configuration, occupies no global namespace, and is removed
-  along with the database. Since it is never `fsync`ed (C-6b), its pages are
-  written back lazily or not at all.
-- **D-13b2** An implementation MAY place it on a **tmpfs** or in a POSIX shared
-  memory object instead, which suits a pure cache — RAM-backed, no writeback,
-  cleared by a reboot. Neither can be the *default*: there is no portable tmpfs
-  path, macOS having no `/dev/shm`.
-- **D-13b2a** For `shm_open` the database UUID supplies the name, and macOS's
-  31-character `PSHMNAMLEN` is not an obstacle provided the UUID is encoded
-  compactly: `/zs-` followed by base64url of the 16 raw bytes is 26 characters,
-  and base32 is 30. Only the 36-character textual form fails to fit. The UUID also
-  makes the global namespace collision-free. What remains is cleanup — an
-  `shm_unlink` is needed when a database is destroyed, and an orphaned segment
-  survives until the next reboot.
-- **D-13b2b** Wherever the index lives, three things MUST hold:
+An unordered file has no pointer section, so key order for it must be derived by
+replaying its spans. **There is no shared index file.** Every process builds its
+own index, in private memory, for each unordered file in its snapshot.
 
-  1. the staging file for a rebuild is on the **same filesystem**, or `rename`
-     cannot switch it atomically (D-13i);
-  2. the stamps of D-13a are sufficient to reject a **foreign or stale** index,
-     since a location outside the database directory can outlive the database or
-     be shared by unrelated ones;
-  3. an index on a filesystem local to one host is **per-host**, so a database on
-     shared storage may have several independent caches. That is harmless
-     precisely because it is a cache, and it is the stamps that keep it so.
-
-- **D-13b3** Anonymous shared memory is **not** an option for the shared index:
-  `MAP_ANONYMOUS|MAP_SHARED` is shareable only by descendants of the process that
-  created it, and the processes using one database are typically unrelated. It is
-  the right choice for the **private** copy D-13g requires.
-- **D-13c** Those invariants are that, for one file, the index supports all
-  three of:
-
-  1. **point lookup** — given a key, the offset of its newest committed record,
-     or absent;
-  2. **lower-bound seek** — given a key, a position from which ordered
-     traversal begins at the first key greater than or equal to it;
-  3. **ordered traversal** — successive keys in comparator order, each with the
-     offset of its newest committed record.
-
-  A hash table satisfies only the first, so the index MUST be an ordered
-  structure. Requirement 3 is what makes an unordered file usable as a merge
-  source (D-14e).
-- **D-13d** The index reflects **committed spans only**, and for each key only
-  its newest committed record. Building it therefore means replaying spans and
-  skipping rolled-back ones (F-25), not simply walking every record in the file.
-  An index built by naively scanning records would resurrect aborted writes.
-- **D-13e** A reader's view of the index MUST be **stable for the lifetime of
-  its transaction**, exactly as its view of the data files is (C-4). Correctness
-  MUST NOT depend on timing: it is not acceptable for a writer's update to
-  perturb a binary search or an ordered traversal already in progress.
-- **D-13f** Only the **active file's** entry is mutable. Every other unordered
-  file has stopped being written, so its index data never changes again and can
-  be read in shared memory with no copying and no coordination. The stability
-  problem is therefore bounded to one file, whose size is bounded by
-  `rollover_size`.
-- **D-13g** An implementation SHOULD satisfy D-13e by **copying the active
-  file's array into private memory** when a transaction takes its snapshot,
-  through the sequence counter of C-4d. That costs one bounded copy, requires no
-  cooperation from the writer beyond maintaining the counter, and adds no shared
-  mutable state that a reader must modify. The alternative — having the writer publish a fresh copy
-  elsewhere in the index and leave the old one for readers — needs a scheme for
-  reclaiming superseded copies, which is precisely the class of problem avoided
-  for data files by relying on POSIX `unlink` semantics (C-4). There is no
-  equivalent trick inside a shared mapping.
-- **D-13h** An implementation MAY instead replace the whole index file by
-  `rename`, in which case readers holding the old one mapped are unaffected for
-  the same reason they are for data files. That handles growth and rebuilds but
-  not incremental updates to the active file, so it does not remove the need for
-  D-13g.
-
-**Reclaiming entries for repacked files (D-13i).** When a repack turns unordered
-files into an in-order one, their index entries become garbage. The protocol is:
-
-1. The repack publishes a manifest that no longer lists those generations, and
-   removes the files (D-23). **It does not touch the index.**
-2. Their entries are now **dead**. A reader MUST ignore any index entry whose
-   generation is not in its own manifest snapshot, so dead entries are inert —
-   they waste space and nothing else.
-3. The **writer**, holding the write lock, rebuilds the index when dead entries
-   or total size pass a threshold: write a fresh index containing entries only
-   for generations in the current manifest, then `rename` it into place. No
-   `fsync` and no directory sync (C-6b) — the rename is for atomic visibility,
-   not durability.
-4. Readers holding the old index mapped are unaffected (D-13h), and the kernel
-   reclaims the old inode once the last mapping closes.
-
-- **D-13j** The repack cannot perform step 3 itself, even though it creates the
-  garbage. Rebuilding means copying the active file's array, which is being
-  mutated concurrently, and the repacker is forbidden from taking the write lock
-  (C-1b). Deferring to the writer is not a stylistic choice: the writer is the
-  only party that can safely read that array.
-- **D-13k** Only a writer ever writes the index file, since a read-only open must
-  have no side effects (R-3). Two consequences worth stating: rebuilds are
-  serialised for free by the write lock, needing no additional lock; and a
-  database that is only ever read never has its index populated, so every reader
-  scans privately. That is the correct trade — a reader that wrote to shared
-  state would no longer be read-only — and it costs nothing for a database with
-  any write traffic at all.
-- **D-13l** No step above requires reference counting or liveness detection. Dead
-  entries are recognised by comparing against the manifest, and superseded index
-  files are reclaimed by the kernel, so nothing has to be cleaned up when a
-  process dies.
-
-The layout is not normative (D-13b), but the shape that works best is worth
-recording. Begin the file with a map from generation to an
-`(offset, IsBig, count)` triple, then store each file's offsets **in exactly the
-format an in-order file uses for its pointer section** (§4.9). One
-implementation of "binary search a pointer array" and "walk a pointer array in
-order" then serves both cases, differing only in the base address it is handed —
-a pointer into the index rather than into a file's mapped pointer section.
+- **D-13** The private index MUST support point lookup, lower-bound seek and
+  ordered traversal. The third is what makes an unordered file usable as a merge
+  source (D-14e), and a hash table provides only the first, so it MUST be an
+  ordered structure.
+- **D-13a** It reflects **committed spans only**, and for each key only its
+  newest committed record. Building it means replaying spans and skipping
+  rolled-back ones (F-25), never simply walking every record, which would
+  resurrect aborted writes.
+- **D-13b** A **writer is a reader that also maintains the active file's index
+  incrementally.** It already knows every record it appends, so it folds them in
+  at commit and discards them on rollback, and never rescans a file it is
+  writing.
+- **D-13c** Making the index private is what allows the design to hold a much
+  stronger property than "the cache is validated before use": **no shared state
+  is ever mutated in place, anywhere.** Data files are append-only, the manifest
+  is replaced by `rename`, superseded files are reclaimed by the kernel. Nothing
+  a reader may be reading is ever rewritten beneath it, so there is no sequence
+  counter, no stability protocol, no reclamation dance, and no starvation under
+  a hot writer.
+- **D-13d** The cost is that each snapshot replays the unordered files it
+  includes. That is bounded twice over: each such file is at most
+  `rollover_size`, and D-12 keeps their number at one in the steady state.
 
 ### 5.5 Reading
 
@@ -751,7 +672,7 @@ Every read draws on the same set of **sources**, ordered newest to oldest:
   | File kind | Method | Cost |
   |---|---|---|
   | in-order | binary search the pointer array, comparing the key at each probe | O(log n) comparisons |
-  | unordered | point lookup in the index (D-13c) | as the index provides |
+  | unordered | point lookup in the private index (D-13) | as that structure provides |
 
   Both MUST report "absent" for an empty source rather than misbehaving: a
   binary search over a zero-length array, and an index for a file with no
@@ -777,7 +698,7 @@ keeping that count low is the point of the repack policy (D-16).
 
 **Iteration (D-14e).** A cursor holds one **per-file cursor** per source, each
 traversable in comparator order — for an in-order file by walking its pointer
-array, for an unordered file by ordered traversal of its index (D-13c), and for
+array, for an unordered file by ordered traversal of its private index, and for
 the write transaction by its own ordered map.
 
 The per-file cursors are held in an array kept sorted by:
@@ -814,7 +735,7 @@ The per-file cursors are held in an array kept sorted by:
   generation above every file's, giving them highest priority for equal keys
   without a special case in the comparator.
 - **D-14h** A per-file cursor never yields the same key twice: an in-order file
-  holds one record per key (D-17), and an unordered file's index exposes only
+  holds one record per key (D-17), and an unordered file's private index exposes only
   the newest committed record per key (D-13d). Duplicates therefore arise only
   *across* sources, which is exactly what step 3 handles.
 - **D-14i** Picking the next record is O(1) and re-sorting one cursor is O(k)
@@ -828,22 +749,22 @@ The per-file cursors are held in an array kept sorted by:
 
 - **D-15** The repacker **never touches the active file**. It runs
   periodically, or whenever a non-active unordered file exists.
-- **D-16** Input selection:
-  1. Take **all** non-active unordered files, which collapse together into a
-     **single** ordered file rather than one ordered file each.
-  2. If the resulting file would be larger than the next lowest in-order file,
-     include that file too and repeat.
+- **D-16** The repacker works **only on in-order files**; converting unordered
+  files is the writer's job (D-12). Input selection:
+  1. Start from the newest in-order file.
+  2. If the result would be larger than the next lowest in-order file, include
+     that file too and repeat.
   3. Stop when every file is included or the next lowest in-order file is
      larger.
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
-- **D-16a** Step 1 collapses all unordered files at once because the cost of a
-  read scales with the number of files that must be consulted, so minimising
-  the resulting file count is the point. Where only one non-active unordered
-  file exists — the common case, since a writer converts the file it has just
-  left (D-12) — this is the same thing as converting it alone.
-- **D-16b** Steps 2 and 3 cascade rather than merging two files per invocation.
+- **D-16a** Splitting the two jobs this way gives each a bounded or unbounded
+  character rather than mixing them: a writer's conversion is bounded by
+  `rollover_size` and happens inline (D-12c), while the repacker's cascade is
+  unbounded and runs out of band. Neither blocks the other, since they take
+  different locks.
+- **D-16b** Steps 1 to 3 cascade rather than merging two files per invocation.
   Both converge to the same steady state, since a cascade is simply several
   pairwise steps run back to back, but the cascade does strictly less total
   I/O: merging *A*, *B*, *C* in one pass writes `a+b+c`, whereas *A*+*B* then
@@ -891,7 +812,7 @@ The per-file cursors are held in an array kept sorted by:
   was really in generation 3. The retained record is the only surviving
   evidence of how far back the chain reaches.
 - **D-20** Inputs are iterated in key order: from the pointer section where present,
-  otherwise from the same index any reader of a pointerless file must build.
+  otherwise from the same private index any reader of a pointerless file builds.
   There is nothing repack-specific about this.
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
   `zeroskip-<uuid>-<start>-<end>` covering the entire range of every input,
@@ -937,8 +858,8 @@ The per-file cursors are held in an array kept sorted by:
 2. `open` and `mmap` every file it lists.
 3. Re-read the manifest. If the sequence is no longer *S*, or if any `open` in
    step 2 failed with `ENOENT`, discard everything and restart from 1.
-4. For each unordered file, obtain a stable view of its index entry by C-4d.
-5. Set the active file's snapshot boundary per C-4e.
+4. Build a private index for each unordered file by replaying its spans, taking
+   its snapshot boundary to be the end of its last valid span.
 
 Everything the snapshot will read is immutable from here on, for the reasons
 below. No lock is taken at any point.
@@ -958,22 +879,15 @@ below. No lock is taken at any point.
   below the snapshot boundary is immutable — a prefix of an append-only file is
   stable by construction. Growth beyond the boundary is invisible: the mapping
   covers the prefix and the reader never looks past it.
-- **C-4d Index entry stability.** An index entry for the active file changes
-  under the reader (D-13f), so it MUST be read through a **sequence counter**:
-  read the entry's sequence, read `valid_to` and copy the array, then re-read the
-  sequence and retry if it changed. The writer increments the counter before and
-  after mutating. This is the same verify-after-read shape as step 3, and like it
-  requires no lock — only that the reader be willing to retry.
-- **C-4e The boundary, and why the index cannot simply be clamped.** The index
-  holds only the *newest* offset per key (D-13d). If a reader chose a boundary
-  earlier than the index's `valid_to` and then ignored entries pointing past it,
-  a key updated after that boundary would appear **absent** — its newer offset
-  discarded and its older version unreachable, because the index never recorded
-  it. Clamping is therefore wrong. Instead the reader **adopts** the index's
-  `valid_to` as its boundary and scans forward from there to the last valid
-  terminator, merging anything newer into its private view. Both are commit
-  boundaries, so adopting the later one is a consistent snapshot; it is simply a
-  slightly newer one than the reader might have taken.
+- **C-4d The index needs no protocol at all.** Because it is private (D-13c),
+  there is nothing shared to synchronise against: no sequence counter, no
+  copy-then-validate, no bounds-checking a length read from concurrently written
+  memory, and no possibility of starvation under a hot writer. An earlier draft
+  shared a mutable sorted array between processes; that cannot be made safe by a
+  sequence counter alone, because the writer's `memmove`, reallocation and file
+  growth can move the array or invalidate a reader's mapping, and a counter tells
+  a reader only afterwards that what it read was rubbish — it cannot un-fault a
+  page.
 - **C-4f Concurrent visibility.** A reader scanning the active file may meet a
   span the writer is still writing. The terminator's checksum covers the span's
   data (F-19), so a terminator whose data is not yet fully visible fails
@@ -1001,19 +915,6 @@ below. No lock is taken at any point.
 - **C-6a** A directory sync is **not** required after `unlink`. If a removed
   name reappears after a crash the file is unreferenced debris, which readers
   ignore (D-7) and a later repack removes again (D-23).
-- **C-6b** The **index** is never `fsync`ed and its rename needs no directory
-  sync, because it is a pure cache (D-13a): a crash that loses it, or leaves it
-  torn or absent, costs a rebuild and nothing else. Syncing it would buy nothing
-  — there is no state in it worth preserving that cannot be recomputed from the
-  data files.
-- **C-6c** What replaces that durability is **validation**. Because a torn index
-  is now a state the design deliberately permits, an implementation MUST be able
-  to detect one: the stamps of D-13a are not merely a version check but the
-  mechanism that makes skipping `fsync` safe, and they MUST be strong enough to
-  reject a partially written or partially visible index rather than read it as
-  valid. `rename` remains necessary for a different reason — it gives readers an
-  atomic switch between whole index files — but atomicity here is about
-  visibility, not durability.
 - **C-7** Default durability `fsync`s after each commit terminator.
   `ZS_NOSYNC` omits it, trading crash survival for throughput while retaining
   atomicity.
@@ -1025,15 +926,15 @@ below. No lock is taken at any point.
 
 Opening is recovery; there is no separate pass.
 
-- **R-1** Open reads the manifest, opens and maps the listed files, then
-  establishes the active file's true end by replaying spans forward from the
-  recorded floor (D-6), stopping at the first record or terminator that fails
-  to validate. The shared index normally means nothing is scanned.
+- **R-1** Open reads the manifest, opens and maps the listed files, then replays
+  each unordered file's spans from its start — building the private index as it
+  goes (D-13a) and stopping at the first record or terminator that fails to
+  validate, which establishes that file's end.
 - **R-2** Live data is the union of records in spans with `COMMIT` terminators;
   rolled-back spans contribute nothing.
 - **R-3** A reader MUST NOT write. Opening a damaged database read-only is
-  side-effect-free: no repack, no new active file, no manifest publish, no
-  index update.
+  side-effect-free: no conversion, no repack, no new active file, no manifest
+  publish. There is no shared cache for it to update (D-13c).
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
@@ -1280,7 +1181,7 @@ the output. The D-19a resurrection is constructed directly, asserting both that
 the key stays absent and that dropping the retained record *does* produce the
 bug — so the test fails if the rule is ever removed as an optimisation. Also
 that D-16 selects inputs correctly — several unordered files collapsing into
-one ordered file rather than one each (D-16a), and the cascade reaching the
+only in-order files as inputs (D-16), and the cascade reaching the
 geometric size relation after many rollovers — and that an empty output is
 still written (D-22).
 
@@ -1313,14 +1214,10 @@ processes racing to remove debris, asserting the surviving set still tiles and
 no needed file is removed; a directory seeded with the debris of two
 half-finished repacks over overlapping ranges, where naive independent cleanup
 would remove both and lose a generation; removal attempted without the packer
-lock, asserting refusal (D-23). The shared index deleted, truncated and
-bit-flipped mid-run, asserting identical results (G-6). Concurrent repack and
-writer both proceeding, with publish serialised. Index reclamation (D-13i): after
-a repack, dead entries asserted inert and ignored; a rebuild asserted to drop
-exactly them; a reader mapping the pre-rebuild index asserted unaffected; and,
-since the index is never synced (C-6b), an index truncated or garbled at a random
-offset asserted to be rejected and rebuilt rather than read — the case that would
-otherwise have justified an `fsync`.
+lock, asserting refusal (D-23). Concurrent repack and writer both proceeding,
+with publish serialised — and a writer whose conversion finds the packer lock held
+by a repack, asserting it skips rather than waits and that the next writer
+performs it (D-12b).
 
 **T-10b The snapshot protocol.** Each step of C-4 attacked directly, since these
 fail only under concurrency. A reader interrupted between reading the manifest
@@ -1328,24 +1225,16 @@ and opening files, with a repack completing in the gap, asserting the retry
 observes a higher sequence and succeeds (C-4a). A file unlinked between steps 2
 and 3, asserting `ENOENT` triggers a retry rather than a partial snapshot. A
 reader holding a snapshot while the writer commits repeatedly, asserting bytes
-below its boundary never change and growth above it is invisible (C-4c). A writer
-committing while a reader copies an index entry, asserting the sequence counter
-forces a retry and the copy is never torn (C-4d). A reader whose index `valid_to`
-is ahead of where it would otherwise have stopped, asserting it adopts the later
-boundary and that a key updated past an earlier boundary is **not** reported
-absent — the clamping bug C-4e describes, constructed to fail if clamping is ever
-implemented. And a writer killed mid-span while a reader scans, asserting the
-reader stops at the last valid terminator (C-4f).
+below its boundary never change and growth above it is invisible (C-4c). And a
+writer killed mid-span while a reader scans, asserting the reader stops at the
+last valid terminator (C-4f) — the case that shows the terminator checksum, not a
+lock, is what makes reading a live file safe.
 
-**T-10a Index stability under a writing writer.** A reader mid-scan while a
-writer commits repeatedly to the active file, asserting the reader's results are
-exactly its snapshot throughout — the direct test for D-13e, and one that fails
-only under concurrency, so it runs with the writer committing in a tight loop for
-a bounded time rather than a fixed number of operations. Repeated with the reader
-holding a cursor across many commits, and with the writer rolling over to a new
-generation mid-scan. Also asserts that a non-active unordered file's index region
-is never written after the file stops being active (D-13f), by checkpointing
-those bytes and comparing.
+**T-10a Steady state.** That the number of unordered files returns to one after
+each rollover, by driving many rollovers through a writer and asserting after each
+that exactly one unordered file remains and the rest are in-order (D-12a). Then a
+backlog: several crashes each leaving an unclean active file, asserting successive
+writers convert them oldest first and the count drains to one.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close;
@@ -1368,7 +1257,10 @@ backend is a thin separate adapter, out of scope.
    If it ever needs bounding, two mitigations preserve the same steady state:
    merge pairwise, one step per invocation, or cap the cascade at a projected
    output size and resume next time.
-2. **Index rebuild threshold.** D-13i specifies how the index is reclaimed but
-   not when: the dead-entry or size threshold that triggers a writer-side
-   rebuild is a tuning constant, and picking it wants a measurement rather than
-   an argument.
+2. **Whether a shared index is worth reintroducing.** Every snapshot now replays
+   the active file, bounded by `rollover_size` but paid per open. If measurement
+   shows that cost matters, the way to share it without reintroducing in-place
+   mutation is an append-only `(key, offset)` log per file published by a single
+   aligned atomic — readers read the immutable prefix and sort privately. That
+   trades a scan for a sort and keeps D-13c intact. Not worth building before
+   there is a number.
