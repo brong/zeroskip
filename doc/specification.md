@@ -635,6 +635,36 @@ directory scan against a repack.
   its newest committed record. Building it therefore means replaying spans and
   skipping rolled-back ones (F-25), not simply walking every record in the file.
   An index built by naively scanning records would resurrect aborted writes.
+- **D-13e** A reader's view of the index MUST be **stable for the lifetime of
+  its transaction**, exactly as its view of the data files is (C-4). Correctness
+  MUST NOT depend on timing: it is not acceptable for a writer's update to
+  perturb a binary search or an ordered traversal already in progress.
+- **D-13f** Only the **active file's** entry is mutable. Every other unordered
+  file has stopped being written, so its index data never changes again and can
+  be read in shared memory with no copying and no coordination. The stability
+  problem is therefore bounded to one file, whose size is bounded by
+  `rollover_size`.
+- **D-13g** An implementation SHOULD satisfy D-13e by **copying the active
+  file's array into private memory** when a transaction takes its snapshot. That
+  costs one bounded copy, requires no cooperation from the writer, and adds no
+  shared mutable state. The alternative — having the writer publish a fresh copy
+  elsewhere in the index and leave the old one for readers — needs a scheme for
+  reclaiming superseded copies, which is precisely the class of problem avoided
+  for data files by relying on POSIX `unlink` semantics (C-4). There is no
+  equivalent trick inside a shared mapping.
+- **D-13h** An implementation MAY instead replace the whole index file by
+  `rename`, in which case readers holding the old one mapped are unaffected for
+  the same reason they are for data files. That handles growth and rebuilds but
+  not incremental updates to the active file, so it does not remove the need for
+  D-13g.
+
+The layout is not normative (D-13b), but the shape that works best is worth
+recording. Begin the file with a map from generation to an
+`(offset, IsBig, count)` triple, then store each file's offsets **in exactly the
+format an in-order file uses for its pointer section** (§4.9). One
+implementation of "binary search a pointer array" and "walk a pointer array in
+order" then serves both cases, differing only in the base address it is handed —
+a pointer into the index rather than into a file's mapped pointer section.
 
 ### 5.5 Reading
 
@@ -1151,6 +1181,16 @@ would remove both and lose a generation; removal attempted without the packer
 lock, asserting refusal (D-23). The shared index deleted, truncated and
 bit-flipped mid-run, asserting identical results (G-6). Concurrent repack and
 writer both proceeding, with publish serialised.
+
+**T-10a Index stability under a writing writer.** A reader mid-scan while a
+writer commits repeatedly to the active file, asserting the reader's results are
+exactly its snapshot throughout — the direct test for D-13e, and one that fails
+only under concurrency, so it runs with the writer committing in a tight loop for
+a bounded time rather than a fixed number of operations. Repeated with the reader
+holding a cursor across many commits, and with the writer rolling over to a new
+generation mid-scan. Also asserts that a non-active unordered file's index region
+is never written after the file stops being active (D-13f), by checkpointing
+those bytes and comparing.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close;
