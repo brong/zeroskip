@@ -589,6 +589,21 @@ filesize-4    4   checksum of the pointer section
 - **D-3** `zeroskip.lock` MUST be a distinct file that is never replaced.
   `fcntl` locks attach to an inode, so locking a file that is replaced by
   `rename` would silently lose mutual exclusion.
+- **D-3a** It is created with the database (D-8a), and is created on open with
+  `O_CREAT` if absent so an existing database is never unopenable for want of it.
+  Concurrent creation is harmless: `O_CREAT` on one path yields one inode, so every
+  process ends up locking the same object.
+- **D-3b** It MUST NOT be unlinked — not by the library, and not by anything
+  else. Unlinking it while processes hold locks is the one way to break mutual
+  exclusion from outside: the holders keep locking the removed inode while a new
+  process creates a fresh one and locks that, so **two writers each believe they
+  hold the write lock** and append to the same file. This is the same failure mode
+  as mixing `flock` with `fcntl` (C-1e) and equally silent. It is worth saying
+  plainly because an empty file named `*.lock` is exactly what cleanup scripts
+  delete.
+- **D-3c** The lock file is empty and its contents are never read. Nothing about
+  the database is stored in it, so it carries no version, no pid and no state to
+  become stale.
 
 ### 5.2 The file set
 
@@ -599,6 +614,12 @@ without opening a single file.
 - **D-4** A file participates if its name matches `zeroskip-<uuid>-*` for this
   database's UUID. Staging files and other databases' files are ignored by
   construction.
+- **D-4a** On first open the UUID is not yet known, so it is **discovered**: take
+  the names matching `zeroskip-*`, parse the UUID from each, and require they all
+  agree. Disagreement means two databases' files have been mixed into one
+  directory and MUST be an error rather than a choice of majority — silently
+  adopting one would read half a database and call it whole. A directory with no
+  data files has no UUID, which is the empty case D-8a handles.
 - **D-5 Resolution by scan.** An output is renamed into place before its inputs
   are removed, so a scan legitimately sees overlapping files. **An overlap is
   never an error — it is resolved, not rejected**, by a single sweep over the
@@ -651,8 +672,8 @@ without opening a single file.
   not an error — it is simply an older snapshot, and every snapshot is an older
   snapshot of something.
 - **D-8a Creating a database.** With `ZS_CREATE` and no existing directory, or a
-  directory holding no data files, an implementation creates the directory,
-  generates a UUID, and creates generation 1 as the active file — a 72-byte header
+  directory holding no data files, an implementation creates the directory, the
+  lock file (D-3a), generates a UUID, and creates generation 1 as the active file — a 72-byte header
   and no spans, which F-26h makes a legal empty file. Without `ZS_CREATE` this is
   `ZS_NOTFOUND`. The UUID's value is arbitrary and opaque; only its 16-byte
   encoding (F-11) and its textual form in filenames (D-0) are fixed.
@@ -910,6 +931,11 @@ The per-file cursors are held in an array kept sorted by:
 - **D-20** Inputs are iterated in key order: from the pointer section where present,
   otherwise from the same private index any reader of a pointerless file builds.
   There is nothing repack-specific about this.
+- **D-20a** A staging file MUST be created with `O_CREAT|O_EXCL`, advancing `<n>`
+  until it succeeds. A process identifier is not unique on shared storage — two
+  hosts readily have the same pid — and two processes writing one staging file
+  would produce an interleaved output that is then renamed into place as though
+  complete. `O_EXCL` costs nothing and removes the case.
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
   `zeroskip-<uuid>-<start>-<end>` covering the entire range of every input,
   only once complete.
@@ -1407,7 +1433,10 @@ directly on generated names, so adding an extension later breaks a test rather
 than the database (D-5c). Sets
 that do **not** tile rejected and retried (D-7): a missing middle generation, a
 gap at the bottom, two files claiming overlapping ranges that are not nested.
-Files disagreeing on UUID or comparator rejected (F-11). Foreign names and
+Files disagreeing on UUID rejected rather than resolved by majority (D-4a), and
+files disagreeing on comparator rejected (F-11). A database with the lock file
+absent opened successfully, recreating it (D-3a). A staging name already taken,
+asserting `O_EXCL` advances rather than overwriting (D-20a). Foreign names and
 staging files ignored (D-4). And that the next generation is one above the
 highest present, including after files have been removed (D-9b).
 
@@ -1476,6 +1505,10 @@ bugs, since they exercise the locking interop surface (C-1e):
   intervention (G-5).
 - *A* and *B* both attempt to remove files concurrently, asserting the surviving
   set still tiles (D-23).
+- the lock file unlinked while *A* holds the write lock, then *B* started:
+  asserting the implementations still exclude each other, or — if they cannot,
+  which is the honest outcome — that the test documents D-3b's hazard rather than
+  appearing to pass.
 
 **T-14 Multi-threaded exclusion.** For any implementation whose language exposes
 threads: two threads of **one process** writing concurrently, asserting they
