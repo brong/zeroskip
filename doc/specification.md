@@ -189,18 +189,27 @@ A 32-bit ancestor fits inside the padding the big forms already carry, so
 than 16.
 | `0x10` | `COMMIT` | 8 | |
 | `0x11` | `COMMIT_LONG` | 24 | |
-| `0x12` | `COMMIT_LONG_2ND` | (tail of `0x11`) | |
 | `0x13` | `FINAL32` | 8 | 32-bit pointers |
 | `0x14` | `FINAL32_LONG` | 24 | 32-bit pointers |
-| `0x15` | `FINAL32_LONG_2ND` | (tail of `0x14`) | |
 | `0x16` | `FINAL64` | 8 | 64-bit pointers |
 | `0x17` | `FINAL64_LONG` | 24 | 64-bit pointers |
-| `0x18` | `FINAL64_LONG_2ND` | (tail of `0x17`) | |
 | `0x19` | `ROLLBACK` | 8 | |
 | `0x1A` | `ROLLBACK_LONG` | 24 | |
-| `0x1B` | `ROLLBACK_LONG_2ND` | (tail of `0x1A`) | |
 
-- **F-12** Any other type byte, including `0x00`, is invalid.
+A long terminator carries a **second type byte** at `+16` (§4.7), whose value is
+the corresponding `_2ND` code. These are field values inside a long terminator,
+not records in their own right, and never appear at the start of one:
+
+| Long terminator | `_2ND` value at `+16` |
+|---|---|
+| `COMMIT_LONG` | `0x12` |
+| `FINAL32_LONG` | `0x15` |
+| `FINAL64_LONG` | `0x18` |
+| `ROLLBACK_LONG` | `0x1B` |
+
+- **F-12** Any other type byte, including `0x00`, is invalid. A `_2ND` code is
+  invalid at the start of a record: it only ever appears at `+16` of a long
+  terminator.
 - **F-12a** Each record shape has exactly two forms: one storing an ancestor
   and one omitting it. Nothing distinguishes a "create" at the record level,
   because nothing needs to (F-17).
@@ -339,18 +348,32 @@ long (24 bytes)                       *_LONG
   +0   1  type
   +1   7  pad
   +8   8  span length
-  +16  1  type2  (the matching *_LONG_2ND value)
+  +16  1  type2  (this form's _2ND code -- see F-20)
   +17  3  pad
   +20  4  checksum
 ```
 
 - **F-19** The checksum covers the span's data bytes followed by the
   terminator's own bytes up to the checksum field.
-- **F-20** `type2` exists so the last 8 bytes of a file reveal whether the
-  trailing terminator is short or the tail of a long one, making it locatable by
-  reading backwards. Reading those 8 bytes therefore yields both the
-  terminator's extent and, for a `FINAL`, the pointer width — everything needed
-  to interpret the index.
+- **F-20** `type2` exists to make the trailing terminator locatable by reading
+  **backwards**, which is how an in-order file is opened: its `[Pointers]` block
+  can only be found via the terminator that covers it. A reader takes the file's
+  last 8 bytes and inspects the first byte:
+
+  | First of the last 8 bytes | Meaning |
+  |---|---|
+  | a short terminator code | an 8-byte terminator starting there |
+  | a `_2ND` code | the tail of a 24-byte terminator starting 16 bytes earlier |
+  | anything else | no valid trailing terminator |
+
+  Those 8 bytes therefore yield the terminator's extent and, for a `FINAL`, the
+  pointer width — everything needed to interpret the index before reading it.
+- **F-20a** `_2ND` codes are disjoint from the codes that may begin a
+  terminator, so the two cases above can never be confused. Zero would have
+  served as a "this is a tail" marker since `0x00` is invalid as a type (F-12),
+  but a distinct code per long form also confirms *which* terminator the tail
+  belongs to, catching a mismatched pair rather than trusting the checksum
+  alone.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
   that says "ignore the records in this span", voiding them. An aborted
   transaction appends a `ROLLBACK`; without one, a later commit's span would
@@ -832,6 +855,14 @@ single-byte mutation rejected; the specific corruptions the magic is designed
 to catch — eighth bit stripped, `0D 0A` collapsed to `0A`, `0A` expanded to
 `0D 0A` — each rejected. Read and write versions above the library's rejected
 appropriately, and a file readable-but-not-writable accepted read-only (F-7).
+
+**T-2a Backward terminator location.** Both branches of F-20's table, since
+opening an in-order file depends on them: files ending in each short terminator
+and in each long one, asserting the terminator's start and extent are found
+correctly and that a `FINAL`'s pointer width is read from it. Negatively, a file
+whose last 8 bytes begin with a `_2ND` code but which is too short to hold the
+24-byte terminator, and one where the `_2ND` code at `+16` does not match the
+type at `+0` (F-20a) — both rejected rather than read.
 
 **T-3 Malformed input.** Every golden file truncated at *every byte offset*,
 not merely record boundaries, and systematically bit-flipped. Each case asserts
