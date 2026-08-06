@@ -141,7 +141,11 @@ tolerate compaction happening out of band.
 - **F-8a** A merge whose output would contain no records at all — every key
   dropped by D-18 — MUST still write the file, as a header plus an empty
   `[Pointers]` block and a `FINAL` terminator. Omitting it would leave a gap
-  in the tiling and make the set undecidable. The cost is a few dozen bytes.
+  in the tiling and make the set undecidable. The cost is a few dozen bytes,
+  and it is transient: an empty file violates D-20's size invariant about as
+  hard as possible, so the next rollover produces a neighbour trivially "as
+  big as" it and the cascade absorbs it on the first check. The policy cleans
+  these up without needing a special case.
 - **F-9** A reader MUST reject a file whose magic, version or header
   checksum fails to validate, or whose UUID does not match the database it
   is being opened as part of.
@@ -399,19 +403,18 @@ unsorted files (F-6a).
   readers.
 - **D-4a** Removing a data file — whether debris from an interrupted merge or
   an input a completed merge has superseded — MUST be done **holding the
-  write lock**, and only after verifying that **a complete set of files exists
-  without it**: that the remaining files still tile a contiguous generation
-  interval per F-8. Verification and removal MUST happen under the same
-  unbroken hold of the lock.
-- **D-4b** The write lock, not the packer lock, is what serialises this. Two
-  processes each scanning for expendable files could otherwise each conclude
-  that a *different* file is redundant and remove both, destroying a file the
-  surviving set needs — two half-finished merges of overlapping ranges leave
-  exactly that ambiguity. Since only one writer exists at a time (G-5),
-  requiring the write lock makes removal decisions mutually exclusive without
-  adding a fourth lock byte. A packer therefore takes the write lock briefly
-  to retire its inputs, which is cheap: the work is a few `unlink` calls,
-  and by C-4 readers holding those files open are unaffected.
+  packer lock**, and only after verifying that **a complete set of files
+  exists without it**: that the remaining files still tile a contiguous
+  generation interval per F-8. Verification and removal MUST happen under the
+  same unbroken hold of the lock.
+- **D-4b** The packer lock is the right one because it also covers rewriting
+  the manifest (C-1), so the file set cannot change between the completeness
+  check and the `unlink`. It equally makes removal decisions mutually
+  exclusive: two processes each scanning for expendable files could otherwise
+  each conclude that a *different* file is redundant and remove both,
+  destroying a file the surviving set needs — the debris of two half-finished
+  merges over overlapping ranges leaves exactly that ambiguity. Appending is
+  unaffected, since a writer needs only the write lock.
 - **D-4c** If verification fails, the file MUST be left alone. Leaking a file
   costs disk space; removing a needed one costs the database.
 
@@ -458,7 +461,7 @@ Four states, each distinguishable from the file itself plus the manifest:
 |---|---|---|---|---|
 | active | 0 | no | append order | shared index |
 | closed | 0 | yes | append order | own `[Pointers]` |
-| sealed | 0 | no | append order | shared index or scan |
+| sealed | 0 | no | append order | index built by scanning (D-9b) |
 | in-order | N | yes | key order | own `[Pointers]` |
 
 The active file is the one the manifest names; a non-active `end == 0` file
@@ -472,15 +475,25 @@ without a trailing `FINAL` is therefore sealed.
 - **D-9a** Closing gives every rolled-over file a durable index, so the
   shared index is only ever needed for the active file and for sealed
   files, and losing it can never force a rescan of a closed file.
-- **D-9b** A **sealed** file cannot be closed, because appending
-  `[Pointers]` would mean appending past an untrustworthy terminator
-  boundary (R-4). Sealed files are searched via the shared index or a scan
-  until a merge absorbs them. This is the only case where index loss costs
-  a rescan.
+- **D-9b** The writer does not close a **sealed** file in the normal course of
+  events, since appending `[Pointers]` would mean appending past a terminator
+  boundary it has already decided not to trust (R-4). A sealed file is read
+  through an index built by scanning it, exactly as the active file is.
+- **D-9c** A tool MAY validate a sealed file and append `[Pointers]` to it,
+  promoting it to closed (F-6a). Semantically this makes no difference: an
+  index for a pointerless file can be persisted into the file or held only in
+  memory, and either way reads resolve identically. Persisting it only saves
+  future rescans.
 - **D-10** Several unsorted files MAY exist at once; putting records into
   key order is a separate, deferrable decision made by merging.
 - **D-11** Merging *k* input files produces one in-order file covering their
   combined range, with `[Pointers]` and a `FINAL` terminator.
+- **D-11a** A merge iterates each input **in key order** and is therefore a
+  linear k-way merge. Key order comes from the input's `[Pointers]` where it
+  has them — which holds whether or not its records are themselves in key
+  order (F-6a) — and otherwise from the same in-memory index any reader of a
+  pointerless file must build. There is nothing merge-specific about this:
+  a merge reads its inputs exactly as any other reader does.
 
 ### 5.4 Shared index
 
@@ -586,11 +599,26 @@ trigger (F-23a).
 
 ## 6. Concurrency and durability
 
-- **C-1** `fcntl` byte-range locks on `zeroskip.lock`: byte 0 writer
-  (exclusive), byte 1 packer (exclusive), byte 2 publish (exclusive, held
-  briefly). Writing and merging therefore proceed concurrently.
+- **C-1** Two `fcntl` byte-range locks on `zeroskip.lock`:
+
+  | Byte | Lock | Covers |
+  |---|---|---|
+  | 0 | write | appending to the active file |
+  | 1 | packer | merging, **rewriting the manifest**, and **removing files** |
+
+  Writing and merging therefore proceed concurrently, since appending needs
+  only the write lock.
+- **C-1a** Grouping publish and removal under the packer lock is what makes
+  both safe: the manifest cannot change between reading it and acting on it.
+  A completeness check followed by an `unlink` (D-4a) is only sound if no
+  other process can republish in between, and the packer lock gives exactly
+  that without a third lock byte.
+- **C-1b Lock ordering.** A writer holding the write lock MAY acquire the
+  packer lock — it needs it briefly to publish after a rollover. A packer MUST
+  NOT acquire the write lock. Acquisition is therefore always write → packer,
+  never the reverse, so the two locks cannot deadlock.
 - **C-2** Readers take **no lock**.
-- **C-3** A publisher MUST take the publish lock, re-read the current
+- **C-3** A publisher MUST hold the packer lock, re-read the current
   manifest, merge its change into it, then write and rename — a
   compare-and-publish.
 - **C-4 Snapshot lifetime.** A reader reads the manifest, opens and `mmap`s
@@ -783,8 +811,7 @@ merge of the latter is asserted *not* to drop the tombstone.
 **T-5a File states.** All four states of §5.3 round-trip and are correctly
 identified from the file plus manifest: that a closed file is searched via
 its own `[Pointers]` and an in-order file likewise, that both are recognised
-by their trailing `FINAL` (F-6a) independently of `end`, and that a sealed
-file is never closed or appended to (D-9b). Also that a live shadowing
+by their trailing `FINAL` (F-6a) independently of `end`, and that the writer never closes or appends to a sealed file, while a tool may (D-9b, D-9c). Also that a live shadowing
 computation over the current file set (F-23a) agrees with the reference
 model about which records are dead.
 
