@@ -233,6 +233,61 @@ mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
+echo "private index (Task 8)"
+
+# D-14: newest version of a key wins within a file.  The sort'"'"'s offset-descending
+# tie-break is what makes that fall out of keeping the first of each run, so
+# reversing it silently returns the OLDEST version of every rewritten key.
+mutant "sort: offset tie-break ascending" catch \
+  's/    return a > b \? -1 : 1;              \/\* higher offset first \*\//    return a < b ? -1 : 1;/'
+
+mutant "dedup: keeps the last of a run" catch \
+  's/                if \(compar\(ka, la, kb, lb\) == 0\) continue;/                if (compar(ka, la, kb, lb) == 0) { b.offs[w - 1] = b.offs[i]; continue; }/'
+
+mutant "dedup: not done at all" catch \
+  's/            if \(w\) \{\n                const char \*ka, \*kb;/            if (0) {\n                const char *ka, *kb;/'
+
+# The delta holds newer records than the base, so consulting the base first, or
+# preferring it on a tie, returns a stale record.
+mutant "find: base consulted before delta" catch \
+  's/    i = zsi_index_lb\(ix->delta, ix->ndelta, &ks, key, keylen\);\n    if \(zsi_index_eq\(ix->delta, ix->ndelta, i, &ks, key, keylen\)\) \{\n        \*off = ix->delta\[i\];\n        return ZS_OK;\n    \}\n\n    i = zsi_index_lb\(ix->base, ix->nbase, &ks, key, keylen\);\n    if \(zsi_index_eq\(ix->base, ix->nbase, i, &ks, key, keylen\)\) \{\n        \*off = ix->base\[i\];\n        return ZS_OK;\n    \}/    i = zsi_index_lb(ix->base, ix->nbase, \&ks, key, keylen);\n    if (zsi_index_eq(ix->base, ix->nbase, i, \&ks, key, keylen)) {\n        *off = ix->base[i];\n        return ZS_OK;\n    }\n\n    i = zsi_index_lb(ix->delta, ix->ndelta, \&ks, key, keylen);\n    if (zsi_index_eq(ix->delta, ix->ndelta, i, \&ks, key, keylen)) {\n        *off = ix->delta[i];\n        return ZS_OK;\n    }/'
+
+mutant "get: prefers base on a tie" catch \
+  's/        chosen = \(compar\(kd, ld, kb, lb\) <= 0\) \? ix->delta\[c->di\]\n                                              : ix->base\[c->bi\];/        chosen = (compar(kd, ld, kb, lb) < 0) ? ix->delta[c->di]\n                                              : ix->base[c->bi];/'
+
+# D-14h, one level down: on a tie both sides must advance, or the base'"'"'s stale copy
+# of the key surfaces on the following step and the key is yielded twice.
+mutant "next: advances only delta on a tie" catch \
+  's/        if \(cmp == 0\) \{\n            \/\* Advance BOTH/        if (cmp == 0) {\n            c->di++;\n            return;\n            \/* Advance BOTH/'
+
+mutant "next: advances only base on a tie" catch \
+  's/            c->di\+\+;\n            c->bi\+\+;\n        \} else if \(cmp < 0\) \{/            c->bi++;\n        } else if (cmp < 0) {/'
+
+# The insert path (D-13b), and the bound that makes it amortised O(1).
+mutant "insert: no replace of an existing key" catch \
+  's/    if \(zsi_index_eq\(ix->delta, ix->ndelta, i, &ks, key, keylen\)\) \{\n        ix->delta\[i\] = off;\n        return ZS_OK;\n    \}/    \/* replace removed *\//'
+
+mutant "insert: delta never merges" catch \
+  's/    if \(ix->ndelta <= ZSI_DELTA_MAX\) return ZS_OK;/    if (ix->ndelta <= SIZE_MAX) return ZS_OK;/'
+
+mutant "merge: base wins ties" catch \
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; \}/        if (cmp == 0)      { merged[w++] = ix->base[bi++]; di++; }/'
+
+mutant "merge: drops the tied base entry twice" catch \
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; }/'
+
+# Lower bound: an off-by-one here makes an exact match miss, or a seek land one
+# entry early, which shows up as a key that cannot be found or one emitted twice.
+mutant "lower_bound: <= instead of <" catch \
+  's/        if \(ks->compar\(k, kl, key, keylen\) < 0\) lo = mid \+ 1;/        if (ks->compar(k, kl, key, keylen) <= 0) lo = mid + 1;/'
+
+mutant "lower_bound: hi = mid - 1" catch \
+  's/        else hi = mid;\n    \}\n\n    return lo;/        else hi = mid ? mid - 1 : 0;\n    }\n\n    return lo;/'
+
+mutant "seek: delta side not sought" catch \
+  's/    c->di = zsi_index_lb\(ix->delta, ix->ndelta, &ks, key, keylen\);/    c->di = 0;/'
+
+echo
 echo "span chain (Task 7)"
 
 # F-25: visibility is per span, not a watermark.  A rolled-back span may sit

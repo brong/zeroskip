@@ -1549,10 +1549,29 @@ static bool zsi_unordered_is_clean(const struct zsi_file *f)
  * The full rationale, and the build and lookup paths, are in the task that
  * implements them.  Only the shape and the destructor live here, because
  * zsi_file_close must be able to free an index without the caller remembering to. */
+/* Above ZSI_DELTA_MAX entries the delta is merged into the base and cleared.
+ *
+ * The bound is what makes insertion amortised O(1) rather than O(n): a splice
+ * into an array of at most this many entries is a bounded memmove, and the merge
+ * that empties it is linear in the whole index but happens once per
+ * ZSI_DELTA_MAX inserts.  A single sorted array with no delta would memmove the
+ * entire index per commit, which for a 2MB active file under bulk load is
+ * megabytes of copying per transaction. */
+#define ZSI_DELTA_MAX 1024
+
+/* Record offsets are size_t rather than uint32_t.
+ *
+ * uint32_t would halve the footprint and rollover_size (2MB by default) keeps
+ * real unordered files far below 4GB -- but rollover_size is caller-configurable
+ * and a crash can leave a larger file behind, and the failure mode of guessing
+ * wrong is a database that cannot be opened.  G-3 says any state a crash can
+ * produce must open; paying 4 bytes an entry to keep that unconditional is the
+ * right trade.  A 2MB file of minimum-size records holds 262144 of them, so the
+ * index is 2MB at worst. */
 struct zsi_index {
     struct zsi_file *file;
-    uint32_t *base;   size_t nbase;
-    uint32_t *delta;  size_t ndelta, adelta;
+    size_t *base;   size_t nbase;
+    size_t *delta;  size_t ndelta, adelta;
 };
 
 static void zsi_index_free(struct zsi_index **ip)
@@ -1564,6 +1583,368 @@ static void zsi_index_free(struct zsi_index **ip)
     free(ix->delta);
     free(ix);
     *ip = NULL;
+}
+
+/* Decode the record at off far enough to reach its key.
+ *
+ * Every offset in an index decoded successfully during the build, so this cannot
+ * fail for a well-formed index -- but it is called from comparison functions
+ * where returning a wrong answer is worse than returning a stable one, so a
+ * failure yields an empty key rather than reading uninitialised memory. */
+static bool zsi_index_key_at(struct zsi_file *f, size_t off,
+                             const char **kp, size_t *klp)
+{
+    const char *b = zsi_file_at(f, off, 1);
+    struct zsi_rec r;
+
+    if (!b || zsi_rec_decode(b, f->size - off, f->hdr.start, &r) != ZS_OK) {
+        *kp = "";
+        *klp = 0;
+        return false;
+    }
+
+    *kp = r.key;
+    *klp = r.keylen;
+    return true;
+}
+
+/* Sort context: the comparator cannot be a global, because two threads may hold
+ * handles on different databases with different comparators.  That rules out
+ * plain qsort, and qsort_r's signature differs between glibc and the BSDs, so
+ * this file carries its own merge sort taking an explicit context. */
+struct zsi_ksort {
+    struct zsi_file *f;
+    zs_compar       *compar;
+};
+
+/* Order by key ascending, then by offset DESCENDING.
+ *
+ * The offset tie-break is what makes "newest version of a key wins within a
+ * file" (D-14) fall out of the sort: equal keys end up newest-first, so keeping
+ * the first of each run keeps the newest.  There is no second pass and no
+ * separate notion of recency. */
+static int zsi_ksort_cmp(struct zsi_ksort *ks, size_t a, size_t b)
+{
+    const char *ka, *kb;
+    size_t la, lb;
+
+    zsi_index_key_at(ks->f, a, &ka, &la);
+    zsi_index_key_at(ks->f, b, &kb, &lb);
+
+    int c = ks->compar(ka, la, kb, lb);
+    if (c) return c;
+
+    if (a == b) return 0;
+    return a > b ? -1 : 1;              /* higher offset first */
+}
+
+static void zsi_msort(size_t *arr, size_t n, size_t *tmp, struct zsi_ksort *ks)
+{
+    if (n < 2) return;
+
+    size_t mid = n / 2;
+    zsi_msort(arr, mid, tmp, ks);
+    zsi_msort(arr + mid, n - mid, tmp + mid, ks);
+
+    size_t i = 0, j = mid, k = 0;
+    while (i < mid && j < n)
+        tmp[k++] = (zsi_ksort_cmp(ks, arr[j], arr[i]) < 0) ? arr[j++] : arr[i++];
+    while (i < mid) tmp[k++] = arr[i++];
+    while (j < n)   tmp[k++] = arr[j++];
+
+    memcpy(arr, tmp, n * sizeof(*arr));
+}
+
+/* The first position in arr whose key is >= (key, keylen). */
+static size_t zsi_index_lb(const size_t *arr, size_t n, struct zsi_ksort *ks,
+                           const char *key, size_t keylen)
+{
+    size_t lo = 0, hi = n;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const char *k;
+        size_t kl;
+        zsi_index_key_at(ks->f, arr[mid], &k, &kl);
+        if (ks->compar(k, kl, key, keylen) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    return lo;
+}
+
+/* Whether the entry at arr[i] has exactly this key. */
+static bool zsi_index_eq(const size_t *arr, size_t n, size_t i,
+                         struct zsi_ksort *ks, const char *key, size_t keylen)
+{
+    const char *k;
+    size_t kl;
+
+    if (i >= n) return false;
+    zsi_index_key_at(ks->f, arr[i], &k, &kl);
+    return ks->compar(k, kl, key, keylen) == 0;
+}
+
+/* Collector for the build replay. */
+struct zsi_index_build {
+    size_t *offs;
+    size_t  n, alloc;
+    bool    oom;
+};
+
+static int zsi_index_build_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    struct zsi_index_build *b = rock;
+
+    (void)rec;
+    if (b->n == b->alloc) {
+        size_t want = b->alloc ? b->alloc * 2 : 256;
+        size_t *p = realloc(b->offs, want * sizeof(*p));
+        if (!p) { b->oom = true; return 1; }
+        b->offs = p;
+        b->alloc = want;
+    }
+
+    b->offs[b->n++] = off;
+    return 0;
+}
+
+/* Build the private index for an unordered file by replaying its spans.
+ *
+ * It reflects COMMITTED spans only, and for each key only its newest committed
+ * record (D-13a).  Building it means replaying spans and skipping rolled-back
+ * ones -- never simply walking every record, which would resurrect aborted
+ * writes.  That is why this goes through zsi_unordered_replay rather than
+ * scanning the file directly, and why test_index_committed_only exists.
+ *
+ * Sets f->complete as a side effect, since the replay establishes it. */
+static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
+{
+    struct zsi_index_build b;
+    struct zsi_index *ix;
+    int r;
+
+    zsi_index_free(&f->index);
+
+    memset(&b, 0, sizeof(b));
+    r = zsi_unordered_replay(f, nocsum, zsi_index_build_cb, &b);
+    if (r != ZS_OK) { free(b.offs); return r; }
+    if (b.oom) { free(b.offs); return ZS_INTERNAL; }
+
+    ix = zsi_zmalloc(sizeof(*ix));
+    if (!ix) { free(b.offs); return ZS_INTERNAL; }
+    ix->file = f;
+
+    if (b.n) {
+        struct zsi_ksort ks = { f, compar };
+        size_t *tmp = malloc(b.n * sizeof(*tmp));
+        if (!tmp) { free(b.offs); free(ix); return ZS_INTERNAL; }
+
+        zsi_msort(b.offs, b.n, tmp, &ks);
+        free(tmp);
+
+        /* Keep the first of each equal-key run, which the offset-descending
+         * tie-break makes the newest (D-14). */
+        size_t w = 0;
+        for (size_t i = 0; i < b.n; i++) {
+            if (w) {
+                const char *ka, *kb;
+                size_t la, lb;
+                zsi_index_key_at(f, b.offs[w - 1], &ka, &la);
+                zsi_index_key_at(f, b.offs[i], &kb, &lb);
+                if (compar(ka, la, kb, lb) == 0) continue;
+            }
+            b.offs[w++] = b.offs[i];
+        }
+        b.n = w;
+    }
+
+    ix->base = b.offs;
+    ix->nbase = b.n;
+    f->index = ix;
+    return ZS_OK;
+}
+
+/* Point lookup.  Consults the delta first, so a key present in both yields the
+ * newer record. */
+static int zsi_index_find(struct zsi_index *ix, zs_compar *compar,
+                          const char *key, size_t keylen, size_t *off)
+{
+    struct zsi_ksort ks = { ix->file, compar };
+    size_t i;
+
+    i = zsi_index_lb(ix->delta, ix->ndelta, &ks, key, keylen);
+    if (zsi_index_eq(ix->delta, ix->ndelta, i, &ks, key, keylen)) {
+        *off = ix->delta[i];
+        return ZS_OK;
+    }
+
+    i = zsi_index_lb(ix->base, ix->nbase, &ks, key, keylen);
+    if (zsi_index_eq(ix->base, ix->nbase, i, &ks, key, keylen)) {
+        *off = ix->base[i];
+        return ZS_OK;
+    }
+
+    return ZS_NOTFOUND;
+}
+
+/* Ordered traversal (D-13).
+ *
+ * A cursor over the merged base+delta ordering.  There is deliberately no random
+ * access: the merged view is not an array -- a key may appear in both sides -- so
+ * a count would be an upper bound and an index-addressed at() would have to
+ * re-walk the merge on every call.  The only consumer advances sequentially. */
+struct zsi_index_cur { size_t bi, di; };
+
+static void zsi_index_cur_seek_first(struct zsi_index_cur *c)
+{
+    c->bi = 0;
+    c->di = 0;
+}
+
+static void zsi_index_cur_seek(struct zsi_index *ix, zs_compar *compar,
+                               const char *key, size_t keylen,
+                               struct zsi_index_cur *c)
+{
+    struct zsi_ksort ks = { ix->file, compar };
+
+    /* Both sides are searched independently: the merge happens on get, not here. */
+    c->bi = zsi_index_lb(ix->base, ix->nbase, &ks, key, keylen);
+    c->di = zsi_index_lb(ix->delta, ix->ndelta, &ks, key, keylen);
+}
+
+/* ZS_DONE when exhausted, otherwise ZS_OK with *out filled and *off set. */
+static int zsi_index_cur_get(struct zsi_index *ix, zs_compar *compar,
+                             struct zsi_index_cur *c,
+                             struct zsi_rec *out, size_t *off)
+{
+    bool have_b = c->bi < ix->nbase;
+    bool have_d = c->di < ix->ndelta;
+    size_t chosen;
+
+    if (!have_b && !have_d) return ZS_DONE;
+
+    if (have_b && have_d) {
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[c->bi], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[c->di], &kd, &ld);
+        /* Prefer the delta when the keys are equal: it is the newer record. */
+        chosen = (compar(kd, ld, kb, lb) <= 0) ? ix->delta[c->di]
+                                              : ix->base[c->bi];
+    } else {
+        chosen = have_d ? ix->delta[c->di] : ix->base[c->bi];
+    }
+
+    const char *b = zsi_file_at(ix->file, chosen, 1);
+    if (!b) return ZS_DONE;
+    if (zsi_rec_decode(b, ix->file->size - chosen, ix->file->hdr.start, out)
+        != ZS_OK)
+        return ZS_DONE;
+
+    if (off) *off = chosen;
+    return ZS_OK;
+}
+
+static void zsi_index_cur_next(struct zsi_index *ix, zs_compar *compar,
+                               struct zsi_index_cur *c)
+{
+    bool have_b = c->bi < ix->nbase;
+    bool have_d = c->di < ix->ndelta;
+
+    if (!have_b && !have_d) return;
+
+    if (have_b && have_d) {
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[c->bi], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[c->di], &kd, &ld);
+        int cmp = compar(kd, ld, kb, lb);
+
+        if (cmp == 0) {
+            /* Advance BOTH.  The delta's record was just yielded; leaving the
+             * base's stale copy of the same key in place would surface it on the
+             * following step, which breaks D-14h one level down -- a per-file
+             * cursor must never yield the same key twice. */
+            c->di++;
+            c->bi++;
+        } else if (cmp < 0) {
+            c->di++;
+        } else {
+            c->bi++;
+        }
+        return;
+    }
+
+    if (have_d) c->di++;
+    else        c->bi++;
+}
+
+/* Fold a newly committed record into the index (D-13b).
+ *
+ * A writer is a reader that also maintains the active file's index
+ * incrementally: it already knows every record it appends, so it folds them in
+ * at commit rather than rescanning a file it is writing. */
+static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
+{
+    struct zsi_ksort ks = { ix->file, compar };
+    const char *key;
+    size_t keylen;
+
+    if (!zsi_index_key_at(ix->file, off, &key, &keylen)) return ZS_BADFORMAT;
+
+    size_t i = zsi_index_lb(ix->delta, ix->ndelta, &ks, key, keylen);
+
+    /* Replacing an existing delta entry for this key keeps the delta at one entry
+     * per key, which is what bounds it at ZSI_DELTA_MAX regardless of how often a
+     * single key is rewritten. */
+    if (zsi_index_eq(ix->delta, ix->ndelta, i, &ks, key, keylen)) {
+        ix->delta[i] = off;
+        return ZS_OK;
+    }
+
+    if (ix->ndelta == ix->adelta) {
+        size_t want = ix->adelta ? ix->adelta * 2 : 64;
+        size_t *p = realloc(ix->delta, want * sizeof(*p));
+        if (!p) return ZS_INTERNAL;
+        ix->delta = p;
+        ix->adelta = want;
+    }
+
+    memmove(ix->delta + i + 1, ix->delta + i,
+            (ix->ndelta - i) * sizeof(*ix->delta));
+    ix->delta[i] = off;
+    ix->ndelta++;
+
+    if (ix->ndelta <= ZSI_DELTA_MAX) return ZS_OK;
+
+    /* Merge the delta into the base and clear it: a linear pass, delta winning
+     * ties because it is newer. */
+    size_t *merged = malloc((ix->nbase + ix->ndelta) * sizeof(*merged));
+    if (!merged) return ZS_OK;      /* the delta is still correct, just large */
+
+    size_t bi = 0, di = 0, w = 0;
+    while (bi < ix->nbase || di < ix->ndelta) {
+        if (bi >= ix->nbase) { merged[w++] = ix->delta[di++]; continue; }
+        if (di >= ix->ndelta) { merged[w++] = ix->base[bi++]; continue; }
+
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[bi], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[di], &kd, &ld);
+        int cmp = compar(kd, ld, kb, lb);
+
+        if (cmp == 0)      { merged[w++] = ix->delta[di++]; bi++; }
+        else if (cmp < 0)  { merged[w++] = ix->delta[di++]; }
+        else               { merged[w++] = ix->base[bi++]; }
+    }
+
+    free(ix->base);
+    ix->base = merged;
+    ix->nbase = w;
+    ix->ndelta = 0;
+
+    return ZS_OK;
 }
 
 /********** PER-FILE CURSOR *************/

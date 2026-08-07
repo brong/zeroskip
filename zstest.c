@@ -2971,6 +2971,763 @@ static void test_span_long_terminator(void)
 
 /*
  * ============================================================
+ * The private index (section 5.4)
+ * ============================================================
+ */
+
+/* Build a hand-made unordered file and index it.  Leaves the open file in *fp. */
+static int index_file(struct sb *s, uint32_t gen, struct zsi_file **fp)
+{
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, gen, 0);
+    if (mkdbdir() != 0) return -1;
+    if (sb_write(s, name) != 0) return -1;
+    if (zsi_file_open(dbdir, name, gen, TEST_EXTERNAL_CSUM, fp) != ZS_OK)
+        return -1;
+    return zsi_index_build(*fp, zsi_compar_default, false);
+}
+
+/* Walk the index and join its keys with '|', so an ordering assertion reads as
+ * one string comparison rather than a loop. */
+static void index_keys(struct zsi_file *f, char *out, size_t outlen)
+{
+    struct zsi_index_cur c;
+    struct zsi_rec r;
+    size_t used = 0;
+
+    out[0] = '\0';
+    zsi_index_cur_seek_first(&c);
+    while (zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+        size_t need = r.keylen + 2;
+        if (used + need >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, r.key, r.keylen);
+        used += r.keylen;
+        out[used] = '\0';
+        zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    }
+}
+
+/* Walk from a seek point, same joining. */
+static void index_keys_from(struct zsi_file *f, const char *key, size_t keylen,
+                            char *out, size_t outlen)
+{
+    struct zsi_index_cur c;
+    struct zsi_rec r;
+    size_t used = 0;
+
+    out[0] = '\0';
+    zsi_index_cur_seek(f->index, zsi_compar_default, key, keylen, &c);
+    while (zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+        size_t need = r.keylen + 2;
+        if (used + need >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, r.key, r.keylen);
+        used += r.keylen;
+        out[used] = '\0';
+        zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    }
+}
+
+static void test_index_committed_only(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+
+    /* D-13a: the index reflects COMMITTED spans only.  A key whose only record is
+     * in a rolled-back span must not be in the index.
+     *
+     * This is the test that catches "walk every record" as an implementation
+     * shortcut -- which is a tempting simplification, and which resurrects aborted
+     * writes. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "live", 4, "1", 1, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "aborted", 7, "x", 1, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "live", 4, &off));
+    ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, "aborted", 7, &off),
+              ZS_NOTFOUND);
+
+    char keys[256];
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "live");
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* A key committed, then rewritten in a rolled-back span: the committed
+     * version survives and the aborted rewrite is invisible.  An implementation
+     * that walked every record would return the aborted value. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "k", 1, "good", 4, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "k", 1, "bad", 3, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    struct zsi_rec r;
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_EQU(r.vallen, 4u);
+    ASSERT_MEM_EQ(r.val, "good", 4);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* A key deleted in a rolled-back span stays present. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "k", 1, "v", 1, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "k", 1, NULL, 0, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_NOT_NULL(r.val);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_newest_per_key(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+    struct zsi_rec r;
+    char keys[256];
+
+    /* A key written three times at increasing offsets yields exactly one entry:
+     * the one at the highest offset (D-14, D-14h). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "k", 1, "v1", 2, false, 0);
+    sb_rec(&s, "k", 1, "v2", 2, false, 0);
+    sb_rec(&s, "k", 1, "v3", 2, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "k");           /* once, not three times */
+
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_MEM_EQ(r.val, "v3", 2);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Across spans, too, and with a deletion last: the tombstone is the newest
+     * version and the index must expose it rather than the value before it.
+     * Resolving a deletion into "absent" is the read path's job (D-14); an index
+     * that dropped tombstones would make a deleted key reappear from an older
+     * file. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "k", 1, "v1", 2, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "k", 1, NULL, 0, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_NULL(r.val);                 /* the tombstone, not "v1" */
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Interleaved keys, each rewritten: every key appears once, with its newest
+     * value, and the ordering is by key rather than by offset. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "c", 1, "c1", 2, false, 0);
+    sb_rec(&s, "a", 1, "a1", 2, false, 0);
+    sb_rec(&s, "b", 1, "b1", 2, false, 0);
+    sb_rec(&s, "a", 1, "a2", 2, false, 0);
+    sb_rec(&s, "c", 1, "c2", 2, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b|c");
+
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "a", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_MEM_EQ(r.val, "a2", 2);
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "c", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_MEM_EQ(r.val, "c2", 2);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_ordered_traversal(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    char keys[512];
+
+    /* Keys inserted in a scrambled order traverse in comparator order (D-13). */
+    static const char *ins[] = { "m", "d", "z", "a", "q", "b", "y", "c" };
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < sizeof(ins) / sizeof(ins[0]); i++)
+        sb_rec(&s, ins[i], strlen(ins[i]), "v", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b|c|d|m|q|y|z");
+
+    /* Lower-bound seek: to a key present, to one absent between two present, to
+     * one before all, and to one after all. */
+    index_keys_from(f, "m", 1, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "m|q|y|z");
+
+    index_keys_from(f, "e", 1, keys, sizeof(keys));     /* absent, between d and m */
+    ASSERT_STR_EQ(keys, "m|q|y|z");
+
+    index_keys_from(f, "", 0, keys, sizeof(keys));      /* before all */
+    ASSERT_STR_EQ(keys, "a|b|c|d|m|q|y|z");
+
+    index_keys_from(f, "zz", 2, keys, sizeof(keys));    /* after all */
+    ASSERT_STR_EQ(keys, "");
+
+    index_keys_from(f, "z", 1, keys, sizeof(keys));     /* exactly the last */
+    ASSERT_STR_EQ(keys, "z");
+
+    /* The comparator's own ordering is used, including the shorter-key-first rule
+     * (F-11a), not byte order alone. */
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "abc", 3, "v", 1, false, 0);
+    sb_rec(&s, "ab", 2, "v", 1, false, 0);
+    sb_rec(&s, "a", 1, "v", 1, false, 0);
+    sb_rec(&s, "b", 1, "v", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|ab|abc|b");
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_empty(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+    struct zsi_index_cur c;
+    struct zsi_rec r;
+    char keys[64];
+
+    /* An index over a file with no committed records: lookup returns ZS_NOTFOUND
+     * and the cursor is immediately exhausted.  D-14b requires this be an ordinary
+     * case rather than a special one, because a binary search over a zero-length
+     * array and an index for an empty file are both routine (F-26h). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    ASSERT_NOT_NULL(f->index);
+    ASSERT_EQU(f->index->nbase, 0u);
+
+    ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off),
+              ZS_NOTFOUND);
+    ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, "", 0, &off),
+              ZS_NOTFOUND);
+
+    zsi_index_cur_seek_first(&c);
+    ASSERT_EQ(zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL),
+              ZS_DONE);
+    /* Advancing an exhausted cursor is a no-op rather than an overrun. */
+    zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    ASSERT_EQ(zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL),
+              ZS_DONE);
+
+    zsi_index_cur_seek(f->index, zsi_compar_default, "anything", 8, &c);
+    ASSERT_EQ(zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL),
+              ZS_DONE);
+
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "");
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Same for a file whose every span was rolled back. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+    ASSERT_EQU(f->index->nbase, 0u);
+    ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, "a", 1, &off),
+              ZS_NOTFOUND);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_delta(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+    struct zsi_rec r;
+
+    /* Build a base, then insert past the merge boundary one record at a time,
+     * asserting lookup and traversal stay correct throughout -- including across
+     * the merge, which is the step most likely to lose or duplicate an entry.
+     *
+     * The records are all really present in the file; only the index's knowledge
+     * of them arrives incrementally, which is what a writer folding in its own
+     * commits looks like (D-13b). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "base0", 5, "b", 1, false, 0);
+    sb_rec(&s, "base1", 5, "b", 1, false, 0);
+    sb_term(&s, false);
+
+    /* Record the offsets of everything appended after the base span. */
+    size_t offs[ZSI_DELTA_MAX + 40];
+    size_t n = 0;
+    for (n = 0; n < ZSI_DELTA_MAX + 32; n++) {
+        char k[32];
+        snprintf(k, sizeof(k), "d%06zu", n);
+        offs[n] = s.len;
+        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+    }
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+
+    /* Build the index over the FIRST span only, by replaying a truncated view.
+     * Simpler: build over everything, then reset to just the base entries and
+     * re-insert.  Instead of contriving that, build normally and then assert the
+     * insert path against a fresh index containing only the base span's keys. */
+    ASSERT_OK(zsi_index_build(f, zsi_compar_default, false));
+    size_t total_keys = f->index->nbase;
+    ASSERT_EQU(total_keys, 2u + n);
+
+    /* Now exercise insert directly: empty the index down to nothing and add the
+     * records back one at a time. */
+    free(f->index->base);
+    f->index->base = NULL;
+    f->index->nbase = 0;
+    f->index->ndelta = 0;
+
+    bool merged_at_least_once = false;
+    for (size_t i = 0; i < n; i++) {
+        ASSERT_OK(zsi_index_insert(f->index, zsi_compar_default, offs[i]));
+        if (f->index->nbase > 0) merged_at_least_once = true;
+
+        /* Every key inserted so far is findable, and none that follow are. */
+        char k[32];
+        snprintf(k, sizeof(k), "d%06zu", i);
+        ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k, strlen(k), &off));
+        ASSERT_EQU(off, offs[i]);
+
+        snprintf(k, sizeof(k), "d%06zu", i + 1);
+        if (i + 1 < n)
+            ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, k, strlen(k),
+                                     &off), ZS_NOTFOUND);
+    }
+
+    /* The delta really did overflow into the base at least once. */
+    ASSERT(merged_at_least_once);
+    ASSERT(f->index->ndelta <= ZSI_DELTA_MAX);
+
+    /* And traversal yields every key exactly once, in order, across the merge
+     * boundary. */
+    struct zsi_index_cur c;
+    zsi_index_cur_seek_first(&c);
+    size_t seen = 0;
+    const char *prev = NULL;
+    size_t prevlen = 0;
+    char prevbuf[32];
+    while (zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+        if (prev) {
+            if (zsi_compar_default(prev, prevlen, r.key, r.keylen) >= 0) {
+                fprintf(stderr, "\n    FAIL out of order at %zu\n", seen);
+                current_test_failed = 1;
+                zsi_file_close(&f);
+                sb_free(&s);
+                return;
+            }
+        }
+        memcpy(prevbuf, r.key, r.keylen);
+        prev = prevbuf;
+        prevlen = r.keylen;
+        seen++;
+        zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    }
+    ASSERT_EQU(seen, n);
+
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_delta_shadows_base(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+    struct zsi_rec r;
+    char keys[256];
+
+    /* A key present in BOTH base and delta must yield the delta's record in
+     * lookup AND in traversal, and must be traversed exactly once.
+     *
+     * Yielding it twice is the failure mode: the delta's copy, then the base's
+     * stale one on the following step.  That breaks the guarantee a per-file
+     * cursor never yields the same key twice (D-14h), one level below where that
+     * rule is stated. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "old", 3, false, 0);
+    sb_rec(&s, "b", 1, "bee", 3, false, 0);
+    sb_rec(&s, "c", 1, "see", 3, false, 0);
+    sb_term(&s, false);
+    size_t newer_a = s.len;
+    sb_rec(&s, "a", 1, "new", 3, false, 0);
+    size_t newer_c = s.len;
+    sb_rec(&s, "c", 1, "cee", 3, false, 0);
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_index_build(f, zsi_compar_default, false));
+
+    /* Reduce the index to the first span's three records, then add the two newer
+     * ones through the insert path, so they land in the delta over a base that
+     * already holds those keys. */
+    struct zsi_index *ix = f->index;
+    ASSERT_EQU(ix->nbase, 3u);
+    /* rebuild base as the three ORIGINAL offsets, in key order */
+    ix->nbase = 0;
+    free(ix->base);
+    ix->base = malloc(3 * sizeof(size_t));
+    ASSERT_NOT_NULL(ix->base);
+    ix->base[0] = ZSI_HEADER_LEN;                                   /* a */
+    ix->base[1] = ZSI_HEADER_LEN + zsi_rec_encoded_len(1, 3, false, false);
+    ix->base[2] = ix->base[1] + zsi_rec_encoded_len(1, 3, false, false);
+    ix->nbase = 3;
+    ix->ndelta = 0;
+
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b|c");
+
+    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_a));
+    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_c));
+    ASSERT_EQU(ix->ndelta, 2u);
+
+    /* Lookup prefers the delta. */
+    ASSERT_OK(zsi_index_find(ix, zsi_compar_default, "a", 1, &off));
+    ASSERT_EQU(off, newer_a);
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_MEM_EQ(r.val, "new", 3);
+
+    ASSERT_OK(zsi_index_find(ix, zsi_compar_default, "c", 1, &off));
+    ASSERT_EQU(off, newer_c);
+
+    /* b is only in the base, and still findable. */
+    ASSERT_OK(zsi_index_find(ix, zsi_compar_default, "b", 1, &off));
+    ASSERT_EQU(off, ix->base[1]);
+
+    /* Traversal yields each key ONCE -- "a|b|c", not "a|a|b|c|c". */
+    index_keys(f, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b|c");
+
+    /* And the values traversed are the newer ones. */
+    struct zsi_index_cur c;
+    zsi_index_cur_seek_first(&c);
+    ASSERT_OK(zsi_index_cur_get(ix, zsi_compar_default, &c, &r, &off));
+    ASSERT_EQU(off, newer_a);
+    ASSERT_MEM_EQ(r.val, "new", 3);
+    zsi_index_cur_next(ix, zsi_compar_default, &c);
+    ASSERT_OK(zsi_index_cur_get(ix, zsi_compar_default, &c, &r, &off));
+    ASSERT_MEM_EQ(r.key, "b", 1);
+    zsi_index_cur_next(ix, zsi_compar_default, &c);
+    ASSERT_OK(zsi_index_cur_get(ix, zsi_compar_default, &c, &r, &off));
+    ASSERT_EQU(off, newer_c);
+    ASSERT_MEM_EQ(r.val, "cee", 3);
+    zsi_index_cur_next(ix, zsi_compar_default, &c);
+    ASSERT_EQ(zsi_index_cur_get(ix, zsi_compar_default, &c, &r, &off), ZS_DONE);
+
+    /* Seeking into the middle still merges correctly. */
+    index_keys_from(f, "b", 1, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "b|c");
+    index_keys_from(f, "a", 1, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b|c");
+
+    /* Re-inserting the same key replaces its delta entry rather than adding one,
+     * which is what keeps the delta at one entry per key. */
+    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_a));
+    ASSERT_EQU(ix->ndelta, 2u);
+
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_delta_merge_with_duplicates(void)
+{
+    /* The merge, with every key present in BOTH base and delta.
+     *
+     * This is the case the other two delta tests each miss half of:
+     * test_index_delta overflows the delta but with all-distinct keys, so the
+     * merge's tie arm never runs; test_index_delta_shadows_base has duplicates but
+     * only two delta entries, so no merge fires.  Mutation testing found the hole
+     * -- a merge that keeps the base's stale record, or that fails to consume the
+     * tied base entry, passed both.
+     *
+     * The failure it guards against is silent and delayed: correct results until
+     * enough writes accumulate to trigger a merge, then stale values for every key
+     * rewritten before it. */
+    enum { N = ZSI_DELTA_MAX + 100 };
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t *old_off = malloc(N * sizeof(size_t));
+    size_t *new_off = malloc(N * sizeof(size_t));
+    ASSERT_NOT_NULL(old_off);
+    ASSERT_NOT_NULL(new_off);
+
+    /* Span one: every key with value "old".  Keys are generated in ascending
+     * order, so these offsets are already in comparator order. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < N; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "k%06zu", i);
+        old_off[i] = s.len;
+        sb_rec(&s, k, strlen(k), "old", 3, false, 0);
+    }
+    sb_term(&s, false);
+
+    /* Span two: the same keys with value "new". */
+    for (size_t i = 0; i < N; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "k%06zu", i);
+        new_off[i] = s.len;
+        sb_rec(&s, k, strlen(k), "new", 3, false, 0);
+    }
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_index_build(f, zsi_compar_default, false));
+
+    /* Reset the index to hold only span one, then feed span two through the
+     * insert path -- which is what a writer folding in its own commits does. */
+    struct zsi_index *ix = f->index;
+    free(ix->base);
+    ix->base = malloc(N * sizeof(size_t));
+    ASSERT_NOT_NULL(ix->base);
+    memcpy(ix->base, old_off, N * sizeof(size_t));
+    ix->nbase = N;
+    ix->ndelta = 0;
+
+    bool merged = false;
+    for (size_t i = 0; i < N; i++) {
+        size_t before = ix->nbase;
+        ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, new_off[i]));
+        if (ix->ndelta == 0 && before == N) merged = true;
+
+        /* Whatever side it currently lives on, the newer record is what resolves. */
+        char k[32];
+        size_t off;
+        snprintf(k, sizeof(k), "k%06zu", i);
+        ASSERT_OK(zsi_index_find(ix, zsi_compar_default, k, strlen(k), &off));
+        ASSERT_EQU(off, new_off[i]);
+    }
+
+    ASSERT(merged);                     /* the merge really did run */
+
+    /* The merge collapsed each key to one base entry rather than accumulating
+     * both versions -- nbase is N, not 2N.  Note that nbase + ndelta is
+     * deliberately NOT asserted to be N: after the merge the remaining inserts
+     * land in a now-empty delta for keys the base already holds, so a key living
+     * on both sides is the ordinary steady state and summing the arrays does not
+     * count keys.  The merged view is what must hold N, asserted by the traversal
+     * below. */
+    ASSERT_EQU(ix->nbase, (size_t)N);
+    ASSERT(ix->ndelta <= ZSI_DELTA_MAX);
+
+    /* Every key resolves to its newer record, and the base did not grow to 2N. */
+    for (size_t i = 0; i < N; i++) {
+        char k[32];
+        size_t off;
+        snprintf(k, sizeof(k), "k%06zu", i);
+        if (zsi_index_find(ix, zsi_compar_default, k, strlen(k), &off) != ZS_OK
+            || off != new_off[i]) {
+            fprintf(stderr, "\n    FAIL %s resolves to %zu, expected %zu\n",
+                    k, off, new_off[i]);
+            current_test_failed = 1;
+            goto done;
+        }
+    }
+
+    /* Traversal yields exactly N keys, each once, in order, all with "new". */
+    {
+        struct zsi_index_cur c;
+        struct zsi_rec r;
+        size_t seen = 0;
+        char prev[32];
+        size_t prevlen = 0;
+
+        zsi_index_cur_seek_first(&c);
+        while (zsi_index_cur_get(ix, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+            if (prevlen &&
+                zsi_compar_default(prev, prevlen, r.key, r.keylen) >= 0) {
+                fprintf(stderr, "\n    FAIL duplicate or misordered key at %zu\n",
+                        seen);
+                current_test_failed = 1;
+                goto done;
+            }
+            if (r.vallen != 3 || memcmp(r.val, "new", 3) != 0) {
+                fprintf(stderr, "\n    FAIL stale value at %zu\n", seen);
+                current_test_failed = 1;
+                goto done;
+            }
+            memcpy(prev, r.key, r.keylen);
+            prevlen = r.keylen;
+            seen++;
+            zsi_index_cur_next(ix, zsi_compar_default, &c);
+        }
+        ASSERT_EQU(seen, (size_t)N);
+    }
+
+done:
+    zsi_file_close(&f);
+    sb_free(&s);
+    free(old_off);
+    free(new_off);
+}
+
+static void test_index_binary_keys(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+    char keys[256];
+
+    /* Keys containing NUL bytes order and look up by length-authoritative
+     * comparison (F-13), not by C-string semantics -- an index that used strcmp
+     * would collapse all of these to "a". */
+    const char k1[] = { 'a', '\0', '1' };
+    const char k2[] = { 'a', '\0', '2' };
+    const char k3[] = { 'a' };
+    const char k4[] = { 'a', '\0' };
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, k2, 3, "v2", 2, false, 0);
+    sb_rec(&s, k1, 3, "v1", 2, false, 0);
+    sb_rec(&s, k4, 2, "v4", 2, false, 0);
+    sb_rec(&s, k3, 1, "v3", 2, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    /* Four distinct keys, ordered shortest-prefix first (F-11a). */
+    struct zsi_index_cur c;
+    struct zsi_rec r;
+    zsi_index_cur_seek_first(&c);
+    size_t n = 0;
+    size_t lens[8];
+    while (zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+        lens[n++] = r.keylen;
+        zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    }
+    ASSERT_EQU(n, 4u);
+    ASSERT_EQU(lens[0], 1u);            /* "a"      */
+    ASSERT_EQU(lens[1], 2u);            /* "a\0"    */
+    ASSERT_EQU(lens[2], 3u);            /* "a\0 1"  */
+    ASSERT_EQU(lens[3], 3u);            /* "a\0 2"  */
+
+    /* Each is findable by its own exact bytes and length. */
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k1, 3, &off));
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k2, 3, &off));
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k3, 1, &off));
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k4, 2, &off));
+
+    (void)keys;
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_index_many(void)
+{
+    struct sb s;
+    struct zsi_file *f = NULL;
+    size_t off;
+
+    /* Enough records that the sort matters, with keys generated in an order that
+     * is neither ascending nor descending. */
+    enum { N = 3000 };
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < N; i++) {
+        char k[32];
+        /* a multiplicative shuffle: hits every value once, in scrambled order */
+        snprintf(k, sizeof(k), "key%08zu", (i * 2654435761u) % N);
+        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+    }
+    sb_term(&s, false);
+    ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
+
+    /* Every generated key is present, and the count matches the distinct keys. */
+    ASSERT(f->index->nbase > 0);
+    ASSERT(f->index->nbase <= N);
+
+    for (size_t i = 0; i < N; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%08zu", (i * 2654435761u) % N);
+        if (zsi_index_find(f->index, zsi_compar_default, k, strlen(k), &off)
+            != ZS_OK) {
+            fprintf(stderr, "\n    FAIL missing %s\n", k);
+            current_test_failed = 1;
+            zsi_file_close(&f);
+            sb_free(&s);
+            return;
+        }
+    }
+
+    /* Traversal is sorted and yields each key once. */
+    struct zsi_index_cur c;
+    struct zsi_rec r;
+    zsi_index_cur_seek_first(&c);
+    size_t seen = 0;
+    char prev[32];
+    size_t prevlen = 0;
+    while (zsi_index_cur_get(f->index, zsi_compar_default, &c, &r, NULL) == ZS_OK) {
+        if (prevlen &&
+            zsi_compar_default(prev, prevlen, r.key, r.keylen) >= 0) {
+            fprintf(stderr, "\n    FAIL out of order at %zu\n", seen);
+            current_test_failed = 1;
+            zsi_file_close(&f);
+            sb_free(&s);
+            return;
+        }
+        memcpy(prev, r.key, r.keylen);
+        prevlen = r.keylen;
+        seen++;
+        zsi_index_cur_next(f->index, zsi_compar_default, &c);
+    }
+    ASSERT_EQU(seen, f->index->nbase);
+
+    /* An absent key is absent. */
+    ASSERT_EQ(zsi_index_find(f->index, zsi_compar_default, "nope", 4, &off),
+              ZS_NOTFOUND);
+
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -3034,6 +3791,17 @@ static struct test_entry tests[] = {
     { "test_span_pointers_rejected",    test_span_pointers_rejected },
     { "test_span_engine_zero",          test_span_engine_zero },
     { "test_span_long_terminator",      test_span_long_terminator },
+
+    { "test_index_committed_only",      test_index_committed_only },
+    { "test_index_newest_per_key",      test_index_newest_per_key },
+    { "test_index_ordered_traversal",   test_index_ordered_traversal },
+    { "test_index_empty",               test_index_empty },
+    { "test_index_delta",               test_index_delta },
+    { "test_index_delta_shadows_base",  test_index_delta_shadows_base },
+    { "test_index_delta_merge_with_duplicates",
+                                        test_index_delta_merge_with_duplicates },
+    { "test_index_binary_keys",         test_index_binary_keys },
+    { "test_index_many",                test_index_many },
 
     { NULL, NULL }
 };
