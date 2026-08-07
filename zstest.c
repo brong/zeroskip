@@ -1987,6 +1987,149 @@ static void test_terminator_long_span(void)
 
 /*
  * ============================================================
+ * Building unordered files by hand
+ * ============================================================
+ *
+ * A growable buffer with span semantics, so a test can lay down exactly the
+ * bytes it wants -- including the shapes a conforming writer never produces: a
+ * span whose terminator claims the wrong length, a terminator whose data was
+ * never written, trailing garbage after a valid span.
+ */
+
+struct sb {
+    char  *buf;
+    size_t len, alloc;
+    size_t span_start;      /* offset where the current span's data began */
+    unsigned engine;
+};
+
+static void sb_init(struct sb *s, uint32_t start, unsigned engine)
+{
+    s->alloc = 4096;
+    s->buf = malloc(s->alloc);
+    assert(s->buf);
+    s->len = 0;
+    s->engine = engine;
+
+    char hdr[ZSI_HEADER_LEN];
+    make_header(hdr, start, 0, engine);
+    memcpy(s->buf, hdr, ZSI_HEADER_LEN);
+    s->len = ZSI_HEADER_LEN;
+    s->span_start = s->len;
+}
+
+static void sb_free(struct sb *s) { free(s->buf); s->buf = NULL; }
+
+static void sb_reserve(struct sb *s, size_t extra)
+{
+    while (s->len + extra > s->alloc) {
+        s->alloc *= 2;
+        s->buf = realloc(s->buf, s->alloc);
+        assert(s->buf);
+    }
+}
+
+/* Append a data record to the current span. */
+static void sb_rec(struct sb *s, const char *key, size_t keylen,
+                   const char *val, size_t vallen,
+                   bool store_anc, uint32_t anc)
+{
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, store_anc);
+    assert(n > 0);
+    sb_reserve(s, n);
+    zsi_rec_encode(s->buf + s->len, key, keylen, val, vallen, store_anc, anc);
+    s->len += n;
+}
+
+/* Close the current span with a terminator, and begin a new one. */
+static void sb_term(struct sb *s, bool rollback)
+{
+    size_t datalen = s->len - s->span_start;
+    size_t n = zsi_term_encoded_len(datalen);
+    sb_reserve(s, n);
+    zsi_term_encode(s->buf + s->len, datalen, rollback,
+                    s->buf + s->span_start,
+                    zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM), s->engine);
+    s->len += n;
+    s->span_start = s->len;
+}
+
+/* Close the current span with a terminator that LIES about its length, so the
+ * span-length check can be exercised independently of the checksum. */
+static void sb_term_badlen(struct sb *s, uint64_t claim)
+{
+    size_t datalen = s->len - s->span_start;
+    size_t n = zsi_term_encoded_len(claim);
+    sb_reserve(s, n);
+    /* checksum still computed over the real data, so only the length is wrong */
+    zsi_term_encode(s->buf + s->len, claim, false, s->buf + s->span_start,
+                    zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM), s->engine);
+    (void)datalen;
+    s->len += n;
+    s->span_start = s->len;
+}
+
+static void sb_raw(struct sb *s, const void *bytes, size_t n)
+{
+    sb_reserve(s, n);
+    memcpy(s->buf + s->len, bytes, n);
+    s->len += n;
+}
+
+static int sb_write(struct sb *s, const char *name)
+{
+    return writefile(name, s->buf, s->len);
+}
+
+/* Replay collector: records the keys a replay presented, in order. */
+struct collected {
+    char   key[64][64];
+    size_t keylen[64];
+    size_t off[64];
+    bool   isdel[64];
+    size_t n;
+};
+
+/* For spans larger than the collector holds: count only. */
+static int count_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    (void)rec;
+    (void)off;
+    (*(size_t *)rock)++;
+    return 0;
+}
+
+static int collect_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    struct collected *c = rock;
+    if (c->n >= 64) return 1;
+    size_t kl = rec->keylen < 63 ? rec->keylen : 63;
+    memcpy(c->key[c->n], rec->key, kl);
+    c->key[c->n][kl] = '\0';
+    c->keylen[c->n] = rec->keylen;
+    c->off[c->n] = off;
+    c->isdel[c->n] = (rec->val == NULL);
+    c->n++;
+    return 0;
+}
+
+/* Write a hand-built file, open it, replay it.  Leaves the open file in *fp for
+ * the caller to inspect and close. */
+static int replay_file(struct sb *s, uint32_t gen, struct collected *c,
+                       struct zsi_file **fp)
+{
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, gen, 0);
+    if (mkdbdir() != 0) return -1;
+    if (sb_write(s, name) != 0) return -1;
+    memset(c, 0, sizeof(*c));
+    if (zsi_file_open(dbdir, name, gen, TEST_EXTERNAL_CSUM, fp) != ZS_OK)
+        return -1;
+    return zsi_unordered_replay(*fp, false, collect_cb, c);
+}
+
+/*
+ * ============================================================
  * File object (part of T-6)
  * ============================================================
  */
@@ -2250,6 +2393,584 @@ static void test_file_open_failures(void)
 
 /*
  * ============================================================
+ * The span chain (section 4.8)
+ * ============================================================
+ */
+
+static void test_span_basic(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* One commit span of three records replays all three, in file order. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "c", 1, "3", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 3u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_STR_EQ(c.key[1], "b");
+    ASSERT_STR_EQ(c.key[2], "c");
+    ASSERT(zsi_unordered_is_clean(f));
+    ASSERT_EQU(f->complete, s.len);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Several spans, all committed, replay in order across span boundaries. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "c", 1, "3", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 3u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_STR_EQ(c.key[2], "c");
+    ASSERT(zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* An empty span -- a terminator with no records -- is legal (F-23 says zero
+     * or more), and contributes nothing. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_term(&s, false);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT(zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Deletions are presented as records with a NULL value (A-1); the replay does
+     * not filter them, because resolving a deletion into "absent" is the read
+     * path's job, and an index must know the tombstone exists. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, NULL, 0, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 2u);
+    ASSERT(!c.isdel[0]);
+    ASSERT(c.isdel[1]);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_span_rollback(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* A rolled-back span replays nothing (F-21, F-25). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    /* ...but the file is still clean: a rollback is a valid span terminator, so
+     * the writer may keep appending to it (F-26h). */
+    ASSERT(zsi_unordered_is_clean(f));
+    ASSERT_EQU(f->complete, s.len);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* F-25 directly: visibility is per span, NOT a watermark.  A rolled-back span
+     * sits between two live ones, and both live spans must survive it -- a
+     * high-water-mark implementation would lose the third span or keep the
+     * second. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "first", 5, "1", 1, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "aborted", 7, "x", 1, false, 0);
+    sb_term(&s, true);
+    sb_rec(&s, "third", 5, "3", 1, false, 0);
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 2u);
+    ASSERT_STR_EQ(c.key[0], "first");
+    ASSERT_STR_EQ(c.key[1], "third");
+    ASSERT(zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Every span rolled back: clean, zero records, not an error (F-26h). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, true);
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_term(&s, true);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    ASSERT(zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Interleaved, several of each, to catch an implementation that skips one
+     * rollback correctly but loses its place afterwards. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    for (int i = 0; i < 6; i++) {
+        char k[8];
+        snprintf(k, sizeof(k), "k%d", i);
+        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+        sb_term(&s, (i % 2) == 1);       /* odd spans rolled back */
+    }
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 3u);
+    ASSERT_STR_EQ(c.key[0], "k0");
+    ASSERT_STR_EQ(c.key[1], "k2");
+    ASSERT_STR_EQ(c.key[2], "k4");
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_span_empty_file(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* A file that is only a header: complete at 72, clean, zero records.  This is
+     * what creating a database produces (D-8a) and F-26h makes it legal. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    ASSERT_EQU(s.len, (size_t)ZSI_HEADER_LEN);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
+    ASSERT(zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_span_torn_tail(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+    size_t good_end;
+
+    /* A span whose terminator never landed.  The earlier spans still replay, the
+     * complete point is before the unterminated span, and the file is NOT clean --
+     * so a writer moves to a new generation rather than appending (D-9, R-4). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    good_end = s.len;
+    sb_rec(&s, "b", 1, "2", 1, false, 0);       /* no terminator */
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_EQU(f->complete, good_end);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* The same file with the terminator present but a data byte flipped.  F-22:
+     * because the checksum covers the span AND the terminator, the outcome is
+     * identical -- the span reads as absent. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    good_end = s.len;
+    size_t victim = s.len;
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_term(&s, false);
+    s.buf[victim + 5] ^= 0x01;                  /* damage the span's data */
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_EQU(f->complete, good_end);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Trailing garbage after a valid span. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    good_end = s.len;
+    sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_EQU(f->complete, good_end);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Truncated at every byte offset past the first valid span.  Whatever the
+     * truncation point, the answer is the committed prefix and never a crash. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    good_end = s.len;
+    sb_rec(&s, "bb", 2, "22", 2, false, 0);
+    sb_term(&s, false);
+    size_t full = s.len;
+
+    for (size_t cut = good_end; cut < full; cut++) {
+        char name[ZSI_NAME_MAX];
+        zsi_name_format(name, test_uuid, 1, 0);
+        ASSERT_EQ(mkdbdir(), 0);
+        ASSERT_EQ(writefile(name, s.buf, cut), 0);
+        memset(&c, 0, sizeof(c));
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+        if (c.n != 1 || f->complete != good_end) {
+            fprintf(stderr, "\n    FAIL cut at %zu: n=%zu complete=%zu (want 1, %zu)\n",
+                    cut, c.n, f->complete, good_end);
+            current_test_failed = 1;
+            zsi_file_close(&f);
+            sb_free(&s);
+            return;
+        }
+
+        /* Cutting exactly at the span boundary leaves a file that is legitimately
+         * clean -- complete == size, nothing after the last valid span -- so a
+         * writer may append to it.  Every cut past that leaves a partial span, and
+         * the file must NOT be clean, or a writer would build a chain on top of a
+         * boundary that failed to validate (D-9, R-4).  The boundary case is the
+         * one a truncating write that happened to land on a span end produces. */
+        if (cut == good_end)
+            ASSERT(zsi_unordered_is_clean(f));
+        else
+            ASSERT(!zsi_unordered_is_clean(f));
+
+        zsi_file_close(&f);
+    }
+    sb_free(&s);
+}
+
+static void test_span_terminator_without_data(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* The exact shape F-22 exists for, and the one C-4f depends on: a terminator
+     * reached disk but the span's data did not.
+     *
+     * Built by writing a span, then a terminator over it, then overwriting the
+     * span's data region with zeros -- which is what a filesystem that reordered
+     * the writes would leave behind.  The terminator is structurally perfect and
+     * its length field matches; only the checksum can tell. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    size_t good_end = s.len;
+
+    size_t data_at = s.len;
+    sb_rec(&s, "ghost", 5, "value", 5, false, 0);
+    size_t data_len = s.len - data_at;
+    sb_term(&s, false);
+    memset(s.buf + data_at, 0, data_len);       /* data never landed */
+
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_EQU(f->complete, good_end);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+
+    /* And with checksums not verified, the same file yields the ghost record --
+     * which is exactly the guarantee ZS_NOCSUM gives up (F-5e).  Asserted so the
+     * cost is visible rather than merely stated in a comment. */
+    {
+        char name[ZSI_NAME_MAX];
+        zsi_name_format(name, test_uuid, 1, 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        memset(&c, 0, sizeof(c));
+        ASSERT_OK(zsi_unordered_replay(f, true, collect_cb, &c));
+        /* the zeroed region does not decode as a record, so the span is rejected
+         * on structure rather than on checksum -- the point is that the OUTCOME
+         * differs from the verified case only when the damage is undetectable
+         * structurally, which the next case constructs */
+        zsi_file_close(&f);
+    }
+    sb_free(&s);
+
+    /* A structurally valid span whose contents were altered: only the checksum
+     * distinguishes it.  Verified, it is rejected; unverified, the altered data is
+     * returned as though committed. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    size_t at = s.len;
+    sb_rec(&s, "key", 3, "aaa", 3, false, 0);
+    sb_term(&s, false);
+    s.buf[at + 4 + 3 + 1] = 'b';                /* first value byte: aaa -> baa */
+
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);                        /* checksum catches it */
+    ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
+    zsi_file_close(&f);
+
+    {
+        char name[ZSI_NAME_MAX];
+        zsi_name_format(name, test_uuid, 1, 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        memset(&c, 0, sizeof(c));
+        ASSERT_OK(zsi_unordered_replay(f, true, collect_cb, &c));
+        ASSERT_EQU(c.n, 1u);                    /* undetected without the csum */
+        ASSERT_STR_EQ(c.key[0], "key");
+        zsi_file_close(&f);
+    }
+    sb_free(&s);
+}
+
+static void test_span_bad_length(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* A terminator whose span length disagrees with the bytes actually present.
+     * F-23 requires they match, and this is checked independently of the checksum
+     * so that a length-only corruption is caught by the rule that names it. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    size_t good_end = s.len;
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_term_badlen(&s, 999);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_EQU(f->complete, good_end);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* Claiming zero when records are present. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term_badlen(&s, 0);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_span_progress(void)
+{
+    /* F-29: iteration computes the next offset from the current record's own
+     * length fields and must verify it is strictly greater and in bounds.
+     * Non-termination must be impossible by construction.
+     *
+     * Under an alarm, so a regression hangs this test rather than the suite --
+     * which is the detector T-3 relies on. */
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    alarm(20);
+
+    /* A record whose encoded length would be zero.  zsi_rec_encoded_len refuses
+     * to produce one, so this is hand-built: a KEYVALUE claiming keylen 0, which
+     * F-14 rejects -- and if it did not, roundup8(4+0+1+0+1) would still be 8 and
+     * so still advance.  The point is that no length field can produce a
+     * non-advancing step. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    char bad[8];
+    memset(bad, 0, sizeof(bad));
+    bad[0] = (char)ZSI_KEYVALUE;
+    bad[1] = 0;                                  /* keylen 0 */
+    sb_raw(&s, bad, sizeof(bad));
+    sb_term(&s, false);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* A file that is entirely 0xFF: no valid type byte anywhere, so the walk stops
+     * immediately rather than scanning to the end repeatedly. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    char junk[4096];
+    memset(junk, 0xFF, sizeof(junk));
+    sb_raw(&s, junk, sizeof(junk));
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* A file of zero bytes throughout: 0x00 is an invalid type byte (F-12), which
+     * is what a sparse hole reads as. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    memset(junk, 0x00, sizeof(junk));
+    sb_raw(&s, junk, sizeof(junk));
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    alarm(0);
+}
+
+static void test_span_bad_header_and_kind(void)
+{
+    struct collected c;
+    struct zsi_file *f = NULL;
+    char name[ZSI_NAME_MAX];
+    char buf[ZSI_HEADER_LEN];
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_name_format(name, test_uuid, 2, 0);
+
+    /* D-10: an invalid header means zero spans, complete at 0, and NOT clean --
+     * so a writer moves on rather than appending past a boundary that failed to
+     * validate (R-4). */
+    memset(buf, 0xFF, sizeof(buf));
+    ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 2, NULL, &f));
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, 0u);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+
+    /* A zero-length file, likewise: complete == size == 0, and yet NOT clean,
+     * because D-9 requires a valid header.  This is the case where a
+     * complete == size test alone would wrongly report clean and let a writer
+     * append to a file with no header. */
+    ASSERT_EQ(writefile(name, "", 0), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 2, NULL, &f));
+    ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+    ASSERT_EQU(f->complete, 0u);
+    ASSERT_EQU(f->size, 0u);
+    ASSERT(!zsi_unordered_is_clean(f));
+    zsi_file_close(&f);
+
+    /* Replaying an in-order file is a usage error, not a data condition: it has no
+     * spans at all (section 4.9), so there is no answer to invent. */
+    char io[96];
+    memset(io, 0, sizeof(io));
+    make_header(io, 5, 5, ZSI_CSUM_XXHASH);
+    io[72] = (char)ZSI_PTRS32;
+    zsi_put64(io + 80, 72);
+    zsi_put32(io + 88, zsi_csum_xxhash(io + 72, 0));
+    zsi_put32(io + 92, zsi_csum_xxhash(io + 72, 20));
+    zsi_name_format(name, test_uuid, 5, 5);
+    ASSERT_EQ(writefile(name, io, sizeof(io)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 5, NULL, &f));
+    ASSERT_EQ(zsi_unordered_replay(f, false, collect_cb, &c), ZS_BADUSAGE);
+    zsi_file_close(&f);
+}
+
+static void test_span_pointers_rejected(void)
+{
+    /* A pointer section cannot appear in an unordered file (section 4.9).  Both
+     * PTRS types are valid type bytes, so this is not caught by type validation --
+     * the walk has to know that a valid type which is neither a data record nor a
+     * terminator ends the file. */
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    for (int wide = 0; wide < 2; wide++) {
+        sb_init(&s, 1, ZSI_CSUM_XXHASH);
+        sb_rec(&s, "a", 1, "1", 1, false, 0);
+        sb_term(&s, false);
+        size_t good_end = s.len;
+
+        char ptrs[16];
+        memset(ptrs, 0, sizeof(ptrs));
+        ptrs[0] = (char)(wide ? ZSI_PTRS64 : ZSI_PTRS32);
+        sb_raw(&s, ptrs, wide ? 16 : 8);
+
+        ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+        ASSERT_EQU(c.n, 1u);
+        ASSERT_EQU(f->complete, good_end);
+        ASSERT(!zsi_unordered_is_clean(f));
+        zsi_file_close(&f);
+        sb_free(&s);
+    }
+}
+
+static void test_span_engine_zero(void)
+{
+    /* Engine 0 writes zeros and never verifies (F-5c), so a torn tail is
+     * undetectable.  The span-length check still applies, which is why a
+     * length-only corruption is caught even here -- but altered data is not. */
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    sb_init(&s, 1, ZSI_CSUM_NONE);
+    size_t at = s.len;
+    sb_rec(&s, "key", 3, "aaa", 3, false, 0);
+    sb_term(&s, false);
+    s.buf[at + 4 + 3 + 1] = 'b';
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);                        /* undetected: engine 0 */
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_NONE);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* But a length disagreement is structural and still caught. */
+    sb_init(&s, 1, ZSI_CSUM_NONE);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term_badlen(&s, 999);
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 0u);
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_span_long_terminator(void)
+{
+    /* A span over 0xFFFFFF bytes forces a long terminator (F-15), and the walk
+     * must handle the 24-byte form -- including that its checksum lives at +20,
+     * not +4. */
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    char val[8192];
+    memset(val, 'v', sizeof(val));
+    size_t n = 0;
+    while (s.len - s.span_start <= ZSI_SHORT_SPANLEN_MAX) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%08zu", n++);
+        sb_rec(&s, k, strlen(k), val, sizeof(val), false, 0);
+    }
+    ASSERT(s.len - s.span_start > ZSI_SHORT_SPANLEN_MAX);
+    size_t nrecs = n;
+    sb_term(&s, false);
+
+    /* The terminator really is the long form. */
+    ASSERT_EQ((unsigned char)s.buf[s.span_start - ZSI_TERMLEN_LONG],
+              ZSI_COMMIT_LONG);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+
+    /* A counting callback, since the span holds far more than the 64-entry
+     * collector holds -- and counting is the assertion that matters: every record
+     * of a large span must be presented, not just the ones before some limit. */
+    size_t count = 0;
+    ASSERT_OK(zsi_unordered_replay(f, false, count_cb, &count));
+    ASSERT_EQU(count, nrecs);
+    ASSERT(zsi_unordered_is_clean(f));
+    ASSERT_EQU(f->complete, s.len);
+    ASSERT(nrecs > 2000);       /* enough records that the span really is large */
+
+    (void)c;
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -2301,6 +3022,18 @@ static struct test_entry tests[] = {
     { "test_file_bad_header",           test_file_bad_header },
     { "test_file_engine_from_header",   test_file_engine_from_header },
     { "test_file_open_failures",        test_file_open_failures },
+
+    { "test_span_basic",                test_span_basic },
+    { "test_span_rollback",             test_span_rollback },
+    { "test_span_empty_file",           test_span_empty_file },
+    { "test_span_torn_tail",            test_span_torn_tail },
+    { "test_span_terminator_without_data", test_span_terminator_without_data },
+    { "test_span_bad_length",           test_span_bad_length },
+    { "test_span_progress",             test_span_progress },
+    { "test_span_bad_header_and_kind",  test_span_bad_header_and_kind },
+    { "test_span_pointers_rejected",    test_span_pointers_rejected },
+    { "test_span_engine_zero",          test_span_engine_zero },
+    { "test_span_long_terminator",      test_span_long_terminator },
 
     { NULL, NULL }
 };

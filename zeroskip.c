@@ -1350,6 +1350,190 @@ static bool zsi_file_is_unordered(const struct zsi_file *f)
 
 /********** UNORDERED FILE *************/
 
+/* From the end of an unordered file's header onwards, the file is a flat sequence
+ * of spans (F-23).  Each span is zero or more data records followed by exactly
+ * one terminator whose span length equals the span's data byte count and whose
+ * checksum validates.  Every byte belongs to exactly one span or terminator: no
+ * gaps, no nesting.
+ *
+ * Spans exist only in unordered files; an in-order file has none (section 4.9). */
+
+/* Invoked for each committed record, in file order.  Records in rolled-back spans
+ * are never presented (F-25).  Returning non-zero stops the replay. */
+typedef int zsi_replay_cb(void *rock, const struct zsi_rec *rec, size_t off);
+
+/* Walk the span chain, setting f->complete to the offset after the last valid
+ * span (F-24) -- which may be short of f->size, and is the header length for a
+ * file with no valid spans at all.
+ *
+ * A torn tail is not an error.  It is the ordinary outcome of a crash, and of
+ * reading a file a writer is still appending to, so this returns ZS_OK and lets
+ * f->complete carry the answer.  Content beyond the complete point is simply not
+ * part of the database.
+ *
+ * nocsum skips checksum verification (F-5e).  That is the caller's choice and it
+ * costs tear detection: without the checksum, a span whose data never landed is
+ * accepted on the strength of its length field alone.  F-22's guarantee does not
+ * hold under it, and neither does C-4f's.
+ *
+ * Two passes per span, deliberately.  Pass one finds the terminator and validates
+ * the whole span; pass two replays its records.  Records are therefore decoded
+ * twice.  The alternative is buffering an unbounded span's records in memory, and
+ * the second decode costs nothing measurable because the span is already in page
+ * cache from the first. */
+static int zsi_unordered_replay(struct zsi_file *f, bool nocsum,
+                                zsi_replay_cb *cb, void *rock)
+{
+    /* D-10: an active file with a corrupt header or zero length is treated as a
+     * complete file with zero spans.  Nothing in it is part of the database, so
+     * the complete point is 0 -- which also makes it not clean (D-9), so a writer
+     * moves to a new file rather than building a chain on an untrustworthy
+     * boundary (R-4). */
+    if (!f->hdr_valid) {
+        f->complete = 0;
+        return ZS_OK;
+    }
+
+    /* An in-order file has no spans.  Calling this on one is a programming error
+     * rather than a data condition, so it reports nothing rather than inventing
+     * an answer. */
+    if (!zsi_header_is_unordered(&f->hdr)) {
+        f->complete = 0;
+        return ZS_BADUSAGE;
+    }
+
+    size_t pos = ZSI_HEADER_LEN;
+    f->complete = pos;
+
+    for (;;) {
+        size_t span_start = pos;
+        size_t p = pos;
+        struct zsi_term term;
+        bool found_term = false;
+
+        /* Pass one: walk records until a terminator, validating as we go. */
+        for (;;) {
+            const char *b = zsi_file_at(f, p, 1);
+            if (!b) break;                      /* ran off the end */
+
+            uint8_t type = (uint8_t)b[0];
+            if (!zsi_type_valid(type)) break;
+
+            size_t avail = f->size - p;
+
+            if (type & ZSI_SPANTERM) {
+                if (zsi_term_decode(b, avail, &term) != ZS_OK) break;
+                if (!zsi_file_at(f, p, term.len)) break;
+                found_term = true;
+                break;
+            }
+
+            /* A pointer section cannot appear in an unordered file (section 4.9),
+             * and a valid type byte that is neither a data record nor a
+             * terminator can only be one.  Ends the file here. */
+            if (!(type & ZSI_HASKEY)) break;
+
+            struct zsi_rec r;
+            if (zsi_rec_decode(b, avail, f->hdr.start, &r) != ZS_OK) break;
+
+            /* F-29's progress rule: the next offset comes from this record's own
+             * length fields, and must be strictly greater and within bounds.
+             * Non-termination is impossible by construction, which T-3's per-case
+             * timeout is the detector for.
+             *
+             * These four checks are DELIBERATELY REDUNDANT, not dead code.
+             * zsi_rec_decode already guarantees every one of them -- it rejects a
+             * saturated roundup8, so out->len is never 0, and it rejects a total
+             * exceeding the length it was given, so p + len never passes f->size.
+             * Mutation testing confirms removing them changes nothing observable.
+             *
+             * They stay for two reasons.  F-29 requires the verification at the
+             * iteration site rather than somewhere it happens to be implied.  And
+             * they become load-bearing the moment the decoder's contract changes,
+             * which is precisely the change nobody would think to audit this walk
+             * for. */
+            size_t next;
+            if (r.len == 0) break;
+            if (!zsi_add_sz(p, r.len, &next)) break;
+            if (next <= p) break;
+            if (next > f->size) break;
+
+            p = next;
+        }
+
+        if (!found_term) break;                 /* complete at span_start */
+
+        /* The span's data byte count is exactly the distance walked, so there is
+         * nothing to accumulate and nothing to overflow. */
+        size_t datalen = p - span_start;
+        if (term.spanlen != (uint64_t)datalen) break;
+
+        const char *spandata = zsi_file_at(f, span_start, datalen);
+        const char *termbytes = zsi_file_at(f, p, term.len);
+        if (!termbytes) break;
+        if (datalen && !spandata) break;
+
+        /* F-19: the checksum covers the span's data followed by the terminator's
+         * own bytes up to the checksum field.  Because it covers BOTH, a
+         * terminator that reached disk without its data fails here and the span
+         * reads as absent.
+         *
+         * This is the load-bearing check of the whole concurrency design.  It is
+         * what makes a torn tail always detectable (F-22), and it supplies the
+         * ordering guarantee that no memory barrier can provide between
+         * independent processes sharing a mapping -- which is what permits reading
+         * a live file with no lock at all (C-4f).  It looks like an ordinary
+         * checksum check and is not. */
+        if (!nocsum) {
+            uint32_t want = zsi_csum2(f->csum, f->csum_id,
+                                      spandata ? spandata : "", datalen,
+                                      termbytes, term.len - 4);
+            if (want != term.csum) break;
+        }
+
+        size_t after;
+        if (!zsi_add_sz(p, term.len, &after)) break;
+        if (after > f->size) break;
+
+        /* Pass two: replay, unless the span was rolled back.
+         *
+         * F-21: a ROLLBACK is a commit that says "ignore the records in this
+         * span".  F-25: visibility is per span, not a watermark -- a rolled-back
+         * span may sit between two live ones, so this must skip exactly this span
+         * and carry on rather than stopping or lowering a high-water mark. */
+        if (cb && !zsi_term_is_rollback(&term)) {
+            size_t q = span_start;
+            while (q < p) {
+                const char *rb = zsi_file_at(f, q, 1);
+                struct zsi_rec r;
+                if (!rb) break;
+                if (zsi_rec_decode(rb, f->size - q, f->hdr.start, &r) != ZS_OK)
+                    break;
+                if (r.len == 0) break;
+                if (cb(rock, &r, q) != 0) return ZS_OK;   /* caller stopped */
+                q += r.len;
+            }
+        }
+
+        f->complete = after;
+        pos = after;
+    }
+
+    return ZS_OK;
+}
+
+/* Whether the active file may be appended to (D-9).
+ *
+ * "An active file is clean if it has a VALID HEADER and zero or more valid spans
+ * with nothing after the last."  Both halves matter: a zero-length file has
+ * complete == size == 0 and would otherwise look clean, but D-10 requires a writer
+ * move to a new file rather than append to it -- so no chain is ever built on a
+ * boundary that failed to validate (R-4). */
+static bool zsi_unordered_is_clean(const struct zsi_file *f)
+{
+    return f->hdr_valid && f->complete == f->size;
+}
+
 /********** PRIVATE INDEX *************/
 
 /* An unordered file has no pointer section, so key order for it must be derived

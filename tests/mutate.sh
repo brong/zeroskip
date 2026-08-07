@@ -233,6 +233,89 @@ mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
+echo "span chain (Task 7)"
+
+# F-25: visibility is per span, not a watermark.  A rolled-back span may sit
+# between two live ones, so stopping at a rollback -- or treating it as a
+# high-water mark -- loses committed data after it.
+mutant "F-25: rollback stops the walk" catch \
+  's/        if \(cb && !zsi_term_is_rollback\(&term\)\) \{/        if (zsi_term_is_rollback(\&term)) break;\n        if (cb) {/'
+
+mutant "F-25: rollback replayed anyway" catch \
+  's/        if \(cb && !zsi_term_is_rollback\(&term\)\) \{/        if (cb) {/'
+
+# F-22 / C-4f: the terminator checksum is what makes a torn tail detectable, and
+# what makes reading a live file safe with no lock.
+mutant "F-22: span checksum not verified" catch \
+  's/            uint32_t want = zsi_csum2\(f->csum, f->csum_id,\n                                      spandata \? spandata : "", datalen,\n                                      termbytes, term.len - 4\);\n            if \(want != term.csum\) break;/            (void)spandata; (void)termbytes;/'
+
+mutant "F-22: checksum over span only" catch \
+  's/                                      spandata \? spandata : "", datalen,\n                                      termbytes, term.len - 4\);/                                      spandata ? spandata : "", datalen,\n                                      termbytes, 0);/'
+
+# F-23: the terminator'"'"'s span length must equal the bytes actually present.
+mutant "F-23: span length not checked" catch \
+  's/        if \(term.spanlen != \(uint64_t\)datalen\) break;/        \/* length check removed *\//'
+
+# F-24: complete at the last VALID span.  Advancing the complete point after pass
+# one but BEFORE the length and checksum checks makes trailing garbage part of the
+# database -- which is the actual failure this rule prevents.
+#
+# An earlier version of this mutant inserted `f->complete = pos` at the top of the
+# loop, which is a no-op: complete already equals pos there.  It was reported as an
+# uncaught gap and was really a mutant that mutated nothing.
+mutant "F-24: complete advanced before validation" catch \
+  's/        size_t datalen = p - span_start;/        f->complete = p;\n        size_t datalen = p - span_start;/'
+
+mutant "F-24: complete set past the terminator" catch \
+  's/        f->complete = after;\n        pos = after;/        f->complete = f->size;\n        pos = after;/'
+
+# D-9: clean requires a VALID HEADER as well as nothing after the last span.  A
+# zero-length file has complete == size == 0 and would otherwise look clean, so a
+# writer would append to a file with no header (R-4).
+mutant "D-9: clean ignores header validity" catch \
+  's/    return f->hdr_valid && f->complete == f->size;/    return f->complete == f->size;/'
+
+# D-10: an invalid header means zero spans, not an error and not a replay attempt.
+mutant "D-10: invalid header replayed anyway" catch \
+  's/    if \(!f->hdr_valid\) \{\n        f->complete = 0;\n        return ZS_OK;\n    \}/    if (!f->hdr_valid) { f->complete = ZSI_HEADER_LEN; }/'
+
+# Section 4.9: a pointer section cannot appear in an unordered file.
+#
+# Equivalent, because zsi_rec_decode rejects any type without HasKey too, so the
+# walk's check is a fast path over a rule enforced one level down (and that level
+# IS tested, by test_record_bounds).  Kept because the walk should not depend on
+# the decoder's error taxonomy to know that a pointer section ends a span.
+mutant "PTRS accepted mid-span" equivalent \
+  's/            if \(!\(type & ZSI_HASKEY\)\) break;/            \/* family check removed *\//'
+
+# F-29: the progress rule.
+#
+# All three of these are equivalent, and it took reading zsi_rec_decode to be sure
+# rather than guessing.  It guarantees out->len != 0 (it rejects a saturated
+# roundup8) and total <= len where len is f->size - p, so next > p and
+# next <= f->size already hold for every record it accepts.
+#
+# The checks stay because F-29 requires the verification at the ITERATION site, not
+# somewhere it happens to be implied, and because they become load-bearing the
+# moment the decoder's contract changes -- which is exactly the change nobody would
+# think to audit the walk for.  They are deliberately redundant, not dead.
+mutant "F-29: no progress check" equivalent \
+  's/            if \(r.len == 0\) break;\n            if \(!zsi_add_sz\(p, r.len, &next\)\) break;\n            if \(next <= p\) break;\n            if \(next > f->size\) break;/            next = p + r.len;/'
+
+mutant "F-29: next not bounded by size" equivalent \
+  's/            if \(next > f->size\) break;/            \/* bound removed *\//'
+
+# ...and the mutant that shows the redundancy above really is defence and not just
+# dead code: break the DECODER's bound as well, so nothing downstream of the walk
+# enforces it either.  Something must object.
+mutant "F-29: neither decode nor walk bounds" catch \
+  's/    if \(total > len\) return ZS_BADFORMAT;/    \/* decode bound removed *\//; s/            if \(next > f->size\) break;/            \/* walk bound removed *\//'
+
+# The walk must start after the header, not at 0.
+mutant "walk starts at offset 0" catch \
+  's/    size_t pos = ZSI_HEADER_LEN;\n    f->complete = pos;/    size_t pos = 0;\n    f->complete = pos;/'
+
+echo
 echo "file object (Task 6)"
 
 # F-30's single choke point.  Every one of these turns a bounds check into a
