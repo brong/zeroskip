@@ -243,6 +243,52 @@ mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
+echo "file set (Task 11)"
+
+# D-5: take the LAST file whose start matches.  Taking the first picks a repack
+# input over the output that encloses it, discarding committed generations.
+mutant "D-5: takes the first not the last" catch \
+  's/        for \(size_t i = 0; i < fs->nall; i\+\+\)\n            if \(fs->all\[i\].start == cur\) pick = \(ssize_t\)i;/        for (size_t i = 0; i < fs->nall; i++)\n            if (fs->all[i].start == cur \&\& pick < 0) pick = (ssize_t)i;/'
+
+# The sweep must advance past the taken file'"'"'s whole range, not just its start.
+mutant "D-5: advances by start not end" catch \
+  's/        uint32_t last = e->end \? e->end : e->start;/        uint32_t last = e->start;/'
+
+# The sort is what makes "last" mean "widest".  Without it, readdir order decides.
+mutant "sort: names not sorted" catch \
+  's/    if \(fs->nall\)\n        qsort\(fs->all, fs->nall, sizeof\(\*fs->all\), zsi_entry_cmp\);/    \/* sort removed *\//'
+
+mutant "sort: descending" catch \
+  's/    return strcmp\(\(\(const struct zsi_entry \*\)a\)->name,\n                  \(\(const struct zsi_entry \*\)b\)->name\);/    return strcmp(((const struct zsi_entry *)b)->name,\n                  ((const struct zsi_entry *)a)->name);/'
+
+# D-6: tiling IS the completeness test.  Without it a gap reads as a complete set
+# and committed data goes missing silently.
+mutant "D-6: tiling not checked" catch \
+  's/    if \(reached != highest\) return ZS_AGAIN;/    \/* tiling check removed *\//'
+
+# D-5c: a partial overlap has no correct interpretation and must be reported.
+mutant "D-5c: partial overlap resolved anyway" catch \
+  's/            if \(s2 > cur && s2 <= last && e2 > last\) return ZS_BADFORMAT;/            (void)s2; (void)e2;/'
+
+# D-4a: disagreeing UUIDs are an error, never a majority vote.
+mutant "D-4a: uuid mismatch ignored" catch \
+  's/            if \(want_uuid\) continue;\n            closedir\(d\);\n            zsi_fileset_fini\(fs\);\n            return ZS_BADFORMAT;/            continue;/'
+
+# D-9b: the next generation comes from ALL files, not the resolved set -- a
+# superseded file still pins its generation until it is removed.
+mutant "D-9b: next gen from resolved set" catch \
+  's/    for \(size_t i = 0; i < fs->nall; i\+\+\) \{\n        uint32_t e = fs->all\[i\].end \? fs->all\[i\].end : fs->all\[i\].start;\n        if \(e > highest\) highest = e;\n    \}\n\n    if \(highest == 0xFFFFFFFFu\) return ZS_FULL;/    for (size_t i = 0; i < fs->nresolved; i++) {\n        uint32_t e = fs->resolved[i].end ? fs->resolved[i].end : fs->resolved[i].start;\n        if (e > highest) highest = e;\n    }\n\n    if (highest == 0xFFFFFFFFu) return ZS_FULL;/'
+
+# D-9c: allocating past the ceiling must fail rather than reissue generation 1.
+mutant "D-9c: generation wraps instead of ZS_FULL" catch \
+  's/    if \(highest == 0xFFFFFFFFu\) return ZS_FULL;/    \/* ZS_FULL check removed *\//'
+
+# The lowest generation present may be above 1: older files are removed once
+# repacked, so assuming 1 rejects every mature database.
+mutant "sweep: starts at generation 1" catch \
+  's/    uint32_t cur = fs->all\[0\].start;\n    for \(size_t i = 1; i < fs->nall; i\+\+\)\n        if \(fs->all\[i\].start < cur\) cur = fs->all\[i\].start;/    uint32_t cur = 1;/'
+
+echo
 echo "per-file cursor (Task 10)"
 
 # D-14g: the transaction sorts as though above every file, so its records win
@@ -286,7 +332,7 @@ mutant "find: inexact hit returned" catch \
 # A cursor that hid tombstones would let an older file's value resurface, since
 # the merge is what turns a deletion into "absent" (D-14e step 4).
 mutant "find: deletions hidden by the cursor" catch \
-  's/    case ZSI_SRC_UNORDERED: \{\n        size_t off;\n        int r = zsi_index_find\(fc->file->index, fc->compar, key, keylen, &off\);\n        if \(r != ZS_OK\) return r;/    case ZSI_SRC_UNORDERED: {\n        size_t off;\n        int r = zsi_index_find(fc->file->index, fc->compar, key, keylen, \&off);\n        if (r != ZS_OK) return r;\n        { const char *bb = zsi_file_at(fc->file, off, 1); struct zsi_rec rr;\n          if (bb \&\& zsi_rec_decode(bb, fc->file->size - off, fc->file->hdr.start, \&rr) == ZS_OK \&\& !rr.val) return ZS_NOTFOUND; }/'
+  's/        const char \*b = zsi_file_at\(fc->file, off, 1\);\n        if \(!b\) return ZS_BADFORMAT;\n        return zsi_rec_decode\(b, fc->file->size - off, fc->file->hdr.start, out\);/        const char *b = zsi_file_at(fc->file, off, 1);\n        if (!b) return ZS_BADFORMAT;\n        { int rr = zsi_rec_decode(b, fc->file->size - off, fc->file->hdr.start, out);\n          if (rr == ZS_OK \&\& !out->val) return ZS_NOTFOUND;\n          return rr; }/'
 
 echo
 echo "pointer section (Task 9)"

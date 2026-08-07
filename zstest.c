@@ -4634,6 +4634,424 @@ static void test_fcur_deletions_visible(void)
 
 /*
  * ============================================================
+ * The file set (T-9)
+ * ============================================================
+ */
+
+/* Seed a directory with names only.  The files are EMPTY -- if anything opened
+ * them, every one of these tests would fail, which is how T-9's "derived from
+ * filenames alone, without opening a file" is asserted rather than assumed. */
+static void seed_names(const char *const *names)
+{
+    /* Clear first.  Without this, successive calls within one test accumulate,
+     * and a case silently inherits the previous case's directory -- which is
+     * exactly the bug that made two of these tests fail on first run, with
+     * symptoms (a spurious ZS_FULL, a wrong resolved set) that pointed at the
+     * implementation rather than at the fixture. */
+    ASSERT_EQ(mkdbdir(), 0);
+
+    DIR *d = opendir(dbdir);
+    ASSERT_NOT_NULL(d);
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        unlink(dbpath(de->d_name));
+    }
+    closedir(d);
+
+    for (size_t i = 0; names[i]; i++)
+        ASSERT_EQ(writefile(names[i], "", 0), 0);
+}
+
+/* Join the resolved set's names, stripping the common prefix, so an assertion
+ * reads as one string. */
+static void resolved_gens(struct zsi_fileset *fs, char *out, size_t outlen)
+{
+    size_t used = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < fs->nresolved; i++) {
+        char buf[32];
+        if (fs->resolved[i].end)
+            snprintf(buf, sizeof(buf), "%u-%u",
+                     fs->resolved[i].start, fs->resolved[i].end);
+        else
+            snprintf(buf, sizeof(buf), "%u", fs->resolved[i].start);
+        size_t n = strlen(buf);
+        if (used + n + 2 >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, buf, n);
+        used += n;
+        out[used] = '\0';
+    }
+}
+
+/* Format a data-file name for the test UUID into a static rotating buffer. */
+static const char *dn(uint32_t start, uint32_t end)
+{
+    static char bufs[8][ZSI_NAME_MAX];
+    static int which = 0;
+    char *b = bufs[which = (which + 1) % 8];
+    zsi_name_format(b, test_uuid, start, end);
+    return b;
+}
+
+static void test_fileset_derives_from_names(void)
+{
+    struct zsi_fileset fs;
+    char got[128];
+
+    const char *names[] = { dn(1, 4), dn(5, 5), dn(6, 0), NULL };
+    seed_names(names);
+
+    ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+    ASSERT(fs.have_uuid);
+    ASSERT_MEM_EQ(fs.uuid, test_uuid, 16);
+    ASSERT_EQU(fs.nall, 3u);
+
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    resolved_gens(&fs, got, sizeof(got));
+    ASSERT_STR_EQ(got, "1-4|5-5|6");
+
+    uint32_t next;
+    ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
+    ASSERT_EQU(next, 7u);
+    zsi_fileset_fini(&fs);
+}
+
+static void test_fileset_overlap_table(void)
+{
+    /* Each row of D-5a's table.  An overlap is resolved, not rejected: an output
+     * is renamed into place before its inputs are removed, so a scan legitimately
+     * sees both. */
+    struct zsi_fileset fs;
+    char got[128];
+
+    /* A repack output [1-4] present with its inputs [1-1]..[4-4].  The widest
+     * wins, because fixed-width hex makes lexical order numeric. */
+    {
+        const char *names[] = { dn(1,1), dn(2,2), dn(3,3), dn(4,4), dn(1,4),
+                                dn(5,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-4|5");
+        zsi_fileset_fini(&fs);
+    }
+
+    /* The same with some inputs already unlinked: the set still tiles. */
+    {
+        const char *names[] = { dn(2,2), dn(1,4), dn(5,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-4|5");
+        zsi_fileset_fini(&fs);
+    }
+
+    /* A conversion output present with its input: the IN-ORDER file wins, because
+     * the unordered name is a strict prefix and so sorts first (D-1a). */
+    {
+        const char *names[] = { dn(5,0), dn(5,5), dn(1,4), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-4|5-5");
+        zsi_fileset_fini(&fs);
+    }
+
+    /* All three at once: unordered N, N-N, and a wider N-M.  The widest wins. */
+    {
+        const char *names[] = { dn(1,4), dn(5,0), dn(5,5), dn(5,9), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-4|5-9");
+        zsi_fileset_fini(&fs);
+    }
+}
+
+static void test_fileset_first_vs_last(void)
+{
+    /* D-5b, asserted rather than assumed: taking the FIRST file at each step
+     * gives a different -- and wrong -- answer.  T-9 asks for this so the rule is
+     * caught by a test rather than rediscovered by a corrupted database. */
+    struct zsi_fileset fs;
+
+    const char *names[] = { dn(1,1), dn(1,4), dn(5,0), NULL };
+    seed_names(names);
+    ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+
+    /* The implementation took the last: [1-4], then 5. */
+    ASSERT_EQU(fs.nresolved, 2u);
+    ASSERT_EQU(fs.resolved[0].start, 1u);
+    ASSERT_EQU(fs.resolved[0].end, 4u);
+
+    /* Taking the first would have chosen [1-1], leaving generations 2..4
+     * unaccounted for -- an incomplete set that discards committed data. */
+    ssize_t first = -1;
+    for (size_t i = 0; i < fs.nall; i++)
+        if (fs.all[i].start == 1) { first = (ssize_t)i; break; }
+    ASSERT(first >= 0);
+    ASSERT_EQU(fs.all[first].end, 1u);      /* the narrow one sorts first */
+    ASSERT(fs.all[first].end != fs.resolved[0].end);
+
+    zsi_fileset_fini(&fs);
+}
+
+static void test_fileset_gaps(void)
+{
+    struct zsi_fileset fs;
+
+    /* D-7: a set that does not tile is not an error to report to the caller -- it
+     * is a torn readdir, and the answer is ZS_AGAIN so the snapshot protocol
+     * retries (C-4 step 2). */
+
+    /* A missing middle generation. */
+    {
+        const char *names[] = { dn(1,1), dn(3,3), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_AGAIN);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* A gap at the bottom is NOT a gap: the set simply starts higher, because
+     * older files are removed once repacked (D-6 says "from the oldest surviving
+     * generation").  This is the case an implementation that assumed generation 1
+     * would wrongly reject. */
+    {
+        const char *names[] = { dn(5,7), dn(8,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        ASSERT_EQU(fs.nresolved, 2u);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* A gap immediately after the first file. */
+    {
+        const char *names[] = { dn(1,2), dn(4,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_AGAIN);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* D-5c: a PARTIAL overlap -- ranges that intersect where neither contains the
+     * other -- cannot arise from any legal sequence and is corruption, reported
+     * rather than resolved. */
+    {
+        const char *names[] = { dn(1,5), dn(3,8), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_BADFORMAT);
+        zsi_fileset_fini(&fs);
+    }
+    {
+        const char *names[] = { dn(1,1), dn(2,6), dn(4,9), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_BADFORMAT);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* Nesting is NOT partial and must still resolve. */
+    {
+        const char *names[] = { dn(1,9), dn(3,5), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        ASSERT_EQU(fs.nresolved, 1u);
+        ASSERT_EQU(fs.resolved[0].end, 9u);
+        zsi_fileset_fini(&fs);
+    }
+}
+
+static void test_fileset_uuid_discovery(void)
+{
+    struct zsi_fileset fs;
+
+    /* D-4a: files disagreeing on UUID are rejected, NOT resolved by majority.
+     * Adopting one would read half a database and call it whole. */
+    static const zsi_uuid_t other = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+    };
+    char othername[ZSI_NAME_MAX];
+    zsi_name_format(othername, other, 1, 0);
+
+    const char *names[] = { dn(1, 0), othername, NULL };
+    seed_names(names);
+    ASSERT_EQ(zsi_fileset_scan(dbdir, NULL, &fs), ZS_BADFORMAT);
+
+    /* Two of one and one of the other: still an error, not a vote. */
+    const char *names2[] = { dn(1, 0), dn(2, 0), othername, NULL };
+    seed_names(names2);
+    ASSERT_EQ(zsi_fileset_scan(dbdir, NULL, &fs), ZS_BADFORMAT);
+
+    /* But when the caller NAMES a uuid, the other database's file is simply not
+     * ours and is ignored -- which is what lets two databases share a directory
+     * once both are known. */
+    ASSERT_OK(zsi_fileset_scan(dbdir, &test_uuid, &fs));
+    ASSERT_EQU(fs.nall, 2u);
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    zsi_fileset_fini(&fs);
+
+    ASSERT_OK(zsi_fileset_scan(dbdir, &other, &fs));
+    ASSERT_EQU(fs.nall, 1u);
+    zsi_fileset_fini(&fs);
+}
+
+static void test_fileset_ignores_foreign(void)
+{
+    struct zsi_fileset fs;
+
+    /* D-2/D-4: staging names, the lock file, and unrelated files are ignored by
+     * construction, because zeroskip.* is metadata and zeroskip-* is data. */
+    const char *names[] = {
+        dn(1, 0),
+        "zeroskip.lock",
+        "zeroskip.tmp.1234.0",
+        "zeroskip.tmp.99999.17",
+        "README",
+        ".hidden",
+        "zeroskip-not-a-uuid-00000001",
+        NULL
+    };
+    seed_names(names);
+
+    ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+    ASSERT_EQU(fs.nall, 1u);
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    ASSERT_EQU(fs.nresolved, 1u);
+    zsi_fileset_fini(&fs);
+
+    /* An empty directory has no UUID, which is the case D-8a handles by creating
+     * one -- not an error.  seed_names clears first, so this really is empty. */
+    const char *none[] = { NULL };
+    seed_names(none);
+    ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+    ASSERT_EQU(fs.nall, 0u);
+    ASSERT(!fs.have_uuid);
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    ASSERT_EQU(fs.nresolved, 0u);
+    zsi_fileset_fini(&fs);
+
+    /* A directory that does not exist at all. */
+    char missing[PATH_MAX];
+    snprintf(missing, sizeof(missing), "%s/nope", basedir);
+    ASSERT_EQ(zsi_fileset_scan(missing, NULL, &fs), ZS_NOTFOUND);
+}
+
+static void test_fileset_next_gen(void)
+{
+    struct zsi_fileset fs;
+    uint32_t next;
+
+    /* D-9b: one above the highest generation PRESENT, computed over every file
+     * rather than the resolved set.  A superseded file still pins its generation,
+     * so the highest never regresses and a generation is never reissued. */
+    {
+        const char *names[] = { dn(1,4), dn(5,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
+        ASSERT_EQU(next, 6u);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* With the repack inputs still present alongside the output, the answer is
+     * unchanged -- the output already covers them. */
+    {
+        const char *names[] = { dn(1,1), dn(2,2), dn(3,3), dn(4,4), dn(1,4),
+                                dn(5,0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
+        ASSERT_EQU(next, 6u);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* And after files have been removed: the highest present still decides. */
+    {
+        const char *names[] = { dn(1,4), dn(5,5), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
+        ASSERT_EQU(next, 6u);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* D-9c: allocating past 0xFFFFFFFF fails rather than wrapping.  Wrapping
+     * would reissue generation 1 while a file bearing that name still existed. */
+    {
+        const char *names[] = { dn(0xFFFFFFF0u, 0xFFFFFFFFu), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_next_gen(&fs, &next), ZS_FULL);
+        zsi_fileset_fini(&fs);
+    }
+    {
+        const char *names[] = { dn(0xFFFFFFFFu, 0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_EQ(zsi_fileset_next_gen(&fs, &next), ZS_FULL);
+        zsi_fileset_fini(&fs);
+    }
+
+    /* One below the ceiling still allocates. */
+    {
+        const char *names[] = { dn(0xFFFFFFFEu, 0), NULL };
+        seed_names(names);
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
+        ASSERT_EQU(next, 0xFFFFFFFFu);
+        zsi_fileset_fini(&fs);
+    }
+}
+
+static void test_fileset_mid_conversion_stable(void)
+{
+    /* A directory left mid-conversion -- the unordered input and the in-order
+     * output both present -- is judged COMPLETE, and stays that way.
+     *
+     * T-9 asks specifically that leaving it indefinitely, as a writer death would,
+     * does not make readers retry forever.  A resolution that treated the overlap
+     * as a gap would spin: every scan would see the same directory and reach the
+     * same wrong conclusion. */
+    struct zsi_fileset fs;
+    char got[128];
+
+    const char *names[] = { dn(1,4), dn(5,0), dn(5,5), NULL };
+    seed_names(names);
+
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-4|5-5");
+        zsi_fileset_fini(&fs);
+    }
+
+    /* The same for an interrupted repack: output plus every input. */
+    const char *names2[] = { dn(1,1), dn(2,2), dn(1,2), NULL };
+    seed_names(names2);
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
+        ASSERT_OK(zsi_fileset_resolve(&fs));
+        resolved_gens(&fs, got, sizeof(got));
+        ASSERT_STR_EQ(got, "1-2");
+        zsi_fileset_fini(&fs);
+    }
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -4723,6 +5141,15 @@ static struct test_entry tests[] = {
     { "test_fcur_empty_sources",        test_fcur_empty_sources },
     { "test_fcur_no_duplicate_keys",    test_fcur_no_duplicate_keys },
     { "test_fcur_deletions_visible",    test_fcur_deletions_visible },
+
+    { "test_fileset_derives_from_names", test_fileset_derives_from_names },
+    { "test_fileset_overlap_table",     test_fileset_overlap_table },
+    { "test_fileset_first_vs_last",     test_fileset_first_vs_last },
+    { "test_fileset_gaps",              test_fileset_gaps },
+    { "test_fileset_uuid_discovery",    test_fileset_uuid_discovery },
+    { "test_fileset_ignores_foreign",   test_fileset_ignores_foreign },
+    { "test_fileset_next_gen",          test_fileset_next_gen },
+    { "test_fileset_mid_conversion_stable", test_fileset_mid_conversion_stable },
 
     { NULL, NULL }
 };

@@ -21,6 +21,7 @@
  * above it.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -2469,6 +2470,218 @@ static void zsi_fcur_init_file(struct zsi_fcur *fc, struct zsi_file *f,
 }
 
 /********** FILE SET *************/
+
+/* There is no manifest.  THE DIRECTORY IS THE FILE SET (section 5.2).
+ *
+ * Filenames carry each file's generation range (D-1), so one readdir yields the
+ * set and every range without opening a single file.  That is not a shortcut: it
+ * is what makes creating a file identical to publishing it (D-8), so there is no
+ * window in which a generation has been allocated but is invisible. */
+
+struct zsi_entry {
+    char     name[ZSI_NAME_MAX];
+    uint32_t start, end;        /* end == 0 for unordered */
+};
+
+struct zsi_fileset {
+    struct zsi_entry *all;      size_t nall;       /* every matching name */
+    struct zsi_entry *resolved; size_t nresolved;  /* D-5's winners, ascending */
+    zsi_uuid_t uuid;
+    bool       have_uuid;
+};
+
+static void zsi_fileset_fini(struct zsi_fileset *fs)
+{
+    free(fs->all);
+    free(fs->resolved);
+    memset(fs, 0, sizeof(*fs));
+}
+
+static int zsi_entry_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct zsi_entry *)a)->name,
+                  ((const struct zsi_entry *)b)->name);
+}
+
+/* readdir the directory, keeping the data files of one database (D-4).
+ *
+ * If want_uuid is NULL the UUID is DISCOVERED: parse it from each zeroskip-*
+ * name and require they all agree (D-4a).  Disagreement is an error, never a
+ * choice of majority -- silently adopting one would read half a database and
+ * call it whole.  A directory with no data files leaves have_uuid false, which is
+ * the empty case D-8a handles. */
+static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
+                            struct zsi_fileset *fs)
+{
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    size_t alloc = 0;
+
+    memset(fs, 0, sizeof(*fs));
+    if (!d) return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+
+    if (want_uuid) {
+        memcpy(fs->uuid, *want_uuid, 16);
+        fs->have_uuid = true;
+    }
+
+    while ((de = readdir(d)) != NULL) {
+        zsi_uuid_t u;
+        uint32_t start, end;
+
+        enum zsi_nametype t = zsi_name_parse(de->d_name, u, &start, &end);
+        if (t == ZSI_NAME_OTHER) continue;      /* staging, lock, foreign, junk */
+
+        if (!fs->have_uuid) {
+            memcpy(fs->uuid, u, 16);
+            fs->have_uuid = true;
+        } else if (memcmp(fs->uuid, u, 16) != 0) {
+            /* Two databases' files mixed into one directory.  If the caller named
+             * a UUID this is simply someone else's file and we ignore it; if we
+             * are discovering, it is corruption and must be reported. */
+            if (want_uuid) continue;
+            closedir(d);
+            zsi_fileset_fini(fs);
+            return ZS_BADFORMAT;
+        }
+
+        if (fs->nall == alloc) {
+            size_t want = alloc ? alloc * 2 : 16;
+            struct zsi_entry *p = realloc(fs->all, want * sizeof(*p));
+            if (!p) { closedir(d); zsi_fileset_fini(fs); return ZS_INTERNAL; }
+            fs->all = p;
+            alloc = want;
+        }
+
+        snprintf(fs->all[fs->nall].name, ZSI_NAME_MAX, "%s", de->d_name);
+        fs->all[fs->nall].start = start;
+        fs->all[fs->nall].end = end;
+        fs->nall++;
+    }
+
+    closedir(d);
+
+    /* Sort lexically.  D-1's fixed-width uppercase hex makes lexical order
+     * numeric order, and D-1a's no-extension rule makes an unordered name a
+     * strict prefix of the in-order name for the same generation -- the two
+     * properties D-5's "take the last" rule rests on, both under test in
+     * test_filename_prefix_property and test_filename_lexical_order. */
+    if (fs->nall)
+        qsort(fs->all, fs->nall, sizeof(*fs->all), zsi_entry_cmp);
+
+    return ZS_OK;
+}
+
+/* D-5's single sweep over the sorted names:
+ *
+ *   Start at the lowest generation present.  Repeatedly take the LAST file whose
+ *   start equals the current generation, then set the current generation to that
+ *   file's end + 1 (or start + 1 for an unordered file).  Stop when no file starts
+ *   at the current generation.
+ *
+ * An overlap is never an error -- it is RESOLVED, not rejected.  An output is
+ * renamed into place before its inputs are removed, so a scan legitimately sees
+ * a repack output alongside the files it encloses.
+ *
+ * Taking the LAST is the whole rule, and it is correct only because of the sort:
+ * fixed-width hex makes the widest end sort last among files sharing a start, and
+ * the prefix property makes an unordered name sort before the in-order name for
+ * the same generation.  T-9 asserts that taking the FIRST fails, so D-5b's
+ * requirement is tested rather than assumed.
+ *
+ * Returns ZS_OK when the resolved set tiles (D-6), ZS_AGAIN when it leaves a gap
+ * (D-7 -- a torn readdir, retry), or ZS_BADFORMAT for a partial overlap (D-5c). */
+static int zsi_fileset_resolve(struct zsi_fileset *fs)
+{
+    free(fs->resolved);
+    fs->resolved = NULL;
+    fs->nresolved = 0;
+
+    if (fs->nall == 0) return ZS_OK;        /* the empty case D-8a handles */
+
+    fs->resolved = malloc(fs->nall * sizeof(*fs->resolved));
+    if (!fs->resolved) return ZS_INTERNAL;
+
+    /* The lowest generation present, over every file rather than the resolved
+     * ones: a superseded file still marks where the database begins. */
+    uint32_t cur = fs->all[0].start;
+    for (size_t i = 1; i < fs->nall; i++)
+        if (fs->all[i].start < cur) cur = fs->all[i].start;
+
+    uint32_t highest = 0;
+    for (size_t i = 0; i < fs->nall; i++) {
+        uint32_t e = fs->all[i].end ? fs->all[i].end : fs->all[i].start;
+        if (e > highest) highest = e;
+    }
+
+    for (;;) {
+        /* The LAST file whose start equals cur.  The array is sorted by name, and
+         * for a shared start that orders unordered-then-narrow-then-widest, so
+         * the last is the one that encloses the others (D-5a). */
+        ssize_t pick = -1;
+        for (size_t i = 0; i < fs->nall; i++)
+            if (fs->all[i].start == cur) pick = (ssize_t)i;
+
+        if (pick < 0) break;
+
+        struct zsi_entry *e = &fs->all[pick];
+        fs->resolved[fs->nresolved++] = *e;
+
+        uint32_t last = e->end ? e->end : e->start;
+
+        /* D-5c: a PARTIAL overlap, where two ranges intersect and neither
+         * contains the other, cannot arise from any legal sequence.  It is
+         * corruption and MUST be reported rather than resolved -- resolving it
+         * would silently pick one interpretation of a directory that has no
+         * correct interpretation. */
+        for (size_t i = 0; i < fs->nall; i++) {
+            uint32_t s2 = fs->all[i].start;
+            uint32_t e2 = fs->all[i].end ? fs->all[i].end : fs->all[i].start;
+            if (s2 > cur && s2 <= last && e2 > last) return ZS_BADFORMAT;
+        }
+
+        if (last == 0xFFFFFFFFu) { cur = last; break; }   /* no next generation */
+        cur = last + 1;
+    }
+
+    /* D-6: the set is complete if and only if the scan consumed every generation
+     * from the lowest present through the highest.  The resolved ranges therefore
+     * TILE a contiguous interval.  This is the whole completeness test -- no
+     * sequence number, timestamp or publication record is needed, because tiling
+     * means every generation is accounted for and so nothing committed is
+     * missing (C-4a). */
+    if (fs->nresolved == 0) return ZS_AGAIN;
+
+    struct zsi_entry *lastres = &fs->resolved[fs->nresolved - 1];
+    uint32_t reached = lastres->end ? lastres->end : lastres->start;
+    if (reached != highest) return ZS_AGAIN;
+
+    return ZS_OK;
+}
+
+/* One above the highest generation present in ALL files, not in the resolved set
+ * (D-9b).
+ *
+ * A superseded file still pins its generation: it is only removed once an
+ * enclosing file covers it (D-23), so the highest generation present never
+ * regresses and a generation can never be reissued.  Computing this from the
+ * resolved set instead would let a generation be reused while a superseded file
+ * bearing that name still existed.
+ *
+ * D-9c: allocating past 0xFFFFFFFF fails with ZS_FULL rather than wrapping. */
+static int zsi_fileset_next_gen(const struct zsi_fileset *fs, uint32_t *out)
+{
+    uint32_t highest = 0;
+
+    for (size_t i = 0; i < fs->nall; i++) {
+        uint32_t e = fs->all[i].end ? fs->all[i].end : fs->all[i].start;
+        if (e > highest) highest = e;
+    }
+
+    if (highest == 0xFFFFFFFFu) return ZS_FULL;
+    *out = highest + 1;
+    return ZS_OK;
+}
 
 /********** SNAPSHOT *************/
 
