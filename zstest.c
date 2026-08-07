@@ -2246,7 +2246,7 @@ static int replay_file(struct sb *s, uint32_t gen, struct collected *c,
     memset(c, 0, sizeof(*c));
     if (zsi_file_open(dbdir, name, gen, TEST_EXTERNAL_CSUM, fp) != ZS_OK)
         return -1;
-    return zsi_unordered_replay(*fp, false, collect_cb, c);
+    return zsi_unordered_replay(*fp, ZSI_HEADER_LEN, false, collect_cb, c);
 }
 
 /*
@@ -2742,7 +2742,7 @@ static void test_span_torn_tail(void)
         ASSERT_EQ(writefile(name, s.buf, cut), 0);
         memset(&c, 0, sizeof(c));
         ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
-        ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+        ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false, collect_cb, &c));
         if (c.n != 1 || f->complete != good_end) {
             fprintf(stderr, "\n    FAIL cut at %zu: n=%zu complete=%zu (want 1, %zu)\n",
                     cut, c.n, f->complete, good_end);
@@ -2807,7 +2807,7 @@ static void test_span_terminator_without_data(void)
         zsi_name_format(name, test_uuid, 1, 0);
         ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
         memset(&c, 0, sizeof(c));
-        ASSERT_OK(zsi_unordered_replay(f, true, collect_cb, &c));
+        ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, true, collect_cb, &c));
         /* the zeroed region does not decode as a record, so the span is rejected
          * on structure rather than on checksum -- the point is that the OUTCOME
          * differs from the verified case only when the damage is undetectable
@@ -2835,7 +2835,7 @@ static void test_span_terminator_without_data(void)
         zsi_name_format(name, test_uuid, 1, 0);
         ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
         memset(&c, 0, sizeof(c));
-        ASSERT_OK(zsi_unordered_replay(f, true, collect_cb, &c));
+        ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, true, collect_cb, &c));
         ASSERT_EQU(c.n, 1u);                    /* undetected without the csum */
         ASSERT_STR_EQ(c.key[0], "key");
         zsi_file_close(&f);
@@ -2949,7 +2949,7 @@ static void test_span_bad_header_and_kind(void)
     ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 2, NULL, &f));
     memset(&c, 0, sizeof(c));
-    ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+    ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false, collect_cb, &c));
     ASSERT_EQU(c.n, 0u);
     ASSERT_EQU(f->complete, 0u);
     ASSERT(!zsi_unordered_is_clean(f));
@@ -2961,7 +2961,7 @@ static void test_span_bad_header_and_kind(void)
      * append to a file with no header. */
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 2, NULL, &f));
-    ASSERT_OK(zsi_unordered_replay(f, false, collect_cb, &c));
+    ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false, collect_cb, &c));
     ASSERT_EQU(f->complete, 0u);
     ASSERT_EQU(f->size, 0u);
     ASSERT(!zsi_unordered_is_clean(f));
@@ -2979,7 +2979,7 @@ static void test_span_bad_header_and_kind(void)
     zsi_name_format(name, test_uuid, 5, 5);
     ASSERT_EQ(writefile(name, io, sizeof(io)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 5, NULL, &f));
-    ASSERT_EQ(zsi_unordered_replay(f, false, collect_cb, &c), ZS_BADUSAGE);
+    ASSERT_EQ(zsi_unordered_replay(f, ZSI_HEADER_LEN, false, collect_cb, &c), ZS_BADUSAGE);
     zsi_file_close(&f);
 }
 
@@ -3079,7 +3079,7 @@ static void test_span_long_terminator(void)
      * collector holds -- and counting is the assertion that matters: every record
      * of a large span must be presented, not just the ones before some limit. */
     size_t count = 0;
-    ASSERT_OK(zsi_unordered_replay(f, false, count_cb, &count));
+    ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false, count_cb, &count));
     ASSERT_EQU(count, nrecs);
     ASSERT(zsi_unordered_is_clean(f));
     ASSERT_EQU(f->complete, s.len);
@@ -10398,6 +10398,144 @@ static void test_idxcache_threshold_defaults(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* P-12: a replay may begin at any span boundary, and one begun at the complete
+ * point finds nothing.  That is the property which makes a partial index safe to
+ * extend, so it is asserted directly rather than only through the cache. */
+struct idxcache_count { size_t n; };
+
+static int idxcache_count_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    struct idxcache_count *c = rock;
+    (void)rec;
+    (void)off;
+    c->n++;
+    return 0;
+}
+
+static void test_idxcache_replays_the_suffix(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    struct idxcache_count c;
+    size_t after_two;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* Three separate commits, so three spans. */
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    after_two = f->complete;
+
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* From the top: all three. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 3u);
+    ASSERT_EQU(f->complete, (unsigned long long)f->size);
+
+    /* From the boundary after the first two spans: only the third. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, after_two, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 1u);
+
+    /* From the complete point: nothing, and the complete point stays put. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, f->size, false, idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, (unsigned long long)f->size);
+
+    /* An offset past the end, or below the header, is not an error: the walk
+     * falls back to the header and simply reports what it finds.  This is what
+     * makes it safe to hand a value read out of a file. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, f->size + 4096, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 3u);
+
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, 3, false, idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 3u);
+
+    /* A non-boundary offset mid-span yields no valid span, which F-24 already
+     * treats as the ordinary outcome. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, after_two + 3, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 0u);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-9: a seeded build agrees with a build from scratch, key for key and offset
+ * for offset. */
+static void test_idxcache_matches_full_build(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    size_t *seed = NULL, nseed = 0;
+    size_t *want = NULL, nwant = 0;
+    size_t *got = NULL, ngot = 0;
+    size_t seed_upto;
+    char key[32];
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 40; i++) {
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "first", 5, 0));
+    }
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* Snapshot the index as it stands: this is exactly what a table holds. */
+    ASSERT_OK(zsi_index_flatten(f->index, db->compar, &seed, &nseed));
+    seed_upto = f->complete;
+    ASSERT(nseed == 40);
+
+    /* Twenty more keys, ten of them rewrites of existing ones, so the seeded
+     * path has to handle both insertion and replacement. */
+    for (int i = 30; i < 60; i++) {
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "second", 6, 0));
+    }
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* The answer, from a full replay. */
+    ASSERT_OK(zsi_index_build(f, db->compar, false));
+    ASSERT_OK(zsi_index_flatten(f->index, db->compar, &want, &nwant));
+    ASSERT_EQU(nwant, 60u);
+
+    /* The same, seeded from the earlier snapshot plus the suffix.  seed's
+     * ownership passes to the index. */
+    ASSERT_OK(zsi_index_build_from(f, db->compar, false, seed, nseed,
+                                   seed_upto));
+    seed = NULL;
+    ASSERT_OK(zsi_index_flatten(f->index, db->compar, &got, &ngot));
+
+    ASSERT_EQU(ngot, nwant);
+    for (size_t i = 0; i < ngot; i++)
+        ASSERT_EQU(got[i], want[i]);
+
+    free(got);
+    free(want);
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -10603,6 +10741,10 @@ static struct test_entry tests[] = {
     { "test_idxcache_rejects_db_dir",   test_idxcache_rejects_db_dir },
     { "test_idxcache_threshold_defaults",
                                         test_idxcache_threshold_defaults },
+    { "test_idxcache_replays_the_suffix",
+                                        test_idxcache_replays_the_suffix },
+    { "test_idxcache_matches_full_build",
+                                        test_idxcache_matches_full_build },
 
     { NULL, NULL }
 };

@@ -1235,6 +1235,18 @@ struct zsi_file {
     size_t            complete;   /* F-24 complete point */
     struct zsi_index *index;      /* private, built by replay */
 
+    /* The span boundary at `complete`, and the checksum the terminator ending
+     * there carries (P-10).  Recorded by the replay so publishing a pointer
+     * table does not need a second walk -- terminators are only ever found by
+     * scanning forward (F-20), so there is no cheap way to recover them later. */
+    size_t            last_term_off;
+    uint32_t          last_term_csum;
+
+    /* The valid_upto of the pointer table this file's index was seeded from, or
+     * ZSI_HEADER_LEN if none was.  P-13 measures the publishing threshold from
+     * here. */
+    size_t            cached_upto;
+
     /* in-order (hdr.end != 0), filled by the POINTER SECTION section */
     size_t            ptr_off;
     uint64_t          nptrs;
@@ -1458,7 +1470,7 @@ typedef int zsi_replay_cb(void *rock, const struct zsi_rec *rec, size_t off);
  * twice.  The alternative is buffering an unbounded span's records in memory, and
  * the second decode costs nothing measurable because the span is already in page
  * cache from the first. */
-static int zsi_unordered_replay(struct zsi_file *f, bool nocsum,
+static int zsi_unordered_replay(struct zsi_file *f, size_t from, bool nocsum,
                                 zsi_replay_cb *cb, void *rock)
 {
     /* D-10: an active file with a corrupt header or zero length is treated as a
@@ -1479,8 +1491,24 @@ static int zsi_unordered_replay(struct zsi_file *f, bool nocsum,
         return ZS_BADUSAGE;
     }
 
-    size_t pos = ZSI_HEADER_LEN;
+    /* P-12: a span is self-delimiting and self-validating, so a walk may begin
+     * at ANY span boundary.  A caller seeding an index from a pointer table
+     * passes that table's valid_upto; everyone else passes ZSI_HEADER_LEN.
+     *
+     * An out-of-range or non-boundary value is not trusted and is not an error:
+     * the walk simply finds no valid span there and reports the file complete at
+     * that point, which is F-24's ordinary outcome rather than a special case.
+     * That is what makes it safe to hand this a value read out of a file. */
+    size_t pos = from < ZSI_HEADER_LEN ? ZSI_HEADER_LEN : from;
+    if (pos > f->size) pos = ZSI_HEADER_LEN;
+
     f->complete = pos;
+
+    /* Recorded so a publisher has the boundary's terminator without a second
+     * walk (P-10).  A caller seeding from a table overwrites these when the
+     * walk finds nothing new -- see zsi_index_build_cached. */
+    f->last_term_off  = pos;
+    f->last_term_csum = 0;
 
     for (;;) {
         size_t span_start = pos;
@@ -1593,6 +1621,8 @@ static int zsi_unordered_replay(struct zsi_file *f, bool nocsum,
         }
 
         f->complete = after;
+        f->last_term_off  = p;
+        f->last_term_csum = term.csum;
         pos = after;
     }
 
@@ -2108,7 +2138,13 @@ static int zsi_index_build_cb(void *rock, const struct zsi_rec *rec, size_t off)
     return 0;
 }
 
-/* Build the private index for an unordered file by replaying its spans.
+/* Folding a newly known record into an index; defined below, forward-declared
+ * because the seeded build path uses it and it is easier to read after the
+ * lookup and traversal it shares its invariants with. */
+static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off);
+
+/* Build the private index for an unordered file by replaying its spans,
+ * optionally SEEDED.
  *
  * It reflects COMMITTED spans only, and for each key only its newest committed
  * record (D-13a).  Building it means replaying spans and skipping rolled-back
@@ -2116,8 +2152,20 @@ static int zsi_index_build_cb(void *rock, const struct zsi_rec *rec, size_t off)
  * writes.  That is why this goes through zsi_unordered_replay rather than
  * scanning the file directly, and why test_index_committed_only exists.
  *
+ * base/nbase, when given, is an already-sorted, already-deduplicated array of
+ * record offsets covering everything committed below `from` -- exactly what a
+ * pointer table holds (P-9).  Ownership transfers to the index, INCLUDING on
+ * every failure path, so a caller that has just loaded a table never has to
+ * decide who frees it.  The replay then starts at `from` and the suffix goes in
+ * one record at a time through zsi_index_insert, which is the same path a writer
+ * uses at commit (D-13b): one insertion path rather than two.
+ *
+ * With base NULL and from ZSI_HEADER_LEN this is the plain full build.
+ *
  * Sets f->complete as a side effect, since the replay establishes it. */
-static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
+static int zsi_index_build_from(struct zsi_file *f, zs_compar *compar,
+                                bool nocsum, size_t *base, size_t nbase,
+                                size_t from)
 {
     struct zsi_index_build b;
     struct zsi_index *ix;
@@ -2126,13 +2174,31 @@ static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
     zsi_index_free(&f->index);
 
     memset(&b, 0, sizeof(b));
-    r = zsi_unordered_replay(f, nocsum, zsi_index_build_cb, &b);
-    if (r != ZS_OK) { free(b.offs); return r; }
-    if (b.oom) { free(b.offs); return ZS_INTERNAL; }
+    r = zsi_unordered_replay(f, from, nocsum, zsi_index_build_cb, &b);
+    if (r != ZS_OK) { free(b.offs); free(base); return r; }
+    if (b.oom) { free(b.offs); free(base); return ZS_INTERNAL; }
 
     ix = zsi_zmalloc(sizeof(*ix));
-    if (!ix) { free(b.offs); return ZS_INTERNAL; }
+    if (!ix) { free(b.offs); free(base); return ZS_INTERNAL; }
     ix->file = f;
+
+    if (base) {
+        ix->base = base;
+        ix->nbase = nbase;
+        f->index = ix;
+
+        for (size_t i = 0; i < b.n; i++) {
+            r = zsi_index_insert(ix, compar, b.offs[i]);
+            if (r != ZS_OK) {
+                free(b.offs);
+                zsi_index_free(&f->index);
+                return r;
+            }
+        }
+
+        free(b.offs);
+        return ZS_OK;
+    }
 
     if (b.n) {
         struct zsi_ksort ks = { f, compar };
@@ -2162,6 +2228,13 @@ static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
     ix->nbase = b.n;
     f->index = ix;
     return ZS_OK;
+}
+
+/* The plain full build: no seed, from the top of the records region. */
+static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
+{
+    f->cached_upto = ZSI_HEADER_LEN;
+    return zsi_index_build_from(f, compar, nocsum, NULL, 0, ZSI_HEADER_LEN);
 }
 
 /* Point lookup.  Consults the delta first, so a key present in both yields the
@@ -2343,6 +2416,46 @@ static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
     ix->nbase = w;
     ix->ndelta = 0;
 
+    return ZS_OK;
+}
+
+/* The merged base+delta ordering as one freshly allocated array (P-9).
+ *
+ * Deliberately does NOT mutate the index, even though merging in place would be
+ * cheaper and would compact it as a useful side effect.  An index may be shared
+ * with a live struct zsi_index_cur holding positions into BOTH arrays, and
+ * rewriting them underneath it is exactly the in-place mutation of something a
+ * reader is reading that G-6 forbids.  The only caller publishes a pointer
+ * table, which is not worth that hazard. */
+static int zsi_index_flatten(struct zsi_index *ix, zs_compar *compar,
+                             size_t **out, size_t *nout)
+{
+    size_t total;
+
+    if (!zsi_add_sz(ix->nbase, ix->ndelta, &total)) return ZS_INTERNAL;
+
+    size_t *merged = malloc(total ? total * sizeof(*merged) : 1);
+    if (!merged) return ZS_INTERNAL;
+
+    size_t bi = 0, di = 0, w = 0;
+    while (bi < ix->nbase || di < ix->ndelta) {
+        if (bi >= ix->nbase) { merged[w++] = ix->delta[di++]; continue; }
+        if (di >= ix->ndelta) { merged[w++] = ix->base[bi++]; continue; }
+
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[bi], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[di], &kd, &ld);
+        int cmp = compar(kd, ld, kb, lb);
+
+        /* Delta wins ties: it is the newer record (D-14). */
+        if (cmp == 0)      { merged[w++] = ix->delta[di++]; bi++; }
+        else if (cmp < 0)  { merged[w++] = ix->delta[di++]; }
+        else               { merged[w++] = ix->base[bi++]; }
+    }
+
+    *out = merged;
+    *nout = w;
     return ZS_OK;
 }
 
@@ -4811,7 +4924,8 @@ static int zsi_check_unordered_file(struct zs_db *db, struct zsi_file *f)
 
     /* The replay validates every span's checksum as it goes, so a torn or
      * corrupted span shows up as a complete point short of the file's end. */
-    r = zsi_unordered_replay(f, db->nocsum, zsi_check_rec_cb, &ctx);
+    r = zsi_unordered_replay(f, ZSI_HEADER_LEN, db->nocsum,
+                             zsi_check_rec_cb, &ctx);
     if (r != ZS_OK) return r;
 
     if (f->complete != f->size) {
