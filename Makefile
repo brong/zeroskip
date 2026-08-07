@@ -74,26 +74,17 @@ all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
 # Object files
 #
-# -Wno-unused-function is scaffolding, and this is the checklist of what it is
-# still hiding.  It came off once when the public API landed, which immediately
-# exposed that the writer was rescanning the active file rather than maintaining
-# its index incrementally (D-13b) -- so it earns its keep as a to-do list.
-#
-#   zsi_staging_name          -> conversion (D-20a)
-#   zsi_ptrs_build            -> conversion and repack (D-21)
-#   zsi_ptrs_verify_records   -> consistency (F-26f)
-#   zsi_rec_is_canonical      -> consistency (F-15, T-6)
-#   zsi_term_is_canonical     -> consistency (F-15)
-#
-# REMOVE once the CONSISTENCY section is complete; a warning-free build without it
-# is that task's acceptance criterion.
-LIBCFLAGS = $(CFLAGS) -Wno-unused-function
-
+# No -Wno-unused-function.  It was scaffolding while the internal helpers landed
+# ahead of their callers, and it earned its keep twice: removing it exposed that
+# the writer was rescanning the active file instead of maintaining its index
+# incrementally (D-13b), and its checklist tracked what remained.  It is gone now
+# that every helper has a caller, because from here on an unused static means dead
+# code and should say so.
 zeroskip.o: zeroskip.c zeroskip.h xxhash.h
-	$(CC) $(LIBCFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 zeroskip.pic.o: zeroskip.c zeroskip.h xxhash.h
-	$(CC) $(LIBCFLAGS) -fPIC -c -o $@ $<
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
 
 # Static library
 libzeroskip.a: zeroskip.o

@@ -3921,28 +3921,30 @@ out:
     return r;
 }
 
+/* Abort.
+ *
+ * This writer BUFFERS a transaction's records in memory and writes them only at
+ * commit, so an abort has nothing on disk to void and writes nothing at all -- not
+ * even a ROLLBACK.
+ *
+ * That is a deliberate departure from the shape C-8 and F-21 describe.  Those
+ * assume a writer that streams records to the active file as they are stored, in
+ * which case a ROLLBACK is essential: without one, a later commit's span would
+ * begin before the aborted records and enclose them, making them live.  With
+ * buffering that span never exists.
+ *
+ * The asymmetry is interop-visible and worth stating plainly: this implementation
+ * READS ROLLBACK spans (a streaming peer produces them, and F-25 requires skipping
+ * them wherever they sit) but never WRITES one.  Both behaviours are conforming --
+ * the format permits either writer -- and the corresponding trade is that a
+ * transaction must fit in memory.  A streaming writer would need the ROLLBACK path
+ * restored, which is why zsi_term_encode still takes the flag. */
 static int zsi_txn_abort(struct zs_txn *txn)
 {
     struct zs_db *db = txn->db;
-    int fd = -1, r = ZS_OK;
-    uint32_t gen = 0;
+    int r = ZS_OK;
 
     if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
-
-    /* F-21: without a ROLLBACK, a later commit's span would enclose the aborted
-     * records and make them live.  That is the only reason the record exists, and
-     * it is why an abort that wrote nothing needs no record at all. */
-    if (txn->npend) {
-        r = zsi_writer_active(db, &fd, &gen);
-        if (r == ZS_OK) {
-            r = zsi_txn_write_span(txn, fd, gen, true, 0, NULL, NULL);
-            close(fd);
-            fd = -1;
-            if (r == ZS_OK) r = zsi_db_refresh(db);
-        }
-    }
-
-    if (fd >= 0) close(fd);
     db->write_txn = NULL;
     zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
     zsi_txn_free(txn);
@@ -4607,6 +4609,277 @@ bool zs_db_should_repack(struct zs_db *db)
 }
 
 /********** CONSISTENCY *************/
+
+/* Checks a reader deliberately does NOT perform, gathered here.
+ *
+ * Two categories, and the distinction matters:
+ *
+ *   - things too expensive for open, which must stay O(1) (F-31): the records
+ *     region checksum (F-26f), and the pointer array's key ordering;
+ *   - things that are non-canonical rather than invalid (F-15, F-17): a big form
+ *     whose lengths would have fitted the short one, an ancestor stored when it
+ *     equals the file's own start.  A conforming writer never produces these, but
+ *     REJECTING them on read would discard committed data -- a record that fails to
+ *     validate makes an unordered file complete at that point (F-24), and G-3
+ *     forbids that costing committed data.  So they are reported here and read
+ *     normally there, which is the division T-6 sets out.
+ */
+
+static void zsi_report(struct zs_db *db, const char *what, const char *fname,
+                       unsigned long long detail)
+{
+    db->error(what, "file=<%s> at=<%llu>", fname, detail);
+}
+
+/* F-28: an in-order file's pointer array MUST be strictly increasing by key.
+ *
+ * That confirms the sort AND catches a repack that emitted a key twice (D-17) --
+ * two failures a binary search cannot detect, because it would simply return wrong
+ * answers over a misordered array rather than noticing. */
+static int zsi_check_inorder(struct zs_db *db, struct zsi_file *f)
+{
+    struct zsi_rec prev, cur;
+    int r = ZS_OK;
+
+    for (uint64_t i = 0; i < f->nptrs; i++) {
+        if (zsi_ptrs_rec(f, i, &cur) != ZS_OK) {
+            zsi_report(db, "record does not decode", f->fname, i);
+            return ZS_BADFORMAT;
+        }
+
+        if (i > 0) {
+            int c = db->compar(prev.key, prev.keylen, cur.key, cur.keylen);
+            if (c == 0) {
+                zsi_report(db, "duplicate key in pointer array", f->fname, i);
+                r = ZS_BADFORMAT;
+            } else if (c > 0) {
+                zsi_report(db, "pointer array not sorted by key", f->fname, i);
+                r = ZS_BADFORMAT;
+            }
+        }
+
+        /* F-15/F-17 non-canonical encodings, reported not rejected. */
+        if (!zsi_rec_is_canonical(&cur, f->hdr.start)) {
+            zsi_report(db, "non-canonical record encoding", f->fname, i);
+            r = ZS_BADFORMAT;
+        }
+
+        prev = cur;
+    }
+
+    /* F-26e: the records region checksum, which is the only thing that detects a
+     * record body corrupted in place in an in-order file. */
+    if (!db->nocsum && zsi_ptrs_verify_records(f) != ZS_OK) {
+        zsi_report(db, "records region checksum mismatch", f->fname, 0);
+        r = ZS_BADCHECKSUM;
+    }
+
+    return r;
+}
+
+struct zsi_check_unordered {
+    struct zs_db    *db;
+    struct zsi_file *f;
+    int              result;
+};
+
+static int zsi_check_rec_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    struct zsi_check_unordered *c = rock;
+
+    if (!zsi_rec_is_canonical(rec, c->f->hdr.start)) {
+        zsi_report(c->db, "non-canonical record encoding", c->f->fname, off);
+        c->result = ZS_BADFORMAT;
+    }
+
+    return 0;
+}
+
+static int zsi_check_unordered_file(struct zs_db *db, struct zsi_file *f)
+{
+    struct zsi_check_unordered ctx = { db, f, ZS_OK };
+    int r;
+
+    if (!f->hdr_valid) {
+        /* D-10: legal for the active file, and already an error for any other
+         * (D-10a), so nothing to report here. */
+        return ZS_OK;
+    }
+
+    /* The replay validates every span's checksum as it goes, so a torn or
+     * corrupted span shows up as a complete point short of the file's end. */
+    r = zsi_unordered_replay(f, db->nocsum, zsi_check_rec_cb, &ctx);
+    if (r != ZS_OK) return r;
+
+    if (f->complete != f->size) {
+        /* Not an error: F-24 makes this an ordinary state, and D-9 has the writer
+         * move on rather than repair.  Reported so a tool can say so. */
+        zsi_report(db, "content after the last valid span", f->fname,
+                   (unsigned long long)f->complete);
+    }
+
+    /* A terminator whose width is not the canonical one for its span (F-15). */
+    size_t pos = ZSI_HEADER_LEN;
+    while (pos < f->complete) {
+        const char *b = zsi_file_at(f, pos, 1);
+        if (!b) break;
+
+        uint8_t type = (uint8_t)b[0];
+        if (type & ZSI_SPANTERM) {
+            struct zsi_term t;
+            if (zsi_term_decode(b, f->size - pos, &t) != ZS_OK) break;
+            if (!zsi_term_is_canonical(&t)) {
+                zsi_report(db, "non-canonical terminator width", f->fname, pos);
+                ctx.result = ZS_BADFORMAT;
+            }
+            pos += t.len;
+            continue;
+        }
+
+        struct zsi_rec rec;
+        if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &rec) != ZS_OK) break;
+        if (rec.len == 0) break;
+        pos += rec.len;
+    }
+
+    return ctx.result;
+}
+
+int zs_db_check_consistency(struct zs_db *db)
+{
+    int result = ZS_OK;
+
+    if (!db) return ZS_BADUSAGE;
+
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        struct zsi_file *f = db->snap->files[i];
+        int r = zsi_file_is_unordered(f) ? zsi_check_unordered_file(db, f)
+                                        : zsi_check_inorder(db, f);
+        if (r != ZS_OK) result = r;
+    }
+
+    /* D-6: the resolved ranges must tile.  Checked last, because a per-file
+     * problem is more specific and more useful to report. */
+    struct zsi_fileset fs;
+    int r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
+    if (r == ZS_OK) {
+        r = zsi_fileset_resolve(&fs);
+        zsi_fileset_fini(&fs);
+        if (r != ZS_OK) {
+            zsi_report(db, "file set does not tile", db->dir, 0);
+            result = r;
+        }
+    }
+
+    return result;
+}
+
+/* zs_db_dump: print structure.
+ *
+ * The line format is a compatibility surface, because it is what T-0a's `dump`
+ * subcommand emits and what the interop runner compares as text.  Changing it
+ * breaks the runner, not just a human's expectations.
+ *
+ *   FILE <name> kind=<unordered|inorder> start=<N> end=<N> csum=<id> size=<N>
+ *   SPAN <off> len=<N> term=<COMMIT|ROLLBACK> records=<N>
+ *   REC  <off> type=<0xNN> keylen=<N> vallen=<N|-> anc=<N> key=<hex>
+ *   PTRS <off> width=<32|64> count=<N>
+ */
+static void zsi_dump_hex(const char *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        printf("%02x", (unsigned char)p[i]);
+}
+
+static void zsi_dump_rec(const struct zsi_rec *r, size_t off, int detail)
+{
+    printf("REC  %zu type=0x%02X keylen=%zu ", off, r->type, r->keylen);
+    if (r->val) printf("vallen=%zu ", r->vallen);
+    else        printf("vallen=- ");
+    printf("anc=%u key=", r->ancestor);
+    zsi_dump_hex(r->key, r->keylen);
+    if (detail > 1 && r->val) {
+        printf(" val=");
+        zsi_dump_hex(r->val, r->vallen);
+    }
+    printf("\n");
+}
+
+struct zsi_dump_ctx { int detail; size_t nrecs; };
+
+static int zsi_dump_cb(void *rock, const struct zsi_rec *rec, size_t off)
+{
+    struct zsi_dump_ctx *c = rock;
+    c->nrecs++;
+    if (c->detail > 0) zsi_dump_rec(rec, off, c->detail);
+    return 0;
+}
+
+int zs_db_dump(struct zs_db *db, int detail)
+{
+    if (!db) return ZS_BADUSAGE;
+
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        struct zsi_file *f = db->snap->files[i];
+        const char *base = strrchr(f->fname, '/');
+        base = base ? base + 1 : f->fname;
+
+        printf("FILE %s kind=%s start=%u end=%u csum=%u size=%zu\n",
+               base, zsi_file_is_unordered(f) ? "unordered" : "inorder",
+               f->hdr.start, f->hdr.end, f->csum_id, f->size);
+
+        if (zsi_file_is_unordered(f)) {
+            /* Walk the spans directly, so a ROLLBACK is reported rather than
+             * silently skipped -- the whole point of a dump is to show what is
+             * there, including what a reader ignores. */
+            size_t pos = ZSI_HEADER_LEN;
+            while (pos < f->complete) {
+                size_t span_start = pos;
+                size_t nrecs = 0;
+
+                for (;;) {
+                    const char *b = zsi_file_at(f, pos, 1);
+                    if (!b) break;
+                    uint8_t type = (uint8_t)b[0];
+
+                    if (type & ZSI_SPANTERM) {
+                        struct zsi_term t;
+                        if (zsi_term_decode(b, f->size - pos, &t) != ZS_OK) break;
+                        printf("SPAN %zu len=%llu term=%s records=%zu\n",
+                               span_start, (unsigned long long)t.spanlen,
+                               zsi_term_is_rollback(&t) ? "ROLLBACK" : "COMMIT",
+                               nrecs);
+                        pos += t.len;
+                        break;
+                    }
+
+                    struct zsi_rec rec;
+                    if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &rec)
+                        != ZS_OK) break;
+                    if (rec.len == 0) break;
+                    if (detail > 0) zsi_dump_rec(&rec, pos, detail);
+                    nrecs++;
+                    pos += rec.len;
+                }
+
+                if (pos <= span_start) break;
+            }
+        } else {
+            printf("PTRS %zu width=%d count=%llu\n", f->ptr_off,
+                   f->ptr_wide ? 64 : 32, (unsigned long long)f->nptrs);
+            if (detail > 0) {
+                for (uint64_t j = 0; j < f->nptrs; j++) {
+                    struct zsi_rec rec;
+                    if (zsi_ptrs_rec(f, j, &rec) != ZS_OK) break;
+                    zsi_dump_rec(&rec, (size_t)zsi_ptrs_at(f, j), detail);
+                }
+            }
+        }
+    }
+
+    (void)zsi_dump_cb;
+    return ZS_OK;
+}
 
 /********** OPEN AND CLOSE *************/
 

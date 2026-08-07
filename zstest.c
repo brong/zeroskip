@@ -6866,6 +6866,10 @@ static void test_write_abort(void)
     api_scan(db, got, sizeof(got));
     ASSERT_STR_EQ(got, "after=3|keep=1");
 
+    /* An abort leaves NO trace at all in the file, because this writer buffers
+     * until commit and so has nothing on disk to void.  A streaming writer would
+     * leave a ROLLBACK span here (C-8, F-21); both are conforming, and the reader
+     * handles either. */
     /* An empty transaction commits and aborts cleanly, leaving no trace. */
     long before = 0;
     char name[ZSI_NAME_MAX];
@@ -8112,6 +8116,369 @@ static void test_repack_never_touches_unordered(void)
 
 /*
  * ============================================================
+ * Consistency checking (T-6 negatives)
+ * ============================================================
+ */
+
+/* Silence the error callback, and count how many reports it received. */
+static int report_count = 0;
+static void counting_error(const char *msg, const char *fmt, ...)
+{
+    (void)msg; (void)fmt;
+    report_count++;
+}
+
+static struct zs_db *open_db_reporting(uint32_t flags)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    setup.flags = flags;
+    setup.csum = TEST_EXTERNAL_CSUM;
+    setup.error = counting_error;
+    report_count = 0;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
+static void test_check_clean_database(void)
+{
+    /* A normally produced database of every arrangement passes, with no reports. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    setup.error = counting_error;
+    report_count = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char val[100];
+    memset(val, 'v', sizeof(val));
+    for (int i = 0; i < 20; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
+    }
+    ASSERT_OK(zs_db_delete(db, "k005", 4, 0));
+    if (zs_db_should_repack(db)) ASSERT_OK(zs_db_repack(db));
+
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_EQ(report_count, 0);
+
+    /* An aborted transaction leaves a ROLLBACK span, which is legal. */
+    struct zs_txn *txn = NULL;
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "aborted", 7, "x", 1, 0));
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_EQ(report_count, 0);
+
+    zs_db_close(&db);
+}
+
+static void test_check_out_of_order_pointers(void)
+{
+    /* F-28: an in-order file's pointer array must be strictly increasing by key.
+     * A misordered array is invisible to a binary search -- it just returns wrong
+     * answers -- so this check is the only thing that finds it. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    /* ib_rec appends in the order given, so this builds a deliberately misordered
+     * file -- which put_inorder_kv would have sorted. */
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "z", 1, "1", 1, false, 0);
+    ib_rec(&b, "a", 1, "2", 1, false, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
+
+    /* A DUPLICATE key, which is what a repack emitting a key twice produces
+     * (D-17).  Sorted, so only the equality test can catch it. */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "dup", 3, "1", 1, false, 0);
+    ib_rec(&b, "dup", 3, "2", 1, false, 0);
+    ib_finish(&b);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
+}
+
+static void test_check_records_checksum(void)
+{
+    /* F-26e/F-26f: a record body corrupted in place is detected here and nowhere
+     * else, since an in-order file has no span terminators to notice. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_finish(&b);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';        /* flip a value byte */
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Opening succeeded -- the check is on demand, so open stays O(1) (F-26f). */
+    ASSERT_EQ(report_count, 0);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
+    ASSERT(report_count > 0);
+
+    /* And ZS_NOCSUM skips it, which is what that flag means (F-5e). */
+    zs_db_close(&db);
+    db = open_db_reporting(ZS_NOCSUM);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
+static void test_check_noncanonical(void)
+{
+    /* T-6's negative: a hand-built file storing an ancestor equal to its own start
+     * is non-canonical (F-17 says omit it exactly then) and is REPORTED, while
+     * still reading correctly -- because rejecting it would discard committed data
+     * (F-24 plus G-3). */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    const char *v;
+    size_t vl;
+
+    clear_db();
+    ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v", 1, true, 5);            /* ancestor == start: wrong */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 5, 5);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(6, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+
+    /* It reads: the data is not lost. */
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
+
+    /* And the divergence is reported. */
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
+
+    /* A big form whose lengths would have fitted the short one: same treatment. */
+    clear_db();
+    {
+        char buf[512];
+        size_t reclen;
+        memset(buf, 0, sizeof(buf));
+        make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
+        /* BIGKEYVALUE with keylen 1, vallen 1 -- both fit the short form */
+        buf[ZSI_HEADER_LEN] = (char)ZSI_BIGKEYVALUE;
+        zsi_put64(buf + ZSI_HEADER_LEN + 8, 1);
+        zsi_put64(buf + ZSI_HEADER_LEN + 16, 1);
+        buf[ZSI_HEADER_LEN + 24] = 'k';
+        buf[ZSI_HEADER_LEN + 25] = '\0';
+        buf[ZSI_HEADER_LEN + 26] = 'v';
+        buf[ZSI_HEADER_LEN + 27] = '\0';
+        reclen = 32;                                /* roundup8(24 + 1 + 1 + 1 + 1) */
+
+        uint64_t ptr = ZSI_HEADER_LEN;
+        char *sec = NULL;
+        size_t seclen = 0;
+        uint32_t rc = zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen);
+        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, rc,
+                                 zsi_csum_xxhash, &sec, &seclen));
+        memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
+        free(sec);
+
+        zsi_name_format(name, test_uuid, 1, 1);
+        ASSERT_EQ(mkdbdir(), 0);
+        ASSERT_EQ(writefile(name, buf, ZSI_HEADER_LEN + reclen + seclen), 0);
+    }
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));   /* reads */
+    ASSERT_MEM_EQ(v, "v", 1);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);          /* reported */
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
+}
+
+static void test_check_unclean_reported(void)
+{
+    /* Content after the last valid span is reported but is NOT an error: F-24
+     * makes it an ordinary state and D-9 has the writer move on rather than
+     * repair. */
+    struct sb s;
+    struct zs_db *db;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+    sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_check_consistency(db));     /* reported, not an error */
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
+}
+
+static void test_dump_line_format(void)
+{
+    /* The dump's line format is a compatibility surface: T-0a's `dump` subcommand
+     * emits it and the interop runner compares it as text.  Asserted by capturing
+     * stdout, so a change to the format fails here rather than in another
+     * implementation's test suite. */
+    struct zs_db *db;
+    char buf[8192];
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Capture stdout. */
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/dump.out", basedir);
+    int saved = dup(1);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0);
+    ASSERT(dup2(fd, 1) >= 0);
+    close(fd);
+
+    ASSERT_OK(zs_db_dump(db, 1));
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+
+    fd = open(path, O_RDONLY);
+    ASSERT(fd >= 0);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    ASSERT(n > 0);
+    buf[n] = '\0';
+
+    /* Both files, with the documented fields. */
+    ASSERT(strstr(buf, "kind=inorder") != NULL);
+    ASSERT(strstr(buf, "kind=unordered") != NULL);
+    ASSERT(strstr(buf, "start=1 end=1") != NULL);
+    ASSERT(strstr(buf, "start=2 end=0") != NULL);
+    ASSERT(strstr(buf, "PTRS ") != NULL);
+    ASSERT(strstr(buf, "width=32") != NULL);
+    ASSERT(strstr(buf, "count=2") != NULL);
+    ASSERT(strstr(buf, "SPAN ") != NULL);
+    ASSERT(strstr(buf, "term=COMMIT") != NULL);
+    ASSERT(strstr(buf, "REC  ") != NULL);
+    /* keys are hex, so binary keys survive the format */
+    ASSERT(strstr(buf, "key=61") != NULL);      /* 'a' */
+    ASSERT(strstr(buf, "key=63") != NULL);      /* 'c' */
+
+    zs_db_close(&db);
+}
+
+static void test_dump_shows_rollback(void)
+{
+    /* A dump must show a ROLLBACK span rather than skipping it: the point of a dump
+     * is to show what is there, INCLUDING what a reader ignores.
+     *
+     * This writer never produces one -- it buffers until commit, so an abort has
+     * nothing to void (see zsi_txn_abort) -- so the file is hand-built to the shape
+     * a STREAMING peer would produce.  That makes this a test of the dump's
+     * handling of a foreign file, which is the case that actually matters. */
+    struct sb s;
+    struct zs_db *db;
+    char buf[8192];
+    char path[PATH_MAX];
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "live", 4, "1", 1, false, 0);
+    sb_term(&s, false);
+    sb_rec(&s, "dead", 4, "2", 1, false, 0);
+    sb_term(&s, true);                          /* a rolled-back span */
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* The reader ignores the rolled-back record (F-25)... */
+    const char *v;
+    size_t vl;
+    ASSERT_EQ(zs_db_fetch(db, "dead", 4, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
+
+    snprintf(path, sizeof(path), "%s/dump2.out", basedir);
+    int saved = dup(1);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0);
+    ASSERT(dup2(fd, 1) >= 0);
+    close(fd);
+    ASSERT_OK(zs_db_dump(db, 1));
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+
+    fd = open(path, O_RDONLY);
+    ASSERT(fd >= 0);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    ASSERT(n > 0);
+    buf[n] = '\0';
+
+    /* ...but the dump shows both spans and both records. */
+    ASSERT(strstr(buf, "term=COMMIT") != NULL);
+    ASSERT(strstr(buf, "term=ROLLBACK") != NULL);
+    ASSERT(strstr(buf, "key=6c697665") != NULL);        /* "live" */
+    ASSERT(strstr(buf, "key=64656164") != NULL);        /* "dead" */
+
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -8274,6 +8641,14 @@ static struct test_entry tests[] = {
     { "test_repack_cascade",            test_repack_cascade },
     { "test_repack_never_touches_unordered",
                                         test_repack_never_touches_unordered },
+
+    { "test_check_clean_database",      test_check_clean_database },
+    { "test_check_out_of_order_pointers", test_check_out_of_order_pointers },
+    { "test_check_records_checksum",    test_check_records_checksum },
+    { "test_check_noncanonical",        test_check_noncanonical },
+    { "test_check_unclean_reported",    test_check_unclean_reported },
+    { "test_dump_line_format",          test_dump_line_format },
+    { "test_dump_shows_rollback",       test_dump_shows_rollback },
 
     { NULL, NULL }
 };
