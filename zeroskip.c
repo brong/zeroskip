@@ -4283,6 +4283,329 @@ static int zsi_convert_pending(struct zs_db *db)
 
 /********** REPACK *************/
 
+/* D-15/D-16: the repacker works ONLY on in-order files.  It never touches the
+ * active file, and never touches an unordered file at all -- converting those is
+ * the writer's job (D-12).
+ *
+ * D-16a: the two jobs divide by whether a file has an `end`, which is what makes
+ * them independent (C-1a).  A writer's conversion is bounded by rollover_size and
+ * runs inline; the repacker's cascade is unbounded and runs out of band.  A file
+ * becomes visible to the repacker precisely when the writer has finished with it,
+ * so a writer never waits on a repack. */
+
+/* Input selection (D-16):
+ *
+ *   1. start from the newest in-order file;
+ *   2. if the result would be larger than the next lowest in-order file, include
+ *      that file too and repeat;
+ *   3. stop when every file is included or the next lowest in-order file is
+ *      larger.
+ *
+ * This yields geometrically sized in-order files and amortised O(log n) rewrites
+ * per record.  D-16c: because conversion keeps in-order files as a contiguous
+ * prefix, the inputs are always adjacent and the cascade is never blocked by an
+ * unordered file sitting between two candidates.
+ *
+ * Returns the number selected, filling *first with the index of the lowest.  The
+ * selection is always a contiguous run ending at the newest in-order file. */
+static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
+{
+    /* The in-order prefix: files [0, nio). */
+    size_t nio = 0;
+    while (nio < snap->nfiles && !zsi_file_is_unordered(snap->files[nio])) nio++;
+
+    if (nio < 2) { *first = 0; return 0; }      /* nothing to merge */
+
+    size_t lo = nio - 1;                        /* the newest in-order file */
+    size_t total = snap->files[lo]->size;
+
+    while (lo > 0) {
+        size_t next = snap->files[lo - 1]->size;
+
+        /* At least as large, NOT strictly larger (D-16d).  Rollover produces files
+         * of near-identical size, so equality is the common case: with a strict
+         * comparison neither the include rule nor the stop rule fires, nothing ever
+         * merges, and the file count grows without bound -- which defeats the
+         * policy entirely.  Merging equals is also what produces the geometric
+         * progression, two files of size s becoming one of 2s. */
+        if (total < next) break;
+        lo--;
+        total += next;
+    }
+
+    *first = lo;
+    return nio - lo;
+}
+
+/* D-24: whether D-16 currently has work. */
+static bool zsi_should_repack(struct zsi_snapshot *snap)
+{
+    size_t first;
+    return zsi_repack_select(snap, &first) >= 2;
+}
+
+/* One key's versions, gathered across the inputs in D-17b's total order.
+ *
+ * D-17b: a repack MUST consider the versions of a key oldest to newest --
+ *
+ *   1. across files, by increasing start generation.  The tiling invariant (D-6)
+ *      means ranges never overlap, so this is total;
+ *   2. within one unordered file, by increasing offset among committed spans;
+ *   3. an in-order file holds one record per key, so there is nothing to order.
+ *
+ * V1 is the first version in that order and V3 the last.  The emitted record takes
+ * V3's VALUE and V1's ANCESTOR -- from those records specifically, and by no other
+ * route.  Getting this wrong silently emits the wrong value or the wrong ancestor,
+ * which is why T-7 tests the ordering directly rather than only its consequences. */
+struct zsi_merge_key {
+    struct zsi_rec v1;          /* oldest version: its ancestor is emitted */
+    struct zsi_rec v3;          /* newest version: its value is emitted */
+    bool           have;
+};
+
+/* Merge the selected inputs into one in-order file (D-17).
+ *
+ * The output holds EXACTLY ONE record per key, built from the live records of all
+ * inputs.  Since the repacker only ever merges in-order files, and each holds one
+ * record per key, "within one file" ordering never arises -- but the code walks
+ * the inputs in increasing start generation regardless, because that is what makes
+ * the order total and what a future pairwise merge would still need. */
+static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
+                            size_t first, size_t count)
+{
+    struct zsi_fcur *fc = NULL;
+    char *recs = NULL;
+    uint64_t *ptrs = NULL;
+    size_t recslen = 0, alloc = 0, nptrs = 0, aptrs = 0;
+    char sname[ZSI_NAME_MAX], fname[ZSI_NAME_MAX];
+    char spath[PATH_MAX], fpath[PATH_MAX];
+    char hdr[ZSI_HEADER_LEN];
+    struct zsi_header h;
+    int fd = -1, r = ZS_OK;
+
+    uint32_t out_start = snap->files[first]->hdr.start;
+    uint32_t out_end   = snap->files[first + count - 1]->hdr.end;
+    if (out_end == 0) return ZS_INTERNAL;       /* never an unordered input */
+
+    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    if (!cs) return ZS_BADUSAGE;
+
+    fc = zsi_zmalloc(count * sizeof(*fc));
+    if (!fc) return ZS_INTERNAL;
+
+    /* Inputs are iterated in key order, from the pointer section (D-20). */
+    for (size_t i = 0; i < count; i++) {
+        zsi_fcur_init_file(&fc[i], snap->files[first + i], db->compar);
+        r = zsi_fcur_seek_first(&fc[i]);
+        if (r != ZS_OK) goto out;
+    }
+
+    for (;;) {
+        /* The least key still present across the inputs. */
+        const char *bestk = NULL;
+        size_t bestkl = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (fc[i].exhausted) continue;
+            if (!bestk || db->compar(fc[i].cur.key, fc[i].cur.keylen,
+                                     bestk, bestkl) < 0) {
+                bestk = fc[i].cur.key;
+                bestkl = fc[i].cur.keylen;
+            }
+        }
+        if (!bestk) break;
+
+        /* Gather this key's versions in D-17b's order.  The inputs are indexed by
+         * increasing start generation, so ascending i IS oldest to newest. */
+        struct zsi_merge_key mk;
+        memset(&mk, 0, sizeof(mk));
+
+        for (size_t i = 0; i < count; i++) {
+            if (fc[i].exhausted) continue;
+            if (db->compar(fc[i].cur.key, fc[i].cur.keylen, bestk, bestkl) != 0)
+                continue;
+
+            if (!mk.have) { mk.v1 = fc[i].cur; mk.have = true; }
+            mk.v3 = fc[i].cur;
+
+            r = zsi_fcur_next(&fc[i]);
+            if (r != ZS_OK) goto out;
+        }
+
+        if (!mk.have) break;
+
+        /* D-19: a key is removed entirely IF AND ONLY IF its latest version is a
+         * deletion AND V1's ancestor lies inside the output range -- its whole
+         * lifespan from create through update to delete is contained.
+         *
+         * Otherwise the tombstone MUST be retained, because an older file may
+         * still hold the key and dropping it would resurrect the value.
+         *
+         * D-19a: the record is written even when a NEWER file already shadows the
+         * key.  Being shadowed does not permit dropping it; only D-19 does.  The
+         * retained record carries the chain's reach, which no other file records.
+         * This looks like a missed optimisation and is not -- T-7 constructs the
+         * resurrection that follows from removing it. */
+        bool v3_delete = zsi_rec_is_delete(&mk.v3);
+        bool contained = (mk.v1.ancestor >= out_start);
+
+        if (v3_delete && contained) continue;   /* drop the key */
+
+        /* D-18's table: the ancestor-omitting form when the chain begins inside
+         * the output range, the ancestor-storing form otherwise, carrying V1's
+         * ancestor -- copied verbatim, never renumbered (D-17a). */
+        bool store_anc = !contained;
+        uint32_t anc = mk.v1.ancestor;
+
+        const char *val = mk.v3.val;
+        size_t vallen = mk.v3.vallen;
+        size_t n = zsi_rec_encoded_len(mk.v3.keylen, vallen, val == NULL,
+                                       store_anc);
+        if (!n) { r = ZS_INTERNAL; goto out; }
+
+        if (recslen + n > alloc) {
+            size_t want = alloc ? alloc * 2 : 8192;
+            while (want < recslen + n) want *= 2;
+            char *q = realloc(recs, want);
+            if (!q) { r = ZS_INTERNAL; goto out; }
+            recs = q;
+            alloc = want;
+        }
+        if (nptrs == aptrs) {
+            size_t want = aptrs ? aptrs * 2 : 256;
+            uint64_t *q = realloc(ptrs, want * sizeof(*q));
+            if (!q) { r = ZS_INTERNAL; goto out; }
+            ptrs = q;
+            aptrs = want;
+        }
+
+        ptrs[nptrs++] = (uint64_t)(ZSI_HEADER_LEN + recslen);
+        zsi_rec_encode(recs + recslen, mk.v3.key, mk.v3.keylen, val, vallen,
+                       store_anc, anc);
+        recslen += n;
+    }
+
+    /* D-22: the output may legitimately contain ZERO records, in F-26g's form --
+     * every key deleted, or a create and its delete repacked together.  It MUST
+     * still be written, so the generation range stays tiled (D-6).  It is cheap and
+     * short-lived: an empty file violates D-16's size relation maximally, so the
+     * next repack absorbs it. */
+
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = out_start;
+    h.end = out_end;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+    zsi_header_encode(hdr, &h, cs);
+
+    char *sec = NULL;
+    size_t seclen = 0;
+    uint32_t rc = cs(recs ? recs : "", recslen);
+    r = zsi_ptrs_build(ptrs, nptrs, ZSI_HEADER_LEN + recslen, rc, cs,
+                       &sec, &seclen);
+    if (r != ZS_OK) goto out;
+
+    r = zsi_staging_open(db, sname, &fd);
+    if (r != ZS_OK) { free(sec); goto out; }
+
+    r = zsi_write_all(fd, hdr, sizeof(hdr));
+    if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
+    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
+    free(sec);
+    if (r == ZS_OK && !db->nosync && fdatasync(fd) < 0) r = ZS_IOERROR;
+    close(fd);
+    fd = -1;
+
+    snprintf(spath, sizeof(spath), "%s/%s", db->dir, sname);
+    if (r != ZS_OK) { unlink(spath); goto out; }
+
+    /* D-21: renamed to a name covering the ENTIRE range of every input, only once
+     * complete.  C-1b: publishing needs no lock. */
+    zsi_name_format(fname, db->uuid, out_start, out_end);
+    snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
+    if (rename(spath, fpath) < 0) { unlink(spath); r = ZS_IOERROR; goto out; }
+
+    if (!db->nosync) {                          /* C-6 */
+        int dfd = open(db->dir, O_RDONLY);
+        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+    }
+
+out:
+    if (fd >= 0) close(fd);
+    free(recs);
+    free(ptrs);
+    free(fc);
+    return r;
+}
+
+/* One repack: select, merge, publish, retire the inputs.
+ *
+ * D-16b: a cascade writes ONE output for the whole selected set, not one per pair.
+ * A single invocation is therefore unbounded in duration, which the spec records
+ * as an open item -- writing continues throughout regardless, because the repack
+ * lock and the write lock never contend (C-1a). */
+static int zsi_repack(struct zs_db *db)
+{
+    int r = zsi_check_writable(db);
+    if (r != ZS_OK) return r;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) return r;
+
+    /* Refresh under the lock: another process may have repacked while we waited. */
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) goto out;
+
+    size_t first, count;
+    count = zsi_repack_select(db->snap, &first);
+    if (count < 2) { r = ZS_OK; goto out; }     /* nothing to do */
+
+    /* Remember the input names before the merge: the snapshot is replaced by the
+     * refresh below, and the names are what D-23 needs. */
+    char (*names)[ZSI_NAME_MAX] = malloc(count * sizeof(*names));
+    if (!names) { r = ZS_INTERNAL; goto out; }
+    for (size_t i = 0; i < count; i++)
+        zsi_name_format(names[i], db->uuid,
+                        db->snap->files[first + i]->hdr.start,
+                        db->snap->files[first + i]->hdr.end);
+
+    r = zsi_repack_merge(db, db->snap, first, count);
+    if (r != ZS_OK) { free(names); goto out; }
+
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) { free(names); goto out; }
+
+    /* Retire the inputs (D-23).  Each is now superseded by the output, so each
+     * verification succeeds -- but a failure is not fatal: a leaked file costs
+     * disk space and a later pass removes it. */
+    for (size_t i = 0; i < count; i++) {
+        int rr = zsi_remove_file(db, names[i]);
+        (void)rr;
+    }
+
+    free(names);
+    r = zsi_db_refresh(db);
+
+out:
+    zsi_lock_release(&db->locks, ZSI_LOCK_REPACK);
+    return r;
+}
+
+int zs_db_repack(struct zs_db *db)
+{
+    if (!db) return ZS_BADUSAGE;
+    return zsi_repack(db);
+}
+
+bool zs_db_should_repack(struct zs_db *db)
+{
+    if (!db) return false;
+    return zsi_should_repack(db->snap);
+}
+
 /********** CONSISTENCY *************/
 
 /********** OPEN AND CLOSE *************/

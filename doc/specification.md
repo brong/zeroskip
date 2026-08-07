@@ -835,13 +835,19 @@ The per-file cursors are held in an array kept sorted by:
 - **D-16** The repacker works **only on in-order files**; converting unordered
   files is the writer's job (D-12). Input selection:
   1. Start from the newest in-order file.
-  2. If the result would be larger than the next lowest in-order file, include
-     that file too and repeat.
+  2. If the result would be **at least as large as** the next lowest in-order
+     file, include that file too and repeat.
   3. Stop when every file is included or the next lowest in-order file is
-     larger.
+     strictly larger.
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
+- **D-16d** Step 2's comparison MUST include equality. Rollover produces files of
+  near-identical size, so equal sizes are the common case rather than a boundary:
+  with a strict comparison neither step 2 nor step 3 fires, no merge ever happens,
+  and the file count grows without bound — which defeats the policy whose whole
+  purpose is keeping that count low. Merging equals is also what produces the
+  geometric progression, since two files of size *s* become one of size 2*s*.
 - **D-16a** The two jobs divide by whether a file has an `end`, which is what
   makes them independent (C-1a): a writer's conversion is bounded by
   `rollover_size` and runs inline (D-12d), the repacker's cascade is unbounded and

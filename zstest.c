@@ -7604,6 +7604,514 @@ static void test_convert_readonly_does_nothing(void)
 
 /*
  * ============================================================
+ * Repacking (T-7)
+ * ============================================================
+ */
+
+/* Read a record's ancestor and form directly from a file, so tests can assert
+ * what was WRITTEN rather than what round-trips. */
+static bool rec_at_key(struct zsi_file *f, const char *key, size_t keylen,
+                       struct zsi_rec *out)
+{
+    uint64_t idx;
+    bool exact;
+
+    if (zsi_ptrs_search(f, zsi_compar_default, key, keylen, &idx, &exact)
+        != ZS_OK) return false;
+    if (!exact) return false;
+    return zsi_ptrs_rec(f, idx, out) == ZS_OK;
+}
+
+static struct zsi_file *file_with_range(struct zs_db *db, uint32_t s, uint32_t e)
+{
+    for (size_t i = 0; i < db->snap->nfiles; i++)
+        if (db->snap->files[i]->hdr.start == s && db->snap->files[i]->hdr.end == e)
+            return db->snap->files[i];
+    return NULL;
+}
+
+static void test_repack_selection(void)
+{
+    /* D-16's geometric rule: include the next lowest file only when the result so
+     * far is larger than it.  Sizes here are controlled by record counts. */
+    struct zs_db *db;
+    size_t first, count;
+
+    /* Two files of EQUAL size are selected, per D-16d.  This is the case a strict
+     * comparison gets wrong: rollover produces near-identical sizes, so equality is
+     * the common case, and with a strict test neither the include rule nor the stop
+     * rule fires -- nothing ever merges and the file count grows without bound. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->files[0]->size, db->snap->files[1]->size);
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT_EQU(count, 2u);
+    ASSERT_EQU(first, 0u);
+    ASSERT(zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* A much larger older file is NOT absorbed by a small newer one: the stop rule
+     * fires, which is what bounds the work a single repack does. */
+    clear_db();
+    {
+        struct kv many[40];
+        char keys[40][16], vals[40][32];
+        for (int i = 0; i < 39; i++) {
+            snprintf(keys[i], 16, "k%03d", i);
+            memset(vals[i], 'v', 30); vals[i][30] = '\0';
+            many[i].k = keys[i]; many[i].v = vals[i];
+        }
+        many[39].k = NULL; many[39].v = NULL;
+        put_inorder_kv(1, 1, many);
+    }
+    put_inorder_kv(2, 2, (const struct kv[]){ {"z","1"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT(db->snap->files[0]->size > db->snap->files[1]->size);
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT(count < 2);
+    ASSERT(!zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* A large newest file and a small older one: the older is absorbed. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    {
+        struct kv many[40];
+        char keys[40][16], vals[40][32];
+        for (int i = 0; i < 39; i++) {
+            snprintf(keys[i], 16, "k%03d", i);
+            memset(vals[i], 'v', 30); vals[i][30] = '\0';
+            many[i].k = keys[i]; many[i].v = vals[i];
+        }
+        many[39].k = NULL; many[39].v = NULL;
+        put_inorder_kv(2, 2, many);
+    }
+    put_unordered_kv(3, (const struct kv[]){ {"z","3"}, {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT_EQU(count, 2u);
+    ASSERT_EQU(first, 0u);
+    ASSERT(zs_db_should_repack(db));
+
+    /* The repacker never selects the active file or any unordered file (D-15). */
+    for (size_t i = first; i < first + count; i++)
+        ASSERT(!zsi_file_is_unordered(db->snap->files[i]));
+
+    ASSERT_OK(zs_db_repack(db));
+
+    /* One output covering the whole input range (D-16b, D-21). */
+    ASSERT_NOT_NULL(file_with_range(db, 1, 2));
+    ASSERT_NULL(file_with_range(db, 1, 1));         /* inputs retired */
+    ASSERT_NULL(file_with_range(db, 2, 2));
+    ASSERT(!zs_db_should_repack(db));
+
+    zs_db_close(&db);
+}
+
+static void test_repack_one_record_per_key(void)
+{
+    /* D-17: exactly one record per key in the output, built from the live records
+     * of all inputs, taking V3's value. */
+    struct zs_db *db;
+    char got[512];
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","a1"}, {"k","v1"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"k","v2"}, {"m","m2"}, {NULL,NULL} });
+    put_inorder_kv(3, 3, (const struct kv[]){ {"k","v3"}, {"z","z3"}, {NULL,NULL} });
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Force a full merge regardless of the size rule. */
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 3));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 1, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 4u);          /* a, k, m, z -- k once */
+    ASSERT_OK(zsi_ptrs_verify_records(out));
+
+    struct zsi_rec r;
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_MEM_EQ(r.val, "v3", 2);        /* V3's value */
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=a1|k=v3|m=m2|z=z3");
+    zs_db_close(&db);
+}
+
+static void test_repack_v1_ancestor_v3_value(void)
+{
+    /* D-17b tested DIRECTLY: the emitted record must take V3's VALUE and V1's
+     * ANCESTOR, from those records specifically.  Getting it wrong silently emits
+     * the wrong value or the wrong ancestor, so this asserts the bytes rather than
+     * a round-trip.
+     *
+     * The chain begins in generation 2 with an ancestor pointing back to 1, so V1's
+     * ancestor is BELOW the output range and must be carried through. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+
+    /* Generation 1: nothing for "k" -- it is only referenced by the ancestor. */
+    put_inorder_kv(1, 1, (const struct kv[]){ {"filler","f"}, {NULL,NULL} });
+
+    /* Generation 2: "k" with a STORED ancestor of 1, so its chain reaches below. */
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v2", 2, true, 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    /* Generation 3: "k" again, ancestor 2 (the file that held the previous one). */
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v3", 2, true, 2);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Merge generations 2 and 3 only, so the output range is [2,3] and V1's
+     * ancestor (1) lies BELOW it. */
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 2, 3);
+    ASSERT_NOT_NULL(out);
+
+    struct zsi_rec r;
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_MEM_EQ(r.val, "v3", 2);                  /* V3's value */
+    ASSERT_EQ(r.type, ZSI_KEYVALUE_ANC);            /* ancestor STORED (D-18) */
+    ASSERT_EQU(r.ancestor, 1u);                     /* V1's ancestor, not V3's */
+
+    zs_db_close(&db);
+}
+
+static void test_repack_d18_table(void)
+{
+    /* Each row of D-18, with the encoding form asserted. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    struct zsi_rec r;
+
+    /* Row 2: V1's ancestor inside the output range, V3 a value -> the
+     * ancestor-OMITTING form. */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v1", 2, false, 0);          /* ancestor omitted == 1 */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v2", 2, true, 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* omitted: chain contained */
+    ASSERT_MEM_EQ(r.val, "v2", 2);
+    ASSERT_EQU(r.ancestor, 1u);                     /* resolves to output start */
+    zs_db_close(&db);
+
+    /* Row 1: V1's ancestor inside the range, V3 a deletion -> EMIT NOTHING. */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v1", 2, false, 0);
+    ib_rec(&b, "other", 5, "o", 1, false, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0, true, 1);           /* delete, chain from 1 */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+    out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 1u);                     /* only "other": k dropped */
+    ASSERT(!rec_at_key(out, "k", 1, &r));
+    ASSERT(rec_at_key(out, "other", 5, &r));
+    zs_db_close(&db);
+
+    /* Row 3: V1's ancestor BELOW the range, V3 a deletion -> the tombstone is
+     * RETAINED in the ancestor-storing form.  This is D-19's "otherwise". */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"k","ancient"}, {NULL,NULL} });
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v2", 2, true, 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0, true, 2);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));    /* merge [2,3] only */
+    ASSERT_OK(zsi_db_refresh(db));
+    out = file_with_range(db, 2, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 1u);
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_NULL(r.val);                             /* the tombstone survives */
+    ASSERT_EQ(r.type, ZSI_DELETION_ANC);            /* ancestor stored */
+    ASSERT_EQU(r.ancestor, 1u);
+    zs_db_close(&db);
+}
+
+static void test_repack_d19a_resurrection(void)
+{
+    /* D-19a, constructed directly.
+     *
+     * The retained tombstone carries the chain's reach, which no other file
+     * records.  Dropping it -- which looks like a safe optimisation, since a newer
+     * file already shadows the key -- lets generation 1's value RESURRECT.
+     *
+     * This test asserts both halves: that the key stays absent with the tombstone,
+     * AND that removing it does produce the bug.  The second half is what stops the
+     * rule being deleted as dead weight later. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    const char *v;
+    size_t vl;
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"k","RESURRECTED"}, {NULL,NULL} });
+
+    /* Generation 2 deletes it, with the chain reaching back to 1. */
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0, true, 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    /* Generation 3 is empty -- it exists so [2,3] is a legal merge range. */
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* Repack [2,3].  V1's ancestor is 1, which is BELOW the output start, so the
+     * tombstone must be retained. */
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 2, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 1u);                     /* the tombstone is there */
+
+    /* The key stays absent -- generation 1's value did not come back. */
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    zs_db_close(&db);
+
+    /* Now the other half: hand-build the same output WITHOUT the tombstone, which
+     * is what dropping it would produce, and confirm the value resurrects. */
+    zsi_name_format(name, test_uuid, 2, 3);
+    ASSERT_EQ(unlink(dbpath(name)), 0);
+    ib_init(&b, 2, 3, ZSI_CSUM_XXHASH);
+    ib_finish(&b);                                  /* zero records */
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "RESURRECTED", 11);            /* the bug, demonstrated */
+    zs_db_close(&db);
+}
+
+static void test_repack_empty_output(void)
+{
+    /* D-22: the output may legitimately hold zero records -- generation X creates a
+     * key and X+1 deletes it, repacked together.  The file MUST still be written so
+     * the generation range stays tiled (D-6). */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    char got[256];
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "only", 4, "v", 1, false, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "only", 4, NULL, 0, true, 1);        /* chain begins in 1 */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 0u);                     /* empty, and written */
+    zsi_name_format(name, test_uuid, 1, 2);
+    ASSERT_EQ(filesize(name), 96);                  /* F-26g's exact form */
+    ASSERT_OK(zsi_ptrs_verify_records(out));
+
+    /* The set still tiles, and the database reads as empty. */
+    struct zsi_fileset fs;
+    ASSERT_OK(zsi_fileset_scan(dbdir, &db->uuid, &fs));
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    zsi_fileset_fini(&fs);
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "");
+    zs_db_close(&db);
+}
+
+static void test_repack_cascade(void)
+{
+    /* D-16's cascade reaching the geometric size relation after many rollovers,
+     * driven through the real writer and the real repacker. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char val[200];
+    memset(val, 'v', sizeof(val));
+
+    for (int i = 0; i < 60; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
+        if (zs_db_should_repack(db)) ASSERT_OK(zs_db_repack(db));
+    }
+
+    /* Every record survives the cascade. */
+    for (int i = 0; i < 60; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "k%03d", i);
+        if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s lost in cascade\n", k);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+    }
+
+    /* The cascade produced a geometric progression rather than a flat pile: the
+     * older files are strictly larger, each roughly the sum of those above it. */
+    ASSERT(!zs_db_should_repack(db));
+    size_t nio = 0;
+    while (nio < db->snap->nfiles && !zsi_file_is_unordered(db->snap->files[nio]))
+        nio++;
+    ASSERT(nio >= 2);
+    for (size_t i = 1; i < nio; i++)
+        ASSERT(db->snap->files[i - 1]->size > db->snap->files[i]->size);
+
+    struct zsi_fileset fs;
+    ASSERT_OK(zsi_fileset_scan(dbdir, &db->uuid, &fs));
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    zsi_fileset_fini(&fs);
+
+    /* And the file count is well below the number of rollovers, which is the point
+     * of the policy (D-16). */
+    ASSERT(db->snap->nfiles < 20);
+
+    zs_db_close(&db);
+}
+
+static void test_repack_never_touches_unordered(void)
+{
+    /* D-15: the repacker never touches the active file, and never touches an
+     * unordered file at all.  With several unordered files present -- a crash
+     * backlog -- selection must still consider only the in-order prefix (D-16). */
+    struct zs_db *db;
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+
+    db = open_db(ZS_SHARED);
+    ASSERT_NOT_NULL(db);
+
+    size_t first, count;
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT(count < 2);              /* only one in-order file: nothing to merge */
+    ASSERT(!zs_db_should_repack(db));
+
+    /* And a read-only handle refuses to repack (R-3). */
+    ASSERT_EQ(zs_db_repack(db), ZS_READONLY);
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -7756,6 +8264,16 @@ static struct test_entry tests[] = {
     { "test_convert_remove_refuses_when_needed",
                                         test_convert_remove_refuses_when_needed },
     { "test_convert_readonly_does_nothing", test_convert_readonly_does_nothing },
+
+    { "test_repack_selection",          test_repack_selection },
+    { "test_repack_one_record_per_key", test_repack_one_record_per_key },
+    { "test_repack_v1_ancestor_v3_value", test_repack_v1_ancestor_v3_value },
+    { "test_repack_d18_table",          test_repack_d18_table },
+    { "test_repack_d19a_resurrection",  test_repack_d19a_resurrection },
+    { "test_repack_empty_output",       test_repack_empty_output },
+    { "test_repack_cascade",            test_repack_cascade },
+    { "test_repack_never_touches_unordered",
+                                        test_repack_never_touches_unordered },
 
     { NULL, NULL }
 };
