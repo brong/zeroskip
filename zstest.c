@@ -542,6 +542,32 @@ static void test_overflow_guards(void)
     ASSERT(!zsi_add3_sz(SIZE_MAX - 100, 200, 2, &out));
 }
 
+/* The engine a test uses to stand in for a caller-supplied one (engine 2).
+ * zsi_csum_none is a legitimate choice: engine 2 is whatever the caller supplies,
+ * and the point of these tests is which function gets selected, not what it
+ * computes. */
+#define TEST_EXTERNAL_CSUM zsi_csum_none
+
+/* Silence the error callback, and count how many reports it received. */
+static int report_count = 0;
+static void counting_error(const char *msg, const char *fmt, ...)
+{
+    (void)msg; (void)fmt;
+    report_count++;
+}
+
+static struct zs_db *open_db_reporting(uint32_t flags)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    setup.flags = flags;
+    setup.csum = TEST_EXTERNAL_CSUM;
+    setup.error = counting_error;
+    report_count = 0;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
 /*
  * ============================================================
  * Building files by hand
@@ -853,12 +879,6 @@ static bool valid_utf8(const unsigned char *p, size_t len)
     }
     return true;
 }
-
-/* The engine a test uses to stand in for a caller-supplied one (engine 2).
- * zsi_csum_none is a legitimate choice: engine 2 is whatever the caller supplies,
- * and the point of these tests is which function gets selected, not what it
- * computes. */
-#define TEST_EXTERNAL_CSUM zsi_csum_none
 
 /* Build a valid header into buf, for a test to then damage.
  *
@@ -5137,7 +5157,7 @@ static void test_snapshot_basic(void)
     put_unordered(5, k2);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
 
     /* Sorted by start ascending -- reads walk it descending (D-14). */
@@ -5165,7 +5185,7 @@ static void test_snapshot_basic(void)
     put_inorder(1, 4, k1);
     put_inorder(5, 5, k2);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -5174,7 +5194,7 @@ static void test_snapshot_basic(void)
      * state D-8a turns into a new database. */
     clear_db();
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 0u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -5193,7 +5213,7 @@ static void test_snapshot_resolves_overlap(void)
     put_inorder(1, 4, k);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[1]->hdr.start, 5u);
     ASSERT_EQU(s->files[1]->hdr.end, 5u);       /* the in-order one won */
@@ -5207,7 +5227,7 @@ static void test_snapshot_resolves_overlap(void)
     put_inorder(1, 2, k);
     put_unordered(3, k);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[0]->hdr.start, 1u);
     ASSERT_EQU(s->files[0]->hdr.end, 2u);
@@ -5229,7 +5249,7 @@ static void test_snapshot_retries_and_bounds(void)
     put_inorder(3, 3, k);       /* generation 2 missing: never tiles */
 
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s), ZS_AGAIN);
+                                TEST_EXTERNAL_CSUM, false, NULL, &s), ZS_AGAIN);
     ASSERT_NULL(s);
 
     /* A partial overlap is corruption rather than a stale scan, so it is
@@ -5238,7 +5258,7 @@ static void test_snapshot_retries_and_bounds(void)
     put_inorder(1, 5, k);
     put_inorder(3, 8, k);
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s), ZS_BADFORMAT);
+                                TEST_EXTERNAL_CSUM, false, NULL, &s), ZS_BADFORMAT);
 
     alarm(0);
 }
@@ -5262,7 +5282,7 @@ static void test_snapshot_boundary(void)
     ASSERT_EQ(sb_write(&s, name), 0);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &snap));
+                                TEST_EXTERNAL_CSUM, false, NULL, &snap));
     ASSERT_EQU(snap->nfiles, 1u);
     ASSERT_EQU(snap->files[0]->complete, boundary);
     ASSERT(snap->files[0]->size > boundary);
@@ -5296,22 +5316,30 @@ static void test_snapshot_bad_nonactive(void)
     zsi_name_format(name, test_uuid, 2, 0);
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
     ASSERT_EQU(s->files[1]->complete, 0u);
     ASSERT(!zsi_unordered_is_clean(s->files[1]));
     zsi_snapshot_release(&s);
 
-    /* Corrupt a NON-ACTIVE file: an error. */
+    /* Corrupt a NON-ACTIVE file: REPORTED, not fatal (D-10a, D-10b).
+     *
+     * Fatal would contradict D-10, which tells a writer to move on from an unclean
+     * active file -- the instant it does, that file is non-active, so the first
+     * write after an ordinary crash would make the database permanently
+     * unopenable.  G-3 forbids that. */
     clear_db();
     put_inorder(1, 1, k);
     put_unordered(2, k);
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
-    ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s), ZS_BADFORMAT);
-    ASSERT_NULL(s);
+    report_count = 0;
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, counting_error, &s));
+    ASSERT_NOT_NULL(s);
+    ASSERT(report_count > 0);       /* not silent */
+    zsi_snapshot_release(&s);
 
     /* A zero-length active file, likewise tolerated (D-10). */
     clear_db();
@@ -5319,7 +5347,7 @@ static void test_snapshot_bad_nonactive(void)
     zsi_name_format(name, test_uuid, 2, 0);
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
     zsi_snapshot_release(&s);
@@ -5339,7 +5367,7 @@ static void test_snapshot_refcount(void)
     put_inorder(1, 1, k);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, &s));
+                                TEST_EXTERNAL_CSUM, false, NULL, &s));
     ASSERT_EQU(s->nfiles, 1u);
 
     /* Unlink the file out from under the open snapshot. */
@@ -5929,8 +5957,13 @@ static void test_open_bad_nonactive(void)
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
 
-    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
-    ASSERT_NULL(db);
+    /* Reported, not fatal (D-10a as amended by D-10b): the file's records are
+     * unrecoverable either way, so refusing to open would cost every OTHER file
+     * too -- and after an ordinary crash this is the state D-10 creates. */
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT(report_count > 0);
+    zs_db_close(&db);
 
     /* The same corruption in the ACTIVE file opens fine (D-10, G-3): any state a
      * crash can produce must open. */
@@ -8119,26 +8152,6 @@ static void test_repack_never_touches_unordered(void)
  * Consistency checking (T-6 negatives)
  * ============================================================
  */
-
-/* Silence the error callback, and count how many reports it received. */
-static int report_count = 0;
-static void counting_error(const char *msg, const char *fmt, ...)
-{
-    (void)msg; (void)fmt;
-    report_count++;
-}
-
-static struct zs_db *open_db_reporting(uint32_t flags)
-{
-    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
-    struct zs_db *db = NULL;
-    setup.flags = flags;
-    setup.csum = TEST_EXTERNAL_CSUM;
-    setup.error = counting_error;
-    report_count = 0;
-    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
-    return db;
-}
 
 static void test_check_clean_database(void)
 {

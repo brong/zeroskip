@@ -40,6 +40,37 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+/* Syscall interposition for crash and sync-failure injection (T-8, T-8a).
+ *
+ * A test build routes the four syscalls that can leave a database in an
+ * intermediate state through function pointers, so a test can count them and fail
+ * or abort at call N.  Compiled out entirely otherwise -- ZS_TEST_HOOKS is defined
+ * only by the crash-test target.
+ *
+ * Function pointers rather than LD_PRELOAD because LD_PRELOAD does not exist on
+ * macOS, and rather than weak symbols because those interpose the whole process
+ * including the harness's own writes.  This way only the library's calls are
+ * counted, which is what makes "abort at call N" reproducible. */
+#ifdef ZS_TEST_HOOKS
+ssize_t (*zs_hook_write)(int, const void *, size_t) = NULL;
+int     (*zs_hook_fdatasync)(int) = NULL;
+int     (*zs_hook_rename)(const char *, const char *) = NULL;
+int     (*zs_hook_unlink)(const char *) = NULL;
+
+#define ZS_WRITE(fd, buf, n)  (zs_hook_write ? zs_hook_write((fd), (buf), (n)) \
+                                             : write((fd), (buf), (n)))
+#define ZS_FDATASYNC(fd)      (zs_hook_fdatasync ? zs_hook_fdatasync(fd) \
+                                                 : fdatasync(fd))
+#define ZS_RENAME(a, b)       (zs_hook_rename ? zs_hook_rename((a), (b)) \
+                                              : rename((a), (b)))
+#define ZS_UNLINK(p)          (zs_hook_unlink ? zs_hook_unlink(p) : unlink(p))
+#else
+#define ZS_WRITE(fd, buf, n)  write((fd), (buf), (n))
+#define ZS_FDATASYNC(fd)      fdatasync(fd)
+#define ZS_RENAME(a, b)       rename((a), (b))
+#define ZS_UNLINK(p)          unlink(p)
+#endif
+
 /********** TUNING *************/
 
 /* A writer moves to a new file when the active file exceeds this (D-9a).
@@ -2787,7 +2818,9 @@ static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
  */
 static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                              zs_compar *compar, zs_csum *external_csum,
-                             bool nocsum, struct zsi_snapshot **out)
+                             bool nocsum,
+                             void (*report)(const char *, const char *, ...),
+                             struct zsi_snapshot **out)
 {
     for (int attempt = 0; attempt < ZSI_SNAPSHOT_RETRIES; attempt++) {
         struct zsi_fileset fs;
@@ -2829,16 +2862,21 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
 
             s->files[s->nfiles++] = f;
 
-            /* D-10a: a NON-ACTIVE file with an invalid header is an error -- its
-             * records cannot be recovered, and silently skipping the generation
-             * would lose committed data.  Only the last file may be the active
-             * one, so only it gets D-10's tolerance. */
+            /* D-10a: a NON-ACTIVE file with an invalid header is REPORTED and
+             * treated as holding no records.  It is deliberately NOT fatal, and
+             * D-10b records why: D-10 directs a writer to move on from an unclean
+             * active file, and the instant it does that file becomes non-active --
+             * so a fatal rule would turn the first write after an ordinary crash
+             * into a permanently unopenable database, which G-3 forbids.
+             *
+             * Tolerating it costs nothing that was not already lost, since an
+             * invalid header means no record in that file is recoverable either
+             * way, while refusing to open costs every other file too.  "Silently"
+             * is the hazard, and the report addresses it. */
             bool is_last = (i + 1 == fs.nresolved);
-            if (!f->hdr_valid && !is_last) {
-                zsi_snapshot_release(&s);
-                zsi_fileset_fini(&fs);
-                return ZS_BADFORMAT;
-            }
+            if (!f->hdr_valid && !is_last && report)
+                report("non-active file has an invalid header",
+                       "file=<%s>", f->fname);
 
             if (zsi_file_is_unordered(f)) {
                 /* Step 4.  The replay sets f->complete, which IS this file's
@@ -3094,14 +3132,28 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) return ZS_IOERROR;
 
-    ssize_t n = write(fd, hdr, sizeof(hdr));
+    ssize_t n = ZS_WRITE(fd, hdr, sizeof(hdr));
     if (n != (ssize_t)sizeof(hdr)) { close(fd); return ZS_IOERROR; }
-    if (!db->nosync && fdatasync(fd) < 0) { close(fd); return ZS_IOERROR; }
+    if (!db->nosync && ZS_FDATASYNC(fd) < 0) { close(fd); return ZS_IOERROR; }
     close(fd);
 
+    /* C-6: fdatasync the DIRECTORY after creating a data file, or the name may be
+     * absent after a crash even though the contents are durable.
+     *
+     * A failure here is REPORTED rather than fatal.  The file exists and its
+     * contents are durable; only the name's durability is in doubt, and if it were
+     * lost the result is a generation that never appeared -- which is
+     * indistinguishable from the transaction not having happened, and recoverable
+     * (C-6a).  Failing the create would be worse: it would leave a file the caller
+     * has been told does not exist. */
     if (!db->nosync) {
         int dfd = open(db->dir, O_RDONLY);
-        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+        if (dfd >= 0) {
+            if (ZS_FDATASYNC(dfd) < 0)
+                db->error("directory sync failed; the new file's name may not "
+                          "be durable", "dir=<%s>", db->dir);
+            close(dfd);
+        }
     }
 
     return ZS_OK;
@@ -3113,7 +3165,8 @@ static int zsi_db_refresh(struct zs_db *db)
 {
     struct zsi_snapshot *s = NULL;
     int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
-                              db->compar, db->external_csum, db->nocsum, &s);
+                              db->compar, db->external_csum, db->nocsum,
+                              db->error, &s);
     if (r != ZS_OK) return r;
 
     zsi_snapshot_release(&db->snap);
@@ -3578,7 +3631,7 @@ static int zsi_write_all(int fd, const char *buf, size_t len)
     size_t off = 0;
 
     while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
+        ssize_t n = ZS_WRITE(fd, buf + off, len - off);
         if (n < 0) {
             if (errno == EINTR) continue;
             return ZS_IOERROR;
@@ -3748,7 +3801,7 @@ static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
     }
 
     if (!db->nosync && !rollback_only) {
-        if (fdatasync(fd) < 0) { free(span); free(offs); return ZS_IOERROR; }
+        if (ZS_FDATASYNC(fd) < 0) { free(span); free(offs); return ZS_IOERROR; }
     }
 
     /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may or
@@ -3782,7 +3835,7 @@ static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
      * writer moves to a new file and reaches the same state.  Nothing is being
      * promised to a caller, so there is nothing to make durable. */
     if (!db->nosync && !rollback_only) {
-        if (fdatasync(fd) < 0) { free(offs); return ZS_IOERROR; }
+        if (ZS_FDATASYNC(fd) < 0) { free(offs); return ZS_IOERROR; }
     }
 
     if (offs_out) { *offs_out = offs; *noffs_out = noffs; }
@@ -4087,7 +4140,7 @@ static int zsi_remove_file(struct zs_db *db, const char *name)
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
-    if (unlink(path) < 0 && errno != ENOENT) r = ZS_IOERROR;
+    if (ZS_UNLINK(path) < 0 && errno != ENOENT) r = ZS_IOERROR;
 
 out:
     zsi_lock_release(&db->locks, ZSI_LOCK_REMOVE);
@@ -4178,7 +4231,7 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
 
     /* The file's contents durable BEFORE the rename, or the name could exist
      * pointing at a partial file after a crash. */
-    if (r == ZS_OK && !db->nosync && fdatasync(fd) < 0) r = ZS_IOERROR;
+    if (r == ZS_OK && !db->nosync && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
     fd = -1;
 
@@ -4192,13 +4245,20 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * disjoint, so they cannot interfere in either order. */
     zsi_name_format(fname, db->uuid, start, end);
     snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
-    if (rename(spath, fpath) < 0) { unlink(spath); r = ZS_IOERROR; goto fail; }
+    if (ZS_RENAME(spath, fpath) < 0) { ZS_UNLINK(spath); r = ZS_IOERROR; goto fail; }
 
     /* C-6: fdatasync the DIRECTORY after renaming an output into place, otherwise
-     * the name may be absent after a crash even though the contents are durable. */
+     * the name may be absent after a crash even though the contents are durable.
+     * Reported rather than fatal: a lost name leaves the inputs in place, which
+     * still tile, so a later pass simply converts again (C-6a, R-5). */
     if (!db->nosync) {
         int dfd = open(db->dir, O_RDONLY);
-        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+        if (dfd >= 0) {
+            if (ZS_FDATASYNC(dfd) < 0)
+                db->error("directory sync failed after publishing a conversion",
+                          "dir=<%s>", db->dir);
+            close(dfd);
+        }
     }
 
     free(recs);
@@ -4536,7 +4596,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
     if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
     free(sec);
-    if (r == ZS_OK && !db->nosync && fdatasync(fd) < 0) r = ZS_IOERROR;
+    if (r == ZS_OK && !db->nosync && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
     fd = -1;
 
@@ -4547,11 +4607,16 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * complete.  C-1b: publishing needs no lock. */
     zsi_name_format(fname, db->uuid, out_start, out_end);
     snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
-    if (rename(spath, fpath) < 0) { unlink(spath); r = ZS_IOERROR; goto out; }
+    if (ZS_RENAME(spath, fpath) < 0) { ZS_UNLINK(spath); r = ZS_IOERROR; goto out; }
 
     if (!db->nosync) {                          /* C-6 */
         int dfd = open(db->dir, O_RDONLY);
-        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+        if (dfd >= 0) {
+            if (ZS_FDATASYNC(dfd) < 0)
+                db->error("directory sync failed after publishing a repack output",
+                          "dir=<%s>", db->dir);
+            close(dfd);
+        }
     }
 
 out:
@@ -5464,7 +5529,7 @@ int zs_db_sync(struct zs_db *db)
 
     int fd = open(act->fname, O_WRONLY);
     if (fd < 0) return ZS_IOERROR;
-    int r = fdatasync(fd) < 0 ? ZS_IOERROR : ZS_OK;
+    int r = ZS_FDATASYNC(fd) < 0 ? ZS_IOERROR : ZS_OK;
     close(fd);
     return r;
 }

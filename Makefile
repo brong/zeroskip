@@ -68,7 +68,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check check-noprobe test asan leaks mutate bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check check-noprobe crashtest test asan leaks mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -115,11 +115,22 @@ zsbench: zsbench.c zeroskip.h libzeroskip.a
 # The C suite, then zstool's driver contract.  Both, because the tool's line
 # format is what a cross-implementation runner compares (T-0a) and a change to it
 # breaks other implementations rather than this one.
-check: zstest zstool
+check: zstest zstool zstest-crash
 	./zstest
+	./zstest-crash
 	./tests/tool.sh
 
 test: check
+
+# T-8/T-8a: crash and sync-failure injection.  Needs ZS_TEST_HOOKS, which routes
+# the library's write, fdatasync, rename and unlink through function pointers, so it
+# is a separate binary rather than part of zstest -- the hooks must not be present in
+# a shipped build.
+zstest-crash: zstest-crash.c zeroskip.c zeroskip.h xxhash.h
+	$(CC) $(CFLAGS) -o $@ zstest-crash.c $(LDLIBS)
+
+crashtest: zstest-crash
+	./zstest-crash
 
 # D-14d's first-and-last probe is a search strategy that cannot change any
 # answer, so the whole suite must pass with it compiled out (T-5a).  Cheap
@@ -209,5 +220,5 @@ zeroskip.pc:
 
 clean:
 	rm -f *.o libzeroskip.a libzeroskip.so* libzeroskip.*.dylib libzeroskip.dylib
-	rm -f zstool zstest zsbench zeroskip.pc
-	rm -rf zstool.dSYM zstest.dSYM zsbench.dSYM
+	rm -f zstool zstest zstest-crash zsbench zeroskip.pc
+	rm -rf zstool.dSYM zstest.dSYM zstest-crash.dSYM zsbench.dSYM

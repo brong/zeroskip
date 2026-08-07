@@ -682,10 +682,18 @@ without opening a single file.
   taken from its filename. Because it is not clean, a writer moves to a new
   file rather than appending, so no chain is ever built on an untrustworthy
   boundary.
-- **D-10a** A **non-active** file with an invalid header is an error
-  (`ZS_BADFORMAT`): its records cannot be recovered and silently skipping the
-  generation would lose committed data. Discarding it requires an explicit
-  tool action.
+- **D-10a** A **non-active** file with an invalid header MUST be **reported**
+  through the error callback, and its generation treated as holding no records.
+  It MUST NOT be fatal. Discarding the file still requires an explicit tool
+  action.
+- **D-10b** An earlier version of D-10a made this fatal, which contradicts D-10
+  and breaks G-3. D-10 directs a writer to move on from an unclean active file;
+  the instant it does, that file becomes non-active, so a fatal rule turns the
+  **first write after an ordinary crash** into a permanently unopenable database.
+  Tolerating it costs nothing that was not already lost, because an invalid
+  header means no record in that file is recoverable either way — whereas
+  refusing to open costs every other file too. "Silently" is the hazard the rule
+  guards against, and reporting addresses it.
 - **D-11** The writer never appends a pointer section to an unordered file. When
   it moves on, the previous file simply stays unordered until it is converted.
 - **D-12 Immediate conversion.** A writer that finds a **non-active unordered
