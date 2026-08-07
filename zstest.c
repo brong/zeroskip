@@ -530,6 +530,238 @@ static void test_overflow_guards(void)
 
 /*
  * ============================================================
+ * Filenames (T-2c, part of T-9)
+ * ============================================================
+ */
+
+static const zsi_uuid_t test_uuid = {
+    0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
+    0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
+};
+#define TEST_UUID_STR "4941da54-9406-4faa-a457-c4b65beae3eb"
+
+static void test_filenames(void)
+{
+    char name[ZSI_NAME_MAX];
+    zsi_uuid_t u;
+    uint32_t s, e;
+
+    /* T-2c: a generated filename for a known UUID and generation range,
+     * character for character.  Lowercase UUID, uppercase 8-digit hex
+     * generations, no extension. */
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000001");
+
+    zsi_name_format(name, test_uuid, 1, 10);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000001-0000000A");
+
+    zsi_name_format(name, test_uuid, 5, 5);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000005-00000005");
+
+    /* The full 32-bit range has a name, which is what 8 digits buys (D-1). */
+    zsi_name_format(name, test_uuid, 0xFFFFFFFFu, 0);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-FFFFFFFF");
+    zsi_name_format(name, test_uuid, 0xABCDEF01u, 0xFEDCBA98u);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-ABCDEF01-FEDCBA98");
+
+    /* Round-trip, both kinds. */
+    zsi_name_format(name, test_uuid, 7, 0);
+    ASSERT_EQ(zsi_name_parse(name, u, &s, &e), ZSI_NAME_UNORDERED);
+    ASSERT_MEM_EQ(u, test_uuid, 16);
+    ASSERT_EQU(s, 7u);
+    ASSERT_EQU(e, 0u);
+
+    zsi_name_format(name, test_uuid, 3, 9);
+    ASSERT_EQ(zsi_name_parse(name, u, &s, &e), ZSI_NAME_INORDER);
+    ASSERT_MEM_EQ(u, test_uuid, 16);
+    ASSERT_EQU(s, 3u);
+    ASSERT_EQU(e, 9u);
+
+    zsi_name_format(name, test_uuid, 0xABCDEF01u, 0xFEDCBA98u);
+    ASSERT_EQ(zsi_name_parse(name, u, &s, &e), ZSI_NAME_INORDER);
+    ASSERT_EQU(s, 0xABCDEF01u);
+    ASSERT_EQU(e, 0xFEDCBA98u);
+}
+
+static void test_filename_rejections(void)
+{
+    zsi_uuid_t u;
+    uint32_t s, e;
+
+    /* Every one of these must be ignored rather than half-accepted (D-4). */
+    static const char *bad[] = {
+        /* lowercase hex generations: D-1 says uppercase */
+        "zeroskip-" TEST_UUID_STR "-0000000a",
+        "zeroskip-" TEST_UUID_STR "-0000000a-0000000b",
+        /* wrong digit count */
+        "zeroskip-" TEST_UUID_STR "-0000001",
+        "zeroskip-" TEST_UUID_STR "-000000001",
+        "zeroskip-" TEST_UUID_STR "-1",
+        "zeroskip-" TEST_UUID_STR "-00000001-000000",
+        /* an extension: D-1a forbids one, and D-5's ordering depends on it */
+        "zeroskip-" TEST_UUID_STR "-00000001.zs",
+        "zeroskip-" TEST_UUID_STR "-00000001-00000004.zs",
+        "zeroskip-" TEST_UUID_STR "-00000001.tmp",
+        /* trailing junk */
+        "zeroskip-" TEST_UUID_STR "-00000001-",
+        "zeroskip-" TEST_UUID_STR "-00000001-00000004-",
+        "zeroskip-" TEST_UUID_STR "-00000001-00000004-00000009",
+        /* generation 0 is never legitimate (F-9) */
+        "zeroskip-" TEST_UUID_STR "-00000000",
+        "zeroskip-" TEST_UUID_STR "-00000000-00000004",
+        /* end == 0 in the in-order form would collide with unordered */
+        "zeroskip-" TEST_UUID_STR "-00000001-00000000",
+        /* a range running backwards */
+        "zeroskip-" TEST_UUID_STR "-00000009-00000003",
+        /* malformed or uppercase UUID */
+        "zeroskip-4941DA54-9406-4FAA-A457-C4B65BEAE3EB-00000001",
+        "zeroskip-4941da54-9406-4faa-a457-c4b65beae3e-00000001",
+        "zeroskip-4941da5494064faaa457c4b65beae3eb-00000001",
+        /* missing separator */
+        "zeroskip-" TEST_UUID_STR "00000001",
+        "zeroskip-" TEST_UUID_STR,
+        /* metadata, not data (D-2) */
+        "zeroskip.lock",
+        "zeroskip.tmp.1234.0",
+        "zeroskip.tmp.1234.17",
+        /* not ours at all */
+        "zeroskip",
+        "zeroskip-",
+        "",
+        "README",
+        ".",
+        "..",
+        "zeroskip_" TEST_UUID_STR "-00000001",
+        "Zeroskip-" TEST_UUID_STR "-00000001",
+        /* 0x prefixes and signs */
+        "zeroskip-" TEST_UUID_STR "-0x000001",
+        "zeroskip-" TEST_UUID_STR "-+0000001"
+    };
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (zsi_name_parse(bad[i], u, &s, &e) != ZSI_NAME_OTHER) {
+            fprintf(stderr, "\n    FAIL accepted '%s'\n", bad[i]);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* Another database's UUID parses fine as a name -- rejecting by UUID is the
+     * file set's job (D-4), not the parser's.  Asserted so the division of
+     * responsibility is explicit. */
+    ASSERT_EQ(zsi_name_parse("zeroskip-00000000-0000-4000-8000-000000000000"
+                             "-00000001", u, &s, &e), ZSI_NAME_UNORDERED);
+}
+
+static void test_filename_prefix_property(void)
+{
+    /* D-1a, asserted directly on generated names.
+     *
+     * D-5 resolves an overlap by taking the LAST file whose start matches, which
+     * is only correct because an unordered file's name sorts before the in-order
+     * name for the same generation.  That holds because the unordered name is a
+     * strict prefix of the in-order one -- which is true only while data files
+     * carry no extension.
+     *
+     * T-9 requires this be a test so that adding an extension later breaks a test
+     * rather than the database. */
+    for (uint32_t g = 1; g <= 300; g++) {
+        char un[ZSI_NAME_MAX], in[ZSI_NAME_MAX];
+        zsi_name_format(un, test_uuid, g, 0);
+        zsi_name_format(in, test_uuid, g, g);
+
+        size_t ul = strlen(un);
+        if (strncmp(un, in, ul) != 0) {
+            fprintf(stderr, "\n    FAIL gen %u: '%s' is not a prefix of '%s'\n",
+                    g, un, in);
+            current_test_failed = 1;
+            return;
+        }
+        if (strcmp(un, in) >= 0) {
+            fprintf(stderr, "\n    FAIL gen %u: '%s' does not sort before '%s'\n",
+                    g, un, in);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* And the three-way case D-5a's table ends with: unordered N, N-N, and a
+     * wider N-M must sort in that order, so "last" is the widest. */
+    char a[ZSI_NAME_MAX], b[ZSI_NAME_MAX], c[ZSI_NAME_MAX];
+    zsi_name_format(a, test_uuid, 5, 0);
+    zsi_name_format(b, test_uuid, 5, 5);
+    zsi_name_format(c, test_uuid, 5, 9);
+    ASSERT(strcmp(a, b) < 0);
+    ASSERT(strcmp(b, c) < 0);
+    ASSERT(strcmp(a, c) < 0);
+}
+
+static void test_filename_lexical_order(void)
+{
+    /* D-1: fixed-width hex keeps lexical and numeric order identical, which is
+     * what lets D-5 sweep a sorted name list and get numeric ordering for free.
+     * Checked across the boundaries where a variable-width encoding would break
+     * it -- 9 to 10, 15 to 16, 255 to 256 -- and at the top of the range. */
+    static const uint32_t gens[] = {
+        1, 2, 9, 10, 15, 16, 17, 255, 256, 4095, 4096, 65535, 65536,
+        0x00FFFFFF, 0x01000000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF
+    };
+    size_t n = sizeof(gens) / sizeof(gens[0]);
+
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < n; j++) {
+            char x[ZSI_NAME_MAX], y[ZSI_NAME_MAX];
+            zsi_name_format(x, test_uuid, gens[i], 0);
+            zsi_name_format(y, test_uuid, gens[j], 0);
+            int lex = strcmp(x, y);
+            int num = (gens[i] > gens[j]) - (gens[i] < gens[j]);
+            if (((lex > 0) - (lex < 0)) != num) {
+                fprintf(stderr, "\n    FAIL %08X vs %08X: lexical %d, numeric %d\n",
+                        gens[i], gens[j], lex, num);
+                current_test_failed = 1;
+                return;
+            }
+        }
+    }
+
+    /* For a shared start, the wider end sorts last -- which is what makes D-5's
+     * "take the last" pick a repack output over its own inputs (D-5a). */
+    static const uint32_t ends[] = { 1, 2, 4, 9, 10, 16, 255, 0xFFFFFFFF };
+    for (size_t i = 1; i < sizeof(ends) / sizeof(ends[0]); i++) {
+        char x[ZSI_NAME_MAX], y[ZSI_NAME_MAX];
+        zsi_name_format(x, test_uuid, 1, ends[i - 1]);
+        zsi_name_format(y, test_uuid, 1, ends[i]);
+        ASSERT(strcmp(x, y) < 0);
+    }
+}
+
+static void test_staging_names(void)
+{
+    char a[ZSI_NAME_MAX], b[ZSI_NAME_MAX];
+    zsi_uuid_t u;
+    uint32_t s, e;
+
+    zsi_staging_name(a, 0);
+    zsi_staging_name(b, 1);
+    ASSERT(strcmp(a, b) != 0);
+
+    /* Staging names begin "zeroskip." and so can never match the data-file
+     * pattern (D-2).  A crashed repack leaves one behind, and it must be ignored
+     * rather than mistaken for a generation (R-5). */
+    ASSERT_EQ(zsi_name_parse(a, u, &s, &e), ZSI_NAME_OTHER);
+    ASSERT_EQ(zsi_name_parse(b, u, &s, &e), ZSI_NAME_OTHER);
+    ASSERT_MEM_EQ(a, ZSI_STAGING_PREFIX, strlen(ZSI_STAGING_PREFIX));
+
+    /* The lock file likewise (D-3). */
+    ASSERT_EQ(zsi_name_parse(ZSI_LOCK_NAME, u, &s, &e), ZSI_NAME_OTHER);
+
+    /* Long enough not to truncate at a large pid and counter. */
+    zsi_staging_name(a, 4294967295u);
+    ASSERT(strlen(a) < ZSI_NAME_MAX - 1);
+}
+
+/*
+ * ============================================================
  * Header and magic (T-2)
  * ============================================================
  */
@@ -1718,6 +1950,12 @@ static struct test_entry tests[] = {
     { "test_interop_constants_csum",    test_interop_constants_csum },
     { "test_interop_constants_compar",  test_interop_constants_compar },
     { "test_interop_constants_uuid",    test_interop_constants_uuid },
+
+    { "test_filenames",                 test_filenames },
+    { "test_filename_rejections",       test_filename_rejections },
+    { "test_filename_prefix_property",  test_filename_prefix_property },
+    { "test_filename_lexical_order",    test_filename_lexical_order },
+    { "test_staging_names",             test_staging_names },
 
     { "test_magic",                     test_magic },
     { "test_magic_designed_corruptions", test_magic_designed_corruptions },

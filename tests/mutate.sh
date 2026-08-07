@@ -152,8 +152,13 @@ mutant "csum: header never verified" catch \
 mutant "csum: covers 72 not 68" catch \
   's/zsi_put32\(buf \+ ZSI_HDR_OFF_CSUM, csum\(buf, ZSI_HDR_OFF_CSUM\)\);/zsi_put32(buf + ZSI_HDR_OFF_CSUM, csum(buf, ZSI_HEADER_LEN));/'
 
+# Anchored on a string unique to zsi_header_decode.  An earlier version anchored
+# on the "F-9: generations start at 1" comment, which zsi_name_parse later grew
+# too -- and since perl replaces the first match and FILENAMES precedes FILE
+# HEADER, the mutation landed in a function with no `buf` in scope and failed to
+# build.  A pattern can rot by matching the WRONG place, not only by not matching.
 mutant "reserved: rejected not ignored" catch \
-  's/    \/\* F-9: generations start at 1/    if (zsi_get32(buf + ZSI_HDR_OFF_RESERVED1)) return ZS_BADFORMAT;\n    if (zsi_get32(buf + ZSI_HDR_OFF_RESERVED2)) return ZS_BADFORMAT;\n\n    \/* F-9: generations start at 1/'
+  's/    memcpy\(out->compar_name, buf \+ ZSI_HDR_OFF_COMPAR, ZSI_COMPAR_NAME_LEN\);/    memcpy(out->compar_name, buf + ZSI_HDR_OFF_COMPAR, ZSI_COMPAR_NAME_LEN);\n    if (zsi_get32(buf + ZSI_HDR_OFF_RESERVED1)) return ZS_BADFORMAT;\n    if (zsi_get32(buf + ZSI_HDR_OFF_RESERVED2)) return ZS_BADFORMAT;/'
 
 mutant "version: write gate in decoder" catch \
   's/    out->version_read  = vread;/    if ((uint8_t)buf[ZSI_HDR_OFF_VWRITE] > ZSI_VERSION_WRITE) return ZS_BADFORMAT;\n    out->version_read  = vread;/'
@@ -184,6 +189,48 @@ mutant "F-9: start==0 allowed" catch \
 
 mutant "encoder: no memset (dirty padding)" catch \
   's/    memset\(buf, 0, ZSI_HEADER_LEN\);\n\n    memcpy\(buf \+ ZSI_HDR_OFF_MAGIC/    memcpy(buf + ZSI_HDR_OFF_MAGIC/'
+
+echo
+echo "filenames (Task 5)"
+
+# The D-1a property D-5's resolution rule rests on: adding an extension to data
+# files reverses the sort order of an unordered name against the in-order name for
+# the same generation, and overlap resolution silently picks the wrong file.
+mutant "names: .zs extension added" catch \
+  's/        snprintf\(out, ZSI_NAME_MAX, "%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X.zs", ZSI_NAME_PREFIX, ustr, start);/'
+
+mutant "names: lowercase generations" catch \
+  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%08x", ZSI_NAME_PREFIX, ustr, start);/'
+
+mutant "names: unpadded generations" catch \
+  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%X", ZSI_NAME_PREFIX, ustr, start);/'
+
+mutant "names: 4-digit generations" catch \
+  's/"%s%s-%08X-%08X",\n                 ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%04X-%04X",\n                 ZSI_NAME_PREFIX, ustr, start, end);/'
+
+mutant "names: decimal generations" catch \
+  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%08u", ZSI_NAME_PREFIX, ustr, start);/'
+
+mutant "parse: lowercase hex accepted" catch \
+  's/        else if \(c >= .A. && c <= .F.\) d = c - .A. \+ 10;/        else if (c >= 0x41 \&\& c <= 0x46) d = c - 0x41 + 10;\n        else if (c >= 0x61 \&\& c <= 0x66) d = c - 0x61 + 10;/'
+
+# Anchored on the comment rather than on the code, to sidestep matching an escaped
+# NUL literal through two layers of quoting -- which is what defeated the previous
+# attempt at this pattern.
+mutant "parse: trailing junk allowed" catch \
+  's/    \/\* No extension, and nothing trailing \(D-1a\)\. \*\/\n    if [^\n]*\n/    \/* trailing check removed *\/\n/'
+
+mutant "parse: generation 0 allowed" catch \
+  's/    if \(s == 0\) return ZSI_NAME_OTHER;/    \/* F-9 check removed *\//'
+
+mutant "parse: backwards range allowed" catch \
+  's/    if \(e == 0 \|\| e < s\) return ZSI_NAME_OTHER;/    if (e == 0) return ZSI_NAME_OTHER;/'
+
+mutant "parse: metadata matches data pattern" catch \
+  's/    if \(strncmp\(name, ZSI_NAME_PREFIX, ZSI_NAME_PREFIX_LEN\) != 0\)\n        return ZSI_NAME_OTHER;/    if (strncmp(name, "zeroskip", 8) != 0)\n        return ZSI_NAME_OTHER;/'
+
+mutant "parse: 7 hex digits accepted" catch \
+  's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
 echo "records and terminators (Task 4)"

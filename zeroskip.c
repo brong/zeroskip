@@ -404,6 +404,147 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
 
 /********** FILENAMES *************/
 
+/* The directory is the file set (section 5.2).  There is no manifest: filenames
+ * carry each file's generation range, so one readdir yields the set and every
+ * range without opening a single file.
+ *
+ *   zeroskip-<uuid>-<gen>            unordered file, one generation
+ *   zeroskip-<uuid>-<start>-<end>    in-order file
+ *   zeroskip.tmp.<pid>.<n>           staging for a repack or conversion output
+ *   zeroskip.lock                    holds the fcntl locks
+ *
+ * zeroskip-* matches data files only and zeroskip.* matches metadata, so both
+ * sets are prefix-globbable and staging names can never match the data-file
+ * pattern (D-2).
+ *
+ * Two properties of this spelling are load-bearing for D-5's overlap resolution,
+ * and both are asserted directly on generated names in test_filename_*:
+ *
+ *   - generations are UPPERCASE hex, zero-padded to exactly 8 digits (D-1).
+ *     Fixed width keeps lexical and numeric order identical, and 8 digits is
+ *     exactly the range of a 32-bit generation, so every representable
+ *     generation has a name and the width never needs to change.
+ *   - data files carry NO extension (D-1a).  An unordered file's name is
+ *     therefore a strict *prefix* of the in-order name covering the same
+ *     generation -- "...-00000005" against "...-00000005-00000005" -- and so
+ *     sorts before it, which D-5's "take the last" rule requires.  Any suffix
+ *     sorting after '-' would reverse that pair and silently break resolution.
+ *
+ * The UUID is lowercase (D-0) against those uppercase generations.  The contrast
+ * is deliberate: it makes a malformed name obvious on sight. */
+
+#define ZSI_NAME_PREFIX     "zeroskip-"
+#define ZSI_NAME_PREFIX_LEN 9
+#define ZSI_LOCK_NAME       "zeroskip.lock"
+#define ZSI_STAGING_PREFIX  "zeroskip.tmp."
+
+/* "zeroskip-" + 36 + "-" + 8 + "-" + 8 + NUL = 64.  Rounded up for headroom. */
+#define ZSI_NAME_MAX 80
+
+enum zsi_nametype {
+    ZSI_NAME_OTHER = 0,      /* not a data file of ours -- ignore (D-4) */
+    ZSI_NAME_UNORDERED,      /* zeroskip-<uuid>-<gen> */
+    ZSI_NAME_INORDER         /* zeroskip-<uuid>-<start>-<end> */
+};
+
+static void zsi_name_format(char *out, const zsi_uuid_t uuid,
+                            uint32_t start, uint32_t end)
+{
+    char ustr[ZSI_UUID_STR_LEN];
+    zsi_uuid_unparse(uuid, ustr);
+
+    if (end == 0)
+        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X", ZSI_NAME_PREFIX, ustr, start);
+    else
+        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X-%08X",
+                 ZSI_NAME_PREFIX, ustr, start, end);
+}
+
+/* Parse exactly 8 uppercase hex digits.  Returns the character count consumed,
+ * or 0 on any deviation: lowercase, fewer or more digits, a 0x prefix, a sign. */
+static size_t zsi_parse_gen8(const char *p, uint32_t *out)
+{
+    uint32_t v = 0;
+
+    for (size_t i = 0; i < 8; i++) {
+        unsigned char c = (unsigned char)p[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return 0;                  /* lowercase deliberately excluded */
+        v = (v << 4) | (uint32_t)d;
+    }
+
+    *out = v;
+    return 8;
+}
+
+/* Classify a directory entry.  Fills uuid/start/end when it is a data file; for
+ * an unordered file *end is 0, which F-9 makes unambiguous.
+ *
+ * Strict by design.  A lenient parser here would let two implementations
+ * disagree about which files belong to a database, and D-4's "a file
+ * participates if its name matches" makes that disagreement a correctness bug
+ * rather than a cosmetic one. */
+static enum zsi_nametype zsi_name_parse(const char *name, zsi_uuid_t uuid,
+                                        uint32_t *start, uint32_t *end)
+{
+    /* Anything beginning "zeroskip." is metadata, not data (D-2): the lock file
+     * and staging names live there and must never match. */
+    if (strncmp(name, ZSI_NAME_PREFIX, ZSI_NAME_PREFIX_LEN) != 0)
+        return ZSI_NAME_OTHER;
+
+    const char *p = name + ZSI_NAME_PREFIX_LEN;
+
+    /* 36 characters of lowercase hyphenated UUID, then a separator. */
+    if (strlen(p) < 36 + 1) return ZSI_NAME_OTHER;
+    if (zsi_uuid_parse(p, uuid) != 0) return ZSI_NAME_OTHER;
+    p += 36;
+    if (*p != '-') return ZSI_NAME_OTHER;
+    p++;
+
+    uint32_t s, e;
+    if (zsi_parse_gen8(p, &s) != 8) return ZSI_NAME_OTHER;
+    p += 8;
+
+    /* F-9: generations start at 1, so 0 is never a legitimate start. */
+    if (s == 0) return ZSI_NAME_OTHER;
+
+    if (*p == '\0') {
+        *start = s;
+        *end = 0;
+        return ZSI_NAME_UNORDERED;
+    }
+
+    if (*p != '-') return ZSI_NAME_OTHER;
+    p++;
+
+    if (zsi_parse_gen8(p, &e) != 8) return ZSI_NAME_OTHER;
+    p += 8;
+
+    /* No extension, and nothing trailing (D-1a). */
+    if (*p != '\0') return ZSI_NAME_OTHER;
+
+    /* end == 0 would make an in-order name indistinguishable from an unordered
+     * one, and a range must not run backwards. */
+    if (e == 0 || e < s) return ZSI_NAME_OTHER;
+
+    *start = s;
+    *end = e;
+    return ZSI_NAME_INORDER;
+}
+
+/* A staging name.  The pid is for human legibility only -- it is NOT what makes
+ * the name unique, because a pid is not unique on shared storage where two hosts
+ * readily have the same one.  D-20a requires O_CREAT|O_EXCL and advancing <n>
+ * until it succeeds; that is what actually guarantees exclusivity, and two
+ * processes writing one staging file would otherwise produce an interleaved
+ * output that then gets renamed into place as though complete. */
+static void zsi_staging_name(char *out, unsigned n)
+{
+    snprintf(out, ZSI_NAME_MAX, "%s%d.%u", ZSI_STAGING_PREFIX, (int)getpid(), n);
+}
+
 /********** FILE HEADER *************/
 
 /* Every file begins with the same 16 bytes (section 4.2):
