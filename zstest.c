@@ -10323,6 +10323,83 @@ static void test_open_is_o1_in_records(void)
 
 /*
  * ============================================================
+ * Pointer table cache (spec section 8)
+ * ============================================================
+ */
+
+/* Make a cache directory under basedir and return its path in `out`. */
+static void idxcache_mkdir(char *out, size_t outlen)
+{
+    snprintf(out, outlen, "%s/cache", basedir);
+    if (mkdir(out, 0700) && errno != EEXIST) {
+        fprintf(stderr, "\n    FAIL: mkdir %s: %s\n", out, strerror(errno));
+        current_test_failed = 1;
+    }
+}
+
+/* A-8, P-2, R-3: the cache directory must not be the database directory.
+ * Allowing it would let a read-only handle write into the database, which is
+ * precisely what R-3 forbids -- the amendment permits publishing only because a
+ * cache directory is somewhere else. */
+static void test_idxcache_rejects_db_dir(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char dotted[PATH_MAX];
+
+    setup.flags = ZS_CREATE;
+
+    /* Identical strings, caught before the database is created. */
+    setup.index_dir = dbdir;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    ASSERT_NULL(db);
+
+    /* Create the database for real, then try to name it a second way.  A plain
+     * string compare cannot catch this one. */
+    setup.index_dir = NULL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_close(&db));
+
+    snprintf(dotted, sizeof(dotted), "%s/./", dbdir);
+    setup.index_dir = dotted;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    ASSERT_NULL(db);
+}
+
+/* A-9: index_threshold 0 resolves to a default derived from rollover_size, so a
+ * caller that sets index_dir and nothing else still gets bounded publishing. */
+static void test_idxcache_threshold_defaults(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cachedir[PATH_MAX];
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.rollover_size = 8192;
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->index_threshold, 8192u / 8u);
+    ASSERT_STR_EQ(db->index_dir, cachedir);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* An explicit value wins, and the cache stays off when index_dir is NULL. */
+    setup.index_threshold = 4321;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQU(db->index_threshold, 4321u);
+    ASSERT_OK(zs_db_close(&db));
+
+    setup.index_dir = NULL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NULL(db->index_dir);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -10522,6 +10599,10 @@ static struct test_entry tests[] = {
     { "test_conversion_avoids_the_repack_lock",
                                         test_conversion_avoids_the_repack_lock },
     { "test_open_is_o1_in_records",     test_open_is_o1_in_records },
+
+    { "test_idxcache_rejects_db_dir",   test_idxcache_rejects_db_dir },
+    { "test_idxcache_threshold_defaults",
+                                        test_idxcache_threshold_defaults },
 
     { NULL, NULL }
 };

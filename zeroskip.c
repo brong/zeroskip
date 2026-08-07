@@ -3083,6 +3083,11 @@ struct zs_db {
     size_t       rollover_size;
     void       (*error)(const char *msg, const char *fmt, ...);
 
+    /* Pointer table cache (spec section 8).  index_dir NULL disables it. */
+    char        *index_dir;          /* owned */
+    size_t       index_threshold;    /* P-13 */
+    bool         idx_publish_warned; /* P-15: report the first failure only */
+
     bool         readonly;          /* ZS_SHARED (A-5) */
     bool         nocsum;            /* ZS_NOCSUM (F-5e) */
     bool         nosync;            /* ZS_NOSYNC (C-7c) */
@@ -5089,6 +5094,28 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     db->dir = strdup(dir);
     if (!db->dir) { free(db); return ZS_INTERNAL; }
 
+    if (setup->index_dir) {
+        /* A-8/P-2, the cheap half: identical strings, caught before anything is
+         * created.  The resolved-path half has to wait until the database
+         * directory exists -- see below. */
+        if (strcmp(dir, setup->index_dir) == 0) {
+            free(db->dir);
+            free(db);
+            return ZS_BADUSAGE;
+        }
+
+        db->index_dir = strdup(setup->index_dir);
+        if (!db->index_dir) { free(db->dir); free(db); return ZS_INTERNAL; }
+
+        /* A-9.  Zero means a default derived from rollover_size, so a caller
+         * that sets index_dir and nothing else still gets bounded publishing.
+         * Never zero in the end: a threshold of zero publishes on every commit,
+         * which P-13 exists to prevent. */
+        db->index_threshold = setup->index_threshold ? setup->index_threshold
+                                                     : db->rollover_size / 8;
+        if (db->index_threshold == 0) db->index_threshold = 1;
+    }
+
     /* Is there anything here?  A directory that does not exist, or holds no data
      * files, is the empty case D-8a handles. */
     struct zsi_fileset probe;
@@ -5118,6 +5145,29 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
             zsi_uuid_generate(db->uuid);
         }
         db->have_uuid = true;
+    }
+
+    /* A-8/P-2.  The cache directory must not be the database directory: writing
+     * a table there would be a write to the database, and the R-3 amendment
+     * permits a read-only handle to publish only because a cache directory is
+     * somewhere else.
+     *
+     * Checked HERE rather than at the top of this function, because with
+     * ZS_CREATE the database directory does not exist until the mkdir above and
+     * realpath cannot resolve a directory that is not there yet.  Checking early
+     * would let the very first open -- the one that creates the database -- slip
+     * through with the two directories identical.
+     *
+     * This is the half that catches "." and a trailing slash.  The identical-
+     * string half already ran, before the mkdir. */
+    if (db->index_dir) {
+        char rd[PATH_MAX], rc[PATH_MAX];
+
+        if (realpath(dir, rd) && realpath(db->index_dir, rc)
+            && strcmp(rd, rc) == 0) {
+            zs_db_close(&db);
+            return ZS_BADUSAGE;
+        }
     }
 
     /* D-3a: the lock file is created with the database, and created on open if
@@ -5168,6 +5218,7 @@ int zs_db_close(struct zs_db **dbp)
     zsi_snapshot_release(&db->snap);
     zsi_lock_close(&db->locks);
     free(db->retbuf);
+    free(db->index_dir);
     free(db->dir);
     free(db);
     *dbp = NULL;

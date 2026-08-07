@@ -76,9 +76,19 @@ struct zs_open_data {
     zs_csum     *csum;           /* required for engine 2 */
     size_t       rollover_size;  /* 0 = default 2MB */
     void       (*error)(const char *msg, const char *fmt, ...);
+
+    /* Pointer table cache (spec section 8).  NULL disables it, which is the
+     * default: the library never picks a directory itself (P-2), because a
+     * planted table yields wrong records and a world-writable default such as
+     * /tmp would make planting one trivial.  MUST NOT name the database
+     * directory -- that would let a read-only handle write into the database,
+     * which is exactly what R-3 forbids.  Not created by the library; a missing
+     * or unwritable directory disables the cache rather than failing the open. */
+    const char  *index_dir;        /* A-8 */
+    size_t       index_threshold;  /* A-9: 0 = rollover_size / 8 */
 };
 
-#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, NULL }
+#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, NULL, NULL, 0 }
 
 /* database operations
  *
