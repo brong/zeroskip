@@ -229,7 +229,7 @@ a spec label is missing here.
 | `P-11` | A reader MUST use a table only if **all** of the following hold, and | `idxcache_rejection_rules` |
 | `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_replays_the_suffix`, `idxcache_open_agrees` |
 | `P-13` | After building or extending an index over an unordered file, a | `idxcache_threshold` |
-| `P-14` | A table MUST NOT be `fsync`ed before publication. It is rebuildable, | `idxcache_no_fsync_on_publish` |
+| `P-14` | A table MUST NOT be `fsync`ed before publication. It is rebuildable, | `crash/idxcache_no_fsync_on_publish` |
 | `P-15` | A failure to publish MUST NOT fail the operation that triggered it. | `idxcache_publish_failure_is_not_fatal` |
 | `P-16` | A process MAY unlink tables in the cache directory whose uuid matches | `idxcache_sweeps_dead_generations` |
 | `P-17` | P-10's binding detects a data file whose covered prefix has changed. | `idxcache_rejects_bad_term_binding` |

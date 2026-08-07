@@ -11330,6 +11330,141 @@ static void test_idxcache_sweeps_dead_generations(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* P-7: the table records the engine the DATA FILE names, not the one this handle
+ * would choose for a file it creates.
+ *
+ * Built by two opens with different engine defaults, which is the arrangement
+ * that caught the equivalent bug for appending: the second handle's default is
+ * XXHASH, the file says engine 0, and the table must follow the file.  A table
+ * checksummed under the handle's engine validates for nobody, so every reader
+ * silently rejects it and the cache does nothing while appearing to work. */
+static void test_idxcache_uses_file_engine(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    struct zsi_idxcfg cfg;
+    char *tab;
+    size_t tablen;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+    cfg.dir = cachedir;
+    cfg.threshold = 1;
+
+    /* Create under engine 0. */
+    setup.flags = ZS_CREATE | ZS_CSUM_NONE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopen with the DEFAULT engine -- XXHASH -- and append. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(db->create_csum_id, ZSI_CSUM_XXHASH);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_NONE);
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+
+    tab = idxcache_slurp(tabpath, &tablen);
+    ASSERT_NOT_NULL(tab);
+    ASSERT_EQ(zsi_idxhdr_engine_id(tab), ZSI_CSUM_NONE);
+    free(tab);
+
+    /* And it loads, which it would not if it had been written under the
+     * handle's engine: the engine check compares against the file's. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc));
+        ASSERT_EQU(nbase, 2u);
+        free(base);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+
+    /* The data survives a cached reopen under either engine default. */
+    {
+        const char *v = NULL;
+        size_t vl = 0;
+        ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+        ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 1u);
+        ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 1u);
+        ASSERT_OK(zs_db_close(&db));
+    }
+}
+
+/* P-8: valid_upto is always a span boundary, and term_off names the terminator
+ * that ends there.  Checked against an independent walk of the file rather than
+ * against the value the publisher happened to store. */
+static void test_idxcache_valid_upto_is_span_boundary(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    struct idxcache_count c;
+    char *tab;
+    size_t tablen;
+    uint64_t vu, to;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 10; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%02d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "v", 1, 0));
+    }
+
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+    tab = idxcache_slurp(tabpath, &tablen);
+    ASSERT_NOT_NULL(tab);
+    vu = zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO);
+    to = zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF);
+    free(tab);
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* An independent walk from the top agrees on where the last span ends. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, ZSI_HEADER_LEN, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 10u);
+    ASSERT_EQU(vu, (unsigned long long)f->complete);
+
+    /* A walk starting there finds nothing further, which is what "boundary"
+     * means, and leaves the complete point where it was. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_OK(zsi_unordered_replay(f, (size_t)vu, false,
+                                   idxcache_count_cb, &c));
+    ASSERT_EQU(c.n, 0u);
+    ASSERT_EQU(f->complete, vu);
+
+    /* And term_off names a terminator that ends exactly at valid_upto. */
+    {
+        struct zsi_term term;
+        const char *tb = zsi_file_at(f, (size_t)to, 1);
+        ASSERT_NOT_NULL(tb);
+        ASSERT_OK(zsi_term_decode(tb, f->size - (size_t)to, &term));
+        ASSERT_EQU(to + term.len, vu);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -11555,6 +11690,9 @@ static struct test_entry tests[] = {
                                         test_idxcache_only_unordered_files },
     { "test_idxcache_sweeps_dead_generations",
                                         test_idxcache_sweeps_dead_generations },
+    { "test_idxcache_uses_file_engine", test_idxcache_uses_file_engine },
+    { "test_idxcache_valid_upto_is_span_boundary",
+                                        test_idxcache_valid_upto_is_span_boundary },
 
     { NULL, NULL }
 };

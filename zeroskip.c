@@ -2902,19 +2902,19 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
     if (fd < 0) { rc = ZS_IOERROR; goto out; }
 
     rc = ZS_IOERROR;
-    if (write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) goto out_unlink;
-    if (arrlen && write(fd, arr, arrlen) != (ssize_t)arrlen) goto out_unlink;
+    if (ZS_WRITE(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) goto out_unlink;
+    if (arrlen && ZS_WRITE(fd, arr, arrlen) != (ssize_t)arrlen) goto out_unlink;
 
     /* Note the empty case: f->csum(arr, 0) must be the ENGINE's value for empty
      * input, not zero.  zsi_csum_xxhash has no empty short-circuit for exactly
      * this reason (F-26g), so passing a zero length here is correct. */
     zsi_put32(csbuf, f->csum(arr, arrlen));
-    if (write(fd, csbuf, 4) != 4) goto out_unlink;
+    if (ZS_WRITE(fd, csbuf, 4) != 4) goto out_unlink;
 
     if (close(fd) < 0) { fd = -1; goto out_unlink; }
     fd = -1;
 
-    if (rename(tmp, path) < 0) goto out_unlink;
+    if (ZS_RENAME(tmp, path) < 0) goto out_unlink;
 
     f->cached_upto = f->complete;
     rc = ZS_OK;
@@ -2922,7 +2922,7 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
 
 out_unlink:
     if (fd >= 0) { close(fd); fd = -1; }
-    unlink(tmp);
+    ZS_UNLINK(tmp);
 
 out:
     if (fd >= 0) close(fd);
@@ -2980,7 +2980,7 @@ static void zsi_idx_sweep(const struct zsi_idxcfg *cfg, const zsi_uuid_t uuid,
 
         if ((size_t)snprintf(path, sizeof(path), "%s/%s", cfg->dir, de->d_name)
             < sizeof(path))
-            unlink(path);
+            ZS_UNLINK(path);
     }
 
     closedir(d);

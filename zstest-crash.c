@@ -836,6 +836,81 @@ static void snapshot_gap(const char *dir)
     gap_staged[0] = '\0';          /* once, so the retry can succeed */
 }
 
+/* P-14: publishing a pointer table must not sync.
+ *
+ * Asserted by COUNTING, not by timing: a commit with the cache on performs
+ * exactly the same number of fdatasync calls as one with it off.  A timing
+ * assertion would be flaky, and a structural one -- grepping the source -- would
+ * pass the moment the sync moved somewhere else.
+ *
+ * This lives in the crash harness rather than zstest because the syscall hooks
+ * only exist under ZS_TEST_HOOKS, which only this target defines.  It doubles as
+ * a check that C-7's two gates are still two. */
+static void test_idxcache_no_fsync_on_publish(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    long without, with;
+
+    total++;
+
+    fresh_dir();
+    hooks_reset();
+    hooks_on();
+
+    snprintf(cachedir, sizeof(cachedir), "%s/cache", basedir);
+    {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", cachedir);
+        if (system(cmd)) {}
+    }
+    CHECK(mkdir(cachedir, 0700) == 0, "mkdir cache");
+
+    /* Baseline: one commit with no cache at all. */
+    setup.flags = ZS_CREATE;
+    setup.error = quiet_error;
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open plain");
+    CHECK(zs_db_store(db, "a", 1, "1", 1, 0) == ZS_OK, "store a");
+    without = sync_calls;
+    CHECK(zs_db_store(db, "b", 1, "2", 1, 0) == ZS_OK, "store b");
+    without = sync_calls - without;
+    zs_db_close(&db);
+
+    /* The same commit with the cache on and a threshold of one byte, so a table
+     * is published for certain. */
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open cached");
+    CHECK(zs_db_store(db, "c", 1, "3", 1, 0) == ZS_OK, "store c");
+    with = sync_calls;
+    CHECK(zs_db_store(db, "d", 1, "4", 1, 0) == ZS_OK, "store d");
+    with = sync_calls - with;
+    zs_db_close(&db);
+
+    CHECK(without == 2, "C-7 gates: expected 2 syncs per commit, got %ld",
+          without);
+    CHECK(with == without,
+          "publishing added %ld sync(s) to a commit (P-14)", with - without);
+
+    /* And a table really was published, so the comparison meant something. */
+    {
+        DIR *d = opendir(cachedir);
+        struct dirent *de;
+        int tables = 0;
+        CHECK(d != NULL, "opendir cache");
+        while ((de = readdir(d)))
+            if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                         strlen(ZSI_IDX_NAME_PREFIX)))
+                tables++;
+        closedir(d);
+        CHECK(tables == 1, "expected one published table, found %d", tables);
+    }
+
+    passed++;
+    fprintf(stderr, "  publishing adds no sync (P-14)           ok\n");
+}
+
 static void test_snapshot_gap_retry(void)
 {
     /* C-4a/C-4b: a file removed between scanning the directory and opening the
@@ -981,6 +1056,7 @@ int main(int argc, char **argv)
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },
         { "crash_after_invalid_terminator", test_crash_after_invalid_terminator },
         { "snapshot_gap_retry",             test_snapshot_gap_retry },
+        { "idxcache_no_fsync_on_publish",   test_idxcache_no_fsync_on_publish },
         { NULL, NULL }
     };
 
