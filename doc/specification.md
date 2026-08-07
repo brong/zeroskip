@@ -89,10 +89,11 @@ whether a pointer section must be present.
   snapshot and takes no lock. Readers never block a writer; a writer never
   blocks readers.
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
-  byte-range lock *plus* an in-process mutex, since `fcntl` locks do not exclude
-  threads of the same process (C-1f). Because the kernel releases `fcntl` locks
-  on process death, a killed writer never blocks the next one; no lock state can
-  outlive a process.
+  byte-range lock. Because the kernel releases `fcntl` locks on process death, a
+  killed writer never blocks the next one; no lock state can outlive a process.
+  A handle is not thread-safe, and a process MUST NOT open two write handles on
+  one database: `fcntl` locks are per-process, so neither would exclude the
+  other (C-1f). Concurrent writers MUST be separate processes.
 - **G-6 No shared mutable state.** Nothing a reader may be reading is ever
   rewritten beneath it: files are append-only, a new file is published by
   `rename`, and every index is private to the process that built it. There is no
@@ -931,8 +932,11 @@ The per-file cursors are held in an array kept sorted by:
   `fcntl` on Linux and does not exclude it, and is a no-op over some network
   filesystems.
 - **C-1f** `fcntl` locks are per-process, not per-thread: two threads of one
-  process both acquire the same lock successfully. G-5 therefore requires an
-  in-process mutex as well, held across the same region as the file lock.
+  process both acquire the same lock successfully, and two handles in one process
+  do not exclude each other. Excluding threads would require a process-global
+  registry keyed by the lock file's identity, which this specification does not
+  require: a caller needing concurrent writers MUST use separate processes, and a
+  binding SHOULD document its handles as not thread-safe.
 - **C-1g** `fcntl` locks are released by closing **any** descriptor for the file
   in that process. An implementation MUST hold exactly one descriptor for
   `zeroskip.lock` for the handle's lifetime, and MUST NOT open a second.
@@ -957,8 +961,10 @@ The per-file cursors are held in an array kept sorted by:
   while writing MUST impose its own consistent order.
 - **C-1i** An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only
   where it has verified that the two conflict with each other on that platform.
-  `F_OFD_SETLK` is scoped to an open file description, so C-1g does not apply to
-  it; C-1f still does, unless every writing thread holds its own descriptor.
+  `F_OFD_SETLK` is scoped to an open file description rather than a process, so
+  C-1g does not apply to it — and unlike `F_SETLK` it *does* exclude two handles
+  in one process, which is the one thing C-1f gives up. An implementation that
+  needs that exclusion should reach for it rather than for a mutex.
 - **C-2** Readers take **no lock**.
 - **C-3** A file is published by writing it under a staging name, then
   `rename`ing it to its final name. Readers see it only once complete, and the
@@ -1492,12 +1498,14 @@ bugs, since they exercise the locking interop surface (C-1e):
   which is the honest outcome — that the test documents D-3b's hazard rather than
   appearing to pass.
 
-**T-14 Multi-threaded exclusion.** For any implementation whose language exposes
-threads: two threads of **one process** writing concurrently, asserting they
-exclude each other. This fails for an implementation that relies on `fcntl`
-alone, since the kernel sees a single owner (C-1f), and it is invisible to a
-single-threaded implementation — so it MUST be run per implementation rather than
-assumed from the C one passing.
+**T-14 Two handles in one process.** Two write handles on one database from a
+single process, asserting the implementation does **not** claim to exclude them
+(C-1f) — either by refusing the second open, or by documenting the hazard. The
+test exists to stop an implementation quietly acquiring a mutex and appearing to
+offer a guarantee the format cannot enforce: `fcntl` sees one process and grants
+both, so a per-handle mutex excludes only threads that share a handle, which is
+not the same property. An implementation using `F_OFD_SETLK` (C-1i) MAY exclude
+them, and if it does it should say so.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close. Each
@@ -1506,8 +1514,8 @@ visible.
 
 ## 10. Non-goals
 
-Multi-writer concurrency; cross-database transactions; secondary indexes;
-compression; network access; in-place value mutation. A Cyrus `cyrusdb`
+Multi-writer concurrency; thread-safe handles; cross-database transactions;
+secondary indexes; compression; network access; in-place value mutation. A Cyrus `cyrusdb`
 backend is a thin separate adapter, out of scope.
 
 ## 11. Open items
