@@ -69,6 +69,26 @@ from the spec; where a task restates one, the spec wins on any discrepancy.
 - **Default `rollover_size`:** 2MB.
 - **C99, no external libraries.** Builds on Linux, macOS and the BSDs.
 
+### Every task also adds mutants
+
+`tests/mutate.sh` (`make mutate`) introduces, one at a time, the bugs the suite
+claims to guard against, and reports whether the suite noticed. **Each task adds
+mutants for the requirements it implements.** A test that passes but cannot fail
+reads as coverage while providing none.
+
+This was added during Task 3 rather than planned, because it immediately found a
+whole class of false confidence: several header tests passed under a *symmetric*
+layout change — swap two field offsets, and a matched encoder/decoder round-trips
+perfectly — which is precisely the bug that makes another implementation unable
+to read our files. The lesson generalises to every remaining task in this plan:
+
+> **A round-trip test through your own encoder and decoder cannot pin a byte
+> layout.** Wherever the plan says "round-trips", also assert the encoded bytes
+> against a literal.
+
+Mark a mutant `equivalent` when it genuinely cannot be caught, with the reason,
+rather than writing a bogus test to chase it. Two are already so marked.
+
 ### Internal naming conventions
 
 - Public API: `zs_db_*`, `zs_txn_*`, `zs_cursor_*`; public types `struct zs_db`,

@@ -64,7 +64,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check test asan bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check test asan mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -123,6 +123,11 @@ asan:
 	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address,undefined \
 		-fno-omit-frame-pointer -fno-sanitize-recover=all"
 	./zstest
+
+# Verify the suite can actually fail, by introducing the bugs it guards against.
+# Slow (one full rebuild per mutant), so it is not part of `make check`.
+mutate:
+	./tests/mutate.sh
 
 # Benchmarks
 bench: zsbench

@@ -403,6 +403,163 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
 
 /********** FILE HEADER *************/
 
+/* Every file begins with the same 16 bytes (section 4.2):
+ *
+ *     89 7A 65 72 6F 73 6B 69 70 31 0D 0A 1A 0A 00 00
+ *     \x89  z  e  r  o  s  k  i  p  1 \r \n ^Z \n \0 \0
+ *
+ * Each part earns its place, following the reasoning behind the PNG signature:
+ *
+ *   89        high bit set, so no text file can be mistaken for a database and a
+ *             transfer that strips the eighth bit is detected.  Also makes the
+ *             sequence invalid UTF-8 (F-6a): 0x89 is in the continuation-byte
+ *             range 0x80-0xBF, and a continuation byte cannot begin a sequence.
+ *             Anything validating the file as text fails at byte 0 rather than
+ *             part way through, and anything that sanitises invalid UTF-8 by
+ *             substitution replaces it with U+FFFD, destroying the magic
+ *             detectably instead of silently corrupting the body.
+ *   zeroskip  human-readable in a hex dump and to file(1)
+ *   1         major format version in the magic, so an incompatible future
+ *             format is distinguishable without parsing
+ *   0D 0A     CR-LF trap: newline translation in either direction alters it
+ *   1A        DOS end-of-file, so accidentally type-ing a file stops early
+ *   0A        bare LF, catching the inverse newline translation
+ *   00 00     NUL-terminates the printable part and pads to 16
+ *
+ * A reader MUST validate all 16 bytes, not a prefix (F-6). */
+#define ZSI_MAGIC_LEN 16
+
+static const unsigned char zsi_magic[ZSI_MAGIC_LEN] = {
+    0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+    0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
+};
+
+/* Field offsets within the 72-byte header (section 4.3).  Spelled out rather
+ * than derived by summing sizes, so a table in the spec maps to a table here. */
+#define ZSI_HEADER_LEN         72
+#define ZSI_HDR_OFF_MAGIC       0   /* 16 */
+#define ZSI_HDR_OFF_VREAD      16   /*  1 */
+#define ZSI_HDR_OFF_VWRITE     17   /*  1 */
+#define ZSI_HDR_OFF_FLAGS      18   /*  2 */
+#define ZSI_HDR_OFF_RESERVED1  20   /*  4 */
+#define ZSI_HDR_OFF_UUID       24   /* 16 */
+#define ZSI_HDR_OFF_START      40   /*  4 */
+#define ZSI_HDR_OFF_END        44   /*  4 */
+#define ZSI_HDR_OFF_COMPAR     48   /* 16 */
+#define ZSI_HDR_OFF_RESERVED2  64   /*  4 */
+#define ZSI_HDR_OFF_CSUM       68   /*  4, covers [0, 68) */
+
+/* The lowest library version able to read, and to write, a file we produce. */
+#define ZSI_VERSION_READ  1
+#define ZSI_VERSION_WRITE 1
+
+#define ZSI_COMPAR_NAME_LEN 16
+
+struct zsi_header {
+    uint8_t     version_read;
+    uint8_t     version_write;
+    uint16_t    flags;                            /* low 4 bits: csum engine */
+    zsi_uuid_t  uuid;
+    uint32_t    start;
+    uint32_t    end;                              /* 0 == unordered (F-9) */
+    char        compar_name[ZSI_COMPAR_NAME_LEN]; /* NUL-padded, not NUL-terminated */
+};
+
+/* end == 0 means unordered with no pointer section; end != 0 means in-order
+ * with pointers.  The two kinds are exhaustive and distinguishable from the
+ * header alone, so a reader always knows, before reading anything else, whether
+ * a pointer section must be present.  Generations start at 1, so end == 0 is
+ * never a legitimate generation (F-9). */
+static bool zsi_header_is_unordered(const struct zsi_header *h)
+{
+    return h->end == 0;
+}
+
+static void zsi_header_encode(char *buf, const struct zsi_header *hdr,
+                              zs_csum *csum)
+{
+    memset(buf, 0, ZSI_HEADER_LEN);
+
+    memcpy(buf + ZSI_HDR_OFF_MAGIC, zsi_magic, ZSI_MAGIC_LEN);
+    buf[ZSI_HDR_OFF_VREAD]  = (char)hdr->version_read;
+    buf[ZSI_HDR_OFF_VWRITE] = (char)hdr->version_write;
+    zsi_put16(buf + ZSI_HDR_OFF_FLAGS, hdr->flags);
+    /* RESERVED1 and RESERVED2 stay zero: written as zero, ignored on read
+     * (F-8).  The memset above is what writes them. */
+    memcpy(buf + ZSI_HDR_OFF_UUID, hdr->uuid, 16);
+    zsi_put32(buf + ZSI_HDR_OFF_START, hdr->start);
+    zsi_put32(buf + ZSI_HDR_OFF_END, hdr->end);
+    memcpy(buf + ZSI_HDR_OFF_COMPAR, hdr->compar_name, ZSI_COMPAR_NAME_LEN);
+
+    /* F-4: the checksum is the last 4 bytes and covers everything before it.
+     * No field-zeroing anywhere. */
+    zsi_put32(buf + ZSI_HDR_OFF_CSUM, csum(buf, ZSI_HDR_OFF_CSUM));
+}
+
+/* Decode and validate.  Returns ZS_BADFORMAT if the buffer is too short, the
+ * magic is wrong, the header checksum fails, or version_read exceeds ours.
+ *
+ * Two things this deliberately does NOT do:
+ *
+ *   - it does not reject a nonzero reserved field.  F-8 says write zero and
+ *     ignore on read; the checksum already covers them, and rejecting would make
+ *     a future extension unreadable by this version, which is exactly what the
+ *     version fields exist to decide instead.
+ *   - it does not enforce version_write.  That gate belongs to the writer, so the
+ *     value is recorded and the caller decides (F-7).  This is what lets a file
+ *     that is readable but not writable be opened read-only rather than refused.
+ *
+ * csum must be the engine named by the header's own flags.  Callers get it by
+ * reading those flags as plain data first -- see zsi_header_engine_id below. */
+static int zsi_header_decode(const char *buf, size_t len,
+                             zs_csum *csum, struct zsi_header *out)
+{
+    if (len < ZSI_HEADER_LEN) return ZS_BADFORMAT;
+
+    if (memcmp(buf + ZSI_HDR_OFF_MAGIC, zsi_magic, ZSI_MAGIC_LEN) != 0)
+        return ZS_BADFORMAT;
+
+    if (zsi_get32(buf + ZSI_HDR_OFF_CSUM) != csum(buf, ZSI_HDR_OFF_CSUM))
+        return ZS_BADCHECKSUM;
+
+    uint8_t vread = (uint8_t)buf[ZSI_HDR_OFF_VREAD];
+    if (vread > ZSI_VERSION_READ) return ZS_BADFORMAT;
+
+    out->version_read  = vread;
+    out->version_write = (uint8_t)buf[ZSI_HDR_OFF_VWRITE];
+    out->flags         = zsi_get16(buf + ZSI_HDR_OFF_FLAGS);
+    memcpy(out->uuid, buf + ZSI_HDR_OFF_UUID, 16);
+    out->start         = zsi_get32(buf + ZSI_HDR_OFF_START);
+    out->end           = zsi_get32(buf + ZSI_HDR_OFF_END);
+    memcpy(out->compar_name, buf + ZSI_HDR_OFF_COMPAR, ZSI_COMPAR_NAME_LEN);
+
+    /* F-9: generations start at 1, so a start of 0 is never legitimate.  This is
+     * checked here rather than left to the caller because every use of start --
+     * resolving an omitted ancestor (F-17), ordering the file set (D-5) -- would
+     * otherwise silently work with a nonsense value. */
+    if (out->start == 0) return ZS_BADFORMAT;
+
+    /* An in-order file covers start..end inclusive, so end < start is
+     * incoherent.  end == 0 is the unordered marker and not a range. */
+    if (out->end != 0 && out->end < out->start) return ZS_BADFORMAT;
+
+    return ZS_OK;
+}
+
+/* The checksum engine id, read as plain data before any verification (F-5a).
+ *
+ * There is no bootstrapping problem only because this comes first: the checksum
+ * cannot be verified until the engine is known, and the engine is recorded in
+ * the very header the checksum protects.  The field is plain data, so reading it
+ * unverified is safe -- a wrong value yields a failed checksum, not a wrong
+ * interpretation.
+ *
+ * Requires len >= ZSI_HEADER_LEN; the caller checks that first. */
+static unsigned zsi_header_engine_id(const char *buf)
+{
+    return (unsigned)(zsi_get16(buf + ZSI_HDR_OFF_FLAGS) & ZSI_CSUM_MASK);
+}
+
 /********** RECORDS *************/
 
 /********** POINTER SECTION *************/

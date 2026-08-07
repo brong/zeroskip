@@ -525,6 +525,420 @@ static void test_overflow_guards(void)
 
 /*
  * ============================================================
+ * Header and magic (T-2)
+ * ============================================================
+ */
+
+/* A minimal UTF-8 validator, so F-6a's property is asserted rather than merely
+ * believed.  Deliberately written here rather than borrowed from the library:
+ * the point is to check the magic against an independent notion of UTF-8. */
+static bool valid_utf8(const unsigned char *p, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = p[i];
+        size_t need;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) need = 1;
+        else if ((c & 0xF0) == 0xE0) need = 2;
+        else if ((c & 0xF8) == 0xF0) need = 3;
+        else return false;              /* continuation byte or 0xF8+ leads */
+        if (i + need >= len + 0 && i + need > len - 1) return false;
+        for (size_t k = 1; k <= need; k++)
+            if ((p[i + k] & 0xC0) != 0x80) return false;
+        i += need + 1;
+    }
+    return true;
+}
+
+/* Build a valid header into buf, for a test to then damage. */
+static void make_header(char *buf, uint32_t start, uint32_t end, unsigned engine)
+{
+    static const zsi_uuid_t u = {
+        0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
+        0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
+    };
+    struct zsi_header h;
+    memset(&h, 0, sizeof(h));
+    h.version_read  = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags         = (uint16_t)engine;
+    memcpy(h.uuid, u, 16);
+    h.start = start;
+    h.end   = end;
+    memcpy(h.compar_name, "memcmp", 6);
+    zsi_header_encode(buf, &h, zsi_csum_for_id(engine, NULL));
+}
+
+static void test_magic(void)
+{
+    char buf[ZSI_HEADER_LEN];
+
+    /* The 16 bytes, as literals.  Any change here is a format change. */
+    static const unsigned char expect[16] = {
+        0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+        0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
+    };
+    ASSERT_MEM_EQ(zsi_magic, expect, 16);
+
+    /* F-6a: not valid UTF-8, and it is byte 0 alone that carries the property --
+     * every byte after it is ASCII.  Asserted both ways so a future change to
+     * byte 0 that kept the file "text-ish" fails here. */
+    ASSERT(!valid_utf8(zsi_magic, 16));
+    ASSERT(valid_utf8(zsi_magic + 1, 15));
+    ASSERT(zsi_magic[0] >= 0x80 && zsi_magic[0] <= 0xBF);
+
+    /* Sanity-check the validator itself, or the assertion above proves nothing. */
+    ASSERT(valid_utf8((const unsigned char *)"hello", 5));
+    ASSERT(valid_utf8((const unsigned char *)"\xC3\xA9", 2));
+    ASSERT(!valid_utf8((const unsigned char *)"\xC3", 1));
+    ASSERT(!valid_utf8((const unsigned char *)"\x80", 1));
+
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    struct zsi_header h;
+    ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
+
+    /* F-6: all 16 bytes are validated, not a prefix.  Every single-byte mutation
+     * at every one of the 16 positions is rejected. */
+    for (size_t pos = 0; pos < ZSI_MAGIC_LEN; pos++) {
+        for (unsigned v = 0; v < 256; v++) {
+            if ((unsigned char)v == zsi_magic[pos]) continue;
+            char t[ZSI_HEADER_LEN];
+            make_header(t, 1, 0, ZSI_CSUM_XXHASH);
+            t[pos] = (char)v;
+            /* Recompute the checksum, so this tests the magic check rather than
+             * incidentally tripping the checksum.  Without this the test would
+             * pass even if the magic were never examined. */
+            zsi_put32(t + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(t, ZSI_HDR_OFF_CSUM));
+            if (zsi_header_decode(t, sizeof(t), zsi_csum_xxhash, &h) == ZS_OK) {
+                fprintf(stderr, "\n    FAIL magic byte %zu = 0x%02X accepted\n",
+                        pos, v);
+                current_test_failed = 1;
+                return;
+            }
+        }
+    }
+}
+
+static void test_magic_designed_corruptions(void)
+{
+    /* The specific corruptions the magic is designed to catch (T-2).  Each is
+     * built as the 16 bytes a real transfer would produce, then given a valid
+     * checksum so only the magic check can reject it. */
+    struct zsi_header h;
+    char buf[ZSI_HEADER_LEN];
+
+    struct { const char *what; unsigned char m[16]; } cases[] = {
+        /* eighth bit stripped from byte 0 */
+        { "8th bit stripped",
+          { 0x09, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+            0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00 } },
+        /* 0D 0A collapsed to 0A: the tail shifts left and a byte enters at the end */
+        { "CRLF -> LF",
+          { 0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+            0x70, 0x31, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00 } },
+        /* bare 0A expanded to 0D 0A: the tail shifts right */
+        { "LF -> CRLF",
+          { 0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+            0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0D, 0x0A, 0x00 } },
+        /* byte 0 replaced by the UTF-8 substitution character's encoding */
+        { "byte 0 -> EF BF BD",
+          { 0xEF, 0xBF, 0xBD, 0x7A, 0x65, 0x72, 0x6F, 0x73,
+            0x6B, 0x69, 0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A } }
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+        memcpy(buf, cases[i].m, 16);
+        zsi_put32(buf + ZSI_HDR_OFF_CSUM,
+                  zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+        if (zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h) == ZS_OK) {
+            fprintf(stderr, "\n    FAIL corruption '%s' accepted\n",
+                    cases[i].what);
+            current_test_failed = 1;
+            return;
+        }
+    }
+}
+
+static void test_header_roundtrip(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    static const unsigned engines[] = { ZSI_CSUM_NONE, ZSI_CSUM_XXHASH };
+
+    for (size_t e = 0; e < 2; e++) {
+        unsigned eng = engines[e];
+        zs_csum *cs = zsi_csum_for_id(eng, NULL);
+
+        /* unordered: end == 0 (F-10) */
+        make_header(buf, 7, 0, eng);
+        ASSERT_OK(zsi_header_decode(buf, sizeof(buf), cs, &h));
+        ASSERT_EQ(h.version_read, ZSI_VERSION_READ);
+        ASSERT_EQ(h.version_write, ZSI_VERSION_WRITE);
+        ASSERT_EQU(h.start, 7u);
+        ASSERT_EQU(h.end, 0u);
+        ASSERT(zsi_header_is_unordered(&h));
+        ASSERT_EQU(h.flags & ZSI_CSUM_MASK, eng);
+        ASSERT_EQU(zsi_header_engine_id(buf), eng);
+        ASSERT_MEM_EQ(h.compar_name, "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
+
+        /* in-order: a range (F-10) */
+        make_header(buf, 3, 9, eng);
+        ASSERT_OK(zsi_header_decode(buf, sizeof(buf), cs, &h));
+        ASSERT_EQU(h.start, 3u);
+        ASSERT_EQU(h.end, 9u);
+        ASSERT(!zsi_header_is_unordered(&h));
+
+        /* single-generation in-order, the shape a conversion produces */
+        make_header(buf, 5, 5, eng);
+        ASSERT_OK(zsi_header_decode(buf, sizeof(buf), cs, &h));
+        ASSERT_EQU(h.start, 5u);
+        ASSERT_EQU(h.end, 5u);
+        ASSERT(!zsi_header_is_unordered(&h));
+
+        /* the extremes of the generation space (D-9c) */
+        make_header(buf, 1, 0xFFFFFFFFu, eng);
+        ASSERT_OK(zsi_header_decode(buf, sizeof(buf), cs, &h));
+        ASSERT_EQU(h.start, 1u);
+        ASSERT_EQU(h.end, 0xFFFFFFFFu);
+    }
+
+    /* The encoder is deterministic: same input, identical bytes.  Canonical
+     * encoding (F-15) is what makes T-12a's byte-for-byte agreement possible. */
+    char a[ZSI_HEADER_LEN], b[ZSI_HEADER_LEN];
+    memset(a, 0xAA, sizeof(a));
+    memset(b, 0x55, sizeof(b));
+    make_header(a, 4, 8, ZSI_CSUM_XXHASH);
+    make_header(b, 4, 8, ZSI_CSUM_XXHASH);
+    ASSERT_MEM_EQ(a, b, ZSI_HEADER_LEN);
+
+    /* The comparator name is NUL-padded to 16, not NUL-terminated at its own
+     * length, and the padding is part of the compared bytes (F-11b). */
+    ASSERT_MEM_EQ(a + ZSI_HDR_OFF_COMPAR, "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
+}
+
+/* The header's byte layout, pinned against literals.
+ *
+ * Every other header test round-trips through this implementation's own encoder
+ * and decoder, so it passes unchanged if the layout table moves as a whole --
+ * swapping the start and end offsets, or getting ZSI_HEADER_LEN wrong, is
+ * invisible to a symmetric encode/decode pair.  Mutation testing confirmed
+ * exactly that.  Only a literal catches it, and a wrong layout is precisely the
+ * class of bug that makes another implementation unable to read our files.
+ *
+ * The golden buffer was generated once and is not to be regenerated to resolve a
+ * mismatch: if this fails, the format moved. */
+static void test_header_byte_layout(void)
+{
+    static const unsigned char golden[ZSI_HEADER_LEN] = {
+        /* 0  magic, all 16 bytes */
+        0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
+        0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00,
+        /* 16 vread, 17 vwrite, 18 flags (LE), 20 reserved */
+        0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 24 uuid */
+        0x49, 0x41, 0xDA, 0x54, 0x94, 0x06, 0x4F, 0xAA,
+        0xA4, 0x57, 0xC4, 0xB6, 0x5B, 0xEA, 0xE3, 0xEB,
+        /* 40 start = 0x01020304 LE, 44 end = 0x05060708 LE */
+        0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,
+        /* 48 comparator name, NUL-padded to 16 */
+        0x6D, 0x65, 0x6D, 0x63, 0x6D, 0x70, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 64 reserved, 68 checksum of [0, 68) */
+        0x00, 0x00, 0x00, 0x00, 0xA7, 0xA7, 0xCF, 0x9D
+    };
+
+    static const zsi_uuid_t u = {
+        0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
+        0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
+    };
+    struct zsi_header h;
+    char buf[ZSI_HEADER_LEN];
+
+    ASSERT_EQ(ZSI_HEADER_LEN, 72);
+    ASSERT_EQ(ZSI_MAGIC_LEN, 16);
+
+    memset(&h, 0, sizeof(h));
+    h.version_read  = 1;
+    h.version_write = 1;
+    h.flags         = 1;
+    memcpy(h.uuid, u, 16);
+    h.start = 0x01020304;
+    h.end   = 0x05060708;
+    memcpy(h.compar_name, "memcmp", 6);
+
+    memset(buf, 0xAA, sizeof(buf));
+    zsi_header_encode(buf, &h, zsi_csum_xxhash);
+
+    for (size_t i = 0; i < ZSI_HEADER_LEN; i++) {
+        if ((unsigned char)buf[i] != golden[i]) {
+            fprintf(stderr, "\n    FAIL byte %zu: got 0x%02X, expected 0x%02X\n",
+                    i, (unsigned char)buf[i], golden[i]);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* Each field at its literal offset, so a failure names the field rather than
+     * just an offset. */
+    ASSERT_MEM_EQ(buf + 0, zsi_magic, 16);
+    ASSERT_EQ((unsigned char)buf[16], 1);
+    ASSERT_EQ((unsigned char)buf[17], 1);
+    ASSERT_EQU(zsi_get16(buf + 18), 1u);
+    ASSERT_EQU(zsi_get32(buf + 20), 0u);
+    ASSERT_MEM_EQ(buf + 24, u, 16);
+    ASSERT_EQU(zsi_get32(buf + 40), 0x01020304u);
+    ASSERT_EQU(zsi_get32(buf + 44), 0x05060708u);
+    ASSERT_MEM_EQ(buf + 48, "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
+    ASSERT_EQU(zsi_get32(buf + 64), 0u);
+    ASSERT_EQU(zsi_get32(buf + 68), 0x9DCFA7A7u);
+
+    /* And it decodes back to what it came from. */
+    ASSERT_OK(zsi_header_decode((const char *)golden, ZSI_HEADER_LEN,
+                                zsi_csum_xxhash, &h));
+    ASSERT_EQU(h.start, 0x01020304u);
+    ASSERT_EQU(h.end, 0x05060708u);
+
+    /* A full 16-byte comparator name, which has no NUL padding at all: the copy
+     * must be the field width, not the string length. */
+    memset(&h, 0, sizeof(h));
+    h.version_read = 1;
+    h.version_write = 1;
+    h.flags = 1;
+    memcpy(h.uuid, u, 16);
+    h.start = 1;
+    memcpy(h.compar_name, "0123456789abcdef", 16);
+    memset(buf, 0xAA, sizeof(buf));
+    zsi_header_encode(buf, &h, zsi_csum_xxhash);
+    ASSERT_MEM_EQ(buf + 48, "0123456789abcdef", 16);
+    ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
+    ASSERT_MEM_EQ(h.compar_name, "0123456789abcdef", 16);
+}
+
+static void test_header_versions(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    /* A read version above ours is refused (F-7). */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_VREAD] = (char)(ZSI_VERSION_READ + 1);
+    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADFORMAT);
+
+    /* A write version above ours with a readable read version decodes, and
+     * reports the write version so the caller can open it read-only.  This split
+     * is the entire reason there are two version fields. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_VWRITE] = (char)(ZSI_VERSION_WRITE + 5);
+    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
+    ASSERT_EQ(h.version_write, ZSI_VERSION_WRITE + 5);
+    ASSERT_EQ(h.version_read, ZSI_VERSION_READ);
+}
+
+static void test_header_checksum(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    /* Under engine 1, flipping any byte in [0, 68) is caught.  Bytes 68..71 are
+     * the checksum field itself, which F-4 excludes from its own coverage. */
+    for (size_t pos = 0; pos < ZSI_HDR_OFF_CSUM; pos++) {
+        make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+        buf[pos] ^= 0x01;
+        int r = zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h);
+        if (r == ZS_OK) {
+            fprintf(stderr, "\n    FAIL flip at %zu not caught\n", pos);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* Corrupting the checksum field itself is also caught. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_CSUM] ^= 0x01;
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADCHECKSUM);
+
+    /* Under engine 0 the field is zero and nothing is verified (F-5c).  A torn
+     * header is undetectable, which is the documented cost of that engine.
+     *
+     * Corrupt the UUID rather than a generation: a damaged generation could be
+     * caught by a structural rule (F-9 rejects start == 0) and then this would
+     * be asserting the wrong thing.  A UUID is opaque, so no rule can save it --
+     * which is precisely the exposure engine 0 accepts. */
+    make_header(buf, 1, 0, ZSI_CSUM_NONE);
+    ASSERT_EQU(zsi_get32(buf + ZSI_HDR_OFF_CSUM), 0u);
+    buf[ZSI_HDR_OFF_UUID + 3] ^= 0x01;
+    ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_none, &h));
+    ASSERT_EQ(h.uuid[3], 0x54 ^ 0x01);
+
+    /* The same corruption under engine 1 is caught, which is the contrast that
+     * makes the assertion above meaningful rather than just a passing call. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_UUID + 3] ^= 0x01;
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADCHECKSUM);
+}
+
+static void test_header_reserved(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    /* The encoder writes zeros (F-8). */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    ASSERT_EQU(zsi_get32(buf + ZSI_HDR_OFF_RESERVED1), 0u);
+    ASSERT_EQU(zsi_get32(buf + ZSI_HDR_OFF_RESERVED2), 0u);
+
+    /* The decoder ignores them rather than rejecting.  Rejecting would make a
+     * future extension unreadable by this version, which is what the version
+     * fields are for -- compatibility decisions do not live in reserved bytes. */
+    for (int which = 0; which < 2; which++) {
+        size_t off = which ? ZSI_HDR_OFF_RESERVED2 : ZSI_HDR_OFF_RESERVED1;
+        make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+        zsi_put32(buf + off, 0xDEADBEEF);
+        zsi_put32(buf + ZSI_HDR_OFF_CSUM,
+                  zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+        ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
+    }
+}
+
+static void test_header_bounds_and_ranges(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    /* Short buffers are refused at every length below the header. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    for (size_t len = 0; len < ZSI_HEADER_LEN; len++)
+        ASSERT_EQ(zsi_header_decode(buf, len, zsi_csum_xxhash, &h),
+                  ZS_BADFORMAT);
+    ASSERT_OK(zsi_header_decode(buf, ZSI_HEADER_LEN, zsi_csum_xxhash, &h));
+
+    /* F-9: generations start at 1, so start == 0 is never legitimate. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    zsi_put32(buf + ZSI_HDR_OFF_START, 0);
+    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADFORMAT);
+
+    /* An in-order range must not run backwards. */
+    make_header(buf, 9, 3, ZSI_CSUM_XXHASH);
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADFORMAT);
+
+    /* end == start is fine: that is what a conversion produces. */
+    make_header(buf, 9, 9, ZSI_CSUM_XXHASH);
+    ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -542,6 +956,16 @@ static struct test_entry tests[] = {
     { "test_interop_constants_csum",    test_interop_constants_csum },
     { "test_interop_constants_compar",  test_interop_constants_compar },
     { "test_interop_constants_uuid",    test_interop_constants_uuid },
+
+    { "test_magic",                     test_magic },
+    { "test_magic_designed_corruptions", test_magic_designed_corruptions },
+    { "test_header_roundtrip",          test_header_roundtrip },
+    { "test_header_byte_layout",        test_header_byte_layout },
+    { "test_header_versions",           test_header_versions },
+    { "test_header_checksum",           test_header_checksum },
+    { "test_header_reserved",           test_header_reserved },
+    { "test_header_bounds_and_ranges",  test_header_bounds_and_ranges },
+
     { NULL, NULL }
 };
 

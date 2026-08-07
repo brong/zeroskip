@@ -20,6 +20,7 @@ make check          # run the test suite (alias: make test)
 ./zstest            # run all tests directly
 ./zstest record     # run tests matching a substring filter
 make asan           # rebuild under ASan + UBSan and run the suite
+make mutate         # verify the suite can actually fail (see Testing below)
 make corpus         # regenerate the golden corpus (see below before using)
 make bench          # zsbench --selftest, then a small smoke benchmark
 make clean
@@ -99,6 +100,16 @@ Each of these has cost someone an afternoon. They are load-bearing.
 Tests use a custom harness with `ASSERT()`, `ASSERT_EQ()`, `ASSERT_EQU()`, `ASSERT_OK()`, `ASSERT_SIGN()`, `ASSERT_STR_EQ()`, `ASSERT_MEM_EQ()`, and `CB_`-prefixed variants for callbacks. Each test gets a fresh temp directory via `setup()`/`teardown()`; `basedir` exists, `dbdir` deliberately does not, so tests exercise `ZS_CREATE`.
 
 `tests/corpus/` is **language-neutral by design** (T-0) — data files plus a portable text description, not fixtures in C source. `make corpus` exists to add cases, not to paper over a diff: if it changes an existing case's bytes, that is a format change and needs a spec commit.
+
+### `make mutate`
+
+`tests/mutate.sh` introduces, one at a time, the specific bugs the suite claims to guard against, and reports whether the suite noticed. Add a mutant whenever you add a test for a requirement — a test that passes but cannot fail reads as coverage while providing none.
+
+It has already earned this: it found that several header tests passed under a *symmetric* layout change (swap the `start` and `end` offsets and a matched encoder/decoder round-trips perfectly), which is exactly the bug class that makes another implementation unable to read our files. `test_header_byte_layout` exists because of that finding, asserting the 72 bytes against a literal.
+
+Two mutants are marked `equivalent` rather than expected-to-be-caught, because they genuinely do not change behaviour: delegating the comparator's prefix compare to `memcmp`, and dropping `roundup8`'s overflow guard. They are listed so nobody writes a bogus test chasing them. If you find a mutant that *should* be equivalent but gets caught, the classification is wrong — investigate rather than reclassifying.
+
+The perl patterns are tied to exact source text and will rot when the code is refactored. The script reports `PATTERN ROTTED` rather than silently passing; fix the pattern, don't delete the mutant.
 
 ## Interoperability surface
 
