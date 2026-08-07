@@ -66,7 +66,7 @@ mutant() {
     fi
 
     rm -f zstest
-    if ! make zstest >"$WORK/build.log" 2>&1; then
+    if ! make zstest EXTRA_CFLAGS=-O0 >"$WORK/build.log" 2>&1; then
         printf '  %-46s BUILD FAILED (inconclusive)\n' "$name"
         sed 's/^/        /' "$WORK/build.log" | grep -m2 error
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
@@ -75,8 +75,18 @@ mutant() {
     # Run detached from the shell's job control, so a crashing mutant does not
     # print an async "Segmentation fault" line that lands next to an unrelated
     # mutant's result and misattributes it.
-    ./zstest >"$WORK/run.log" 2>&1
+    # Watchdog: a mutation can cause non-termination (dropping a bound, losing a
+    # progress check), and without this one such mutant consumes the entire run.
+    # A timeout is itself a catch -- the suite hanging IS the detection -- but it
+    # is reported distinctly, because "hangs" and "fails an assertion" are
+    # different evidence about the tests.
+    ./zstest >"$WORK/run.log" 2>&1 &
+    local pid=$!
+    ( sleep 25; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
+    local wd=$!
+    wait $pid
     local rc=$?
+    kill $wd 2>/dev/null
 
     if [ "$rc" -eq 0 ]; then
         if [ "$expect" = equivalent ]; then
@@ -92,6 +102,9 @@ mutant() {
     elif [ "$expect" = equivalent ] || [ "$expect" = subsumed ]; then
         printf '  %-46s CAUGHT but marked %s -- reclassify\n' "$name" "$expect"
         missed=$((missed + 1))
+    elif [ "$rc" -eq 137 ]; then
+        printf '  %-46s caught by TIMEOUT (non-termination)\n' "$name"
+        caught=$((caught + 1))
     elif [ "$rc" -gt 128 ]; then
         # Killed by a signal rather than failing an assertion.  Still detected,
         # but worth naming: it means the mutation corrupts memory before any
@@ -241,6 +254,49 @@ mutant "parse: metadata matches data pattern" catch \
 
 mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
+
+echo
+echo "snapshot (Task 12)"
+
+# C-4 step 3: a file unlinked between the scan and the open is a stale scan, not
+# an error -- retry.  Treating ENOENT as fatal makes an ordinary packer retiring
+# an input into a failed read.
+mutant "C-4: ENOENT is fatal" catch \
+  's/            if \(r == ZS_NOTFOUND\) \{ retry = true; break; \}/            if (r == ZS_NOTFOUND) { zsi_snapshot_release(\&s); zsi_fileset_fini(\&fs); return r; }/'
+
+# C-4h: bounded retries.  Unbounded, a directory that never tiles livelocks.
+mutant "C-4h: unbounded retries" catch \
+  's/    for \(int attempt = 0; attempt < ZSI_SNAPSHOT_RETRIES; attempt\+\+\) \{/    for (int attempt = 0; ; attempt++) {/'
+
+# D-10a: a non-active file with a bad header is an error; only the active file
+# gets D-10 tolerance.  Getting the position test backwards either loses committed
+# data or refuses to open after an ordinary crash.
+mutant "D-10a: bad non-active header tolerated" catch \
+  's/            if \(!f->hdr_valid && !is_last\) \{/            if (false \&\& !is_last) {/'
+
+mutant "D-10: bad active header rejected" catch \
+  's/            bool is_last = \(i \+ 1 == fs.nresolved\);/            bool is_last = false;/'
+
+# Step 4 must build an index for every unordered file, or a reader sees an empty
+# source where committed records are.
+mutant "step 4: index not built" catch \
+  's/                r = zsi_index_build\(f, compar, nocsum\);/                r = ZS_OK; (void)compar; (void)nocsum;/'
+
+mutant "step 4: pointers not loaded" catch \
+  's/                r = zsi_ptrs_load\(f\);/                r = ZS_OK;/'
+
+# The active file is the highest-generation UNORDERED file.  Returning an in-order
+# file would have a writer append to a file that has a pointer section.
+mutant "active: in-order file returned" catch \
+  's/    return zsi_file_is_unordered\(last\) \? last : NULL;/    return last;/'
+
+mutant "active: lowest generation returned" catch \
+  's/    struct zsi_file \*last = s->files\[s->nfiles - 1\];/    struct zsi_file *last = s->files[0];/'
+
+# Refcounting: releasing a shared snapshot must not free files another holder is
+# still reading (C-4g).
+mutant "refcount: released regardless" catch \
+  's/    if \(--s->refcount > 0\) \{ \*sp = NULL; return; \}/    \/* refcount ignored *\//'
 
 echo
 echo "file set (Task 11)"

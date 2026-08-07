@@ -2685,6 +2685,157 @@ static int zsi_fileset_next_gen(const struct zsi_fileset *fs, uint32_t *out)
 
 /********** SNAPSHOT *************/
 
+/* C-4h: a retry happens only when the file set changed during the scan, which is
+ * a structural event rather than a per-operation one.  Bounded so a pathological
+ * rate of structural change surfaces as ZS_AGAIN instead of a livelock. */
+#define ZSI_SNAPSHOT_RETRIES 20
+
+struct zsi_snapshot {
+    struct zsi_file **files;    /* the resolved set, sorted by start ASCENDING */
+    size_t            nfiles;
+    int               refcount;
+};
+
+static void zsi_snapshot_release(struct zsi_snapshot **sp)
+{
+    struct zsi_snapshot *s = *sp;
+    if (!s) return;
+
+    if (--s->refcount > 0) { *sp = NULL; return; }
+
+    for (size_t i = 0; i < s->nfiles; i++)
+        zsi_file_close(&s->files[i]);
+    free(s->files);
+    free(s);
+    *sp = NULL;
+}
+
+/* The active file: the highest-generation UNORDERED file, or NULL if the newest
+ * file is in-order.  The only file a writer appends to. */
+static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
+{
+    if (!s->nfiles) return NULL;
+
+    struct zsi_file *last = s->files[s->nfiles - 1];
+    return zsi_file_is_unordered(last) ? last : NULL;
+}
+
+/* C-4: take a snapshot.
+ *
+ *   1. readdir, keeping names matching zeroskip-<uuid>-* and parsing each
+ *      generation range from its name;
+ *   2. run D-5's scan.  If it leaves a gap the set is incomplete -- a torn
+ *      readdir or corruption -- so restart from 1;
+ *   3. open and map every file in the resolved set.  If any open fails with
+ *      ENOENT, restart from 1;
+ *   4. build a private index for each unordered file by replaying its spans,
+ *      taking its snapshot boundary to be the end of its last valid span.
+ *
+ * NO LOCK IS TAKEN AT ANY POINT (C-2).  That is the single most surprising
+ * property of this design and the place someone will later be tempted to add one.
+ * What makes it safe:
+ *
+ *   - step 2's tiling check IS the completeness proof (C-4a).  Every generation
+ *     in the interval is covered exactly once, so no committed data is missing,
+ *     and there is nothing to compare against a published record;
+ *   - a retry always converges (C-4b), because both failure modes -- a torn
+ *     readdir and a file removed underneath us -- show up AS failures rather than
+ *     as a set that looks complete and is not.  Removal is only ever permitted
+ *     when the remaining files still tile (D-23);
+ *   - everything opened is immutable from here on (C-4c).  In-order files are
+ *     never modified; a non-active unordered file is never appended to again; the
+ *     active file is appended to but ONLY appended to, so every byte below the
+ *     boundary is stable by construction and growth beyond it is never looked at;
+ *   - every index is private (C-4d), so there is no shared state to synchronise
+ *     against a writer and nothing to clean up when a process dies.
+ */
+static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
+                             zs_compar *compar, zs_csum *external_csum,
+                             bool nocsum, struct zsi_snapshot **out)
+{
+    for (int attempt = 0; attempt < ZSI_SNAPSHOT_RETRIES; attempt++) {
+        struct zsi_fileset fs;
+        int r = zsi_fileset_scan(dir, uuid, &fs);
+        if (r != ZS_OK) return r;
+
+        r = zsi_fileset_resolve(&fs);
+        if (r == ZS_AGAIN) { zsi_fileset_fini(&fs); continue; }
+        if (r != ZS_OK) { zsi_fileset_fini(&fs); return r; }
+
+        struct zsi_snapshot *s = zsi_zmalloc(sizeof(*s));
+        if (!s) { zsi_fileset_fini(&fs); return ZS_INTERNAL; }
+        s->refcount = 1;
+
+        if (fs.nresolved) {
+            s->files = zsi_zmalloc(fs.nresolved * sizeof(*s->files));
+            if (!s->files) {
+                free(s);
+                zsi_fileset_fini(&fs);
+                return ZS_INTERNAL;
+            }
+        }
+
+        bool retry = false;
+        for (size_t i = 0; i < fs.nresolved && !retry; i++) {
+            struct zsi_file *f = NULL;
+            r = zsi_file_open(dir, fs.resolved[i].name, fs.resolved[i].start,
+                              external_csum, &f);
+
+            /* A file may legitimately be unlinked between steps 2 and 3, by a
+             * packer retiring an input it has already superseded.  That is not an
+             * error, it is a stale scan -- restart. */
+            if (r == ZS_NOTFOUND) { retry = true; break; }
+            if (r != ZS_OK) {
+                zsi_snapshot_release(&s);
+                zsi_fileset_fini(&fs);
+                return r;
+            }
+
+            s->files[s->nfiles++] = f;
+
+            /* D-10a: a NON-ACTIVE file with an invalid header is an error -- its
+             * records cannot be recovered, and silently skipping the generation
+             * would lose committed data.  Only the last file may be the active
+             * one, so only it gets D-10's tolerance. */
+            bool is_last = (i + 1 == fs.nresolved);
+            if (!f->hdr_valid && !is_last) {
+                zsi_snapshot_release(&s);
+                zsi_fileset_fini(&fs);
+                return ZS_BADFORMAT;
+            }
+
+            if (zsi_file_is_unordered(f)) {
+                /* Step 4.  The replay sets f->complete, which IS this file's
+                 * snapshot boundary: growth beyond it is invisible (C-4c). */
+                r = zsi_index_build(f, compar, nocsum);
+                if (r != ZS_OK) {
+                    zsi_snapshot_release(&s);
+                    zsi_fileset_fini(&fs);
+                    return r;
+                }
+            } else {
+                r = zsi_ptrs_load(f);
+                if (r != ZS_OK) {
+                    zsi_snapshot_release(&s);
+                    zsi_fileset_fini(&fs);
+                    return r;
+                }
+            }
+        }
+
+        zsi_fileset_fini(&fs);
+
+        if (retry) { zsi_snapshot_release(&s); continue; }
+
+        *out = s;
+        return ZS_OK;
+    }
+
+    /* C-4h: bounded rather than spinning, so a pathological rate of structural
+     * change is reported instead of hanging. */
+    return ZS_AGAIN;
+}
+
 /********** FILE LOCKING *************/
 
 /********** READ PATH *************/

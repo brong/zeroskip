@@ -5052,6 +5052,292 @@ static void test_fileset_mid_conversion_stable(void)
 
 /*
  * ============================================================
+ * Snapshots (C-4)
+ * ============================================================
+ */
+
+/* Write a real (non-empty) unordered file with the given keys. */
+static void put_unordered(uint32_t gen, const char *const *keys)
+{
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+
+    sb_init(&s, gen, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; keys && keys[i]; i++)
+        sb_rec(&s, keys[i], strlen(keys[i]), "v", 1, false, 0);
+    sb_term(&s, false);
+    zsi_name_format(name, test_uuid, gen, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+}
+
+/* Write a real in-order file with the given keys, which must be in order. */
+static void put_inorder(uint32_t start, uint32_t end, const char *const *keys)
+{
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    ib_init(&b, start, end, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; keys && keys[i]; i++)
+        ib_rec(&b, keys[i], strlen(keys[i]), "v", 1, false, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, start, end);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+}
+
+static void clear_db(void)
+{
+    const char *none[] = { NULL };
+    seed_names(none);
+}
+
+static void test_snapshot_basic(void)
+{
+    struct zsi_snapshot *s = NULL;
+
+    clear_db();
+    static const char *k1[] = { "a", "b", NULL };
+    static const char *k2[] = { "c", NULL };
+    put_inorder(1, 4, k1);
+    put_unordered(5, k2);
+
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+
+    /* Sorted by start ascending -- reads walk it descending (D-14). */
+    ASSERT_EQU(s->files[0]->hdr.start, 1u);
+    ASSERT_EQU(s->files[1]->hdr.start, 5u);
+
+    /* The active file is the highest-generation unordered one. */
+    struct zsi_file *act = zsi_snapshot_active(s);
+    ASSERT_NOT_NULL(act);
+    ASSERT_EQU(act->hdr.start, 5u);
+    ASSERT(zsi_file_is_unordered(act));
+
+    /* Step 4 built an index for the unordered file, and loaded pointers for the
+     * in-order one. */
+    ASSERT_NOT_NULL(s->files[1]->index);
+    ASSERT_EQU(s->files[1]->index->nbase, 1u);
+    ASSERT_EQU(s->files[0]->nptrs, 2u);
+
+    zsi_snapshot_release(&s);
+    ASSERT_NULL(s);
+
+    /* When the newest file is in-order there is no active file: a writer must
+     * create one rather than append (D-9). */
+    clear_db();
+    put_inorder(1, 4, k1);
+    put_inorder(5, 5, k2);
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+    ASSERT_NULL(zsi_snapshot_active(s));
+    zsi_snapshot_release(&s);
+
+    /* An empty directory snapshots to zero files rather than failing: that is the
+     * state D-8a turns into a new database. */
+    clear_db();
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 0u);
+    ASSERT_NULL(zsi_snapshot_active(s));
+    zsi_snapshot_release(&s);
+}
+
+static void test_snapshot_resolves_overlap(void)
+{
+    /* A snapshot taken mid-conversion opens the winner and ignores the input,
+     * without needing to know a conversion happened (D-5, R-5). */
+    struct zsi_snapshot *s = NULL;
+    static const char *k[] = { "a", NULL };
+
+    clear_db();
+    put_unordered(5, k);
+    put_inorder(5, 5, k);
+    put_inorder(1, 4, k);
+
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+    ASSERT_EQU(s->files[1]->hdr.start, 5u);
+    ASSERT_EQU(s->files[1]->hdr.end, 5u);       /* the in-order one won */
+    ASSERT_NULL(zsi_snapshot_active(s));
+    zsi_snapshot_release(&s);
+
+    /* And mid-repack: the output wins over every input. */
+    clear_db();
+    put_inorder(1, 1, k);
+    put_inorder(2, 2, k);
+    put_inorder(1, 2, k);
+    put_unordered(3, k);
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+    ASSERT_EQU(s->files[0]->hdr.start, 1u);
+    ASSERT_EQU(s->files[0]->hdr.end, 2u);
+    zsi_snapshot_release(&s);
+}
+
+static void test_snapshot_retries_and_bounds(void)
+{
+    /* A set that never tiles must be reported in bounded time rather than
+     * spinning (C-4h).  Under an alarm, because the failure mode this guards
+     * against is a livelock, not a wrong answer. */
+    struct zsi_snapshot *s = NULL;
+    static const char *k[] = { "a", NULL };
+
+    alarm(30);
+
+    clear_db();
+    put_inorder(1, 1, k);
+    put_inorder(3, 3, k);       /* generation 2 missing: never tiles */
+
+    ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s), ZS_AGAIN);
+    ASSERT_NULL(s);
+
+    /* A partial overlap is corruption rather than a stale scan, so it is
+     * reported immediately rather than retried to exhaustion. */
+    clear_db();
+    put_inorder(1, 5, k);
+    put_inorder(3, 8, k);
+    ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s), ZS_BADFORMAT);
+
+    alarm(0);
+}
+
+static void test_snapshot_boundary(void)
+{
+    /* Step 4 takes each unordered file's boundary to be the end of its last valid
+     * span, so anything past it is invisible (C-4c).  Modelled here with trailing
+     * garbage, which is what a torn append looks like to a reader. */
+    struct sb s;
+    struct zsi_snapshot *snap = NULL;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "visible", 7, "1", 1, false, 0);
+    sb_term(&s, false);
+    size_t boundary = s.len;
+    sb_rec(&s, "invisible", 9, "2", 1, false, 0);   /* no terminator */
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &snap));
+    ASSERT_EQU(snap->nfiles, 1u);
+    ASSERT_EQU(snap->files[0]->complete, boundary);
+    ASSERT(snap->files[0]->size > boundary);
+
+    /* The index reflects the boundary, not the file size. */
+    size_t off;
+    ASSERT_OK(zsi_index_find(snap->files[0]->index, zsi_compar_default,
+                             "visible", 7, &off));
+    ASSERT_EQ(zsi_index_find(snap->files[0]->index, zsi_compar_default,
+                             "invisible", 9, &off), ZS_NOTFOUND);
+
+    zsi_snapshot_release(&snap);
+    sb_free(&s);
+}
+
+static void test_snapshot_bad_nonactive(void)
+{
+    /* D-10a: a NON-ACTIVE file with an invalid header is an error, because its
+     * records cannot be recovered and skipping the generation would lose
+     * committed data.  D-10: the ACTIVE file in the same state is fine. */
+    struct zsi_snapshot *s = NULL;
+    static const char *k[] = { "a", NULL };
+    char name[ZSI_NAME_MAX];
+    char junk[ZSI_HEADER_LEN];
+    memset(junk, 0xFF, sizeof(junk));
+
+    /* Corrupt the ACTIVE (highest, unordered) file: tolerated. */
+    clear_db();
+    put_inorder(1, 1, k);
+    put_unordered(2, k);
+    zsi_name_format(name, test_uuid, 2, 0);
+    ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+    ASSERT(!s->files[1]->hdr_valid);
+    ASSERT_EQU(s->files[1]->complete, 0u);
+    ASSERT(!zsi_unordered_is_clean(s->files[1]));
+    zsi_snapshot_release(&s);
+
+    /* Corrupt a NON-ACTIVE file: an error. */
+    clear_db();
+    put_inorder(1, 1, k);
+    put_unordered(2, k);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
+    ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s), ZS_BADFORMAT);
+    ASSERT_NULL(s);
+
+    /* A zero-length active file, likewise tolerated (D-10). */
+    clear_db();
+    put_inorder(1, 1, k);
+    zsi_name_format(name, test_uuid, 2, 0);
+    ASSERT_EQ(writefile(name, "", 0), 0);
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 2u);
+    ASSERT(!s->files[1]->hdr_valid);
+    zsi_snapshot_release(&s);
+}
+
+static void test_snapshot_refcount(void)
+{
+    /* A snapshot outlives the files being unlinked underneath it (C-4g): the
+     * kernel keeps each inode alive until the last descriptor and mapping is
+     * gone, so a reader holding one keeps reading while a packer retires its
+     * inputs.  There is no reference table and nothing to clean up on death. */
+    struct zsi_snapshot *s = NULL;
+    static const char *k[] = { "alpha", "beta", NULL };
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    put_inorder(1, 1, k);
+
+    ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
+                                TEST_EXTERNAL_CSUM, false, &s));
+    ASSERT_EQU(s->nfiles, 1u);
+
+    /* Unlink the file out from under the open snapshot. */
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(unlink(dbpath(name)), 0);
+
+    /* Still readable, in full. */
+    struct zsi_fcur fc;
+    char keys[128];
+    zsi_fcur_init_file(&fc, s->files[0], zsi_compar_default);
+    fcur_keys_from(&fc, NULL, 0, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "alpha|beta");
+    ASSERT_OK(zsi_ptrs_verify_records(s->files[0]));
+
+    /* Refcounting: an extra reference keeps it alive across a release. */
+    s->refcount++;
+    struct zsi_snapshot *alias = s;
+    zsi_snapshot_release(&alias);
+    ASSERT_NULL(alias);
+    ASSERT_EQU(s->nfiles, 1u);           /* still valid */
+    zsi_fcur_init_file(&fc, s->files[0], zsi_compar_default);
+    fcur_keys_from(&fc, NULL, 0, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "alpha|beta");
+
+    zsi_snapshot_release(&s);
+    ASSERT_NULL(s);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -5150,6 +5436,13 @@ static struct test_entry tests[] = {
     { "test_fileset_ignores_foreign",   test_fileset_ignores_foreign },
     { "test_fileset_next_gen",          test_fileset_next_gen },
     { "test_fileset_mid_conversion_stable", test_fileset_mid_conversion_stable },
+
+    { "test_snapshot_basic",            test_snapshot_basic },
+    { "test_snapshot_resolves_overlap", test_snapshot_resolves_overlap },
+    { "test_snapshot_retries_and_bounds", test_snapshot_retries_and_bounds },
+    { "test_snapshot_boundary",         test_snapshot_boundary },
+    { "test_snapshot_bad_nonactive",    test_snapshot_bad_nonactive },
+    { "test_snapshot_refcount",         test_snapshot_refcount },
 
     { NULL, NULL }
 };
