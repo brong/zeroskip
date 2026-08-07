@@ -116,17 +116,26 @@ conversion already use, plus random digits so that two processes sharing an
 44   4  reserved (zero)
 48  16  compar         comparator name, byte-identical to the data file's field
 64   8  valid_upto     data-file offset covered; always a span boundary
-72   8  nptrs
-80   4  term_csum      checksum carried by the terminator immediately below
-                       valid_upto; 0 when the file has no spans
-84   4  header checksum over [0, 84)
-88      nptrs x 8-byte little-endian record offsets, sorted by key ascending
+72   8  term_off       offset of the terminator immediately below valid_upto;
+                       equals valid_upto when the file has no spans
+80   8  nptrs
+88   4  term_csum      checksum carried by the terminator at term_off;
+                       0 when the file has no spans
+92   4  header checksum over [0, 92)
+96      nptrs x 8-byte little-endian record offsets, sorted by key ascending
         under compar, one entry per distinct key, each being the newest
         committed record for that key below valid_upto
         4-byte checksum over the pointer array
 ```
 
-Total size is `88 + 8 * nptrs + 4`.
+Total size is `96 + 8 * nptrs + 4`.
+
+`term_off` is not redundant. Terminators are variable-length and are located by
+walking spans **forward**, so a reader given only `valid_upto` cannot find the
+terminator below it without the replay this cache exists to avoid. Recording the
+offset makes the check O(1): decode the terminator at `term_off`, require
+`term_off + term.len == valid_upto`, and compare its checksum against
+`term_csum`.
 
 The magic follows the same construction as the data-file magic and for the same
 reasons: high bit set so no text file is mistaken for one and a transfer that
@@ -151,12 +160,15 @@ never reported as corruption: it is a cache.
 - uuid and `start` match the data file
 - `compar` matches both the data file's comparator name field and our own
 - `H <= valid_upto <= data file size`, and every offset lies in `[H, valid_upto)`,
-  where `H` is the **data file's** header length, 72 — not the table's, which is 88
+  where `H` is the **data file's** header length, 72 — not the table's, which is 96
+- the table's own size is exactly `96 + 8 * nptrs + 4`
 - flags bit 4 is set, unless we are ourselves running under `ZS_NOCSUM` — an
   index built without checksum verification may contain records a verifying
   reader would reject, so it must not be handed to one
-- the terminator immediately below `valid_upto` carries checksum `term_csum`, or
-  `valid_upto == H` (the file has no spans) and `term_csum == 0`
+- either `valid_upto == term_off == H` with `term_csum == 0` and `nptrs == 0`
+  (the file has no spans), or `H <= term_off < valid_upto`, the bytes at
+  `term_off` decode as a terminator, `term_off + term.len == valid_upto`, and
+  `term.csum == term_csum`
 
 ### Why `term_csum`, and what it does not cover
 
@@ -276,7 +288,7 @@ spec wins or the spec changes deliberately.
 - `doc/conformance.md` gains a row per `P-n`.
 
 The following become interoperability surface and cannot change without a further
-spec commit: the 16 magic bytes, the 88-byte header layout, the pointer array
+spec commit: the 16 magic bytes, the 96-byte header layout, the pointer array
 encoding and its trailing checksum, the published and staging name formats, and
 the acceptance rules in section 4.
 
@@ -331,6 +343,6 @@ contract and the interop runner can compare it as text.
 Both are guesses to be settled during implementation rather than assumptions
 baked in:
 
-- The **88-byte header layout**. It could be padded or rearranged to mirror the
+- The **96-byte header layout**. It could be padded or rearranged to mirror the
   72-byte data header's shape more closely.
 - The **`rollover_size / 8` threshold default**. `zsbench` should choose it.
