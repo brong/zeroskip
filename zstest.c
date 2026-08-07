@@ -5157,7 +5157,8 @@ static void test_snapshot_basic(void)
     put_unordered(5, k2);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
 
     /* Sorted by start ascending -- reads walk it descending (D-14). */
@@ -5185,7 +5186,8 @@ static void test_snapshot_basic(void)
     put_inorder(1, 4, k1);
     put_inorder(5, 5, k2);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -5194,7 +5196,8 @@ static void test_snapshot_basic(void)
      * state D-8a turns into a new database. */
     clear_db();
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 0u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -5213,7 +5216,8 @@ static void test_snapshot_resolves_overlap(void)
     put_inorder(1, 4, k);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[1]->hdr.start, 5u);
     ASSERT_EQU(s->files[1]->hdr.end, 5u);       /* the in-order one won */
@@ -5227,7 +5231,8 @@ static void test_snapshot_resolves_overlap(void)
     put_inorder(1, 2, k);
     put_unordered(3, k);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[0]->hdr.start, 1u);
     ASSERT_EQU(s->files[0]->hdr.end, 2u);
@@ -5249,7 +5254,8 @@ static void test_snapshot_retries_and_bounds(void)
     put_inorder(3, 3, k);       /* generation 2 missing: never tiles */
 
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s), ZS_AGAIN);
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s), ZS_AGAIN);
     ASSERT_NULL(s);
 
     /* A partial overlap is corruption rather than a stale scan, so it is
@@ -5258,7 +5264,8 @@ static void test_snapshot_retries_and_bounds(void)
     put_inorder(1, 5, k);
     put_inorder(3, 8, k);
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s), ZS_BADFORMAT);
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s), ZS_BADFORMAT);
 
     alarm(0);
 }
@@ -5282,7 +5289,8 @@ static void test_snapshot_boundary(void)
     ASSERT_EQ(sb_write(&s, name), 0);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &snap));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &snap));
     ASSERT_EQU(snap->nfiles, 1u);
     ASSERT_EQU(snap->files[0]->complete, boundary);
     ASSERT(snap->files[0]->size > boundary);
@@ -5321,7 +5329,8 @@ static void test_snapshot_bad_nonactive(void)
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
     report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, counting_error, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                counting_error, &s));
     ASSERT_EQ(report_count, 0);
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
@@ -5342,7 +5351,8 @@ static void test_snapshot_bad_nonactive(void)
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
     report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, counting_error, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                counting_error, &s));
     ASSERT_NOT_NULL(s);
     ASSERT(report_count > 0);       /* not silent */
     zsi_snapshot_release(&s);
@@ -5353,7 +5363,8 @@ static void test_snapshot_bad_nonactive(void)
     zsi_name_format(name, test_uuid, 2, 0);
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
     zsi_snapshot_release(&s);
@@ -5373,7 +5384,8 @@ static void test_snapshot_refcount(void)
     put_inorder(1, 1, k);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                "memcmp", TEST_EXTERNAL_CSUM, false, NULL,
+                                NULL, &s));
     ASSERT_EQU(s->nfiles, 1u);
 
     /* Unlink the file out from under the open snapshot. */
@@ -10702,6 +10714,622 @@ static void test_idxcache_matches_full_build(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+static char *idxcache_slurp(const char *path, size_t *lenp)
+{
+    struct stat sb;
+    char *buf;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) return NULL;
+    if (fstat(fd, &sb) < 0) { close(fd); return NULL; }
+    buf = malloc((size_t)sb.st_size ? (size_t)sb.st_size : 1);
+    if (!buf) { close(fd); return NULL; }
+    if (read(fd, buf, (size_t)sb.st_size) != (ssize_t)sb.st_size) {
+        free(buf);
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    *lenp = (size_t)sb.st_size;
+    return buf;
+}
+
+static int idxcache_spew(const char *path, const char *buf, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0) return ZS_IOERROR;
+    if (write(fd, buf, len) != (ssize_t)len) { close(fd); return ZS_IOERROR; }
+    close(fd);
+    return ZS_OK;
+}
+
+/* Fill `out` with the path of the table for the active file's generation, and
+ * return that generation. */
+static uint32_t idxcache_table_path(struct zs_db *db, const char *cachedir,
+                                    char *out, size_t outlen)
+{
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    char name[ZSI_NAME_MAX];
+
+    if (!act) return 0;
+    zsi_name_format_index(name, act->hdr.uuid, act->hdr.start);
+    snprintf(out, outlen, "%s/%s", cachedir, name);
+    return act->hdr.start;
+}
+
+/* P-11: every rejection rule, one at a time.
+ *
+ * Each must yield ZS_NOTFOUND -- "ignore it and replay" -- and never an error,
+ * because a bad table in a directory the database does not depend on must not be
+ * able to make a readable database look unreadable. */
+static void test_idxcache_rejection_rules(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zsi_idxcfg cfg;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    char *tab = NULL;
+    size_t tablen = 0;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+    cfg.dir = cachedir;
+    cfg.threshold = 1;
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 30; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
+    }
+
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+    tab = idxcache_slurp(tabpath, &tablen);
+    ASSERT_NOT_NULL(tab);
+    ASSERT(tablen > ZSI_IDX_HEADER_LEN);
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* Baseline: the pristine table loads, and describes every key. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc));
+        ASSERT_EQU(nbase, 30u);
+        ASSERT_EQU(vu, (unsigned long long)f->complete);
+        free(base);
+    }
+
+    {
+        static const struct { const char *what; size_t off; } cases[] = {
+            { "magic",        ZSI_IDX_OFF_MAGIC      },
+            { "header csum",  ZSI_IDX_OFF_CSUM       },
+            { "uuid",         ZSI_IDX_OFF_UUID       },
+            { "generation",   ZSI_IDX_OFF_START      },
+            { "comparator",   ZSI_IDX_OFF_COMPAR     },
+            { "engine",       ZSI_IDX_OFF_FLAGS      },
+            { "valid_upto",   ZSI_IDX_OFF_VALID_UPTO },
+            { "term_off",     ZSI_IDX_OFF_TERM_OFF   },
+            { "nptrs",        ZSI_IDX_OFF_NPTRS      },
+            { "term_csum",    ZSI_IDX_OFF_TERM_CSUM  },
+            { "first offset", ZSI_IDX_HEADER_LEN     }
+        };
+
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+            uint32_t tc = 0;
+            size_t off = cases[i].off;
+
+            tab[off] = (char)((unsigned char)tab[off] ^ 0x01);
+
+            /* Fields the header checksum covers need it recomputed, or every
+             * case would only ever exercise the checksum rule. */
+            if (off < ZSI_IDX_OFF_CSUM)
+                zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                          zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+
+            ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+            if (zsi_idx_load(f, &cfg, db->compar_name, false,
+                             &base, &nbase, &vu, &to, &tc) != ZS_NOTFOUND) {
+                fprintf(stderr, "\n    FAIL %s: accepted a table it should "
+                        "have rejected\n", cases[i].what);
+                current_test_failed = 1;
+                free(base);
+                free(tab);
+                zs_db_close(&db);
+                return;
+            }
+            ASSERT_NULL(base);
+
+            tab[off] = (char)((unsigned char)tab[off] ^ 0x01);
+            if (off < ZSI_IDX_OFF_CSUM)
+                zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                          zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        }
+    }
+
+    /* The checksum over the offset array. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        tab[tablen - 1] = (char)((unsigned char)tab[tablen - 1] ^ 0x01);
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+        tab[tablen - 1] = (char)((unsigned char)tab[tablen - 1] ^ 0x01);
+    }
+
+    /* Truncated and padded: the size must be exactly 96 + 8n + 4. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen - 1));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        {
+            char *padded = malloc(tablen + 8);
+            ASSERT_NOT_NULL(padded);
+            memcpy(padded, tab, tablen);
+            memset(padded + tablen, 0, 8);
+            ASSERT_OK(idxcache_spew(tabpath, padded, tablen + 8));
+            free(padded);
+        }
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    }
+
+    /* A table built without checksum verification must not be handed to a
+     * verifying reader, and IS acceptable to a non-verifying one. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        uint16_t fl = zsi_get16(tab + ZSI_IDX_OFF_FLAGS);
+
+        zsi_put16(tab + ZSI_IDX_OFF_FLAGS,
+                  (uint16_t)(fl & ~ZSI_IDX_FLAG_CSUM_VERIFIED));
+        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name, true,
+                               &base, &nbase, &vu, &to, &tc));
+        free(base);
+
+        zsi_put16(tab + ZSI_IDX_OFF_FLAGS, fl);
+        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    }
+
+    /* A comparator name this handle does not implement, even though the file
+     * agrees with the table.  Constructed by asking with a different name. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        char other[ZSI_COMPAR_NAME_LEN];
+
+        memset(other, 0, sizeof(other));
+        memcpy(other, "notmemcmp", 9);
+        ASSERT_EQ(zsi_idx_load(f, &cfg, other, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+    }
+
+    /* A missing table is ZS_NOTFOUND, not an error, and no cache directory at
+     * all is the same. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        struct zsi_idxcfg off = { NULL, 0 };
+
+        ASSERT_EQ(zsi_idx_load(f, &off, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        ASSERT_EQ(unlink(tabpath), 0);
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+        ASSERT_EQU(vu, (unsigned long long)ZSI_HEADER_LEN);
+    }
+
+    free(tab);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-10, P-17: the terminator binding.  A table whose recorded terminator is not
+ * the one at valid_upto in the file it is being applied to is rejected, which is
+ * what catches a database directory restored from backup under a surviving cache
+ * directory. */
+static void test_idxcache_rejects_bad_term_binding(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zsi_idxcfg cfg;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    char *tab;
+    size_t tablen;
+    size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+    uint32_t tc = 0;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+    cfg.dir = cachedir;
+    cfg.threshold = 1;
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 10; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%02d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
+    }
+
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+    tab = idxcache_slurp(tabpath, &tablen);
+    ASSERT_NOT_NULL(tab);
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+
+    /* The recorded checksum is genuinely the terminator's, and the recorded
+     * offset genuinely ends at valid_upto -- so the baseline is meaningful. */
+    {
+        struct zsi_term term;
+        const char *tb;
+        size_t rec_off = (size_t)zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF);
+        size_t rec_vu  = (size_t)zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO);
+
+        tb = zsi_file_at(f, rec_off, 1);
+        ASSERT_NOT_NULL(tb);
+        ASSERT_OK(zsi_term_decode(tb, f->size - rec_off, &term));
+        ASSERT_EQU(rec_off + term.len, rec_vu);
+        ASSERT_EQU(term.csum, zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM));
+    }
+
+    /* A term_csum that is not the terminator's. */
+    zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
+              zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
+    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+    ASSERT_NULL(base);
+    zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
+              zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
+
+    /* A term_off that does not end at valid_upto. */
+    zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
+              zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF) - 8);
+    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+    ASSERT_NULL(base);
+    zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
+              zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF) + 8);
+
+    /* term_off at or beyond valid_upto. */
+    zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
+              zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO));
+    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+    ASSERT_NULL(base);
+
+    /* valid_upto past the end of the data file. */
+    zsi_put64(tab + ZSI_IDX_OFF_VALID_UPTO, (uint64_t)f->size + 4096);
+    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+    ASSERT_NULL(base);
+
+    /* And below the data file's header length. */
+    zsi_put64(tab + ZSI_IDX_OFF_VALID_UPTO, 3);
+    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+    ASSERT_NULL(base);
+
+    free(tab);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-13: nothing published below the threshold, something at it. */
+static void test_idxcache_threshold(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct stat sb;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1024 * 1024;   /* far above anything written here */
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 20; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
+    }
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+    ASSERT_EQ(stat(tabpath, &sb), -1);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Same database, threshold of one byte: a table appears. */
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "another", 7, "value", 5, 0));
+    ASSERT_EQ(stat(tabpath, &sb), 0);
+    ASSERT(sb.st_size > ZSI_IDX_HEADER_LEN);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-9, P-12: a cached open and an uncached open agree on every key.  This is the
+ * test the whole feature exists for. */
+static void test_idxcache_open_agrees(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data cached = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_open_data plain = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char key[32];
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    cached.flags = ZS_CREATE;
+    cached.index_dir = cachedir;
+    cached.index_threshold = 1;
+    plain.flags = ZS_CREATE;
+
+    /* Written in two halves with a close in between, so the second open loads a
+     * table and replays only the suffix. */
+    ASSERT_OK(zs_db_open(dbdir, &cached, &db));
+    for (int i = 0; i < 50; i++) {
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "first", 5, 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    ASSERT_OK(zs_db_open(dbdir, &cached, &db));
+    {
+        /* The open really did use a table rather than replaying from the top. */
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT(act->cached_upto > ZSI_HEADER_LEN);
+    }
+    for (int i = 25; i < 75; i++) {
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "second", 6, 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    for (int pass = 0; pass < 2; pass++) {
+        ASSERT_OK(zs_db_open(dbdir, pass ? &plain : &cached, &db));
+        for (int i = 0; i < 75; i++) {
+            const char *v = NULL;
+            size_t vl = 0;
+            snprintf(key, sizeof(key), "key%03d", i);
+            ASSERT_OK(zs_db_fetch(db, key, strlen(key), NULL, NULL, &v, &vl, 0));
+            if (i < 25) { ASSERT_EQU(vl, 5u); ASSERT_MEM_EQ(v, "first", 5); }
+            else        { ASSERT_EQU(vl, 6u); ASSERT_MEM_EQ(v, "second", 6); }
+        }
+        ASSERT_OK(zs_db_close(&db));
+    }
+}
+
+/* P-4: published by rename, never written in place.  Checked by inode, because
+ * writing in place would expose a half-written table to a concurrent reader --
+ * which no amount of checksumming makes acceptable, since it is G-6's rule. */
+static void test_idxcache_publishes_by_rename(void)
+{
+    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct stat a, b;
+    DIR *d;
+    struct dirent *de;
+    int staging = 0;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
+    ASSERT_EQ(stat(tabpath, &a), 0);
+
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_EQ(stat(tabpath, &b), 0);
+    ASSERT(a.st_ino != b.st_ino);
+
+    /* And no staging file survives a successful publish. */
+    d = opendir(cachedir);
+    ASSERT_NOT_NULL(d);
+    while ((de = readdir(d)))
+        if (!strncmp(de->d_name, ZSI_STAGING_PREFIX, strlen(ZSI_STAGING_PREFIX)))
+            staging++;
+    closedir(d);
+    ASSERT_EQ(staging, 0);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-15: a cache directory that cannot be written to must not fail a commit, and
+ * must not stop the database working. */
+static void test_idxcache_publish_failure_is_not_fatal(void)
+{
+    char cachedir[PATH_MAX], p[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+    DIR *d;
+    struct dirent *de;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+
+    /* Take the cache directory away underneath the open handle. */
+    d = opendir(cachedir);
+    ASSERT_NOT_NULL(d);
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        snprintf(p, sizeof(p), "%s/%s", cachedir, de->d_name);
+        unlink(p);
+    }
+    closedir(d);
+    ASSERT_EQ(rmdir(cachedir), 0);
+
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_MEM_EQ(v, "2", 1);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And a handle opened against a cache directory that does not exist works
+     * exactly as one with no cache at all. */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-1: only unordered files get a table.  An in-order file has a pointer section
+ * of its own, and after a repack nothing but the active file is unordered. */
+static void test_idxcache_only_unordered_files(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    DIR *d;
+    struct dirent *de;
+    int tables = 0;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    setup.rollover_size = 512;          /* force rollovers and conversions */
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 60; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "0123456789", 10, 0));
+    }
+    ASSERT_OK(zs_db_repack(db));
+
+    /* Every surviving table must name a generation that is still an unordered
+     * file, and after a repack that is at most the active one. */
+    d = opendir(cachedir);
+    ASSERT_NOT_NULL(d);
+    while ((de = readdir(d)))
+        if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                     strlen(ZSI_IDX_NAME_PREFIX)))
+            tables++;
+    closedir(d);
+
+    ASSERT(tables <= 1);
+
+    /* And the data is intact. */
+    for (int i = 0; i < 60; i++) {
+        char key[32];
+        const char *v = NULL;
+        size_t vl = 0;
+        snprintf(key, sizeof(key), "key%03d", i);
+        ASSERT_OK(zs_db_fetch(db, key, strlen(key), NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 10u);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-16: a table whose generation is no longer an unordered file is unlinked; one
+ * whose generation is still live, and one belonging to another database sharing
+ * the directory, are both kept. */
+static void test_idxcache_sweeps_dead_generations(void)
+{
+    char cachedir[PATH_MAX], live[PATH_MAX], dead[PATH_MAX], other[PATH_MAX];
+    char name[ZSI_NAME_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct stat sb;
+    zsi_uuid_t alien;
+    uint32_t gen;
+    char junk[ZSI_IDX_HEADER_LEN + 4];
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+    memset(junk, 0, sizeof(junk));
+
+    setup.flags = ZS_CREATE;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    gen = idxcache_table_path(db, cachedir, live, sizeof(live));
+    ASSERT(gen != 0);
+    ASSERT_EQ(stat(live, &sb), 0);
+
+    /* A table for a generation that has never existed.  Its contents do not
+     * matter: the sweep works on names. */
+    zsi_name_format_index(name, db->uuid, gen + 100);
+    snprintf(dead, sizeof(dead), "%s/%s", cachedir, name);
+    ASSERT_OK(idxcache_spew(dead, junk, sizeof(junk)));
+
+    /* And one for a different database sharing the directory. */
+    memcpy(alien, db->uuid, 16);
+    alien[0] = (unsigned char)(alien[0] ^ 0xFF);
+    zsi_name_format_index(name, alien, gen);
+    snprintf(other, sizeof(other), "%s/%s", cachedir, name);
+    ASSERT_OK(idxcache_spew(other, junk, sizeof(junk)));
+
+    /* A store refreshes the snapshot, and the sweep runs with it. */
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    ASSERT_EQ(stat(dead, &sb), -1);      /* dead generation gone */
+    ASSERT_EQ(stat(other, &sb), 0);      /* another database untouched */
+    ASSERT_EQ(stat(live, &sb), 0);       /* our own live generation kept */
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -10914,6 +11542,19 @@ static struct test_entry tests[] = {
                                         test_idxcache_replays_the_suffix },
     { "test_idxcache_matches_full_build",
                                         test_idxcache_matches_full_build },
+    { "test_idxcache_rejection_rules",  test_idxcache_rejection_rules },
+    { "test_idxcache_rejects_bad_term_binding",
+                                        test_idxcache_rejects_bad_term_binding },
+    { "test_idxcache_threshold",        test_idxcache_threshold },
+    { "test_idxcache_open_agrees",      test_idxcache_open_agrees },
+    { "test_idxcache_publishes_by_rename",
+                                        test_idxcache_publishes_by_rename },
+    { "test_idxcache_publish_failure_is_not_fatal",
+                                        test_idxcache_publish_failure_is_not_fatal },
+    { "test_idxcache_only_unordered_files",
+                                        test_idxcache_only_unordered_files },
+    { "test_idxcache_sweeps_dead_generations",
+                                        test_idxcache_sweeps_dead_generations },
 
     { NULL, NULL }
 };

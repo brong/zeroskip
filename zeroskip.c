@@ -2634,6 +2634,358 @@ struct zsi_idxcfg {
     size_t      threshold;
 };
 
+/* Load and fully validate the pointer table for this file (P-11).
+ *
+ * EVERY failure is ZS_NOTFOUND: a missing file, a short read, an allocation
+ * failure, a rule violation.  That uniformity is the point, not laziness.  A
+ * table is an optimisation living outside the database, and the only correct
+ * response to any doubt about one is to ignore it and replay.  Returning an
+ * error instead would let a corrupt file in a directory the database does not
+ * depend on turn a readable database into an unreadable one, which is precisely
+ * what P-11 forbids and what G-3 is about.
+ *
+ * On ZS_OK, *base is an owned array of *nbase offsets in key order. */
+static int zsi_idx_load(struct zsi_file *f, const struct zsi_idxcfg *cfg,
+                        const char *compar_name, bool nocsum,
+                        size_t **base, size_t *nbase, size_t *valid_upto,
+                        size_t *term_off, uint32_t *term_csum)
+{
+    char name[ZSI_NAME_MAX], path[PATH_MAX];
+    struct zsi_idxhdr h;
+    struct stat sb;
+    char *buf = NULL;
+    size_t len, want, arrlen;
+    size_t *offs = NULL;
+    int fd = -1, rc = ZS_NOTFOUND;
+
+    *base = NULL;
+    *nbase = 0;
+    *valid_upto = ZSI_HEADER_LEN;
+    *term_off = ZSI_HEADER_LEN;
+    *term_csum = 0;
+
+    if (!cfg || !cfg->dir) return ZS_NOTFOUND;
+
+    /* D-10: a file with an invalid header has no records to index and no
+     * generation we would trust a table against. */
+    if (!f->hdr_valid || !f->csum) return ZS_NOTFOUND;
+
+    zsi_name_format_index(name, f->hdr.uuid, f->hdr.start);
+    if ((size_t)snprintf(path, sizeof(path), "%s/%s", cfg->dir, name)
+        >= sizeof(path))
+        return ZS_NOTFOUND;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return ZS_NOTFOUND;
+    if (fstat(fd, &sb) < 0 || !S_ISREG(sb.st_mode)) goto out;
+
+    len = (size_t)sb.st_size;
+    if (len < ZSI_IDX_HEADER_LEN + 4) goto out;
+    if (len > ZSI_IDX_MAX_BYTES) goto out;
+
+    buf = malloc(len);
+    if (!buf) goto out;
+    if (read(fd, buf, len) != (ssize_t)len) goto out;
+
+    /* P-7: the engine is the DATA FILE's, never ours.  Resolving it from the
+     * file and then REQUIRING the table to agree is what closes the hole F-5a
+     * closes for data files -- otherwise a table could name an engine the file
+     * does not use and still validate under it. */
+    if (zsi_idxhdr_engine_id(buf) != f->csum_id) goto out;
+    if (zsi_idxhdr_decode(buf, len, f->csum, &h) != ZS_OK) goto out;
+
+    if (memcmp(h.uuid, f->hdr.uuid, 16) != 0) goto out;
+    if (h.start != f->hdr.start) goto out;
+
+    /* Both comparator names: the file's, because a table sorted under a
+     * different order is meaningless against it, and OUR OWN, because a handle
+     * may legitimately open a file whose recorded comparator it does not
+     * implement. */
+    if (memcmp(h.compar_name, f->hdr.compar_name, ZSI_COMPAR_NAME_LEN) != 0)
+        goto out;
+    if (memcmp(h.compar_name, compar_name, ZSI_COMPAR_NAME_LEN) != 0) goto out;
+
+    /* An index built without verification may hold records a verifying reader
+     * would reject, so it must not be handed to one.  The converse is fine. */
+    if (!nocsum && !(h.flags & ZSI_IDX_FLAG_CSUM_VERIFIED)) goto out;
+
+    /* Exact size, so a truncated or padded table is rejected rather than read
+     * short.  The division guards the multiply. */
+    if (h.nptrs > (ZSI_IDX_MAX_BYTES - ZSI_IDX_HEADER_LEN - 4) / 8) goto out;
+    arrlen = (size_t)h.nptrs * 8;
+    if (!zsi_add_sz(arrlen, ZSI_IDX_HEADER_LEN + 4, &want)) goto out;
+    if (want != len) goto out;
+
+    if (zsi_get32(buf + len - 4)
+        != f->csum(buf + ZSI_IDX_HEADER_LEN, arrlen))
+        goto out;
+
+    if (h.valid_upto < ZSI_HEADER_LEN || h.valid_upto > f->size) goto out;
+
+    /* P-10's binding, in O(1).  The table names the terminator's offset because
+     * terminators are only ever found by scanning forward (F-20): a reader given
+     * valid_upto alone could not locate it without the replay this whole
+     * mechanism exists to avoid.
+     *
+     * What this catches is a data file whose covered prefix is not the one the
+     * table was built over -- which the format itself cannot produce, since
+     * files are append-only and generations are never reissued (D-9b), so it is
+     * there for out-of-band events such as a restore from backup under a
+     * surviving cache directory.  It examines one span, so P-17 states the
+     * limit plainly rather than implying more. */
+    if (h.valid_upto == ZSI_HEADER_LEN) {
+        if (h.term_off != ZSI_HEADER_LEN || h.term_csum != 0 || h.nptrs != 0)
+            goto out;
+    } else {
+        struct zsi_term term;
+        const char *tb;
+        size_t after;
+
+        if (h.term_off < ZSI_HEADER_LEN || h.term_off >= h.valid_upto) goto out;
+        tb = zsi_file_at(f, (size_t)h.term_off, 1);
+        if (!tb) goto out;
+        if (zsi_term_decode(tb, f->size - (size_t)h.term_off, &term) != ZS_OK)
+            goto out;
+        if (!zsi_add_sz((size_t)h.term_off, term.len, &after)) goto out;
+        if (after != (size_t)h.valid_upto) goto out;
+        if (term.csum != h.term_csum) goto out;
+    }
+
+    offs = malloc(h.nptrs ? (size_t)h.nptrs * sizeof(*offs) : 1);
+    if (!offs) goto out;
+
+    for (uint64_t i = 0; i < h.nptrs; i++) {
+        uint64_t v = zsi_get64(buf + ZSI_IDX_HEADER_LEN + i * 8);
+
+        /* Every offset must address a record inside the covered prefix.  This
+         * is O(n) over the array but touches no data-file page, so it costs
+         * nothing the cache is trying to save.
+         *
+         * It deliberately does NOT verify that the offsets are in key order:
+         * that needs a record decode per entry, which is exactly the work being
+         * avoided, and the array checksum already stands behind the ordering. */
+        if (v < ZSI_HEADER_LEN || v >= h.valid_upto) goto out;
+        if (v > (uint64_t)SIZE_MAX) goto out;
+        offs[i] = (size_t)v;
+    }
+
+    *base = offs;
+    *nbase = (size_t)h.nptrs;
+    *valid_upto = (size_t)h.valid_upto;
+    *term_off = (size_t)h.term_off;
+    *term_csum = h.term_csum;
+    offs = NULL;
+    rc = ZS_OK;
+
+out:
+    free(offs);
+    free(buf);
+    if (fd >= 0) close(fd);
+    return rc;
+}
+
+/* Build the private index, seeded from a table if one is usable (P-12). */
+static int zsi_index_build_cached(struct zsi_file *f, zs_compar *compar,
+                                  const char *compar_name, bool nocsum,
+                                  const struct zsi_idxcfg *cfg)
+{
+    size_t *base = NULL, nbase = 0;
+    size_t vu = ZSI_HEADER_LEN, to = ZSI_HEADER_LEN;
+    uint32_t tc = 0;
+    int r;
+
+    if (zsi_idx_load(f, cfg, compar_name, nocsum,
+                     &base, &nbase, &vu, &to, &tc) != ZS_OK)
+        return zsi_index_build(f, compar, nocsum);
+
+    f->cached_upto = vu;
+    r = zsi_index_build_from(f, compar, nocsum, base, nbase, vu);
+    if (r != ZS_OK) return r;
+
+    /* A replay that found no new span leaves last_term_* at the values it
+     * started with, so seed them from the table.  Without this, publishing after
+     * a no-op catch-up would record a terminator that is not the one at the
+     * complete point, and every later reader would reject the result. */
+    if (f->complete == vu) {
+        f->last_term_off  = to;
+        f->last_term_csum = tc;
+    }
+
+    return ZS_OK;
+}
+
+/* Publish a table covering this file's complete point (P-4, P-13).
+ *
+ * ZS_DONE means the threshold was not reached and nothing was written, which is
+ * the common case and not a failure.  Any other non-OK is a real problem with
+ * the cache directory, and the caller is REQUIRED to swallow it (P-15): the data
+ * is already durable, and failing an operation over a rebuildable cache would be
+ * a regression rather than a safety measure.
+ *
+ * There is deliberately NO fsync (P-14).  A table is rebuildable, a torn or
+ * zero-filled file after a crash is rejected by P-11's checksums, and syncing
+ * would put a third sync on a commit path C-7 defines as exactly two -- which is
+ * the cost this whole mechanism exists to reduce. */
+static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
+                           zs_compar *compar, bool nocsum)
+{
+    char name[ZSI_NAME_MAX], path[PATH_MAX], tmp[PATH_MAX];
+    unsigned char rnd[4];
+    struct zsi_idxhdr h;
+    char hdr[ZSI_IDX_HEADER_LEN], csbuf[4];
+    size_t *offs = NULL, n = 0, arrlen;
+    char *arr = NULL;
+    int fd = -1, rc = ZS_INTERNAL;
+
+    if (!cfg || !cfg->dir) return ZS_DONE;
+    if (!f->hdr_valid || !f->csum || !f->index) return ZS_DONE;
+    if (!zsi_file_is_unordered(f)) return ZS_DONE;          /* P-1 */
+
+    /* P-13.  cached_upto is the valid_upto of the table this index was seeded
+     * from, or the header length if none was.  Publishing below the threshold is
+     * what would make a bulk load quadratic: a table is rewritten whole, so one
+     * publication per commit costs O(records in the file) of I/O per commit. */
+    if (f->complete < f->cached_upto) return ZS_DONE;
+    if (f->complete - f->cached_upto < cfg->threshold) return ZS_DONE;
+
+    if (zsi_index_flatten(f->index, compar, &offs, &n) != ZS_OK)
+        return ZS_INTERNAL;
+
+    if (n > (ZSI_IDX_MAX_BYTES - ZSI_IDX_HEADER_LEN - 4) / 8) goto out;
+    arrlen = n * 8;
+
+    arr = malloc(arrlen ? arrlen : 1);
+    if (!arr) goto out;
+    for (size_t i = 0; i < n; i++)
+        zsi_put64(arr + i * 8, (uint64_t)offs[i]);
+
+    memset(&h, 0, sizeof(h));
+    h.version_read  = ZSI_IDX_VERSION_READ;
+    h.version_write = ZSI_IDX_VERSION_WRITE;
+    /* P-7: the FILE's engine, never the handle's.  Using the handle's would
+     * produce tables a conforming peer must reject -- the same silent failure
+     * that using the handle's engine to append to an existing file causes
+     * (A-6, F-5a). */
+    h.flags = (uint16_t)(f->csum_id & ZSI_CSUM_MASK);
+    if (!nocsum) h.flags |= ZSI_IDX_FLAG_CSUM_VERIFIED;
+    memcpy(h.uuid, f->hdr.uuid, 16);
+    h.start = f->hdr.start;
+    memcpy(h.compar_name, f->hdr.compar_name, ZSI_COMPAR_NAME_LEN);
+    h.valid_upto = (uint64_t)f->complete;
+    h.term_off   = (uint64_t)f->last_term_off;
+    h.nptrs      = (uint64_t)n;
+    h.term_csum  = f->last_term_csum;
+
+    zsi_idxhdr_encode(hdr, &h, f->csum);
+
+    if (!zsi_random_bytes(rnd, sizeof(rnd))) {
+        uint64_t e = zsi_weak_entropy();
+        memcpy(rnd, &e, sizeof(rnd));
+    }
+
+    /* Random digits as well as the pid: two processes sharing a cache directory
+     * across a network filesystem can have the same pid, and two of them writing
+     * one staging name would interleave into a file that is then renamed into
+     * place.  P-11 would reject the result, but at the cost of both processes'
+     * work and with nothing to explain why. */
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s/%s%d.%02x%02x%02x%02x",
+                         cfg->dir, ZSI_STAGING_PREFIX, (int)getpid(),
+                         rnd[0], rnd[1], rnd[2], rnd[3]) >= sizeof(tmp))
+        goto out;
+
+    zsi_name_format_index(name, f->hdr.uuid, f->hdr.start);
+    if ((size_t)snprintf(path, sizeof(path), "%s/%s", cfg->dir, name)
+        >= sizeof(path))
+        goto out;
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { rc = ZS_IOERROR; goto out; }
+
+    rc = ZS_IOERROR;
+    if (write(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) goto out_unlink;
+    if (arrlen && write(fd, arr, arrlen) != (ssize_t)arrlen) goto out_unlink;
+
+    /* Note the empty case: f->csum(arr, 0) must be the ENGINE's value for empty
+     * input, not zero.  zsi_csum_xxhash has no empty short-circuit for exactly
+     * this reason (F-26g), so passing a zero length here is correct. */
+    zsi_put32(csbuf, f->csum(arr, arrlen));
+    if (write(fd, csbuf, 4) != 4) goto out_unlink;
+
+    if (close(fd) < 0) { fd = -1; goto out_unlink; }
+    fd = -1;
+
+    if (rename(tmp, path) < 0) goto out_unlink;
+
+    f->cached_upto = f->complete;
+    rc = ZS_OK;
+    goto out;
+
+out_unlink:
+    if (fd >= 0) { close(fd); fd = -1; }
+    unlink(tmp);
+
+out:
+    if (fd >= 0) close(fd);
+    free(arr);
+    free(offs);
+    return rc;
+}
+
+/* P-16.  Unlink tables for this database whose generation is no longer an
+ * unordered file.
+ *
+ * Takes the live generations as a plain array rather than a struct zsi_fileset,
+ * because FILE SET is defined below this section and the layering runs one way.
+ *
+ * Safe against a concurrent reader: a descriptor already open survives the
+ * unlink, and a reader that misses a table replays instead.  Every error is
+ * ignored, because a sweep that cannot run costs disk space, not correctness. */
+static void zsi_idx_sweep(const struct zsi_idxcfg *cfg, const zsi_uuid_t uuid,
+                          const uint32_t *live, size_t nlive)
+{
+    char want[ZSI_UUID_STR_LEN];
+    size_t plen = strlen(ZSI_IDX_NAME_PREFIX);
+    struct dirent *de;
+    DIR *d;
+
+    if (!cfg || !cfg->dir) return;
+
+    zsi_uuid_unparse(uuid, want);
+
+    d = opendir(cfg->dir);
+    if (!d) return;
+
+    while ((de = readdir(d))) {
+        const char *nm = de->d_name;
+        char path[PATH_MAX];
+        uint32_t gen;
+        bool alive = false;
+
+        if (strncmp(nm, ZSI_IDX_NAME_PREFIX, plen) != 0) continue;
+        nm += plen;
+
+        /* Another database's tables, in a cache directory serving several, are
+         * not ours to remove. */
+        if (strncmp(nm, want, 36) != 0) continue;
+        nm += 36;
+        if (*nm != '-') continue;
+        nm++;
+
+        if (zsi_parse_gen8(nm, &gen) != 8) continue;
+        if (nm[8] != '\0') continue;
+
+        for (size_t i = 0; i < nlive; i++)
+            if (live[i] == gen) { alive = true; break; }
+        if (alive) continue;
+
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", cfg->dir, de->d_name)
+            < sizeof(path))
+            unlink(path);
+    }
+
+    closedir(d);
+}
+
 /********** PER-FILE CURSOR *************/
 
 /* One cursor over one source, presenting the same four operations whatever the
@@ -3115,8 +3467,9 @@ static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
  *     against a writer and nothing to clean up when a process dies.
  */
 static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
-                             zs_compar *compar, zs_csum *external_csum,
-                             bool nocsum,
+                             zs_compar *compar, const char *compar_name,
+                             zs_csum *external_csum,
+                             bool nocsum, const struct zsi_idxcfg *idxcfg,
                              void (*report)(const char *, const char *, ...),
                              struct zsi_snapshot **out)
 {
@@ -3181,13 +3534,28 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
 
             if (zsi_file_is_unordered(f)) {
                 /* Step 4.  The replay sets f->complete, which IS this file's
-                 * snapshot boundary: growth beyond it is invisible (C-4c). */
-                r = zsi_index_build(f, compar, nocsum);
+                 * snapshot boundary: growth beyond it is invisible (C-4c).
+                 *
+                 * Seeded from a published pointer table when one is usable
+                 * (P-12), which turns the replay from "the whole file" into
+                 * "whatever has been appended since somebody last published". */
+                r = zsi_index_build_cached(f, compar, compar_name, nocsum,
+                                           idxcfg);
                 if (r != ZS_OK) {
                     zsi_snapshot_release(&s);
                     zsi_fileset_fini(&fs);
                     return r;
                 }
+
+                /* P-13.  A reader publishes on exactly the same rule as a
+                 * writer: whoever builds the pointers and has moved far enough
+                 * past the last published table writes it out.  Safe from either
+                 * side, because publication is a rename (P-4), and never fatal
+                 * (P-15) -- which is why the result is discarded here rather
+                 * than reported.  The write path, which has a handle to warn
+                 * through, does report the first failure. */
+                if (idxcfg && idxcfg->dir)
+                    (void)zsi_idx_publish(f, idxcfg, compar, nocsum);
             } else {
                 r = zsi_ptrs_load(f);
                 if (r != ZS_OK) {
@@ -3201,6 +3569,35 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
         zsi_fileset_fini(&fs);
 
         if (retry) { zsi_snapshot_release(&s); continue; }
+
+        /* P-16.  Done here rather than inside the publish, because this is the
+         * one place that knows the whole file set.  A table whose generation is
+         * still an unordered file is kept, so a stranded unconverted file does
+         * not lose its own.  Every failure inside is ignored: a sweep that
+         * cannot run costs disk space, not correctness. */
+        if (idxcfg && idxcfg->dir && s->nfiles) {
+            const zsi_uuid_t *u = NULL;
+            uint32_t stackbuf[16];
+            uint32_t *live = stackbuf;
+            size_t nlive = 0;
+
+            for (size_t i = 0; i < s->nfiles; i++)
+                if (s->files[i]->hdr_valid) { u = &s->files[i]->hdr.uuid; break; }
+
+            if (u) {
+                if (s->nfiles > sizeof(stackbuf) / sizeof(stackbuf[0]))
+                    live = malloc(s->nfiles * sizeof(*live));
+
+                if (live) {
+                    for (size_t i = 0; i < s->nfiles; i++)
+                        if (zsi_file_is_unordered(s->files[i]))
+                            live[nlive++] = s->files[i]->hdr.start;
+
+                    zsi_idx_sweep(idxcfg, *u, live, nlive);
+                    if (live != stackbuf) free(live);
+                }
+            }
+        }
 
         *out = s;
         return ZS_OK;
@@ -3470,9 +3867,10 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
 static int zsi_db_refresh(struct zs_db *db)
 {
     struct zsi_snapshot *s = NULL;
+    struct zsi_idxcfg idxcfg = { db->index_dir, db->index_threshold };
     int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
-                              db->compar, db->external_csum, db->nocsum,
-                              db->error, &s);
+                              db->compar, db->compar_name, db->external_csum,
+                              db->nocsum, &idxcfg, db->error, &s);
     if (r != ZS_OK) return r;
 
     zsi_snapshot_release(&db->snap);
@@ -4056,7 +4454,8 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
                               zs_csum *cs, unsigned csum_id,
                               bool rollback_only, size_t base_off,
-                              size_t **offs_out, size_t *noffs_out)
+                              size_t **offs_out, size_t *noffs_out,
+                              size_t *term_off_out, uint32_t *term_csum_out)
 {
     struct zs_db *db = txn->db;
     char *span = NULL;
@@ -4147,6 +4546,14 @@ static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
     if (offs_out) { *offs_out = offs; *noffs_out = noffs; }
     else free(offs);
 
+    /* Where the terminator landed and what checksum it carries (P-10).  Handed
+     * back rather than recovered later because terminators are only ever found
+     * by scanning FORWARD (F-20): a caller that skipped the replay -- which is
+     * the whole point of the incremental index path -- has no other way to know,
+     * and re-walking the span it just wrote would checksum it twice. */
+    if (term_off_out) *term_off_out = base_off + spanlen;
+    if (term_csum_out) *term_csum_out = zsi_get32(term + termlen - 4);
+
     return ZS_OK;
 }
 
@@ -4211,6 +4618,8 @@ static int zsi_txn_commit(struct zs_txn *txn)
     int fd = -1, r;
     uint32_t gen = 0;
     size_t *offs = NULL, noffs = 0;
+    size_t term_off = 0;
+    uint32_t term_csum = 0;
 
     if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
 
@@ -4247,7 +4656,7 @@ static int zsi_txn_commit(struct zs_txn *txn)
     if (!cs) { r = ZS_BADUSAGE; goto out; }
 
     r = zsi_txn_write_span(txn, fd, gen, cs, csum_id, false, base_off,
-                           &offs, &noffs);
+                           &offs, &noffs, &term_off, &term_csum);
     close(fd);
     fd = -1;
     if (r != ZS_OK) goto out;
@@ -4268,12 +4677,34 @@ static int zsi_txn_commit(struct zs_txn *txn)
         r = zsi_file_remap(act);
         if (r == ZS_OK) {
             act->complete = act->size;
+            /* The span just written ends the file, so its terminator is the one
+             * at the complete point (P-10).  Taken from the writer rather than
+             * rediscovered, since skipping the replay is the point of this
+             * branch and terminators are only found by scanning forward. */
+            act->last_term_off  = term_off;
+            act->last_term_csum = term_csum;
             for (size_t i = 0; i < noffs && r == ZS_OK; i++)
                 r = zsi_index_insert(act->index, db->compar, offs[i]);
         }
         /* A failure here is not fatal to the commit -- the data is on disk and
          * durable.  Fall back to a rebuild so this handle's view is correct. */
         if (r != ZS_OK) r = zsi_db_refresh(db);
+
+        /* P-13, P-15.  The writer publishes on the same threshold rule a reader
+         * uses, and a failure never fails the commit: the records are already
+         * durable, and a cache is not something a caller can act on.  Reported
+         * once per handle so a broken cache directory is visible without
+         * becoming noise on every commit. */
+        if (r == ZS_OK && db->index_dir) {
+            struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold };
+            int pr = zsi_idx_publish(act, &cfg, db->compar, db->nocsum);
+
+            if (pr != ZS_OK && pr != ZS_DONE && !db->idx_publish_warned) {
+                db->idx_publish_warned = true;
+                db->error("could not publish a pointer table; continuing "
+                          "without the index cache", "dir=<%s>", db->index_dir);
+            }
+        }
     } else {
         r = zsi_db_refresh(db);
     }
