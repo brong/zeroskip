@@ -22,7 +22,12 @@ protocol (§6), and open and recovery (§7). Two implementations that agree on
 these can share a directory, read each other's files, and lock against each
 other.
 
-**What is a binding, not a contract:** §8 gives a C API. Its *semantics* are
+The pointer table cache (§8) is normative *when present* — implementations that
+use one must agree on its bytes, or they will reject each other's work — but it
+is optional and never load-bearing. A conforming implementation MUST produce
+identical results with it absent.
+
+**What is a binding, not a contract:** §9 gives a C API. Its *semantics* are
 normative — what `store` with no value means, what a transaction makes visible,
 what each flag does — but its spelling is not. An implementation in another
 language SHOULD express the same semantics idiomatically.
@@ -30,7 +35,7 @@ language SHOULD express the same semantics idiomatically.
 - **G-0** Nothing in the format depends on `mmap`, on pointer-sized integers,
   or on any CPU feature. An implementation MAY read files with ordinary reads
   and copy data out; `mmap` is an optimisation the format permits, not one it
-  requires. Only §8's zero-copy pointer lifetimes (A-4) assume it, and that is a
+  requires. Only §9's zero-copy pointer lifetimes (A-4) assume it, and that is a
   binding-level promise a copying implementation simply makes differently.
 - **G-0a** Every integer in every structure is little-endian (F-1), including
   lengths, counts, generations and offsets. A header checksum will not catch a
@@ -98,7 +103,9 @@ whether a pointer section must be present.
   rewritten beneath it: files are append-only, a new file is published by
   `rename`, and every index is private to the process that built it. There is no
   manifest and no shared cache, so correctness cannot depend on one, and nothing
-  needs cleaning up when a process dies.
+  needs cleaning up when a process dies. The optional pointer table cache (§8)
+  does not weaken this: it lives outside the database, its tables are published
+  by `rename` and never modified, and results MUST be identical with it absent.
 - **G-7 Read paths agree.** Point lookups and range scans resolve visibility
   through one shared rule (D-14), so they cannot disagree about whether a key
   exists.
@@ -1092,9 +1099,13 @@ Opening is recovery; there is no separate pass.
   or terminator that fails to validate, which establishes that file's end.
 - **R-2** Live data is the union of records in spans with `COMMIT` terminators;
   rolled-back spans contribute nothing.
-- **R-3** A reader MUST NOT write. Opening a damaged database read-only is
-  side-effect-free: no conversion, no repack, no new active file, no removal.
-  There is no shared cache for it to update (D-13c).
+- **R-3** A reader MUST NOT write **to the database**. Opening a damaged
+  database read-only is side-effect-free: no conversion, no repack, no new
+  active file, no removal. There is no shared cache inside the database for it
+  to update (D-13c). Publishing a pointer table into a separately configured
+  cache directory (§8) is not a write to the database, and a read-only handle
+  MAY do it — which is why P-2 forbids that directory from being the database
+  directory.
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
@@ -1108,7 +1119,151 @@ Opening is recovery; there is no separate pass.
   removed (D-23). There is no separate reconstruction path, because discovery by
   directory scan is the only path.
 
-## 8. C binding
+---
+
+## 8. Pointer table cache
+
+An unordered file has no pointer section, so key order for it is derived by
+replaying its spans (D-13a). That replay is bounded by `rollover_size` but paid
+on every open. A **pointer table** is one process's replay result, published so
+another can load it and replay only the suffix beyond it.
+
+It is **optional and never load-bearing**. A conforming implementation MUST
+produce identical results with the cache directory empty, absent, unwritable, or
+full of tables it rejects. Nothing here may turn a readable database into an
+unreadable one.
+
+- **P-1** A pointer table covers exactly one **unordered** file, identified by
+  the database uuid and that file's generation. An in-order file has a pointer
+  section (§4.9) and MUST NOT have a table.
+- **P-2** Tables live in a **cache directory** named by the caller. It MUST NOT
+  be the database directory, and an implementation MUST reject that
+  configuration. Writing to a cache directory is therefore not a write to the
+  database, and R-3 is not weakened: a read-only handle MAY publish a table.
+  An implementation MUST NOT choose a cache directory on the caller's behalf —
+  a planted table yields wrong records, and a world-writable default such as
+  `/tmp` would make planting one trivial.
+- **P-3** A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using
+  D-0's uuid form and D-1's generation form. The `zeroskip.` prefix puts it in
+  the metadata namespace (D-2), so it can never be parsed as a data file.
+- **P-4** A table is published by writing a complete file under a staging name
+  `zeroskip.tmp.<pid>.<hex digits>` in the cache directory and `rename`-ing it
+  over the published name. A table is never modified in place, never appended
+  to, and never truncated. G-6 therefore holds for the cache directory as well
+  as for the database.
+- **P-5** A table is a 96-byte header, then `nptrs` 8-byte little-endian record
+  offsets, then a 4-byte checksum over those offsets. Its size is exactly
+  `96 + 8 × nptrs + 4`.
+
+  | offset | size | field |
+  |---|---|---|
+  | 0 | 16 | magic (P-6) |
+  | 16 | 1 | version_read |
+  | 17 | 1 | version_write |
+  | 18 | 2 | flags — low 4 bits the checksum engine, bit 4 "checksums verified" |
+  | 20 | 4 | reserved, written zero, ignored on read |
+  | 24 | 16 | uuid |
+  | 40 | 4 | start — the covered file's generation |
+  | 44 | 4 | reserved, written zero, ignored on read |
+  | 48 | 16 | comparator name |
+  | 64 | 8 | valid_upto |
+  | 72 | 8 | term_off |
+  | 80 | 8 | nptrs |
+  | 88 | 4 | term_csum |
+  | 92 | 4 | checksum, covering [0, 92) |
+
+- **P-6** The magic is the 16 bytes
+
+      89 7A 73 69 6E 64 65 78 31 0D 0A 1A 0A 00 00 00
+      \x89  z  s  i  n  d  e  x  1 \r \n ^Z \n \0 \0 \0
+
+  built on the same principles as F-6's and deliberately **different** from it,
+  so a table and a data file are distinguishable by content as well as by name.
+  A reader MUST validate all 16 bytes, not a prefix.
+- **P-7** A table's checksums use **the engine named by the covered data file's
+  header**, not the engine the reading or writing handle would choose for a new
+  file. This is F-5a applied to the table: any peer able to read the data file
+  can validate its table. A table checksummed under the handle's engine instead
+  validates for nobody, so every reader silently rejects it and the cache does
+  nothing while appearing to work.
+- **P-8** `valid_upto` is the data-file offset the table covers. It MUST be a
+  span boundary: the offset immediately after a valid span's terminator, or the
+  data file's header length when the file has no valid spans.
+- **P-9** The offsets are the record offsets of every distinct key committed
+  below `valid_upto`, each being that key's newest such record (D-14), sorted
+  ascending by key under the named comparator. Rolled-back spans contribute
+  nothing (F-25).
+- **P-10** `term_off` is the offset of the terminator immediately below
+  `valid_upto`, and `term_csum` is the checksum that terminator carries. When
+  the file has no valid spans, `valid_upto` and `term_off` both equal the data
+  file's header length, `term_csum` is 0 and `nptrs` is 0.
+
+  `term_off` is recorded rather than derived because terminators are located by
+  walking spans **forward**: a reader given only `valid_upto` could not find the
+  terminator below it without performing the very replay the table exists to
+  avoid.
+- **P-11** A reader MUST use a table only if **all** of the following hold, and
+  MUST otherwise ignore it and build the index by replay. A rejected table is
+  never an error and MUST NOT be reported as corruption — it lives outside the
+  database, and reporting it would let a file the database does not depend on
+  make a readable database look unreadable.
+  - the magic matches, the header checksum validates, and the checksum over the
+    offset array validates;
+  - `version_read` does not exceed the reader's;
+  - the file size is exactly `96 + 8 × nptrs + 4`;
+  - the recorded engine is the one the data file's header names (P-7);
+  - uuid and `start` match the data file;
+  - the comparator name matches both the data file's field and the reader's own;
+  - flags bit 4 is set, unless the reader is itself not verifying checksums
+    (F-5e) — an index built without verification may contain records a verifying
+    reader would reject, so it MUST NOT be handed to one;
+  - `H ≤ valid_upto ≤` the data file's size, where `H` is the data file's header
+    length;
+  - every offset lies in `[H, valid_upto)`;
+  - either P-10's no-spans case holds exactly, or `H ≤ term_off < valid_upto`,
+    the bytes at `term_off` decode as a terminator, `term_off + term_len =
+    valid_upto`, and that terminator's checksum equals `term_csum`.
+- **P-12** Having accepted a table, a reader takes its offsets as the index's
+  ordered base and replays spans from `valid_upto` onwards, folding the results
+  in (D-13b). Beginning a replay at a span boundary is sound because a span is
+  self-delimiting and self-validating (F-23, F-19).
+- **P-13** After building or extending an index over an unordered file, a
+  process SHOULD publish a table covering that file's complete point when the
+  distance from the loaded table's `valid_upto` — or from `H`, if no table was
+  loaded — reaches an implementation-defined threshold. Readers and writers
+  apply the same rule: whoever builds the pointers publishes them.
+
+  The threshold is required rather than advisory. A table is rewritten whole,
+  so publishing on every commit costs O(records in the file) of I/O per commit
+  and makes a bulk load quadratic. The threshold bounds both the publisher's
+  write amplification and the next reader's catch-up replay to the same figure.
+- **P-14** A table MUST NOT be `fsync`ed before publication. It is rebuildable,
+  and a torn or zero-filled file after a crash is rejected by P-11. Syncing it
+  would add a sync to the commit path, which C-7 defines as exactly two.
+- **P-15** A failure to publish MUST NOT fail the operation that triggered it.
+  The data is already durable, and a cache is not something a caller can act on.
+- **P-16** A process MAY unlink tables in the cache directory whose uuid matches
+  its own database and whose generation is not present as an unordered file in
+  its snapshot. Tables carrying another uuid are not its to remove. Unlinking is
+  safe against a concurrent reader: a descriptor already open survives it, and a
+  reader that misses a table replays instead.
+- **P-17** P-10's binding detects a data file whose covered prefix has changed.
+  Within the format that cannot happen — files are append-only and generations
+  are never reissued (D-9b) — so the check exists for out-of-band events, of
+  which restoring a database directory from backup under a surviving cache
+  directory is the realistic one. It examines one span, so it cannot detect
+  divergence confined to an earlier one. A cache directory MUST therefore be
+  scoped to the lifetime of the database instance, and a caller that restores a
+  database directory out of band MUST discard its tables.
+
+Checksumming the whole covered prefix would close P-17 completely, and is
+deliberately not required: the cache's largest benefit on a cold page cache is
+not touching the data file at all, and hashing the prefix would force reading
+every byte of it.
+
+---
+
+## 9. C binding
 
 The semantics below are normative; the spelling is a C binding (§1).
 Opaque types, one 32-bit flag space, output through pointer parameters, and
@@ -1237,8 +1392,17 @@ different calls, though not every flag is meaningful everywhere:
 - **A-7** `zs_compar` returns negative, zero or positive like `memcmp`, but MUST
   implement F-11a's total order rather than delegating to `memcmp` alone, which
   says nothing about keys of differing length.
+- **A-8** `index_dir` names the pointer table cache directory (§8). A null or
+  absent value disables the cache, which is the default: an implementation MUST
+  NOT choose a directory itself (P-2). Naming the database directory is a usage
+  error (`ZS_BADUSAGE`). The library does not create the directory; a directory
+  that is missing or unwritable disables the cache for that handle rather than
+  failing the open (P-15).
+- **A-9** `index_threshold` is P-13's threshold in bytes. Zero selects an
+  implementation-defined default derived from `rollover_size`, so a caller that
+  sets `index_dir` and nothing else still gets bounded publishing.
 
-## 9. Conformance suite
+## 10. Conformance suite
 
 The suite has two halves. **T-1 to T-11 are per-implementation tests**, run
 inside one implementation in whatever harness suits it — for the C
@@ -1534,13 +1698,13 @@ here to the test enforcing it. A requirement with no test is a gap to close. Eac
 implementation records which requirements it passes, so partial conformance is
 visible.
 
-## 10. Non-goals
+## 11. Non-goals
 
 Multi-writer concurrency; thread-safe handles; cross-database transactions;
 secondary indexes; compression; network access; in-place value mutation. A Cyrus `cyrusdb`
 backend is a thin separate adapter, out of scope.
 
-## 11. Open items
+## 12. Open items
 
 1. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
    database while the writer continues appending. The packer lock permits one
@@ -1550,10 +1714,15 @@ backend is a thin separate adapter, out of scope.
    If it ever needs bounding, two mitigations preserve the same steady state:
    merge pairwise, one step per invocation, or cap the cascade at a projected
    output size and resume next time.
-2. **Whether a shared index is worth reintroducing.** Every snapshot now replays
-   the active file, bounded by `rollover_size` but paid per open. If measurement
-   shows that cost matters, the way to share it without reintroducing in-place
-   mutation is an append-only `(key, offset)` log per file published by a single
-   aligned atomic — readers read the immutable prefix and sort privately. That
-   trades a scan for a sort and keeps D-13c intact. Not worth building before
-   there is a number.
+**Resolved.** *Whether a shared index is worth reintroducing.* Measurement said
+yes — roughly 1.5 ms per open at the 2 MB `rollover_size` ceiling, flat per
+record, which is the dominant cost for a process that opens a database per
+request. §8 is the answer, and it is a different shape from the one sketched
+here. That sketch was an append-only `(key, offset)` log per file inside the
+database directory, published by a single aligned atomic, with readers sorting
+privately: it traded a scan for a sort. §8 publishes the **sorted** table
+instead, which removes the sort as well as the scan, and puts it outside the
+database directory, which leaves D-1, D-2, D-4 and the file-set scan untouched.
+The cost of that choice is P-17: a table outlives an out-of-band restore of the
+database directory, so a cache directory must be scoped to the database
+instance.

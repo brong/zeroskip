@@ -124,7 +124,7 @@ CONVERSION          D-12 unordered -> in-order
 REPACK              §5.6 selection and merge
 CONSISTENCY         F-28, F-26f, dump
 OPEN AND CLOSE      §7
-PUBLIC API          §8
+PUBLIC API          §9
 ```
 
 ---
@@ -136,10 +136,10 @@ PUBLIC API          §8
 - Copy: `xxhash.h` from `../twom/xxhash.h` verbatim
 - Modify: `README.md` (rewrite for the new layout)
 
-**Requirements:** §8 (API surface declaration only), §9 harness shape.
+**Requirements:** §9 (API surface declaration only), §10 harness shape.
 
 **Interfaces produced:**
-- `zeroskip.h`: the complete public surface from §8 — `enum zs_ret`, `enum
+- `zeroskip.h`: the complete public surface from §9 — `enum zs_ret`, `enum
   zs_flagspec`, `zs_cb`, `zs_compar`, `zs_csum`, `struct zs_open_data`, all
   function prototypes, the three `*_delete` macros. Declared, not implemented.
 - `zstest.c`: `ASSERT`, `ASSERT_EQ`, `ASSERT_OK`, `ASSERT_NULL`,
@@ -161,10 +161,10 @@ enum zs_ret {
     ZS_EXISTS       = -1,
     ZS_IOERROR      = -2,
     ZS_INTERNAL     = -3,
-    ZS_LOCKED       = -4,   /* pinned by §8 */
-    ZS_NOTFOUND     = -5,   /* pinned by §8 */
+    ZS_LOCKED       = -4,   /* pinned by §9 */
+    ZS_NOTFOUND     = -5,   /* pinned by §9 */
     ZS_READONLY     = -6,
-    ZS_BADFORMAT    = -7,   /* pinned by §8 */
+    ZS_BADFORMAT    = -7,   /* pinned by §9 */
     ZS_BADUSAGE     = -8,
     ZS_BADCHECKSUM  = -9,
     ZS_FULL         = -10,
@@ -172,7 +172,7 @@ enum zs_ret {
 };
 ```
 
-**Flags** — one 32-bit space, never reused across calls (§8):
+**Flags** — one 32-bit space, never reused across calls (§9):
 
 ```c
 enum zs_flagspec {
@@ -214,7 +214,7 @@ but it stays as belt and braces.
 
 - [ ] **Step 2: `zeroskip.h`**
 
-Transcribe §8's declarations exactly, with the enums above. Include
+Transcribe §9's declarations exactly, with the enums above. Include
 `<stdbool.h>`, `<stdlib.h>`, `<stdint.h>`. Guard `INCLUDED_ZEROSKIP_H`. Add
 `#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, NULL }` matching
 `struct zs_open_data`'s six members in order.
@@ -1920,7 +1920,7 @@ git commit -am "feat: write path with two durability gates per commit"
 
 **Files:** `zeroskip.c` (PUBLIC API), `zstest.c`
 
-**Requirements:** §8 — A-0, A-1b, A-2, A-3, A-4, A-5, A-7; T-4
+**Requirements:** §9 — A-0, A-1b, A-2, A-3, A-4, A-5, A-7; T-4
 
 - [ ] **Step 1: Implement the three forms**
 
@@ -2662,6 +2662,6 @@ be run per implementation rather than assumed.
 The shared language-neutral runner for T-12/T-13 belongs in its own plan,
 written when there is a second implementation to run it against.
 
-**Spec open items (§11)** are deliberately not addressed: repack duration stays
+**Spec open items (§12)** are deliberately not addressed: repack duration stays
 unbounded (D-16b), and no shared index is built. Task 26 produces the
 measurement open item 2 asks for before that decision is reconsidered.

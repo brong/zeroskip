@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 197 |
-| With an enforcing test | 188 |
+| Requirements | 216 |
+| With an enforcing test | 207 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -208,9 +208,31 @@ a spec label is missing here.
 |---|---|---|
 | `R-1` | Open is C-4: scan the directory, resolve enclosures, check the tiling, | `open_create, crash/crash_at_every_call` |
 | `R-2` | Live data is the union of records in spans with `COMMIT` terminators; | `span_rollback` |
-| `R-3` | A reader MUST NOT write. Opening a damaged database read-only is | `convert_readonly_does_nothing`, `corpus_engine_from_file_not_config`, `open_readonly_no_side_effects`, +1 more |
+| `R-3` | A reader MUST NOT write **to the database**. Opening a damaged | `convert_readonly_does_nothing`, `corpus_engine_from_file_not_config`, `open_readonly_no_side_effects`, `idxcache_rejects_db_dir`, +1 more |
 | `R-4` | There is no in-place repair. A file that is not clean is simply | `crash/crash_after_invalid_terminator`, `span_bad_header_and_kind`, `span_torn_tail`, +1 more |
 | `R-5` | A crash during a repack or conversion leaves either a staging file, | `snapshot_resolves_overlap`, `staging_names` |
+
+## Pointer table cache (`P-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `P-1` | A pointer table covers exactly one **unordered** file, identified by | `idxcache_only_unordered_files` |
+| `P-2` | Tables live in a **cache directory** named by the caller. It MUST NOT | `idxcache_rejects_db_dir` |
+| `P-3` | A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using | `idxcache_published_name` |
+| `P-4` | A table is published by writing a complete file under a staging name | `idxcache_publishes_by_rename` |
+| `P-5` | A table is a 96-byte header, then `nptrs` 8-byte little-endian record | `idxcache_header_byte_layout` |
+| `P-6` | The magic is the 16 bytes | `idxcache_header_byte_layout` |
+| `P-7` | A table's checksums use **the engine named by the covered data file's | `idxcache_uses_file_engine` |
+| `P-8` | `valid_upto` is the data-file offset the table covers. It MUST be a | `idxcache_valid_upto_is_span_boundary` |
+| `P-9` | The offsets are the record offsets of every distinct key committed | `idxcache_matches_full_build`, `idxcache_open_agrees` |
+| `P-10` | `term_off` is the offset of the terminator immediately below | `idxcache_rejects_bad_term_binding` |
+| `P-11` | A reader MUST use a table only if **all** of the following hold, and | `idxcache_rejection_rules` |
+| `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_replays_the_suffix`, `idxcache_open_agrees` |
+| `P-13` | After building or extending an index over an unordered file, a | `idxcache_threshold` |
+| `P-14` | A table MUST NOT be `fsync`ed before publication. It is rebuildable, | `idxcache_no_fsync_on_publish` |
+| `P-15` | A failure to publish MUST NOT fail the operation that triggered it. | `idxcache_publish_failure_is_not_fatal` |
+| `P-16` | A process MAY unlink tables in the cache directory whose uuid matches | `idxcache_sweeps_dead_generations` |
+| `P-17` | P-10's binding detects a data file whose covered prefix has changed. | `idxcache_rejects_bad_term_binding` |
 
 ## C binding (`A-n`)
 
@@ -226,6 +248,8 @@ a spec label is missing here.
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
 | `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
+| `A-8` | `index_dir` names the pointer table cache directory (§8). A null or | `idxcache_rejects_db_dir`, `idxcache_publish_failure_is_not_fatal` |
+| `A-9` | `index_threshold` is P-13's threshold in bytes. Zero selects an | `idxcache_threshold_defaults` |
 
 ## Conformance suite (`T-n`)
 
