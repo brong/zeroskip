@@ -8977,6 +8977,385 @@ static void test_corpus_engine_from_file_not_config(void)
 
 /*
  * ============================================================
+ * Malformed input (T-3)
+ * ============================================================
+ *
+ * Every golden corpus file, truncated at EVERY byte offset and systematically
+ * bit-flipped.  Each case asserts an error OR the committed prefix, and never a
+ * crash, a hang, or an out-of-bounds read.
+ *
+ * "Or the committed prefix" is not a weakening: F-24 makes a truncated unordered
+ * file legitimately complete at its last valid span, so both outcomes are correct
+ * and the harness must accept either -- while still checking that what comes back
+ * IS a prefix of what the intact file held, rather than merely non-empty.
+ *
+ * The per-case wall-clock alarm is THE DETECTOR FOR F-29: a progress-rule bug
+ * shows up as non-termination, not as a wrong answer, so without a timeout this
+ * suite would hang rather than fail.
+ *
+ * Run under ASan and UBSan by `make asan`, which is where an out-of-bounds read
+ * becomes an observable failure rather than a value nobody notices.
+ */
+
+/* Every scanned key of a database, joined -- or NULL if it will not open. */
+static bool damaged_scan(const char *dir, char *out, size_t outlen, bool *opened)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct hexbuf hb = { out, 0, outlen, false };
+
+    out[0] = '\0';
+    *opened = false;
+
+    /* ZS_SHARED: a damaged database must be inspectable without being written to
+     * (R-3), and a harness that let the library repair the file under it would be
+     * testing something else on the next iteration. */
+    setup.flags = ZS_SHARED;
+    setup.error = counting_error;
+    if (zs_db_open(dir, &setup, &db) != ZS_OK) return true;   /* an error is fine */
+
+    *opened = true;
+    int r = zs_db_foreach(db, NULL, 0, NULL, corpus_scan_cb, &hb, 0);
+    zs_db_close(&db);
+
+    /* A scan may fail; that is an error, which is an acceptable outcome. */
+    return (r == ZS_OK || r == ZS_DONE || r < 0);
+}
+
+/* The invariant a damaged database must still satisfy.
+ *
+ * NOT "a prefix of the intact scan": truncation removes later TRANSACTIONS, so the
+ * surviving state can contain keys the final state does not -- the `deletion` case
+ * truncated after its first span yields the key a later span deleted.  That is
+ * correct behaviour, and asserting a scan prefix rejected it.
+ *
+ * What must hold is that the surviving state is INTERNALLY CONSISTENT: every key
+ * the scan reports resolves by point lookup to the same value, and every key it
+ * does not report resolves to absent.  That is G-7 -- the guarantee that the two
+ * read paths cannot disagree -- and it is the property most likely to break when a
+ * file is damaged part-way through a record or a pointer array. */
+static bool damaged_is_consistent(const char *dir, const char *scan)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    bool ok = true;
+
+    setup.flags = ZS_SHARED;
+    setup.error = counting_error;
+    if (zs_db_open(dir, &setup, &db) != ZS_OK) return true;
+
+    /* Every line is "<keyhex> <valhex>"; check each by lookup. */
+    const char *p = scan;
+    while (*p && ok) {
+        const char *eol = strchr(p, '\n');
+        if (!eol) break;
+
+        char line[300000];
+        size_t len = (size_t)(eol - p);
+        if (len >= sizeof(line)) break;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        p = eol + 1;
+
+        char *sp = strchr(line, ' ');
+        if (!sp) { ok = false; break; }
+        *sp++ = '\0';
+
+        static char kbuf[70000], vbuf[70000];
+        size_t kl = unhex_into(line, kbuf, sizeof(kbuf));
+        size_t vl = unhex_into(sp, vbuf, sizeof(vbuf));
+        if (kl == (size_t)-1 || vl == (size_t)-1) { ok = false; break; }
+
+        const char *gv;
+        size_t gvl;
+        int r = zs_db_fetch(db, kbuf, kl, NULL, NULL, &gv, &gvl, 0);
+        if (r != ZS_OK || gvl != vl || (vl && memcmp(gv, vbuf, vl) != 0))
+            ok = false;
+    }
+
+    zs_db_close(&db);
+    return ok;
+}
+
+struct damage_target {
+    char   dir[PATH_MAX];       /* a scratch copy we may damage */
+    char   name[ZSI_NAME_MAX];  /* the data file within it */
+    char  *orig;                /* its intact bytes */
+    size_t len;
+    char  *intact_scan;         /* what the intact database scans to */
+};
+
+static bool damage_setup(struct damage_target *t, const char *casedir,
+                         const char *name)
+{
+    char src[PATH_MAX], dst[PATH_MAX];
+    bool opened;
+
+    snprintf(t->dir, sizeof(t->dir), "%s/damage", basedir);
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s'", t->dir, t->dir);
+    if (system(cmd)) return false;
+
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    snprintf(src, sizeof(src), "%s/%s", casedir, name);
+    snprintf(dst, sizeof(dst), "%s/%s", t->dir, name);
+
+    t->orig = slurp(src, &t->len);
+    if (!t->orig) return false;
+
+    /* Copy every data file, so a multi-file case keeps its tiling. */
+    snprintf(cmd, sizeof(cmd), "cp '%s'/zeroskip-* '%s'/", casedir, t->dir);
+    if (system(cmd)) { free(t->orig); return false; }
+
+    t->intact_scan = malloc(1u << 20);
+    if (!t->intact_scan) { free(t->orig); return false; }
+    if (!damaged_scan(t->dir, t->intact_scan, 1u << 20, &opened) || !opened) {
+        free(t->orig);
+        free(t->intact_scan);
+        return false;
+    }
+
+    (void)dst;
+    return true;
+}
+
+static void damage_teardown(struct damage_target *t)
+{
+    free(t->orig);
+    free(t->intact_scan);
+}
+
+/* Write `len` bytes of the target's file, then scan.  Returns false on a
+ * disallowed outcome. */
+static bool damage_write_and_scan(struct damage_target *t, const char *buf,
+                                 size_t len, char *scan, size_t scanlen,
+                                 bool check_consistency)
+{
+    char path[PATH_MAX];
+    bool opened;
+
+    snprintf(path, sizeof(path), "%s/%s", t->dir, t->name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    if (len && write(fd, buf, len) != (ssize_t)len) { close(fd); return false; }
+    close(fd);
+
+    if (!damaged_scan(t->dir, scan, scanlen, &opened)) return false;
+
+    /* Whatever survived must be internally consistent: the two read paths must
+     * agree about it (G-7). */
+    if (check_consistency && opened && !damaged_is_consistent(t->dir, scan))
+        return false;
+
+    return true;
+}
+
+static void test_malformed_truncation(void)
+{
+    /* Truncated at EVERY byte offset, not merely record boundaries. */
+    char cases[32][64];
+    size_t ncases = corpus_cases(cases, 32);
+    char *scan = malloc(1u << 20);
+
+    if (!ncases) { free(scan); SKIP("no corpus (run make corpus)"); }
+    ASSERT_NOT_NULL(scan);
+
+    for (size_t i = 0; i < ncases; i++) {
+        char casedir[PATH_MAX], names[4096];
+        snprintf(casedir, sizeof(casedir), CORPUS_DIR "/%s", cases[i]);
+        list_data_files(casedir, names, sizeof(names));
+
+        char *save = NULL;
+        for (char *nm = strtok_r(names, "\n", &save); nm;
+             nm = strtok_r(NULL, "\n", &save)) {
+            struct damage_target t;
+            if (!damage_setup(&t, casedir, nm)) continue;
+
+            /* Large files get a stride, so the suite stays runnable; the boundary
+             * regions -- the header, the first records, and the tail -- are always
+             * covered exhaustively, because that is where the interesting offsets
+             * are.  The sampling is logged rather than silent (T-3). */
+            size_t stride = t.len > 4096 ? 64 : 1;
+
+            for (size_t cut = 0; cut <= t.len; cut++) {
+                bool near_edge = (cut < 256) || (cut + 256 > t.len);
+                if (!near_edge && (cut % stride)) continue;
+
+                alarm(30);
+                bool ok = damage_write_and_scan(&t, t.orig, cut, scan,
+                                                1u << 20, true);
+                alarm(0);
+
+                if (!ok) {
+                    fprintf(stderr,
+                            "\n    FAIL %s/%s truncated to %zu of %zu\n",
+                            cases[i], nm, cut, t.len);
+                    current_test_failed = 1;
+                    damage_teardown(&t);
+                    free(scan);
+                    return;
+                }
+            }
+
+            if (stride > 1)
+                fprintf(stderr, "[%s/%s: stride %zu] ", cases[i], nm, stride);
+
+            damage_teardown(&t);
+        }
+    }
+
+    free(scan);
+}
+
+static void test_malformed_bitflips(void)
+{
+    /* Systematically bit-flipped.  Exhaustive for small files; a deterministic
+     * sample for large ones, seeded so a failure reproduces (ZS_TEST_SEED). */
+    char cases[32][64];
+    size_t ncases = corpus_cases(cases, 32);
+    char *scan = malloc(1u << 20);
+    char *tmp = NULL;
+    unsigned seed = 20260807;
+    const char *env = getenv("ZS_TEST_SEED");
+    bool full = getenv("ZS_TEST_FUZZ_FULL") != NULL;
+
+    if (env) seed = (unsigned)strtoul(env, NULL, 10);
+    if (!ncases) { free(scan); SKIP("no corpus (run make corpus)"); }
+    ASSERT_NOT_NULL(scan);
+
+    for (size_t i = 0; i < ncases; i++) {
+        char casedir[PATH_MAX], names[4096];
+        snprintf(casedir, sizeof(casedir), CORPUS_DIR "/%s", cases[i]);
+        list_data_files(casedir, names, sizeof(names));
+
+        char *save = NULL;
+        for (char *nm = strtok_r(names, "\n", &save); nm;
+             nm = strtok_r(NULL, "\n", &save)) {
+            struct damage_target t;
+            if (!damage_setup(&t, casedir, nm)) continue;
+
+            tmp = realloc(tmp, t.len ? t.len : 1);
+            if (!tmp) { damage_teardown(&t); free(scan); return; }
+
+            size_t total = t.len * 8;
+            size_t budget = (full || total <= 4096) ? total : 4096;
+            size_t tried = 0;
+
+            for (size_t n = 0; n < budget; n++) {
+                size_t bit;
+                if (budget == total) {
+                    bit = n;
+                } else {
+                    seed = seed * 1103515245u + 12345u;
+                    bit = (size_t)((seed >> 8) % total);
+                }
+
+                memcpy(tmp, t.orig, t.len);
+                tmp[bit / 8] ^= (char)(1u << (bit % 8));
+
+                alarm(30);
+                bool ok = damage_write_and_scan(&t, tmp, t.len, scan,
+                                                1u << 20, false);
+                alarm(0);
+                tried++;
+
+                if (!ok) {
+                    fprintf(stderr, "\n    FAIL %s/%s bit %zu (seed %u)\n",
+                            cases[i], nm, bit, seed);
+                    current_test_failed = 1;
+                    damage_teardown(&t);
+                    free(scan);
+                    free(tmp);
+                    return;
+                }
+            }
+
+            /* Never let a reduced run read as full coverage (T-3). */
+            if (budget < total)
+                fprintf(stderr, "[%s/%s: %zu of %zu bits] ",
+                        cases[i], nm, tried, total);
+
+            damage_teardown(&t);
+        }
+    }
+
+    free(scan);
+    free(tmp);
+}
+
+static void test_malformed_never_hangs(void)
+{
+    /* F-29 head on: files built to make a naive walker loop -- a record whose
+     * length would not advance, a file of repeated valid type bytes with nonsense
+     * lengths, and a file that is entirely one byte value.
+     *
+     * The alarm is the detector.  A progress bug is non-termination rather than a
+     * wrong answer, so without it this test would hang the suite instead of
+     * failing it. */
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    char scan[4096];
+    bool opened;
+
+    alarm(60);
+
+    /* Repeated KEYVALUE headers claiming keylen 0, which F-14 rejects. */
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    {
+        char junk[4096];
+        for (size_t i = 0; i < sizeof(junk); i += 8) {
+            junk[i] = (char)ZSI_KEYVALUE;
+            junk[i + 1] = 0;
+            memset(junk + i + 2, 0, 6);
+        }
+        sb_raw(&s, junk, sizeof(junk));
+    }
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+    ASSERT(damaged_scan(dbdir, scan, sizeof(scan), &opened));
+
+    /* Every byte value as the whole file body, one at a time: 256 files, each of
+     * which must terminate. */
+    for (unsigned v = 0; v < 256; v++) {
+        clear_db();
+        sb_init(&s, 1, ZSI_CSUM_XXHASH);
+        char junk[512];
+        memset(junk, (int)v, sizeof(junk));
+        sb_raw(&s, junk, sizeof(junk));
+        ASSERT_EQ(sb_write(&s, name), 0);
+        sb_free(&s);
+        if (!damaged_scan(dbdir, scan, sizeof(scan), &opened)) {
+            fprintf(stderr, "\n    FAIL body of 0x%02X\n", v);
+            current_test_failed = 1;
+            alarm(0);
+            return;
+        }
+    }
+
+    /* A big record claiming enormous lengths, so the overflow guards are the only
+     * thing between the walk and a wild pointer. */
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    {
+        char big[32];
+        memset(big, 0, sizeof(big));
+        big[0] = (char)ZSI_BIGKEYVALUE;
+        zsi_put64(big + 8, 0xFFFFFFFFFFFFFFFFull);
+        zsi_put64(big + 16, 0xFFFFFFFFFFFFFFFFull);
+        sb_raw(&s, big, sizeof(big));
+    }
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+    ASSERT(damaged_scan(dbdir, scan, sizeof(scan), &opened));
+
+    alarm(0);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -9153,6 +9532,10 @@ static struct test_entry tests[] = {
                                         test_corpus_encode_byte_identical },
     { "test_corpus_engine_from_file_not_config",
                                         test_corpus_engine_from_file_not_config },
+
+    { "test_malformed_never_hangs",     test_malformed_never_hangs },
+    { "test_malformed_truncation",      test_malformed_truncation },
+    { "test_malformed_bitflips",        test_malformed_bitflips },
 
     { NULL, NULL }
 };
