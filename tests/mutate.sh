@@ -1,5 +1,10 @@
 #!/bin/bash
 #
+# Copyright (c) 2026 Fastmail Pty Ltd
+#
+# Available under any of: CC0-1.0, 0BSD, or MIT-0
+# See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
+#
 # Mutation testing: verify that the test suite can actually fail.
 #
 # A test that passes but cannot fail is worse than no test, because it reads as

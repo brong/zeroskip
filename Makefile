@@ -1,5 +1,10 @@
 # zeroskip - append-only ordered key-value store
 #
+# Copyright (c) 2026 Fastmail Pty Ltd
+#
+# Available under any of: CC0-1.0, 0BSD, or MIT-0
+# See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
+#
 # Versioning: MAJOR.MINOR.PATCH (semver)
 #   Bump MAJOR for ABI-breaking changes
 #   Bump MINOR for new features (backward compatible)

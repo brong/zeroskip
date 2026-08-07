@@ -96,7 +96,12 @@ readers that never take a lock, and tolerate compaction happening out of band.
 Multi-writer concurrency, cross-database transactions, secondary indexes,
 compression, network access, in-place value mutation.
 
-## Licence
+## License
 
-zeroskip is free software, released under the MIT licence as specified in the
-LICENSE file. The vendored `xxhash.h` is BSD-2-Clause.
+This software is available under any of the following licenses, at your choice:
+
+- [CC0 1.0 Universal](LICENSE-CC0) — public domain dedication
+- [Zero-Clause BSD (0BSD)](LICENSE-0BSD)
+- [MIT No Attribution (MIT-0)](LICENSE-MIT-0)
+
+The vendored `xxhash.h` is BSD-2-Clause, © Yann Collet.

@@ -1,10 +1,13 @@
-/* zstool.c - command line tool for zeroskip databases
+/* zstool.c - standalone CLI tool for zeroskip databases
+ *
+ * Copyright (c) 2026 Fastmail Pty Ltd
+ *
+ * Available under any of: CC0-1.0, 0BSD, or MIT-0
+ * See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
  *
  * Implements the driver contract from the spec's section 9.1 (T-0a): a fixed
  * set of subcommands over a database directory, with a defined line format, so
  * one language-neutral runner can drive every implementation.
- *
- * See LICENSE.
  */
 
 #include <stdio.h>

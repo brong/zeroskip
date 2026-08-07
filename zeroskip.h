@@ -1,5 +1,10 @@
 /* zeroskip.h - append-only ordered key-value store
  *
+ * Copyright (c) 2026 Fastmail Pty Ltd
+ *
+ * Available under any of: CC0-1.0, 0BSD, or MIT-0
+ * See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
+ *
  * A zeroskip database is a directory of immutable and append-only files, with
  * lock-free readers and a single writer.  Nothing is ever written except by
  * appending to a file or by creating a new one.
@@ -9,8 +14,6 @@
  * doc/specification.md, and are normative for
  * every implementation.  This header is one binding: its *semantics* are
  * normative, its spelling is not.
- *
- * See LICENSE.
  */
 
 #ifndef INCLUDED_ZEROSKIP_H

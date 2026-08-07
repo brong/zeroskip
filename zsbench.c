@@ -1,9 +1,12 @@
 /* zsbench.c - benchmark tool for zeroskip
  *
+ * Copyright (c) 2026 Fastmail Pty Ltd
+ *
+ * Available under any of: CC0-1.0, 0BSD, or MIT-0
+ * See LICENSE-CC0, LICENSE-0BSD, or LICENSE-MIT-0 for details.
+ *
  * Workloads are kept comparable with the sibling twom library's twombench, so
  * numbers can be read side by side.  Documented in doc/benchmarking.md.
- *
- * See LICENSE.
  */
 
 #include <stdio.h>
