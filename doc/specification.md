@@ -910,6 +910,14 @@ The per-file cursors are held in an array kept sorted by:
   removal MUST happen under one unbroken hold of the lock, so the set cannot
   change in between. If verification fails the file MUST be left alone:
   leaking a file costs disk space, removing a needed one costs the database.
+- **D-23a** Tiling alone is **not** a sufficient test, because D-6 measures
+  completeness from the oldest *surviving* generation: deleting the oldest file
+  merely raises that floor, so the remainder tiles perfectly while its data is
+  gone. With `{[1-2], 3}`, removing `[1-2]` leaves `{3}`, which tiles. The
+  candidate MUST therefore also be **superseded**: the set without it MUST still
+  span the **same generation interval**, from the same lowest generation through
+  the same highest. A set covering less is not a complete set of the same
+  database.
 - **D-24** `zs_db_should_repack` reports whether D-16 currently has work.
 
 ## 6. Concurrency and durability

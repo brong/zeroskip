@@ -3566,6 +3566,12 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
     fc->ti = pos;
 }
 
+/* Defined in CONVERSION.  D-12 requires a writer convert any non-active unordered
+ * file BEFORE IT FINISHES, so the call belongs at the end of a commit -- which
+ * means this one forward declaration, since conversion needs the write path's file
+ * writer in turn. */
+static int zsi_convert_pending(struct zs_db *db);
+
 /* Append bytes to a file descriptor, retrying a short write. */
 static int zsi_write_all(int fd, const char *buf, size_t len)
 {
@@ -3893,6 +3899,19 @@ static int zsi_txn_commit(struct zs_txn *txn)
         r = zsi_db_refresh(db);
     }
 
+    /* D-12: a writer that finds a non-active unordered file MUST convert it before
+     * it finishes.  This is what holds the steady state at exactly one unordered
+     * file (D-12a), so a snapshot normally replays only the active one.
+     *
+     * A conversion failure does not fail the commit: the records are already
+     * durable, and an unconverted file is a performance matter that the next
+     * writer retries.  Reporting it would turn a successful commit into an error
+     * the caller cannot act on. */
+    if (r == ZS_OK) {
+        int cr = zsi_convert_pending(db);
+        (void)cr;
+    }
+
 out:
     free(offs);
     if (fd >= 0) close(fd);
@@ -3931,6 +3950,336 @@ static int zsi_txn_abort(struct zs_txn *txn)
 }
 
 /********** CONVERSION *************/
+
+/* D-12, immediate conversion.
+ *
+ * A writer that finds a NON-ACTIVE unordered file MUST convert it to its
+ * single-generation in-order form -- <uuid>-N becomes <uuid>-N-N -- before it
+ * finishes, oldest first, and MUST NOT go further: it does not merge in-order
+ * files, which is the repacker's job (D-16).
+ *
+ * D-12a: this is what keeps the steady state at EXACTLY ONE unordered file, the
+ * active one, so a snapshot normally replays only that file and nothing else.  A
+ * non-active unordered file exists only transiently -- between a rollover and the
+ * next writer's conversion, or after a crash left an unclean file behind.
+ *
+ * D-12d: each conversion is bounded by rollover_size, so a writer's extra cost is
+ * bounded and predictable rather than proportional to the database. */
+
+/* D-20a: a staging file MUST be created with O_CREAT|O_EXCL, advancing <n> until
+ * it succeeds.
+ *
+ * A process identifier is NOT unique on shared storage -- two hosts readily have
+ * the same pid -- and two processes writing one staging file would produce an
+ * interleaved output that is then renamed into place as though complete.  O_EXCL
+ * costs nothing and removes the case. */
+static int zsi_staging_open(struct zs_db *db, char *name_out, int *fdp)
+{
+    for (unsigned n = 0; n < 10000; n++) {
+        char path[PATH_MAX];
+
+        zsi_staging_name(name_out, n);
+        snprintf(path, sizeof(path), "%s/%s", db->dir, name_out);
+
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { *fdp = fd; return ZS_OK; }
+        if (errno != EEXIST) return ZS_IOERROR;
+    }
+
+    return ZS_IOERROR;
+}
+
+/* Remove a data file (D-23).
+ *
+ * MUST be done holding the REMOVE lock, and only after verifying that a complete
+ * set of files exists WITHOUT it.  Verification and removal happen under one
+ * unbroken hold, so the set cannot change in between.
+ *
+ * If verification fails the file is left alone: leaking a file costs disk space,
+ * removing a needed one costs the database.  That asymmetry is the whole reason
+ * this is not just an unlink.
+ *
+ * C-6a: no directory sync after unlink.  If a removed name reappears after a
+ * crash it is a file an enclosing range already supersedes, which readers ignore
+ * and a later pass removes again. */
+static int zsi_remove_file(struct zs_db *db, const char *name)
+{
+    struct zsi_fileset fs;
+    int r;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_REMOVE,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) return r;
+
+    r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
+    if (r != ZS_OK) goto out;
+
+    /* The interval the database currently covers.  Tiling ALONE is not a
+     * sufficient precondition, which is worth spelling out because it is a
+     * tempting reading of D-23: D-6 measures completeness "from the oldest
+     * SURVIVING generation", so deleting the oldest file merely raises that floor
+     * and the remainder tiles perfectly while the data is gone.  With files
+     * {1-2, 3}, removing 1-2 leaves {3}, which tiles.
+     *
+     * So the real precondition is that the candidate be SUPERSEDED: the set
+     * without it must tile AND still span the same interval.  That is what "a
+     * complete set of files exists without it" has to mean, since a set covering
+     * less is not the same set. */
+    uint32_t lowest = 0, highest = 0;
+    for (size_t i = 0; i < fs.nall; i++) {
+        uint32_t s0 = fs.all[i].start;
+        uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
+        if (i == 0 || s0 < lowest) lowest = s0;
+        if (e0 > highest) highest = e0;
+    }
+
+    /* Drop the candidate, then ask.  Doing it in this order -- rather than
+     * unlinking and re-scanning -- is what makes a failed verification harmless. */
+    size_t w = 0;
+    for (size_t i = 0; i < fs.nall; i++)
+        if (strcmp(fs.all[i].name, name) != 0) fs.all[w++] = fs.all[i];
+
+    if (w == fs.nall) { r = ZS_NOTFOUND; zsi_fileset_fini(&fs); goto out; }
+    fs.nall = w;
+
+    r = zsi_fileset_resolve(&fs);
+
+    if (r == ZS_OK) {
+        uint32_t nlow = 0, nhigh = 0;
+        for (size_t i = 0; i < fs.nall; i++) {
+            uint32_t s0 = fs.all[i].start;
+            uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
+            if (i == 0 || s0 < nlow) nlow = s0;
+            if (e0 > nhigh) nhigh = e0;
+        }
+        if (fs.nall == 0 || nlow != lowest || nhigh != highest) r = ZS_AGAIN;
+    }
+
+    zsi_fileset_fini(&fs);
+
+    if (r != ZS_OK) {
+        /* Still needed.  Leave it: a leaked file is reclaimed by a later pass. */
+        r = ZS_AGAIN;
+        goto out;
+    }
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
+    if (unlink(path) < 0 && errno != ENOENT) r = ZS_IOERROR;
+
+out:
+    zsi_lock_release(&db->locks, ZSI_LOCK_REMOVE);
+    return r;
+}
+
+/* Write an in-order file holding the records at the given offsets of src, in the
+ * order given, and rename it into place (D-21, C-3).
+ *
+ * The output has NO spans and NO terminators: every record in it is live by
+ * construction, and it is written whole under a temporary name and renamed only
+ * once finished, so a commit record would assert nothing not already guaranteed
+ * (section 4.9, F-24a).
+ *
+ * Ancestors are copied through VERBATIM.  For a single-generation conversion the
+ * containing file's start is unchanged (N becomes N-N), so a record whose ancestor
+ * was omitted stays omitted and one that stored an ancestor keeps it -- F-17 is
+ * satisfied without recomputation (F-16c, D-17a). */
+static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
+                             const size_t *offs, size_t n,
+                             uint32_t start, uint32_t end)
+{
+    char sname[ZSI_NAME_MAX], fname[ZSI_NAME_MAX];
+    char spath[PATH_MAX], fpath[PATH_MAX];
+    char hdr[ZSI_HEADER_LEN];
+    struct zsi_header h;
+    uint64_t *ptrs = NULL;
+    char *recs = NULL;
+    size_t recslen = 0, alloc = 0;
+    int fd = -1, r;
+
+    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    if (!cs) return ZS_BADUSAGE;
+
+    if (n) {
+        ptrs = malloc(n * sizeof(*ptrs));
+        if (!ptrs) return ZS_INTERNAL;
+    }
+
+    /* Lay the records out contiguously, recording each one's offset in the
+     * output.  A record is copied byte for byte from the source, which is what
+     * makes ancestors verbatim rather than recomputed. */
+    for (size_t i = 0; i < n; i++) {
+        const char *b = zsi_file_at(src, offs[i], 1);
+        struct zsi_rec rec;
+
+        if (!b) { r = ZS_BADFORMAT; goto fail; }
+        if (zsi_rec_decode(b, src->size - offs[i], src->hdr.start, &rec)
+            != ZS_OK) { r = ZS_BADFORMAT; goto fail; }
+
+        if (recslen + rec.len > alloc) {
+            size_t want = alloc ? alloc * 2 : 8192;
+            while (want < recslen + rec.len) want *= 2;
+            char *q = realloc(recs, want);
+            if (!q) { r = ZS_INTERNAL; goto fail; }
+            recs = q;
+            alloc = want;
+        }
+
+        ptrs[i] = (uint64_t)(ZSI_HEADER_LEN + recslen);
+        memcpy(recs + recslen, b, rec.len);
+        recslen += rec.len;
+    }
+
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = start;
+    h.end = end;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+    zsi_header_encode(hdr, &h, cs);
+
+    char *sec = NULL;
+    size_t seclen = 0;
+    uint32_t rc = cs(recs ? recs : "", recslen);
+    r = zsi_ptrs_build(ptrs, n, ZSI_HEADER_LEN + recslen, rc, cs, &sec, &seclen);
+    if (r != ZS_OK) goto fail;
+
+    r = zsi_staging_open(db, sname, &fd);
+    if (r != ZS_OK) { free(sec); goto fail; }
+
+    r = zsi_write_all(fd, hdr, sizeof(hdr));
+    if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
+    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
+    free(sec);
+
+    /* The file's contents durable BEFORE the rename, or the name could exist
+     * pointing at a partial file after a crash. */
+    if (r == ZS_OK && !db->nosync && fdatasync(fd) < 0) r = ZS_IOERROR;
+    close(fd);
+    fd = -1;
+
+    snprintf(spath, sizeof(spath), "%s/%s", db->dir, sname);
+    if (r != ZS_OK) { unlink(spath); goto fail; }
+
+    /* C-3: a file is published by writing it under a staging name, then renaming.
+     * Readers see it only once complete, and the rename is the instant it joins
+     * the file set.  C-1b: publishing needs NO LOCK -- rename is atomic, and a
+     * conversion's output [c..c] and a repack's output [a..b] with c > b are
+     * disjoint, so they cannot interfere in either order. */
+    zsi_name_format(fname, db->uuid, start, end);
+    snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
+    if (rename(spath, fpath) < 0) { unlink(spath); r = ZS_IOERROR; goto fail; }
+
+    /* C-6: fdatasync the DIRECTORY after renaming an output into place, otherwise
+     * the name may be absent after a crash even though the contents are durable. */
+    if (!db->nosync) {
+        int dfd = open(db->dir, O_RDONLY);
+        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+    }
+
+    free(recs);
+    free(ptrs);
+    return ZS_OK;
+
+fail:
+    if (fd >= 0) close(fd);
+    free(recs);
+    free(ptrs);
+    return r;
+}
+
+/* Convert one non-active unordered file to its single-generation in-order form. */
+static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
+{
+    struct zsi_index_cur ic;
+    struct zsi_rec rec;
+    size_t *offs = NULL, n = 0, alloc = 0;
+    int r;
+
+    if (!f->index) return ZS_INTERNAL;
+
+    /* The index already holds exactly the live records, newest per key, in key
+     * order (D-13a) -- which is precisely what the output needs (D-20: inputs are
+     * iterated in key order, from the same private index any reader builds; there
+     * is nothing conversion-specific about it). */
+    zsi_index_cur_seek_first(&ic);
+    for (;;) {
+        size_t off;
+        if (zsi_index_cur_get(f->index, db->compar, &ic, &rec, &off) != ZS_OK)
+            break;
+
+        if (n == alloc) {
+            size_t want = alloc ? alloc * 2 : 256;
+            size_t *p = realloc(offs, want * sizeof(*p));
+            if (!p) { free(offs); return ZS_INTERNAL; }
+            offs = p;
+            alloc = want;
+        }
+        offs[n++] = off;
+
+        zsi_index_cur_next(f->index, db->compar, &ic);
+    }
+
+    r = zsi_write_inorder(db, f, offs, n, f->hdr.start, f->hdr.start);
+    free(offs);
+    if (r != ZS_OK) return r;
+
+    /* Retire the input under the remove lock (D-23).  D-12c: conversion never
+     * takes the repack lock -- it renames its output in without any lock and holds
+     * remove only momentarily, so a writer never waits on a repack. */
+    char iname[ZSI_NAME_MAX];
+    zsi_name_format(iname, db->uuid, f->hdr.start, 0);
+    r = zsi_remove_file(db, iname);
+
+    /* ZS_AGAIN means the set still needs it, which cannot happen here -- the
+     * output covers exactly its range -- but a leaked input is harmless and a
+     * later pass removes it, so this is not fatal. */
+    if (r == ZS_AGAIN) r = ZS_OK;
+
+    return r;
+}
+
+/* Convert every non-active unordered file, OLDEST FIRST (D-12b).
+ *
+ * Oldest first keeps the generation range split into a prefix of in-order files
+ * followed by a suffix of unordered ones, the last of which is the active file.
+ * Converting out of order would leave an unordered file stranded between in-order
+ * ones, and since only adjacent files may be merged (D-19), that hole would block
+ * the repacker's cascade until it was filled (D-12b, D-16c). */
+static int zsi_convert_pending(struct zs_db *db)
+{
+    int r = zsi_check_writable(db);
+    if (r != ZS_OK) return r;
+
+    for (;;) {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        struct zsi_file *victim = NULL;
+
+        /* The oldest unordered file that is not the active one. */
+        for (size_t i = 0; i < db->snap->nfiles; i++) {
+            struct zsi_file *f = db->snap->files[i];
+            if (f == act) continue;
+            if (!zsi_file_is_unordered(f)) continue;
+            victim = f;
+            break;
+        }
+
+        if (!victim) return ZS_OK;
+
+        /* A file with an invalid header cannot be converted -- there is nothing
+         * to read.  D-10a already makes that an error at open for a non-active
+         * file, so reaching here means the active file, which we skip. */
+        if (!victim->hdr_valid) return ZS_OK;
+
+        r = zsi_convert_one(db, victim);
+        if (r != ZS_OK) return r;
+
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) return r;
+    }
+}
 
 /********** REPACK *************/
 

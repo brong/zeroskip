@@ -6717,6 +6717,19 @@ static int api_collect_cb(void *rock, const char *key, size_t keylen,
     return 0;
 }
 
+/* Keys only, for cases whose values are too large to join. */
+static int api_keys_cb(void *rock, const char *key, size_t keylen,
+                       const char *val, size_t vallen)
+{
+    char *out = rock;
+    size_t used = strlen(out);
+    (void)val; (void)vallen;
+    if (used) out[used++] = '|';
+    memcpy(out + used, key, keylen); used += keylen;
+    out[used] = '\0';
+    return 0;
+}
+
 static void api_scan(struct zs_db *db, char *out, size_t outlen)
 {
     (void)outlen;
@@ -6889,12 +6902,26 @@ static void test_write_rollover(void)
         ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
     }
 
-    /* Several generations now exist, all unordered (nothing converts them yet). */
+    /* Several generations now exist, and D-12a's steady state holds: EXACTLY ONE
+     * unordered file, the active one, with everything older converted.  The
+     * writer converts before it finishes (D-12), so this is true after any commit
+     * rather than only after an explicit maintenance pass.
+     *
+     * The active file has no pointer section, because a writer never appends one
+     * to an unordered file (D-11). */
     ASSERT(db->snap->nfiles > 1);
+    size_t nunordered = 0;
     for (size_t i = 0; i < db->snap->nfiles; i++) {
-        ASSERT(zsi_file_is_unordered(db->snap->files[i]));
-        ASSERT_EQU(db->snap->files[i]->nptrs, 0u);    /* D-11 */
+        if (zsi_file_is_unordered(db->snap->files[i])) {
+            nunordered++;
+            ASSERT_EQU(db->snap->files[i]->nptrs, 0u);    /* D-11 */
+        } else {
+            ASSERT(db->snap->files[i]->nptrs > 0
+                   || db->snap->files[i]->hdr.end != 0);
+        }
     }
+    ASSERT_EQU(nunordered, 1u);
+    ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
 
     /* Every record still reads back, across the file boundaries. */
     for (int i = 0; i < 40; i++) {
@@ -7273,6 +7300,310 @@ static void test_api_pointer_lifetime(void)
 
 /*
  * ============================================================
+ * Conversion (D-12, T-10a)
+ * ============================================================
+ */
+
+/* Count unordered and in-order files in the current snapshot. */
+static void count_kinds(struct zs_db *db, size_t *unordered, size_t *inorder)
+{
+    *unordered = *inorder = 0;
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        if (zsi_file_is_unordered(db->snap->files[i])) (*unordered)++;
+        else                                           (*inorder)++;
+    }
+}
+
+static void test_convert_basic(void)
+{
+    /* A rollover leaves generation 1 unordered; the writer converts it to 1-1
+     * before finishing (D-12), and the data reads back identically. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char got[512];
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 256;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    char pad[300];
+    memset(pad, 'p', sizeof(pad));
+    ASSERT_OK(zs_db_store(db, "big", 3, pad, sizeof(pad), 0));   /* forces rollover */
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+
+    size_t un, in;
+    count_kinds(db, &un, &in);
+    ASSERT_EQU(un, 1u);            /* D-12a: exactly one, the active file */
+    ASSERT(in >= 1);
+
+    /* The converted file really is in-order, with a pointer section. */
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT_EQU(db->snap->files[0]->hdr.start, 1u);
+    ASSERT_EQU(db->snap->files[0]->hdr.end, 1u);
+    ASSERT(db->snap->files[0]->nptrs > 0);
+    ASSERT_OK(zsi_ptrs_verify_records(db->snap->files[0]));
+
+    /* The unordered input was retired (D-23). */
+    char iname[ZSI_NAME_MAX];
+    zsi_name_format(iname, db->uuid, 1, 0);
+    ASSERT_EQ(fexists(dbpath(iname)), -ENOENT);
+
+    /* The keys survived the conversion, in order.  (The join would include a
+     * 300-byte value, so this checks presence and order rather than the text.) */
+    got[0] = '\0';
+    ASSERT_OK(zs_db_foreach(db, NULL, 0, NULL, api_keys_cb, got, 0));
+    ASSERT_STR_EQ(got, "a|b|big|c");
+
+    /* Everything still reads by key. */
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "1", 1);
+    ASSERT_OK(zs_db_fetch(db, "big", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(pad));
+
+    /* And after a reopen, which validates the converted file's structure. */
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "2", 1);
+    zs_db_close(&db);
+}
+
+static void test_convert_steady_state(void)
+{
+    /* T-10a: drive many rollovers, asserting after EACH that exactly one
+     * unordered file remains and the rest are in-order (D-12a). */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char val[200];
+    memset(val, 'v', sizeof(val));
+
+    for (int i = 0; i < 30; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
+
+        size_t un, in;
+        count_kinds(db, &un, &in);
+        if (un != 1) {
+            fprintf(stderr, "\n    FAIL after %d writes: %zu unordered files\n",
+                    i, un);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+        /* and the unordered one is the newest */
+        ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
+    }
+
+    /* Every record readable, across all those files. */
+    for (int i = 0; i < 30; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "k%03d", i);
+        if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s lost\n", k);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+    }
+
+    /* And the generation range tiles, which is what makes the set complete (D-6). */
+    struct zsi_fileset fs;
+    ASSERT_OK(zsi_fileset_scan(dbdir, &db->uuid, &fs));
+    ASSERT_OK(zsi_fileset_resolve(&fs));
+    zsi_fileset_fini(&fs);
+
+    zs_db_close(&db);
+}
+
+static void test_convert_backlog_oldest_first(void)
+{
+    /* T-10a's second half: several crashes each leaving an unclean active file,
+     * then a writer draining the backlog.
+     *
+     * D-12b requires OLDEST FIRST, because converting out of order strands an
+     * unordered file between in-order ones -- and since only adjacent files may be
+     * merged, that hole blocks the repacker's cascade until it is filled (D-16c).
+     */
+    struct zs_db *db = NULL;
+    char name[ZSI_NAME_MAX];
+    char got[1024];
+
+    clear_db();
+
+    /* Three unclean unordered files plus a clean active one, as three crashes
+     * would leave: each has a valid span, then trailing garbage. */
+    for (uint32_t gen = 1; gen <= 3; gen++) {
+        struct sb s;
+        char k[16];
+        sb_init(&s, gen, ZSI_CSUM_XXHASH);
+        snprintf(k, sizeof(k), "g%u", gen);
+        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+        sb_term(&s, false);
+        sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);   /* torn tail */
+        zsi_name_format(name, test_uuid, gen, 0);
+        ASSERT_EQ(mkdbdir(), 0);
+        ASSERT_EQ(sb_write(&s, name), 0);
+        sb_free(&s);
+    }
+    put_unordered_kv(4, (const struct kv[]){ {"g4","v"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    size_t un, in;
+    count_kinds(db, &un, &in);
+    ASSERT_EQU(un, 4u);            /* the backlog, before any write */
+    ASSERT_EQU(in, 0u);
+
+    /* One write drains the whole backlog, oldest first. */
+    ASSERT_OK(zs_db_store(db, "new", 3, "n", 1, 0));
+
+    count_kinds(db, &un, &in);
+    ASSERT_EQU(un, 1u);            /* drained to one */
+    ASSERT_EQU(in, 3u);
+
+    /* Converted oldest first, so the in-order files form a contiguous PREFIX --
+     * generations 1, 2, 3 -- with the unordered ones after (D-12b). */
+    for (size_t i = 0; i < 3; i++) {
+        ASSERT(!zsi_file_is_unordered(db->snap->files[i]));
+        ASSERT_EQU(db->snap->files[i]->hdr.start, (uint32_t)(i + 1));
+        ASSERT_EQU(db->snap->files[i]->hdr.end, (uint32_t)(i + 1));
+    }
+    ASSERT(zsi_file_is_unordered(db->snap->files[3]));
+
+    /* Every committed record survived the conversions; the torn tails did not
+     * contribute anything. */
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "g1=v|g2=v|g3=v|g4=v|new=n");
+
+    zs_db_close(&db);
+}
+
+static void test_convert_staging_exclusive(void)
+{
+    /* D-20a: a staging name already taken must make O_EXCL advance <n> rather than
+     * overwrite.  Two processes writing one staging file would produce an
+     * interleaved output that is then renamed in as though complete -- and a pid
+     * is not unique on shared storage, so this is reachable rather than
+     * theoretical. */
+    struct zs_db *db = fresh_db();
+    char taken[ZSI_NAME_MAX];
+    int fd = -1;
+
+    ASSERT_NOT_NULL(db);
+
+    /* Occupy the first staging name. */
+    zsi_staging_name(taken, 0);
+    ASSERT_EQ(writefile(taken, "squatter", 8), 0);
+
+    ASSERT_OK(zsi_staging_open(db, taken, &fd));
+    ASSERT(fd >= 0);
+    close(fd);
+
+    /* It picked a different name, and did not clobber the squatter. */
+    char first[ZSI_NAME_MAX];
+    zsi_staging_name(first, 0);
+    ASSERT(strcmp(taken, first) != 0);
+    ASSERT_EQ(filesize(first), 8);
+
+    unlink(dbpath(taken));
+    unlink(dbpath(first));
+    zs_db_close(&db);
+}
+
+static void test_convert_remove_refuses_when_needed(void)
+{
+    /* D-23: removal happens only after verifying a complete set exists WITHOUT the
+     * candidate, and verification plus removal are one unbroken hold of the remove
+     * lock.  If verification fails the file is left alone -- leaking a file costs
+     * disk space, removing a needed one costs the database. */
+    struct zs_db *db;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Generation 2 is needed: without it the set does not tile. */
+    zsi_name_format(name, db->uuid, 2, 2);
+    ASSERT_EQ(zsi_remove_file(db, name), ZS_AGAIN);
+    ASSERT_EQ(fexists(dbpath(name)), 0);        /* still there */
+
+    /* A file nobody needs -- a superseded repack input -- is removed. */
+    put_inorder_kv(1, 2, (const struct kv[]){ {"a","1"}, {"b","2"}, {NULL,NULL} });
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    zsi_name_format(name, db->uuid, 1, 1);
+    ASSERT_OK(zsi_remove_file(db, name));
+    ASSERT_EQ(fexists(dbpath(name)), -ENOENT);
+
+    /* And now generation 2's narrow file is also superseded. */
+    zsi_name_format(name, db->uuid, 2, 2);
+    ASSERT_OK(zsi_remove_file(db, name));
+    ASSERT_EQ(fexists(dbpath(name)), -ENOENT);
+
+    /* But 1-2 itself is needed. */
+    zsi_name_format(name, db->uuid, 1, 2);
+    ASSERT_EQ(zsi_remove_file(db, name), ZS_AGAIN);
+    ASSERT_EQ(fexists(dbpath(name)), 0);
+
+    /* Removing a name that is not there at all. */
+    zsi_name_format(name, db->uuid, 99, 99);
+    ASSERT_EQ(zsi_remove_file(db, name), ZS_NOTFOUND);
+
+    zs_db_close(&db);
+}
+
+static void test_convert_readonly_does_nothing(void)
+{
+    /* R-3: a read-only handle performs no conversion, however much backlog there
+     * is.  Asserted by listing the directory before and after. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    put_unordered_kv(1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+
+    setup.flags = ZS_SHARED;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    size_t un, in;
+    count_kinds(db, &un, &in);
+    ASSERT_EQU(un, 2u);
+    ASSERT_EQ(zsi_convert_pending(db), ZS_READONLY);
+
+    count_kinds(db, &un, &in);
+    ASSERT_EQU(un, 2u);            /* unchanged */
+    ASSERT_EQU(in, 0u);
+
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -7417,6 +7748,14 @@ static struct test_entry tests[] = {
     { "test_api_cursor_replace",        test_api_cursor_replace },
     { "test_api_readonly",              test_api_readonly },
     { "test_api_pointer_lifetime",      test_api_pointer_lifetime },
+
+    { "test_convert_basic",             test_convert_basic },
+    { "test_convert_steady_state",      test_convert_steady_state },
+    { "test_convert_backlog_oldest_first", test_convert_backlog_oldest_first },
+    { "test_convert_staging_exclusive", test_convert_staging_exclusive },
+    { "test_convert_remove_refuses_when_needed",
+                                        test_convert_remove_refuses_when_needed },
+    { "test_convert_readonly_does_nothing", test_convert_readonly_does_nothing },
 
     { NULL, NULL }
 };
