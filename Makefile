@@ -175,7 +175,7 @@ mutate:
 # Benchmarks
 bench: zsbench
 	./zsbench --selftest
-	./zsbench -n 2000 --reps 2
+	./zsbench -n 4000 --reps 1
 
 # Regenerate the language-neutral golden corpus (T-0).  The checked-in bytes
 # are the contract, so this target exists to add cases, not to paper over a
