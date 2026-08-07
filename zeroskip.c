@@ -2270,6 +2270,204 @@ static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
 
 /********** PER-FILE CURSOR *************/
 
+/* One cursor over one source, presenting the same four operations whatever the
+ * source is.  This is what lets the read path (D-14, D-14e) be written once
+ * rather than per file kind -- the merge does not know or care which kind it is
+ * pulling from.
+ *
+ * Three kinds, matching D-14's table of sources:
+ *
+ *   ZSI_SRC_TXN        the current write transaction's uncommitted records
+ *   ZSI_SRC_UNORDERED  an unordered file, via its private index (D-13)
+ *   ZSI_SRC_INORDER    an in-order file, via its pointer array
+ *
+ * D-14h: a per-file cursor never yields the same key twice.  An in-order file
+ * holds one record per key by construction (D-17), and a private index exposes
+ * only the newest committed record per key (D-13a).  Duplicates therefore arise
+ * only ACROSS sources, which is exactly what the merge's step 3 handles. */
+
+enum zsi_src_kind { ZSI_SRC_INORDER, ZSI_SRC_UNORDERED, ZSI_SRC_TXN };
+
+/* The transaction's records sort as though they had a generation above every
+ * file's, giving them highest priority for equal keys without a special case in
+ * the merge comparator (D-14g). */
+#define ZSI_GEN_TXN UINT32_MAX
+
+struct zsi_fcur {
+    enum zsi_src_kind kind;
+    struct zsi_file  *file;      /* NULL for ZSI_SRC_TXN */
+    struct zs_txn    *txn;       /* NULL otherwise */
+    zs_compar        *compar;
+    uint32_t          gen;       /* file->hdr.start, or ZSI_GEN_TXN */
+    bool              exhausted;
+    struct zsi_rec    cur;       /* valid iff !exhausted */
+
+    /* kind-specific position */
+    uint64_t             pi;     /* in-order: pointer array index */
+    struct zsi_index_cur ic;     /* unordered: index cursor */
+    size_t               ti;     /* txn: index into its sorted pending array */
+};
+
+/* Filled in by the WRITE PATH section, which owns struct zs_txn.  Declared here
+ * because the cursor must be able to present a transaction as just another
+ * source; the alternative is a special case in the merge, which D-14g exists to
+ * avoid. */
+static int zsi_txn_cur_load(struct zsi_fcur *fc);
+static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
+
+/* Load the record at the cursor's current position, or mark it exhausted. */
+static int zsi_fcur_load(struct zsi_fcur *fc)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER:
+        if (fc->pi >= fc->file->nptrs) { fc->exhausted = true; return ZS_OK; }
+        if (zsi_ptrs_rec(fc->file, fc->pi, &fc->cur) != ZS_OK) {
+            fc->exhausted = true;
+            return ZS_BADFORMAT;
+        }
+        fc->exhausted = false;
+        return ZS_OK;
+
+    case ZSI_SRC_UNORDERED: {
+        /* No index means the caller skipped building one, which is a wiring
+         * error rather than a data condition.  Report an exhausted source rather
+         * than dereferencing NULL: G-3 requires that no state produce a crash,
+         * and a cursor over a source with nothing in it is a defined answer. */
+        if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
+
+        int r = zsi_index_cur_get(fc->file->index, fc->compar, &fc->ic,
+                                  &fc->cur, NULL);
+        fc->exhausted = (r != ZS_OK);
+        return ZS_OK;
+    }
+
+    case ZSI_SRC_TXN:
+        return zsi_txn_cur_load(fc);
+    }
+
+    fc->exhausted = true;
+    return ZS_OK;
+}
+
+/* Position at the first record with key >= the given key, or exhaust.
+ *
+ * A source holding no records exhausts immediately -- an empty in-order file
+ * (F-26g) or an unordered file with no committed records (F-26h) are ordinary
+ * cases here, not special ones (D-14e step 1). */
+static int zsi_fcur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER: {
+        uint64_t idx;
+        bool exact;
+        int r = zsi_ptrs_search(fc->file, fc->compar, key, keylen, &idx, &exact);
+        if (r != ZS_OK) { fc->exhausted = true; return r; }
+        fc->pi = idx;
+        break;
+    }
+
+    case ZSI_SRC_UNORDERED:
+        if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
+        zsi_index_cur_seek(fc->file->index, fc->compar, key, keylen, &fc->ic);
+        break;
+
+    case ZSI_SRC_TXN:
+        zsi_txn_cur_seek(fc, key, keylen);
+        break;
+    }
+
+    return zsi_fcur_load(fc);
+}
+
+static int zsi_fcur_seek_first(struct zsi_fcur *fc)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER:   fc->pi = 0; break;
+    case ZSI_SRC_UNORDERED: zsi_index_cur_seek_first(&fc->ic); break;
+    case ZSI_SRC_TXN:       fc->ti = 0; break;
+    }
+
+    return zsi_fcur_load(fc);
+}
+
+static int zsi_fcur_next(struct zsi_fcur *fc)
+{
+    if (fc->exhausted) return ZS_OK;
+
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER:   fc->pi++; break;
+    case ZSI_SRC_UNORDERED:
+        if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
+        zsi_index_cur_next(fc->file->index, fc->compar, &fc->ic);
+        break;
+    case ZSI_SRC_TXN:       fc->ti++; break;
+    }
+
+    return zsi_fcur_load(fc);
+}
+
+/* Search one source for a single key, independently of any cursor state (D-14b).
+ *
+ * in-order   binary search the pointer array          O(log n) comparisons
+ * unordered  point lookup in the private index        as that structure provides
+ * txn        binary search its sorted pending array
+ *
+ * Both file kinds MUST report "absent" for an empty source rather than
+ * misbehaving: a binary search over a zero-length array and an index for a file
+ * with no committed records are both ordinary cases. */
+static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
+                         struct zsi_rec *out)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER: {
+        uint64_t idx;
+        bool exact;
+        int r = zsi_ptrs_search(fc->file, fc->compar, key, keylen, &idx, &exact);
+        if (r != ZS_OK) return r;
+        if (!exact) return ZS_NOTFOUND;
+        return zsi_ptrs_rec(fc->file, idx, out);
+    }
+
+    case ZSI_SRC_UNORDERED: {
+        size_t off;
+        if (!fc->file->index) return ZS_NOTFOUND;
+        int r = zsi_index_find(fc->file->index, fc->compar, key, keylen, &off);
+        if (r != ZS_OK) return r;
+        const char *b = zsi_file_at(fc->file, off, 1);
+        if (!b) return ZS_BADFORMAT;
+        return zsi_rec_decode(b, fc->file->size - off, fc->file->hdr.start, out);
+    }
+
+    case ZSI_SRC_TXN: {
+        /* Seek a scratch cursor and check for an exact hit, so the transaction's
+         * lookup shares the ordering logic rather than duplicating it. */
+        struct zsi_fcur scratch = *fc;
+        int r = zsi_fcur_seek(&scratch, key, keylen);
+        if (r != ZS_OK) return r;
+        if (scratch.exhausted) return ZS_NOTFOUND;
+        if (fc->compar(scratch.cur.key, scratch.cur.keylen, key, keylen) != 0)
+            return ZS_NOTFOUND;
+        *out = scratch.cur;
+        return ZS_OK;
+    }
+    }
+
+    return ZS_NOTFOUND;
+}
+
+/* Initialise a cursor over a file.  The caller has already built the index for
+ * an unordered file and loaded the pointers for an in-order one. */
+static void zsi_fcur_init_file(struct zsi_fcur *fc, struct zsi_file *f,
+                               zs_compar *compar)
+{
+    memset(fc, 0, sizeof(*fc));
+    fc->kind = zsi_file_is_unordered(f) ? ZSI_SRC_UNORDERED : ZSI_SRC_INORDER;
+    fc->file = f;
+    fc->compar = compar;
+    fc->gen = f->hdr.start;
+    fc->exhausted = true;
+}
+
 /********** FILE SET *************/
 
 /********** SNAPSHOT *************/
@@ -2279,6 +2477,27 @@ static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
 /********** READ PATH *************/
 
 /********** WRITE PATH *************/
+
+/* The transaction arm of the per-file cursor.
+ *
+ * A write transaction's uncommitted records are the highest-priority source in
+ * D-14's table, and they are presented through the same interface as a file so
+ * the merge needs no special case.  Until the transaction type exists these
+ * report an exhausted source, which is exactly right for a read transaction: it
+ * has no pending records, so the arm is not merely a placeholder. */
+static int zsi_txn_cur_load(struct zsi_fcur *fc)
+{
+    if (!fc->txn) { fc->exhausted = true; return ZS_OK; }
+    fc->exhausted = true;
+    return ZS_OK;
+}
+
+static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
+{
+    (void)key;
+    (void)keylen;
+    fc->ti = 0;
+}
 
 /********** CONVERSION *************/
 

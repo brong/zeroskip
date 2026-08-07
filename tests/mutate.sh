@@ -243,6 +243,52 @@ mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
+echo "per-file cursor (Task 10)"
+
+# D-14g: the transaction sorts as though above every file, so its records win
+# equal keys with no special case in the merge comparator.
+mutant "txn generation not above all files" catch \
+  's/#define ZSI_GEN_TXN UINT32_MAX/#define ZSI_GEN_TXN 0/'
+
+# The kind must come from the file, not be assumed.
+mutant "cursor: every file treated as in-order" catch \
+  's/    fc->kind = zsi_file_is_unordered\(f\) \? ZSI_SRC_UNORDERED : ZSI_SRC_INORDER;/    fc->kind = ZSI_SRC_INORDER;/'
+
+mutant "cursor: every file treated as unordered" catch \
+  's/    fc->kind = zsi_file_is_unordered\(f\) \? ZSI_SRC_UNORDERED : ZSI_SRC_INORDER;/    fc->kind = ZSI_SRC_UNORDERED;/'
+
+mutant "cursor: gen not taken from the file" catch \
+  's/    fc->gen = f->hdr.start;/    fc->gen = 0;/'
+
+# Seek must be a lower bound, and exhaustion must be reported rather than
+# producing a stale record.
+mutant "seek: in-order lands one early" catch \
+  's/        fc->pi = idx;/        fc->pi = idx ? idx - 1 : 0;/'
+
+mutant "load: exhaustion not detected in-order" catch \
+  's/        if \(fc->pi >= fc->file->nptrs\) \{ fc->exhausted = true; return ZS_OK; \}/        if (fc->pi > fc->file->nptrs) { fc->exhausted = true; return ZS_OK; }/'
+
+mutant "load: unordered never exhausts" catch \
+  's/        fc->exhausted = \(r != ZS_OK\);/        fc->exhausted = false; (void)r;/'
+
+# Subsumed: zsi_fcur_load re-derives exhaustion from the position on every call,
+# so the guard changes nothing a test can reach.  It is observable in principle --
+# 2^64 next() calls on an exhausted in-order cursor would wrap pi back into range
+# -- which is why this is subsumed rather than equivalent, and why the guard stays.
+mutant "next: advances an exhausted cursor" subsumed \
+  's/    if \(fc->exhausted\) return ZS_OK;\n\n    switch \(fc->kind\) \{\n    case ZSI_SRC_INORDER:   fc->pi\+\+; break;/    switch (fc->kind) {\n    case ZSI_SRC_INORDER:   fc->pi++; break;/'
+
+# find must report an exact hit only, or a point lookup silently returns a
+# neighbouring key -- which the read path would then treat as the answer.
+mutant "find: inexact hit returned" catch \
+  's/        if \(!exact\) return ZS_NOTFOUND;/        \/* exactness ignored *\//'
+
+# A cursor that hid tombstones would let an older file's value resurface, since
+# the merge is what turns a deletion into "absent" (D-14e step 4).
+mutant "find: deletions hidden by the cursor" catch \
+  's/    case ZSI_SRC_UNORDERED: \{\n        size_t off;\n        int r = zsi_index_find\(fc->file->index, fc->compar, key, keylen, &off\);\n        if \(r != ZS_OK\) return r;/    case ZSI_SRC_UNORDERED: {\n        size_t off;\n        int r = zsi_index_find(fc->file->index, fc->compar, key, keylen, \&off);\n        if (r != ZS_OK) return r;\n        { const char *bb = zsi_file_at(fc->file, off, 1); struct zsi_rec rr;\n          if (bb \&\& zsi_rec_decode(bb, fc->file->size - off, fc->file->hdr.start, \&rr) == ZS_OK \&\& !rr.val) return ZS_NOTFOUND; }/'
+
+echo
 echo "pointer section (Task 9)"
 
 # F-26g: the empty in-order file.  Every property of it is pinned, because it is

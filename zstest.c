@@ -4340,6 +4340,300 @@ static void test_inorder_probe_ends_agrees(void)
 
 /*
  * ============================================================
+ * The per-file cursor
+ * ============================================================
+ */
+
+/* Walk a per-file cursor from a seek point, joining keys with '|'. */
+static void fcur_keys_from(struct zsi_fcur *fc, const char *key, size_t keylen,
+                           char *out, size_t outlen)
+{
+    size_t used = 0;
+
+    out[0] = '\0';
+    if (key) assert(zsi_fcur_seek(fc, key, keylen) == ZS_OK);
+    else     assert(zsi_fcur_seek_first(fc) == ZS_OK);
+
+    while (!fc->exhausted) {
+        if (used + fc->cur.keylen + 2 >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, fc->cur.key, fc->cur.keylen);
+        used += fc->cur.keylen;
+        out[used] = '\0';
+        assert(zsi_fcur_next(fc) == ZS_OK);
+    }
+}
+
+/* The same six keys, presented as an unordered file and as an in-order file, so
+ * every assertion below can be run against both and compared. */
+static void build_both_kinds(struct sb *s, struct ib *b,
+                             struct zsi_file **uf, struct zsi_file **inf,
+                             const char *const *keys, size_t n)
+{
+    ASSERT_EQ(mkdbdir(), 0);
+
+    sb_init(s, 1, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < n; i++)
+        sb_rec(s, keys[i], strlen(keys[i]), "v", 1, false, 0);
+    sb_term(s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(sb_write(s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, uf));
+    ASSERT_OK(zsi_index_build(*uf, zsi_compar_default, false));
+
+    /* the in-order file needs its records in key order */
+    char sorted[16][32];
+    ASSERT(n <= 16);
+    for (size_t i = 0; i < n; i++) snprintf(sorted[i], 32, "%s", keys[i]);
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (zsi_compar_default(sorted[i], strlen(sorted[i]),
+                                   sorted[j], strlen(sorted[j])) > 0) {
+                char t[32];
+                memcpy(t, sorted[i], 32);
+                memcpy(sorted[i], sorted[j], 32);
+                memcpy(sorted[j], t, 32);
+            }
+
+    ib_init(b, 2, 2, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < n; i++)
+        ib_rec(b, sorted[i], strlen(sorted[i]), "v", 1, false, 0);
+    ib_finish(b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b->buf, b->len), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 2, TEST_EXTERNAL_CSUM, inf));
+    ASSERT_OK(zsi_ptrs_load(*inf));
+}
+
+static void test_fcur_uniform(void)
+{
+    /* The same assertions driven against both file kinds, asserting they agree.
+     *
+     * This is the property that lets the read path be written once: if the two
+     * kinds disagree about seek or traversal, the merge above them cannot be
+     * correct for both, and D-14a's guarantee that all read paths resolve
+     * visibility identically (G-7) fails at its foundation. */
+    static const char *keys[] = { "c", "a", "e", "b", "d" };
+    struct sb s;
+    struct ib b;
+    struct zsi_file *uf = NULL, *inf = NULL;
+    struct zsi_fcur fu, fi;
+    char ku[256], ki[256];
+
+    build_both_kinds(&s, &b, &uf, &inf, keys, 5);
+    zsi_fcur_init_file(&fu, uf, zsi_compar_default);
+    zsi_fcur_init_file(&fi, inf, zsi_compar_default);
+
+    ASSERT_EQ(fu.kind, ZSI_SRC_UNORDERED);
+    ASSERT_EQ(fi.kind, ZSI_SRC_INORDER);
+    ASSERT_EQU(fu.gen, 1u);
+    ASSERT_EQU(fi.gen, 2u);
+
+    /* Full traversal. */
+    fcur_keys_from(&fu, NULL, 0, ku, sizeof(ku));
+    fcur_keys_from(&fi, NULL, 0, ki, sizeof(ki));
+    ASSERT_STR_EQ(ku, "a|b|c|d|e");
+    ASSERT_STR_EQ(ki, ku);
+
+    /* Seek to a key present, absent-between-two, before all, after all, and
+     * exactly the last -- the two kinds must agree on every one. */
+    static const char *probes[] = { "a", "c", "e", "b", "", "aa", "cc", "f", "z" };
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        fcur_keys_from(&fu, probes[i], strlen(probes[i]), ku, sizeof(ku));
+        fcur_keys_from(&fi, probes[i], strlen(probes[i]), ki, sizeof(ki));
+        if (strcmp(ku, ki) != 0) {
+            fprintf(stderr, "\n    FAIL seek '%s': unordered '%s', in-order '%s'\n",
+                    probes[i], ku, ki);
+            current_test_failed = 1;
+            goto done;
+        }
+    }
+
+    /* Seeking past every key exhausts immediately, and advancing an exhausted
+     * cursor stays exhausted rather than wrapping or overrunning. */
+    ASSERT_OK(zsi_fcur_seek(&fu, "z", 1));
+    ASSERT(fu.exhausted);
+    ASSERT_OK(zsi_fcur_next(&fu));
+    ASSERT(fu.exhausted);
+    ASSERT_OK(zsi_fcur_seek(&fi, "z", 1));
+    ASSERT(fi.exhausted);
+    ASSERT_OK(zsi_fcur_next(&fi));
+    ASSERT(fi.exhausted);
+
+    /* Single-key search agrees too, hit and miss. */
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        struct zsi_rec ru, ri;
+        int a = zsi_fcur_find(&fu, probes[i], strlen(probes[i]), &ru);
+        int c = zsi_fcur_find(&fi, probes[i], strlen(probes[i]), &ri);
+        if (a != c) {
+            fprintf(stderr, "\n    FAIL find '%s': unordered %d, in-order %d\n",
+                    probes[i], a, c);
+            current_test_failed = 1;
+            goto done;
+        }
+        if (a == ZS_OK)
+            ASSERT_MEM_EQ(ru.key, ri.key, ru.keylen);
+    }
+
+done:
+    zsi_file_close(&uf);
+    zsi_file_close(&inf);
+    sb_free(&s);
+    ib_free(&b);
+}
+
+static void test_fcur_empty_sources(void)
+{
+    /* An empty source exhausts at seek rather than misbehaving -- D-14e step 1
+     * calls this "immediately the case for a source holding no records", and
+     * D-14b requires both kinds treat it as ordinary. */
+    struct sb s;
+    struct ib b;
+    struct zsi_file *uf = NULL, *inf = NULL;
+    struct zsi_fcur fc;
+    struct zsi_rec r;
+    char name[ZSI_NAME_MAX];
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* An unordered file with no committed records (F-26h). */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &uf));
+    ASSERT_OK(zsi_index_build(uf, zsi_compar_default, false));
+
+    zsi_fcur_init_file(&fc, uf, zsi_compar_default);
+    ASSERT_OK(zsi_fcur_seek_first(&fc));
+    ASSERT(fc.exhausted);
+    ASSERT_OK(zsi_fcur_seek(&fc, "k", 1));
+    ASSERT(fc.exhausted);
+    ASSERT_OK(zsi_fcur_next(&fc));
+    ASSERT(fc.exhausted);
+    ASSERT_EQ(zsi_fcur_find(&fc, "k", 1, &r), ZS_NOTFOUND);
+
+    /* An in-order file with zero records (F-26g). */
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 2, TEST_EXTERNAL_CSUM, &inf));
+    ASSERT_OK(zsi_ptrs_load(inf));
+
+    zsi_fcur_init_file(&fc, inf, zsi_compar_default);
+    ASSERT_OK(zsi_fcur_seek_first(&fc));
+    ASSERT(fc.exhausted);
+    ASSERT_OK(zsi_fcur_seek(&fc, "k", 1));
+    ASSERT(fc.exhausted);
+    ASSERT_OK(zsi_fcur_next(&fc));
+    ASSERT(fc.exhausted);
+    ASSERT_EQ(zsi_fcur_find(&fc, "k", 1, &r), ZS_NOTFOUND);
+    ASSERT_EQ(zsi_fcur_find(&fc, "", 0, &r), ZS_NOTFOUND);
+
+    /* A transaction source with no transaction is exhausted too, which is what a
+     * read transaction looks like. */
+    memset(&fc, 0, sizeof(fc));
+    fc.kind = ZSI_SRC_TXN;
+    fc.compar = zsi_compar_default;
+    fc.gen = ZSI_GEN_TXN;
+    ASSERT_OK(zsi_fcur_seek_first(&fc));
+    ASSERT(fc.exhausted);
+    ASSERT_EQ(zsi_fcur_find(&fc, "k", 1, &r), ZS_NOTFOUND);
+    ASSERT_EQU(fc.gen, (uint32_t)UINT32_MAX);
+
+    zsi_file_close(&uf);
+    zsi_file_close(&inf);
+    sb_free(&s);
+    ib_free(&b);
+}
+
+static void test_fcur_no_duplicate_keys(void)
+{
+    /* D-14h: a per-file cursor never yields the same key twice.
+     *
+     * For an unordered file that comes from the private index exposing only the
+     * newest committed record per key; for an in-order file it is structural, one
+     * record per key (D-17).  The merge above relies on this -- its step 3 handles
+     * duplicates ACROSS sources only, so a source that duplicated internally would
+     * emit a key twice with no rule to catch it. */
+    struct sb s;
+    struct zsi_file *f = NULL;
+    struct zsi_fcur fc;
+    char keys[256];
+
+    /* A key written three times in one file, plus neighbours either side. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "k", 1, "v1", 2, false, 0);
+    sb_rec(&s, "k", 1, "v2", 2, false, 0);
+    sb_rec(&s, "z", 1, "9", 1, false, 0);
+    sb_rec(&s, "k", 1, "v3", 2, false, 0);
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_index_build(f, zsi_compar_default, false));
+
+    zsi_fcur_init_file(&fc, f, zsi_compar_default);
+    fcur_keys_from(&fc, NULL, 0, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|k|z");            /* k once, not three times */
+
+    /* And it is the newest version. */
+    ASSERT_OK(zsi_fcur_seek(&fc, "k", 1));
+    ASSERT(!fc.exhausted);
+    ASSERT_MEM_EQ(fc.cur.val, "v3", 2);
+
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+static void test_fcur_deletions_visible(void)
+{
+    /* A per-file cursor presents deletions as records with a NULL value.  It does
+     * NOT filter them: resolving a deletion into "absent" is the merge's job
+     * (D-14e step 4), and it can only do that if the tombstone reaches it.  A
+     * cursor that hid tombstones would let an older file's value resurface. */
+    struct sb s;
+    struct zsi_file *f = NULL;
+    struct zsi_fcur fc;
+    char keys[256];
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "b", 1, NULL, 0, false, 0);
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_index_build(f, zsi_compar_default, false));
+
+    zsi_fcur_init_file(&fc, f, zsi_compar_default);
+    fcur_keys_from(&fc, NULL, 0, keys, sizeof(keys));
+    ASSERT_STR_EQ(keys, "a|b");
+
+    ASSERT_OK(zsi_fcur_seek(&fc, "b", 1));
+    ASSERT(!fc.exhausted);
+    ASSERT_NULL(fc.cur.val);                 /* the tombstone reaches the merge */
+
+    struct zsi_rec r;
+    ASSERT_OK(zsi_fcur_find(&fc, "b", 1, &r));
+    ASSERT_NULL(r.val);
+
+    zsi_file_close(&f);
+    sb_free(&s);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -4424,6 +4718,11 @@ static struct test_entry tests[] = {
     { "test_inorder_ptrs64",            test_inorder_ptrs64 },
     { "test_inorder_kind_rules",        test_inorder_kind_rules },
     { "test_inorder_probe_ends_agrees", test_inorder_probe_ends_agrees },
+
+    { "test_fcur_uniform",              test_fcur_uniform },
+    { "test_fcur_empty_sources",        test_fcur_empty_sources },
+    { "test_fcur_no_duplicate_keys",    test_fcur_no_duplicate_keys },
+    { "test_fcur_deletions_visible",    test_fcur_deletions_visible },
 
     { NULL, NULL }
 };
