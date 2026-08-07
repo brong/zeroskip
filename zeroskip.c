@@ -2459,6 +2459,181 @@ static int zsi_index_flatten(struct zsi_index *ix, zs_compar *compar,
     return ZS_OK;
 }
 
+/********** POINTER TABLE CACHE *************/
+
+/* Spec section 8.  An unordered file has no pointer section, so key order for it
+ * is derived by replaying its spans (D-13a) -- bounded by rollover_size but paid
+ * on every open.  A POINTER TABLE is that replay's result, published into a
+ * cache directory the CALLER names, so another process can load it and replay
+ * only the suffix beyond it.
+ *
+ * Three properties keep this from weakening anything:
+ *
+ *   - the cache directory is NOT the database (P-2), so R-3 still holds.  A
+ *     reader writes nothing the database's correctness depends on, which is why
+ *     a read-only handle may publish;
+ *   - a table is published by rename and never modified (P-4), so G-6's "nothing
+ *     a reader may be reading is ever rewritten beneath it" is unchanged;
+ *   - a table is self-validating, and EVERY failure means "ignore it and replay"
+ *     (P-11).  Nothing here can turn a readable database into an unreadable one.
+ *
+ * That last one is why nothing in this section reports corruption.  A rejected
+ * table is ZS_NOTFOUND, identical to no table at all.
+ *
+ * Layering: this section may call upwards into PRIVATE INDEX and FILE OBJECT.
+ * SNAPSHOT and WRITE PATH call into it. */
+
+/* The same construction as the data-file magic (F-6), for the same reasons --
+ * high bit set so no text file is mistaken for one and an eighth-bit-stripping
+ * transfer is detected, invalid UTF-8 at byte 0, a CR-LF trap, a DOS
+ * end-of-file, a bare LF, NUL padding -- and DELIBERATELY different bytes, so a
+ * table and a data file are distinguishable by content as well as by name.
+ * A reader validates all 16 (P-6). */
+#define ZSI_IDX_MAGIC_LEN 16
+
+static const unsigned char zsi_idx_magic[ZSI_IDX_MAGIC_LEN] = {
+    0x89, 0x7A, 0x73, 0x69, 0x6E, 0x64, 0x65, 0x78,
+    0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00
+};
+
+/* Field offsets within the 96-byte header (P-5).  Spelled out rather than
+ * derived by summing sizes, so the table in the spec maps to a table here. */
+#define ZSI_IDX_HEADER_LEN        96
+#define ZSI_IDX_OFF_MAGIC          0   /* 16 */
+#define ZSI_IDX_OFF_VREAD         16   /*  1 */
+#define ZSI_IDX_OFF_VWRITE        17   /*  1 */
+#define ZSI_IDX_OFF_FLAGS         18   /*  2 */
+#define ZSI_IDX_OFF_RESERVED1     20   /*  4 */
+#define ZSI_IDX_OFF_UUID          24   /* 16 */
+#define ZSI_IDX_OFF_START         40   /*  4 */
+#define ZSI_IDX_OFF_RESERVED2     44   /*  4 */
+#define ZSI_IDX_OFF_COMPAR        48   /* 16 */
+#define ZSI_IDX_OFF_VALID_UPTO    64   /*  8 */
+#define ZSI_IDX_OFF_TERM_OFF      72   /*  8 */
+#define ZSI_IDX_OFF_NPTRS         80   /*  8 */
+#define ZSI_IDX_OFF_TERM_CSUM     88   /*  4 */
+#define ZSI_IDX_OFF_CSUM          92   /*  4, covers [0, 92) */
+
+#define ZSI_IDX_VERSION_READ  1
+#define ZSI_IDX_VERSION_WRITE 1
+
+/* Bit 4 of flags: the index was built with checksum verification.  A table built
+ * under ZS_NOCSUM may hold records a verifying reader would reject, so it must
+ * not be handed to one (P-11).  The low 4 bits are the engine, exactly as in a
+ * data file header. */
+#define ZSI_IDX_FLAG_CSUM_VERIFIED 0x0010
+
+/* A ceiling on a table's size, so a corrupt nptrs cannot become a huge
+ * allocation before the exact-size check runs.  Deliberately generous rather
+ * than tight: rollover_size is caller-configurable and a crash can leave a
+ * larger file behind, and this is a sanity bound, not a policy. */
+#define ZSI_IDX_MAX_BYTES ((size_t)1 << 31)
+
+struct zsi_idxhdr {
+    uint8_t     version_read;
+    uint8_t     version_write;
+    uint16_t    flags;
+    zsi_uuid_t  uuid;
+    uint32_t    start;
+    char        compar_name[ZSI_COMPAR_NAME_LEN];  /* NUL-padded, as in a file */
+    uint64_t    valid_upto;
+    uint64_t    term_off;
+    uint64_t    nptrs;
+    uint32_t    term_csum;
+};
+
+static void zsi_idxhdr_encode(char *buf, const struct zsi_idxhdr *h,
+                              zs_csum *csum)
+{
+    memset(buf, 0, ZSI_IDX_HEADER_LEN);
+
+    memcpy(buf + ZSI_IDX_OFF_MAGIC, zsi_idx_magic, ZSI_IDX_MAGIC_LEN);
+    buf[ZSI_IDX_OFF_VREAD]  = (char)h->version_read;
+    buf[ZSI_IDX_OFF_VWRITE] = (char)h->version_write;
+    zsi_put16(buf + ZSI_IDX_OFF_FLAGS, h->flags);
+    /* RESERVED1 and RESERVED2 stay zero: written as zero, ignored on read.  The
+     * memset above is what writes them. */
+    memcpy(buf + ZSI_IDX_OFF_UUID, h->uuid, 16);
+    zsi_put32(buf + ZSI_IDX_OFF_START, h->start);
+    memcpy(buf + ZSI_IDX_OFF_COMPAR, h->compar_name, ZSI_COMPAR_NAME_LEN);
+    zsi_put64(buf + ZSI_IDX_OFF_VALID_UPTO, h->valid_upto);
+    zsi_put64(buf + ZSI_IDX_OFF_TERM_OFF, h->term_off);
+    zsi_put64(buf + ZSI_IDX_OFF_NPTRS, h->nptrs);
+    zsi_put32(buf + ZSI_IDX_OFF_TERM_CSUM, h->term_csum);
+
+    /* Last 4 bytes, covering everything before them, exactly as F-4 has it for a
+     * data file header.  No field-zeroing anywhere. */
+    zsi_put32(buf + ZSI_IDX_OFF_CSUM, csum(buf, ZSI_IDX_OFF_CSUM));
+}
+
+/* Decode and validate the header ALONE.  The cross-checks against the data file
+ * -- uuid, generation, comparator, offset ranges, the terminator binding --
+ * belong to the loader, because they need the file. */
+static int zsi_idxhdr_decode(const char *buf, size_t len, zs_csum *csum,
+                             struct zsi_idxhdr *out)
+{
+    if (len < ZSI_IDX_HEADER_LEN) return ZS_BADFORMAT;
+
+    if (memcmp(buf + ZSI_IDX_OFF_MAGIC, zsi_idx_magic, ZSI_IDX_MAGIC_LEN) != 0)
+        return ZS_BADFORMAT;
+
+    if (zsi_get32(buf + ZSI_IDX_OFF_CSUM) != csum(buf, ZSI_IDX_OFF_CSUM))
+        return ZS_BADCHECKSUM;
+
+    uint8_t vread = (uint8_t)buf[ZSI_IDX_OFF_VREAD];
+    if (vread > ZSI_IDX_VERSION_READ) return ZS_BADFORMAT;
+
+    out->version_read  = vread;
+    out->version_write = (uint8_t)buf[ZSI_IDX_OFF_VWRITE];
+    out->flags         = zsi_get16(buf + ZSI_IDX_OFF_FLAGS);
+    memcpy(out->uuid, buf + ZSI_IDX_OFF_UUID, 16);
+    out->start         = zsi_get32(buf + ZSI_IDX_OFF_START);
+    memcpy(out->compar_name, buf + ZSI_IDX_OFF_COMPAR, ZSI_COMPAR_NAME_LEN);
+    out->valid_upto    = zsi_get64(buf + ZSI_IDX_OFF_VALID_UPTO);
+    out->term_off      = zsi_get64(buf + ZSI_IDX_OFF_TERM_OFF);
+    out->nptrs         = zsi_get64(buf + ZSI_IDX_OFF_NPTRS);
+    out->term_csum     = zsi_get32(buf + ZSI_IDX_OFF_TERM_CSUM);
+
+    /* F-9 again: generations start at 1, so a start of 0 is never legitimate. */
+    if (out->start == 0) return ZS_BADFORMAT;
+
+    return ZS_OK;
+}
+
+/* The engine id, read as plain data before any verification -- exactly as
+ * zsi_header_engine_id does, and for the same reason (F-5a): the checksum cannot
+ * be verified until the engine is known, and the engine is recorded inside the
+ * header the checksum protects.  A wrong value yields a failed checksum, not a
+ * wrong interpretation.
+ *
+ * Requires len >= ZSI_IDX_HEADER_LEN; the caller checks that first. */
+static unsigned zsi_idxhdr_engine_id(const char *buf)
+{
+    return (unsigned)(zsi_get16(buf + ZSI_IDX_OFF_FLAGS) & ZSI_CSUM_MASK);
+}
+
+/* P-3.  The `zeroskip.` prefix is the metadata namespace (D-2), so a table can
+ * never be parsed as a data file even if someone points a cache directory at a
+ * database.  The uuid and generation forms are D-0's and D-1's, so a table's
+ * name reads naturally beside the file it describes. */
+#define ZSI_IDX_NAME_PREFIX "zeroskip.index-"
+
+static void zsi_name_format_index(char *out, const zsi_uuid_t uuid,
+                                  uint32_t gen)
+{
+    char ustr[ZSI_UUID_STR_LEN];
+    zsi_uuid_unparse(uuid, ustr);
+
+    snprintf(out, ZSI_NAME_MAX, "%s%s-%08X", ZSI_IDX_NAME_PREFIX, ustr, gen);
+}
+
+/* Where a handle's tables live, and how far past the last one it lets the file
+ * grow before publishing another (P-13).  dir NULL disables the cache. */
+struct zsi_idxcfg {
+    const char *dir;
+    size_t      threshold;
+};
+
 /********** PER-FILE CURSOR *************/
 
 /* One cursor over one source, presenting the same four operations whatever the

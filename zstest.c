@@ -10398,6 +10398,172 @@ static void test_idxcache_threshold_defaults(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* P-5, P-6: all 96 bytes against a literal.
+ *
+ * A matched encoder and decoder round-trip perfectly under a SYMMETRIC layout
+ * change -- swap two fields in both and nothing notices -- which is the exact
+ * bug class that leaves a peer unable to read our tables.  Mutation testing
+ * found it once already, in the data-file header, which is why
+ * test_header_byte_layout exists.  Only a literal catches it. */
+static void test_idxcache_header_byte_layout(void)
+{
+    static const unsigned char golden[ZSI_IDX_HEADER_LEN] = {
+        /* 0  magic, all 16 bytes */
+        0x89, 0x7A, 0x73, 0x69, 0x6E, 0x64, 0x65, 0x78,
+        0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00,
+        /* 16 vread, 17 vwrite, 18 flags (LE) = 0x0011, 20 reserved */
+        0x01, 0x01, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 24 uuid */
+        0x49, 0x41, 0xDA, 0x54, 0x94, 0x06, 0x4F, 0xAA,
+        0xA4, 0x57, 0xC4, 0xB6, 0x5B, 0xEA, 0xE3, 0xEB,
+        /* 40 start = 0x01020304 LE, 44 reserved */
+        0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
+        /* 48 comparator name, NUL-padded to 16 */
+        0x6D, 0x65, 0x6D, 0x63, 0x6D, 0x70, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 64 valid_upto = 0x1122334455667788 LE */
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        /* 72 term_off = 200 LE */
+        0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 80 nptrs = 7 LE */
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 88 term_csum = 0xDEADBEEF LE, 92 checksum of [0, 92) */
+        0xEF, 0xBE, 0xAD, 0xDE, 0x30, 0x10, 0x2D, 0x0D
+    };
+
+    static const zsi_uuid_t u = {
+        0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
+        0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
+    };
+    struct zsi_idxhdr h;
+    char buf[ZSI_IDX_HEADER_LEN];
+
+    ASSERT_EQ(ZSI_IDX_HEADER_LEN, 96);
+    ASSERT_EQ(ZSI_IDX_MAGIC_LEN, 16);
+
+    /* Different from the data-file magic, so the two artefacts are told apart by
+     * content and not only by name (P-6). */
+    ASSERT(memcmp(zsi_idx_magic, zsi_magic, ZSI_MAGIC_LEN) != 0);
+
+    memset(&h, 0, sizeof(h));
+    h.version_read  = 1;
+    h.version_write = 1;
+    h.flags         = ZSI_CSUM_XXHASH | ZSI_IDX_FLAG_CSUM_VERIFIED;
+    memcpy(h.uuid, u, 16);
+    h.start      = 0x01020304;
+    memcpy(h.compar_name, "memcmp", 6);
+    h.valid_upto = 0x1122334455667788ULL;
+    h.term_off   = 200;
+    h.nptrs      = 7;
+    h.term_csum  = 0xDEADBEEF;
+
+    memset(buf, 0xAA, sizeof(buf));
+    zsi_idxhdr_encode(buf, &h, zsi_csum_xxhash);
+
+    for (size_t i = 0; i < ZSI_IDX_HEADER_LEN; i++) {
+        if ((unsigned char)buf[i] != golden[i]) {
+            fprintf(stderr, "\n    FAIL byte %zu: got 0x%02X, expected 0x%02X\n",
+                    i, (unsigned char)buf[i], golden[i]);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* Each field at its literal offset, so a failure names the field rather than
+     * just an offset. */
+    ASSERT_MEM_EQ(buf + 0, zsi_idx_magic, 16);
+    ASSERT_EQ((unsigned char)buf[16], 1);
+    ASSERT_EQ((unsigned char)buf[17], 1);
+    ASSERT_EQU(zsi_get16(buf + 18), 0x0011u);
+    ASSERT_EQU(zsi_get32(buf + 20), 0u);
+    ASSERT_MEM_EQ(buf + 24, u, 16);
+    ASSERT_EQU(zsi_get32(buf + 40), 0x01020304u);
+    ASSERT_EQU(zsi_get32(buf + 44), 0u);
+    ASSERT_MEM_EQ(buf + 48, "memcmp", 6);
+    ASSERT_EQU(zsi_get64(buf + 64), 0x1122334455667788ULL);
+    ASSERT_EQU(zsi_get64(buf + 72), 200u);
+    ASSERT_EQU(zsi_get64(buf + 80), 7u);
+    ASSERT_EQU(zsi_get32(buf + 88), 0xDEADBEEFu);
+    ASSERT_EQU(zsi_get32(buf + 92), zsi_csum_xxhash(buf, 92));
+
+    /* Round-trip, including the engine read as plain data first (F-5a). */
+    {
+        struct zsi_idxhdr back;
+        memset(&back, 0, sizeof(back));
+        ASSERT_EQ(zsi_idxhdr_engine_id(buf), ZSI_CSUM_XXHASH);
+        ASSERT_OK(zsi_idxhdr_decode(buf, sizeof(buf), zsi_csum_xxhash, &back));
+        ASSERT_EQU(back.flags, h.flags);
+        ASSERT_MEM_EQ(back.uuid, u, 16);
+        ASSERT_EQU(back.start, h.start);
+        ASSERT_MEM_EQ(back.compar_name, h.compar_name, ZSI_COMPAR_NAME_LEN);
+        ASSERT_EQU(back.valid_upto, h.valid_upto);
+        ASSERT_EQU(back.term_off, h.term_off);
+        ASSERT_EQU(back.nptrs, h.nptrs);
+        ASSERT_EQU(back.term_csum, h.term_csum);
+    }
+
+    /* A corrupt byte anywhere before the checksum is rejected. */
+    {
+        struct zsi_idxhdr back;
+        buf[40] = (char)((unsigned char)buf[40] ^ 0x01);
+        ASSERT_EQ(zsi_idxhdr_decode(buf, sizeof(buf), zsi_csum_xxhash, &back),
+                  ZS_BADCHECKSUM);
+        buf[40] = (char)((unsigned char)buf[40] ^ 0x01);
+    }
+
+    /* Wrong magic is rejected before anything else, and every byte counts. */
+    for (size_t i = 0; i < ZSI_IDX_MAGIC_LEN; i++) {
+        struct zsi_idxhdr back;
+        buf[i] = (char)((unsigned char)buf[i] ^ 0x01);
+        ASSERT_EQ(zsi_idxhdr_decode(buf, sizeof(buf), zsi_csum_xxhash, &back),
+                  ZS_BADFORMAT);
+        buf[i] = (char)((unsigned char)buf[i] ^ 0x01);
+    }
+
+    /* Too short to hold a header. */
+    {
+        struct zsi_idxhdr back;
+        ASSERT_EQ(zsi_idxhdr_decode(buf, ZSI_IDX_HEADER_LEN - 1,
+                                    zsi_csum_xxhash, &back), ZS_BADFORMAT);
+    }
+
+    /* A read version above ours is refused rather than guessed at (F-7). */
+    {
+        struct zsi_idxhdr back;
+        buf[ZSI_IDX_OFF_VREAD] = (char)(ZSI_IDX_VERSION_READ + 1);
+        zsi_put32(buf + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(buf, ZSI_IDX_OFF_CSUM));
+        ASSERT_EQ(zsi_idxhdr_decode(buf, sizeof(buf), zsi_csum_xxhash, &back),
+                  ZS_BADFORMAT);
+    }
+}
+
+/* P-3: the published name.  This is interoperability surface -- a peer looks for
+ * exactly this string -- so it is asserted against a literal rather than
+ * round-tripped through our own parser. */
+static void test_idxcache_published_name(void)
+{
+    static const zsi_uuid_t u = {
+        0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
+        0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
+    };
+    char name[ZSI_NAME_MAX];
+    zsi_uuid_t parsed;
+    uint32_t s, e;
+
+    zsi_name_format_index(name, u, 0x0000002A);
+    ASSERT_STR_EQ(name,
+        "zeroskip.index-4941da54-9406-4faa-a457-c4b65beae3eb-0000002A");
+
+    /* D-2: the zeroskip. prefix is the metadata namespace, so this must never
+     * parse as a data file -- even if a cache directory and a database directory
+     * were somehow the same. */
+    ASSERT_EQ(zsi_name_parse(name, parsed, &s, &e), ZSI_NAME_OTHER);
+
+    /* And it fits the shared name buffer with room to spare. */
+    ASSERT(strlen(name) < ZSI_NAME_MAX);
+}
+
 /* P-12: a replay may begin at any span boundary, and one begun at the complete
  * point finds nothing.  That is the property which makes a partial index safe to
  * extend, so it is asserted directly rather than only through the cache. */
@@ -10741,6 +10907,9 @@ static struct test_entry tests[] = {
     { "test_idxcache_rejects_db_dir",   test_idxcache_rejects_db_dir },
     { "test_idxcache_threshold_defaults",
                                         test_idxcache_threshold_defaults },
+    { "test_idxcache_header_byte_layout",
+                                        test_idxcache_header_byte_layout },
+    { "test_idxcache_published_name",   test_idxcache_published_name },
     { "test_idxcache_replays_the_suffix",
                                         test_idxcache_replays_the_suffix },
     { "test_idxcache_matches_full_build",
