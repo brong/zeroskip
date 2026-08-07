@@ -112,8 +112,12 @@ zsbench: zsbench.c zeroskip.h libzeroskip.a
 	$(CC) $(CFLAGS) -o $@ zsbench.c libzeroskip.a $(LDLIBS)
 
 # Tests
-check: zstest
+# The C suite, then zstool's driver contract.  Both, because the tool's line
+# format is what a cross-implementation runner compares (T-0a) and a change to it
+# breaks other implementations rather than this one.
+check: zstest zstool
 	./zstest
+	./tests/tool.sh
 
 test: check
 
