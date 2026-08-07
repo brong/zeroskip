@@ -530,6 +530,50 @@ static void test_overflow_guards(void)
 
 /*
  * ============================================================
+ * Building files by hand
+ * ============================================================
+ *
+ * Much of the conformance suite needs files this implementation would never
+ * write: a truncated pointer section, a back pointer that is not 8-aligned, a
+ * PTRS64 section without 4GB of data behind it.  These helpers write bytes, not
+ * databases, so a test can construct exactly the damage it wants to assert about.
+ */
+
+/* Create dbdir if absent.  Most tests want ZS_CREATE to make it, so setup()
+ * deliberately does not. */
+static int mkdbdir(void)
+{
+    if (mkdir(dbdir, 0700) && errno != EEXIST) return -1;
+    return 0;
+}
+
+static char *dbpath(const char *name)
+{
+    static char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dbdir, name);
+    return path;
+}
+
+/* Write buf to dbdir/name, replacing anything there. */
+static int writefile(const char *name, const void *buf, size_t len)
+{
+    char *path = dbpath(name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    ssize_t n = len ? write(fd, buf, len) : 0;
+    close(fd);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
+static long filesize(const char *name)
+{
+    struct stat sb;
+    if (stat(dbpath(name), &sb) < 0) return -1;
+    return (long)sb.st_size;
+}
+
+/*
+ * ============================================================
  * Filenames (T-2c, part of T-9)
  * ============================================================
  */
@@ -788,23 +832,33 @@ static bool valid_utf8(const unsigned char *p, size_t len)
     return true;
 }
 
-/* Build a valid header into buf, for a test to then damage. */
+/* The engine a test uses to stand in for a caller-supplied one (engine 2).
+ * zsi_csum_none is a legitimate choice: engine 2 is whatever the caller supplies,
+ * and the point of these tests is which function gets selected, not what it
+ * computes. */
+#define TEST_EXTERNAL_CSUM zsi_csum_none
+
+/* Build a valid header into buf, for a test to then damage.
+ *
+ * Resolves engine 2 to TEST_EXTERNAL_CSUM rather than passing NULL through.  An
+ * earlier version passed zsi_csum_for_id(engine, NULL), which is NULL for engine
+ * 2, and then called it -- crashing the suite inside a helper rather than
+ * failing an assertion. */
 static void make_header(char *buf, uint32_t start, uint32_t end, unsigned engine)
 {
-    static const zsi_uuid_t u = {
-        0x49, 0x41, 0xda, 0x54, 0x94, 0x06, 0x4f, 0xaa,
-        0xa4, 0x57, 0xc4, 0xb6, 0x5b, 0xea, 0xe3, 0xeb
-    };
     struct zsi_header h;
     memset(&h, 0, sizeof(h));
     h.version_read  = ZSI_VERSION_READ;
     h.version_write = ZSI_VERSION_WRITE;
     h.flags         = (uint16_t)engine;
-    memcpy(h.uuid, u, 16);
+    memcpy(h.uuid, test_uuid, 16);
     h.start = start;
     h.end   = end;
     memcpy(h.compar_name, "memcmp", 6);
-    zsi_header_encode(buf, &h, zsi_csum_for_id(engine, NULL));
+
+    zs_csum *cs = zsi_csum_for_id(engine, TEST_EXTERNAL_CSUM);
+    if (!cs) cs = zsi_csum_none;        /* an unknown engine: write zeros */
+    zsi_header_encode(buf, &h, cs);
 }
 
 static void test_magic(void)
@@ -1933,6 +1987,269 @@ static void test_terminator_long_span(void)
 
 /*
  * ============================================================
+ * File object (part of T-6)
+ * ============================================================
+ */
+
+static void test_file_open_unordered(void)
+{
+    char hdr[ZSI_HEADER_LEN];
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* A 72-byte header and no spans: a legal empty unordered file, which is
+     * exactly what creating a database produces (D-8a, F-26h). */
+    make_header(hdr, 1, 0, ZSI_CSUM_XXHASH);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_EQ(filesize(name), 72);
+
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+    ASSERT_NOT_NULL(f);
+    ASSERT(f->hdr_valid);
+    ASSERT_EQU(f->size, 72u);
+    ASSERT_EQU(f->hdr.start, 1u);
+    ASSERT_EQU(f->hdr.end, 0u);
+    ASSERT(zsi_file_is_unordered(f));
+    ASSERT(f->csum == zsi_csum_xxhash);
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_XXHASH);
+    zsi_file_close(&f);
+    ASSERT_NULL(f);
+}
+
+static void test_file_open_inorder(void)
+{
+    /* The smallest valid in-order file is 96 bytes: a 72-byte header, an 8-byte
+     * PTRS32 section with count == 0, and the 16-byte trailer (F-26g).  Built by
+     * hand here -- the pointer section proper arrives in a later section, but the
+     * kind must already be recognised from the header alone. */
+    char buf[96];
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    memset(buf, 0, sizeof(buf));
+    make_header(buf, 5, 5, ZSI_CSUM_XXHASH);
+    buf[72] = (char)ZSI_PTRS32;             /* count stays 0 */
+    zsi_put64(buf + 80, 72);                /* trailer: back pointer */
+    zsi_put32(buf + 88, zsi_csum_xxhash(buf + 72, 0));   /* records region: empty */
+    zsi_put32(buf + 92, zsi_csum_xxhash(buf + 72, 20));  /* section through +92 */
+
+    zsi_name_format(name, test_uuid, 5, 5);
+    ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
+    ASSERT_EQ(filesize(name), 96);
+
+    ASSERT_OK(zsi_file_open(dbdir, name, 5, NULL, &f));
+    ASSERT(f->hdr_valid);
+    ASSERT_EQU(f->hdr.start, 5u);
+    ASSERT_EQU(f->hdr.end, 5u);
+
+    /* The kind comes from the header alone, before anything else is read. */
+    ASSERT(!zsi_file_is_unordered(f));
+    zsi_file_close(&f);
+}
+
+static void test_file_bounds(void)
+{
+    char hdr[ZSI_HEADER_LEN];
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    make_header(hdr, 1, 0, ZSI_CSUM_XXHASH);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+
+    /* In range. */
+    ASSERT_NOT_NULL(zsi_file_at(f, 0, 72));
+    ASSERT_NOT_NULL(zsi_file_at(f, 71, 1));
+    ASSERT_NOT_NULL(zsi_file_at(f, 0, 0));
+    ASSERT_NOT_NULL(zsi_file_at(f, 72, 0));   /* the end itself, zero bytes */
+
+    /* One byte past the end, and every larger overrun. */
+    ASSERT_NULL(zsi_file_at(f, 72, 1));
+    ASSERT_NULL(zsi_file_at(f, 71, 2));
+    ASSERT_NULL(zsi_file_at(f, 0, 73));
+    ASSERT_NULL(zsi_file_at(f, 73, 0));
+
+    /* Offsets and lengths that would overflow rather than merely exceed (G-0b).
+     * This is the case that turns a bounds check into a bypass when unguarded. */
+    ASSERT_NULL(zsi_file_at(f, SIZE_MAX, 1));
+    ASSERT_NULL(zsi_file_at(f, 1, SIZE_MAX));
+    ASSERT_NULL(zsi_file_at(f, SIZE_MAX, SIZE_MAX));
+    ASSERT_NULL(zsi_file_at(f, SIZE_MAX - 4, 8));
+
+    /* And that a returned pointer really addresses the requested offset. */
+    const char *p = zsi_file_at(f, 16, 2);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ((unsigned char)p[0], ZSI_VERSION_READ);
+    ASSERT_EQ((unsigned char)p[1], ZSI_VERSION_WRITE);
+
+    zsi_file_close(&f);
+}
+
+static void test_file_zero_length(void)
+{
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_name_format(name, test_uuid, 3, 0);
+    ASSERT_EQ(writefile(name, "", 0), 0);
+    ASSERT_EQ(filesize(name), 0);
+
+    /* D-10: an active file of zero length is treated as a complete file with zero
+     * spans.  It is not an error, and its generation comes from its filename --
+     * which is the only place it could come from. */
+    ASSERT_OK(zsi_file_open(dbdir, name, 3, NULL, &f));
+    ASSERT_NOT_NULL(f);
+    ASSERT(!f->hdr_valid);
+    ASSERT_EQU(f->size, 0u);
+    ASSERT_EQU(f->hdr.start, 3u);
+    ASSERT(zsi_file_is_unordered(f));
+
+    /* Nothing can be read from it, at any offset, including zero bytes at zero. */
+    ASSERT_NULL(zsi_file_at(f, 0, 0));
+    ASSERT_NULL(zsi_file_at(f, 0, 1));
+    zsi_file_close(&f);
+}
+
+static void test_file_bad_header(void)
+{
+    char buf[ZSI_HEADER_LEN];
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_name_format(name, test_uuid, 4, 0);
+
+    /* Garbage where a header should be (D-10).  Opens, reports the header as
+     * invalid, and takes its generation from the name. */
+    memset(buf, 0xFF, sizeof(buf));
+    ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
+    ASSERT(!f->hdr_valid);
+    ASSERT_EQU(f->hdr.start, 4u);
+    ASSERT_EQU(f->hdr.end, 0u);
+    ASSERT(zsi_file_is_unordered(f));
+    zsi_file_close(&f);
+
+    /* All zeroes: no magic, and byte 0 of 0x00 is also an invalid type byte. */
+    memset(buf, 0, sizeof(buf));
+    ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
+    ASSERT(!f->hdr_valid);
+    zsi_file_close(&f);
+
+    /* Shorter than a header: valid magic but truncated.  Still not an error at
+     * this level -- the caller's position in the file set decides (D-10/D-10a). */
+    make_header(buf, 4, 0, ZSI_CSUM_XXHASH);
+    for (size_t len = 1; len < ZSI_HEADER_LEN; len += 7) {
+        ASSERT_EQ(writefile(name, buf, len), 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
+        ASSERT(!f->hdr_valid);
+        ASSERT_EQU(f->size, len);
+        ASSERT_EQU(f->hdr.start, 4u);
+        /* Bounds still hold over the short file. */
+        ASSERT_NOT_NULL(zsi_file_at(f, 0, len));
+        ASSERT_NULL(zsi_file_at(f, 0, len + 1));
+        zsi_file_close(&f);
+    }
+
+    /* A header whose checksum does not match: unverifiable, so invalid. */
+    make_header(buf, 4, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_UUID] ^= 0xFF;
+    ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
+    ASSERT(!f->hdr_valid);
+    zsi_file_close(&f);
+}
+
+static void test_file_engine_from_header(void)
+{
+    char hdr[ZSI_HEADER_LEN];
+    char name[ZSI_NAME_MAX];
+    struct zsi_file *f = NULL;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_name_format(name, test_uuid, 1, 0);
+
+    /* F-5a: a file's engine comes from its OWN header, so files written under
+     * different engines coexist and a reader's configuration never overrides
+     * what a file records. */
+    make_header(hdr, 1, 0, ZSI_CSUM_NONE);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+    ASSERT(f->hdr_valid);
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_NONE);
+    ASSERT(f->csum == zsi_csum_none);
+    zsi_file_close(&f);
+
+    make_header(hdr, 1, 0, ZSI_CSUM_XXHASH);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_XXHASH);
+    ASSERT(f->csum == zsi_csum_xxhash);
+    zsi_file_close(&f);
+
+    /* Engine 2 with the caller's function supplied: readable, and the engine is
+     * reported as external rather than as whatever function happened to match. */
+    make_header(hdr, 1, 0, ZSI_CSUM_EXTERNAL);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT(f->hdr_valid);
+    ASSERT_EQ(f->csum_id, ZSI_CSUM_EXTERNAL);
+    ASSERT(f->csum == TEST_EXTERNAL_CSUM);
+    zsi_file_close(&f);
+
+    /* The same file with NO function supplied: unverifiable, so the header is not
+     * accepted.  A-6 makes this an error at the database level; here it comes back
+     * as an invalid header for the caller to judge, because a tool must still be
+     * able to inspect the file. */
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+    ASSERT(!f->hdr_valid);
+    zsi_file_close(&f);
+
+    /* An unknown engine id, likewise. */
+    make_header(hdr, 1, 0, 3);
+    ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
+    ASSERT(!f->hdr_valid);
+    zsi_file_close(&f);
+}
+
+static void test_file_open_failures(void)
+{
+    struct zsi_file *f = NULL;
+    char name[ZSI_NAME_MAX];
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* A missing file is ZS_NOTFOUND specifically, not a generic I/O error: the
+     * snapshot protocol distinguishes them, restarting its scan on ENOENT because
+     * a file may legitimately be unlinked mid-scan (C-4 step 3). */
+    zsi_name_format(name, test_uuid, 99, 0);
+    ASSERT_EQ(zsi_file_open(dbdir, name, 99, NULL, &f), ZS_NOTFOUND);
+    ASSERT_NULL(f);
+
+    /* A directory where a data file should be is malformed, not missing. */
+    char sub[PATH_MAX];
+    snprintf(sub, sizeof(sub), "%s/notafile", dbdir);
+    ASSERT_EQ(mkdir(sub, 0700), 0);
+    ASSERT_EQ(zsi_file_open(dbdir, "notafile", 1, NULL, &f), ZS_BADFORMAT);
+    ASSERT_NULL(f);
+
+    /* Closing a NULL handle is a no-op, so cleanup paths need no guard. */
+    zsi_file_close(&f);
+    ASSERT_NULL(f);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -1976,6 +2293,14 @@ static struct test_entry tests[] = {
     { "test_terminator",                test_terminator },
     { "test_terminator_detects_tear",   test_terminator_detects_tear },
     { "test_terminator_long_span",      test_terminator_long_span },
+
+    { "test_file_open_unordered",       test_file_open_unordered },
+    { "test_file_open_inorder",         test_file_open_inorder },
+    { "test_file_bounds",               test_file_bounds },
+    { "test_file_zero_length",          test_file_zero_length },
+    { "test_file_bad_header",           test_file_bad_header },
+    { "test_file_engine_from_header",   test_file_engine_from_header },
+    { "test_file_open_failures",        test_file_open_failures },
 
     { NULL, NULL }
 };

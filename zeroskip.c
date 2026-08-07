@@ -1166,9 +1166,221 @@ static bool zsi_term_is_canonical(const struct zsi_term *t)
 
 /********** FILE OBJECT *************/
 
+/* One open, mapped data file.
+ *
+ * Nothing in the format depends on mmap (G-0): an implementation may read files
+ * with ordinary reads and copy data out.  This one maps, because the C binding
+ * promises zero-copy pointer lifetimes (A-4), but the mapping is an optimisation
+ * the format permits rather than one it requires.
+ *
+ * Everything a reader touches through this object is immutable for its lifetime.
+ * In-order files are never modified.  A non-active unordered file is never
+ * appended to again.  The active file IS appended to, but only ever appended to
+ * (G-1), so every byte below the snapshot boundary is stable by construction and
+ * growth beyond it is simply not looked at (C-4c). */
+struct zsi_file {
+    char             *fname;      /* full path, owned */
+    int               fd;
+    const char       *base;       /* mmap, or NULL for a zero-length file */
+    size_t            maplen;     /* bytes mapped; 0 when base is NULL */
+    size_t            size;       /* st_size at map time */
+    struct zsi_header hdr;
+    zs_csum          *csum;       /* the engine this file's own header names */
+    unsigned          csum_id;
+    bool              hdr_valid;  /* false for the D-10 case */
+
+    /* unordered (hdr.end == 0), filled by the UNORDERED FILE section */
+    size_t            complete;   /* F-24 complete point */
+    struct zsi_index *index;      /* private, built by replay */
+
+    /* in-order (hdr.end != 0), filled by the POINTER SECTION section */
+    size_t            ptr_off;
+    uint64_t          nptrs;
+    bool              ptr_wide;
+};
+
+/* Bounds-checked access to file data (F-30).
+ *
+ * This is the single choke point: no other code indexes base directly.  That is
+ * deliberate, and worth preserving -- it is the difference between one audited
+ * check and thirty unaudited ones, and every offset reaching it is
+ * corruption-controlled.  Returns NULL unless [off, off+len) lies wholly within
+ * the file.
+ *
+ * A zero-length request is answered with a valid pointer when the offset itself
+ * is in range, because an empty records region is an ordinary case (F-26g) and
+ * checksumming zero bytes at a legitimate offset must not look like a failure. */
+static const char *zsi_file_at(const struct zsi_file *f, size_t off, size_t len)
+{
+    size_t end;
+
+    if (!zsi_add_sz(off, len, &end)) return NULL;   /* G-0b */
+    if (end > f->size) return NULL;
+    if (!f->base) return NULL;                      /* zero-length file */
+
+    return f->base + off;
+}
+
+/* Forward declaration, and the one place this file's strict downward layering is
+ * broken.  A struct zsi_file owns its private index, so closing the file must
+ * free it -- but the index is defined further down, since building one needs span
+ * replay which in turn needs this struct.  The alternative, making some caller
+ * remember to free the index before closing the file, is a leak waiting to
+ * happen: every early-return path in the snapshot protocol would need it. */
+static void zsi_index_free(struct zsi_index **ip);
+
+static void zsi_file_close(struct zsi_file **fp)
+{
+    struct zsi_file *f = *fp;
+    if (!f) return;
+
+    zsi_index_free(&f->index);
+    if (f->base) munmap((void *)f->base, f->maplen);
+    if (f->fd >= 0) close(f->fd);
+    free(f->fname);
+    free(f);
+    *fp = NULL;
+}
+
+/* Open and map one data file.
+ *
+ * name_start is the generation parsed from the filename (D-1), used when the
+ * header cannot supply one.  On a header that fails to validate, or a zero-length
+ * file, this succeeds with hdr_valid == false and hdr.start taken from the name:
+ * D-10 requires that state be representable, because an active file in it is
+ * treated as a complete file with zero spans rather than as an error.
+ *
+ * The CALLER decides whether that is tolerable, and the answer differs by
+ * position in the file set: for the active file, yes (D-10); for any other file,
+ * it is ZS_BADFORMAT, because its records cannot be recovered and silently
+ * skipping the generation would lose committed data (D-10a).  This function
+ * cannot make that call, since it does not know the file set. */
+static int zsi_file_open(const char *dir, const char *name,
+                         uint32_t name_start, zs_csum *external_csum,
+                         struct zsi_file **out)
+{
+    struct zsi_file *f = zsi_zmalloc(sizeof(*f));
+    if (!f) return ZS_INTERNAL;
+
+    f->fd = -1;
+
+    size_t dlen = strlen(dir), nlen = strlen(name);
+    f->fname = malloc(dlen + 1 + nlen + 1);
+    if (!f->fname) { zsi_file_close(&f); return ZS_INTERNAL; }
+    memcpy(f->fname, dir, dlen);
+    f->fname[dlen] = '/';
+    memcpy(f->fname + dlen + 1, name, nlen + 1);
+
+    /* Read-only: a struct zsi_file is a reader's view.  Writers append through a
+     * separate descriptor, so nothing can write through this mapping and G-6's
+     * "nothing a reader may be reading is ever rewritten beneath it" is enforced
+     * by the open mode rather than by convention. */
+    f->fd = open(f->fname, O_RDONLY);
+    if (f->fd < 0) {
+        int r = (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+        zsi_file_close(&f);
+        return r;
+    }
+
+    struct stat sb;
+    if (fstat(f->fd, &sb) < 0) { zsi_file_close(&f); return ZS_IOERROR; }
+    if (!S_ISREG(sb.st_mode)) { zsi_file_close(&f); return ZS_BADFORMAT; }
+    f->size = (size_t)sb.st_size;
+
+    /* A zero-length file cannot be mapped, and must not be an error: D-10 makes
+     * it a legal state for the active file.  base stays NULL and zsi_file_at
+     * refuses every request, which is the correct behaviour for a file with no
+     * content rather than a special case anyone has to remember. */
+    if (f->size > 0) {
+        void *m = mmap(NULL, f->size, PROT_READ, MAP_SHARED, f->fd, 0);
+        if (m == MAP_FAILED) { zsi_file_close(&f); return ZS_IOERROR; }
+        f->base = (const char *)m;
+        f->maplen = f->size;
+    }
+
+    /* Default the generation from the filename before attempting the header, so
+     * the D-10 path has it regardless of what the header turns out to hold. */
+    f->hdr.start = name_start;
+    f->hdr.end = 0;
+
+    if (f->size >= ZSI_HEADER_LEN) {
+        /* The engine id comes out of the flags field as plain data first (F-5a):
+         * the checksum cannot be verified until the engine is known, and the
+         * engine is recorded inside the header the checksum protects. */
+        unsigned id = zsi_header_engine_id(f->base);
+        zs_csum *cs = zsi_csum_for_id(id, external_csum);
+
+        /* An unknown engine, or engine 2 with no function supplied, leaves the
+         * header unverifiable.  Treat it as an invalid header rather than
+         * guessing: the caller's position test (D-10 vs D-10a) then decides,
+         * and for a non-active file that is the error A-6 wants. */
+        if (cs && zsi_header_decode(f->base, f->size, cs, &f->hdr) == ZS_OK) {
+            f->hdr_valid = true;
+            f->csum = cs;
+            f->csum_id = id;
+        }
+    }
+
+    if (!f->hdr_valid) {
+        /* Restore the name-derived generation: zsi_header_decode may have written
+         * fields before failing, and a partially-filled header must not be
+         * mistaken for a real one. */
+        memset(&f->hdr, 0, sizeof(f->hdr));
+        f->hdr.start = name_start;
+        f->hdr.end = 0;
+        f->csum = zsi_csum_none;
+        f->csum_id = ZSI_CSUM_NONE;
+    }
+
+    *out = f;
+    return ZS_OK;
+}
+
+/* Which kind of file this is, from the header alone.
+ *
+ * The two kinds are exhaustive and distinguishable before reading anything else,
+ * so a reader always knows whether a pointer section must be present (section 2).
+ * An invalid header reads as unordered, which is what D-10 needs: an active file
+ * with a corrupt header is a complete file with zero spans, and spans only exist
+ * in unordered files. */
+static bool zsi_file_is_unordered(const struct zsi_file *f)
+{
+    return !f->hdr_valid || zsi_header_is_unordered(&f->hdr);
+}
+
 /********** UNORDERED FILE *************/
 
 /********** PRIVATE INDEX *************/
+
+/* An unordered file has no pointer section, so key order for it must be derived
+ * by replaying its spans.  There is no shared index file: every process builds
+ * its own, in private memory, for each unordered file in its snapshot (section
+ * 5.4).  That is what makes G-6 hold without a lock -- nothing a reader may be
+ * reading is ever rewritten beneath it, because nothing is shared at all.
+ *
+ * Structure: a sorted array of record offsets, plus a small sorted delta array
+ * for records committed since the base was built.  Lookups consult the delta
+ * first; traversal merges the two, preferring the delta on equal keys.
+ *
+ * The full rationale, and the build and lookup paths, are in the task that
+ * implements them.  Only the shape and the destructor live here, because
+ * zsi_file_close must be able to free an index without the caller remembering to. */
+struct zsi_index {
+    struct zsi_file *file;
+    uint32_t *base;   size_t nbase;
+    uint32_t *delta;  size_t ndelta, adelta;
+};
+
+static void zsi_index_free(struct zsi_index **ip)
+{
+    struct zsi_index *ix = *ip;
+    if (!ix) return;
+
+    free(ix->base);
+    free(ix->delta);
+    free(ix);
+    *ip = NULL;
+}
 
 /********** PER-FILE CURSOR *************/
 

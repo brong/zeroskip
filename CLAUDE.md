@@ -20,6 +20,7 @@ make check          # run the test suite (alias: make test)
 ./zstest            # run all tests directly
 ./zstest record     # run tests matching a substring filter
 make asan           # rebuild under ASan + UBSan and run the suite
+make leaks          # rebuild plain and leak-check (LSan on Linux, leaks(1) on macOS)
 make mutate         # verify the suite can actually fail (see Testing below)
 make corpus         # regenerate the golden corpus (see below before using)
 make bench          # zsbench --selftest, then a small smoke benchmark
@@ -28,7 +29,9 @@ make clean
 
 Requires: C99 compiler, POSIX (`mmap`, `fcntl` locking, `/dev/urandom`). Builds on Linux, macOS and the BSDs with no external libraries.
 
-Default `CFLAGS` are `-Wall -Wextra -g -O2 -fno-strict-aliasing -std=c99`. Append to them with `EXTRA_CFLAGS=...` rather than overriding `CFLAGS`, which would drop the platform feature defines. `-fno-strict-aliasing` is precautionary rather than known to be required: the little-endian accessors go through `memcpy`, so unlike `twom.c` they do not punt on aliasing.
+Default `CFLAGS` are `-Wall -Wextra -g -O2 -fno-strict-aliasing -std=c99`. Append to them with `EXTRA_CFLAGS=...` rather than overriding `CFLAGS`, which would drop the platform feature defines.
+
+**Every target builds a binary called `zstest`**, so make cannot tell an instrumented build from a plain one and will reuse whichever was built last. `asan` and `leaks` therefore clean first, and you should assume `make check` straight after `make asan` is running the *sanitizer* binary. This is not hypothetical: it made `make leaks` fail with "malloc replacement library without the required support", which reads like a tooling problem and was really ASan's `malloc` in a stale binary. `-fno-strict-aliasing` is precautionary rather than known to be required: the little-endian accessors go through `memcpy`, so unlike `twom.c` they do not punt on aliasing.
 
 ## Source Layout
 

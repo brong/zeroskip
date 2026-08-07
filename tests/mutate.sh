@@ -233,6 +233,57 @@ mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
 
 echo
+echo "file object (Task 6)"
+
+# F-30's single choke point.  Every one of these turns a bounds check into a
+# bounds-check bypass, which is the whole reason the check lives in one place.
+mutant "bounds: overflow unguarded" catch \
+  's/    if \(!zsi_add_sz\(off, len, &end\)\) return NULL;   \/\* G-0b \*\//    end = off + len;/'
+
+mutant "bounds: off-by-one at the end" catch \
+  's/    if \(end > f->size\) return NULL;/    if (end > f->size + 1) return NULL;/'
+
+mutant "bounds: only offset checked" catch \
+  's/    if \(end > f->size\) return NULL;/    if (off > f->size) return NULL;/'
+
+# base is NULL exactly when size is 0, so the size check already rejects every
+# request with a nonzero length, and the only surviving case -- offset 0, length 0
+# -- returns `base + 0`, which is NULL either way.  Confirmed unobservable: UBSan
+# with -fsanitize=pointer-overflow does not flag it, and C23 made NULL + 0
+# well-defined regardless.  The check stays because it states the invariant
+# linking base to size, which is otherwise only implied by the open path.
+mutant "bounds: NULL base not checked" equivalent \
+  's/    if \(!f->base\) return NULL;                      \/\* zero-length file \*\//    \/* base check removed *\//'
+
+# D-10: a zero-length or corrupt-header active file must be a legal state, not an
+# error, or a crash leaves a database that cannot be opened at all (G-3).
+mutant "D-10: zero length is an error" catch \
+  's/    if \(f->size > 0\) \{/    if (f->size == 0) { zsi_file_close(\&f); return ZS_BADFORMAT; }\n    if (f->size > 0) {/'
+
+mutant "D-10: bad header is an error" catch \
+  's/    if \(!f->hdr_valid\) \{\n        \/\* Restore the name-derived generation/    if (!f->hdr_valid) { zsi_file_close(\&f); return ZS_BADFORMAT; }\n    if (!f->hdr_valid) {\n        \/* Restore the name-derived generation/'
+
+mutant "D-10: generation not taken from name" catch \
+  's/        f->hdr.start = name_start;\n        f->hdr.end = 0;\n        f->csum = zsi_csum_none;/        f->hdr.start = 0;\n        f->hdr.end = 0;\n        f->csum = zsi_csum_none;/'
+
+# F-5a: a file'"'"'s engine comes from its own header, never the reader'"'"'s configuration.
+mutant "engine: hardcoded xxhash" catch \
+  's/        zs_csum \*cs = zsi_csum_for_id\(id, external_csum\);/        zs_csum *cs = zsi_csum_xxhash; (void)id; (void)external_csum;/'
+
+mutant "engine: unknown id accepted" catch \
+  's/        if \(cs && zsi_header_decode\(f->base, f->size, cs, &f->hdr\) == ZS_OK\) \{/        if (!cs) cs = zsi_csum_none;\n        if (zsi_header_decode(f->base, f->size, cs, \&f->hdr) == ZS_OK) {/'
+
+# The kind must be readable from the header alone (section 2).
+mutant "kind: invalid header reads as in-order" catch \
+  's/    return !f->hdr_valid \|\| zsi_header_is_unordered\(&f->hdr\);/    return f->hdr_valid \&\& zsi_header_is_unordered(\&f->hdr);/'
+
+mutant "open: ENOENT reported as IOERROR" catch \
+  's/        int r = \(errno == ENOENT\) \? ZS_NOTFOUND : ZS_IOERROR;/        int r = ZS_IOERROR;/'
+
+mutant "open: directory accepted as a file" catch \
+  's/    if \(!S_ISREG\(sb.st_mode\)\) \{ zsi_file_close\(&f\); return ZS_BADFORMAT; \}/    \/* S_ISREG check removed *\//'
+
+echo
 echo "records and terminators (Task 4)"
 
 mutant "type: computed instead of tabled" catch \

@@ -69,7 +69,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check test asan mutate bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check test asan leaks mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -128,6 +128,25 @@ asan:
 	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address,undefined \
 		-fno-omit-frame-pointer -fno-sanitize-recover=all"
 	./zstest
+
+# Leak check.  AddressSanitizer includes LeakSanitizer on Linux but NOT on macOS,
+# so `make asan` alone proves nothing about leaks there -- hence the split.
+#
+# Both variants rebuild from clean, for the same reason `asan` does: every target
+# here produces a binary called `zstest`, so make cannot tell an instrumented one
+# from a plain one and will happily reuse whichever was built last.  Skipping the
+# clean made `make leaks` inspect an ASan build and fail with "malloc replacement
+# library without the required support", which reads like a tooling problem and is
+# really a stale binary.
+leaks:
+	$(MAKE) clean
+ifeq ($(UNAME_S),Darwin)
+	$(MAKE) zstest
+	MallocStackLogging=1 leaks --atExit -- ./zstest
+else
+	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address -fno-omit-frame-pointer"
+	ASAN_OPTIONS=detect_leaks=1 ./zstest
+endif
 
 # Verify the suite can actually fail, by introducing the bugs it guards against.
 # Slow (one full rebuild per mutant), so it is not part of `make check`.
