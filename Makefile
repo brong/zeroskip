@@ -74,13 +74,19 @@ all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
 # Object files
 #
-# -Wno-unused-function is scaffolding for bottom-up development: the internal
-# helpers land section by section, and until the public API is implemented some
-# of them genuinely have no caller in the library build.  zstest reaches them
-# all (it includes zeroskip.c), so they are not untested, merely not yet wired.
-# REMOVE THIS once the PUBLIC API section is complete -- a warning-free build
-# without it is the acceptance criterion for that task, and leaving it in would
-# hide genuinely dead code from then on.
+# -Wno-unused-function is scaffolding, and this is the checklist of what it is
+# still hiding.  It came off once when the public API landed, which immediately
+# exposed that the writer was rescanning the active file rather than maintaining
+# its index incrementally (D-13b) -- so it earns its keep as a to-do list.
+#
+#   zsi_staging_name          -> conversion (D-20a)
+#   zsi_ptrs_build            -> conversion and repack (D-21)
+#   zsi_ptrs_verify_records   -> consistency (F-26f)
+#   zsi_rec_is_canonical      -> consistency (F-15, T-6)
+#   zsi_term_is_canonical     -> consistency (F-15)
+#
+# REMOVE once the CONSISTENCY section is complete; a warning-free build without it
+# is that task's acceptance criterion.
 LIBCFLAGS = $(CFLAGS) -Wno-unused-function
 
 zeroskip.o: zeroskip.c zeroskip.h xxhash.h
@@ -149,7 +155,7 @@ leaks:
 	$(MAKE) clean
 ifeq ($(UNAME_S),Darwin)
 	$(MAKE) zstest
-	MallocStackLogging=1 leaks --atExit -- ./zstest
+	ZS_TEST_NO_FORK=1 MallocStackLogging=1 leaks --atExit -- ./zstest
 else
 	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address -fno-omit-frame-pointer"
 	ASAN_OPTIONS=detect_leaks=1 ./zstest

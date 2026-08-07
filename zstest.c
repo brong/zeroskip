@@ -140,6 +140,18 @@ static int cb_failures = 0;
     return; \
 } while (0)
 
+/* macOS's leaks(1) analyses a process at exit, and a forked child inherits that
+ * arrangement -- so each child tries to leak-check itself and the run never
+ * finishes.  `make leaks` therefore sets ZS_TEST_NO_FORK, and the fork-based tests
+ * skip rather than being filtered out by name, so the skip is visible in the
+ * summary instead of silently absent.
+ *
+ * Nothing is lost: on Linux the leak target uses LeakSanitizer, which has no such
+ * problem and runs the whole suite. */
+#define SKIP_IF_NO_FORK() do { \
+    if (getenv("ZS_TEST_NO_FORK")) SKIP("fork tests disabled (ZS_TEST_NO_FORK)"); \
+} while (0)
+
 /*
  * ============================================================
  * Per-test scratch directory
@@ -5422,6 +5434,8 @@ static void test_lock_basic(void)
 
 static void test_lock_byte_offsets(void)
 {
+    SKIP_IF_NO_FORK();
+
     /* C-1e: the byte offsets are normative, because implementations in different
      * languages must exclude each other.  Asserted against literals, and verified
      * with a raw fcntl call rather than through this library's own wrapper -- a
@@ -5470,6 +5484,8 @@ static void test_lock_byte_offsets(void)
 
 static void test_lock_excludes_other_process(void)
 {
+    SKIP_IF_NO_FORK();
+
     /* Two processes, exactly one proceeding.  The child holds the write lock for
      * a while; the parent's non-blocking take must report ZS_LOCKED and its
      * blocking take must wait. */
@@ -5523,6 +5539,8 @@ static void test_lock_excludes_other_process(void)
 
 static void test_lock_dies_with_process(void)
 {
+    SKIP_IF_NO_FORK();
+
     /* G-5: a writer SIGKILLed holding the lock never blocks the next one.
      *
      * The kernel releases fcntl locks on process death, so no lock state can
@@ -6670,6 +6688,591 @@ static void test_read_model(void)
 
 /*
  * ============================================================
+ * The write path and the public API (T-4)
+ * ============================================================
+ */
+
+static struct zs_db *fresh_db(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    clear_db();
+    setup.flags = ZS_CREATE;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
+/* Collect a whole database through the PUBLIC scan, so these tests exercise the
+ * same path a caller would. */
+static int api_collect_cb(void *rock, const char *key, size_t keylen,
+                          const char *val, size_t vallen)
+{
+    char *out = rock;
+    size_t used = strlen(out);
+    if (used) out[used++] = '|';
+    memcpy(out + used, key, keylen); used += keylen;
+    out[used++] = '=';
+    memcpy(out + used, val, vallen); used += vallen;
+    out[used] = '\0';
+    return 0;
+}
+
+static void api_scan(struct zs_db *db, char *out, size_t outlen)
+{
+    (void)outlen;
+    out[0] = '\0';
+    ASSERT_OK(zs_db_foreach(db, NULL, 0, NULL, api_collect_cb, out, 0));
+}
+
+static void test_write_basic(void)
+{
+    struct zs_db *db = fresh_db();
+    char got[512];
+    const char *v;
+    size_t vl;
+
+    ASSERT_NOT_NULL(db);
+
+    ASSERT_OK(zs_db_store(db, "b", 1, "two", 3, 0));
+    ASSERT_OK(zs_db_store(db, "a", 1, "one", 3, 0));
+    ASSERT_OK(zs_db_store(db, "c", 1, "three", 5, 0));
+
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 3u);
+    ASSERT_MEM_EQ(v, "one", 3);
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=one|b=two|c=three");
+
+    /* Overwrite. */
+    ASSERT_OK(zs_db_store(db, "b", 1, "TWO", 3, 0));
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "TWO", 3);
+
+    /* Delete, via the macro, which is a store of NULL (A-1b). */
+    ASSERT_OK(zs_db_delete(db, "b", 1, 0));
+    ASSERT_EQ(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=one|c=three");
+
+    /* A-1: an empty value is legal and DISTINCT from an absent key. */
+    ASSERT_OK(zs_db_store(db, "empty", 5, "", 0, 0));
+    ASSERT_OK(zs_db_fetch(db, "empty", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 0u);
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQ(zs_db_fetch(db, "absent", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* F-14: a zero-length key is invalid. */
+    ASSERT_EQ(zs_db_store(db, "", 0, "x", 1, 0), ZS_BADUSAGE);
+
+    /* Reopening sees everything. */
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=one|c=three|empty=");
+    zs_db_close(&db);
+}
+
+static void test_write_txn_isolation(void)
+{
+    /* A-1a: a write inside a transaction is visible to subsequent reads on that
+     * same transaction, and to nothing else until commit. */
+    struct zs_db *db = fresh_db();
+    struct zs_txn *txn = NULL;
+    const char *v;
+    size_t vl;
+    char got[512];
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "before", 6, "x", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "inside", 6, "y", 1, 0));
+
+    /* Read-your-own-writes. */
+    ASSERT_OK(zs_txn_fetch(txn, "inside", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "y", 1);
+
+    /* And the transaction's scan sees it, ordered among the committed records. */
+    got[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(txn, NULL, 0, NULL, api_collect_cb, got, 0));
+    ASSERT_STR_EQ(got, "before=x|inside=y");
+
+    /* A second handle does not, until commit. */
+    struct zs_db *other = open_db(0);
+    ASSERT_NOT_NULL(other);
+    ASSERT_EQ(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0),
+              ZS_NOTFOUND);
+
+    ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_NULL(txn);
+
+    /* Still not: `other` holds its own snapshot, taken before the commit.  A
+     * FRESH open sees it (G-4: a read transaction sees a fixed snapshot). */
+    ASSERT_EQ(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0),
+              ZS_NOTFOUND);
+    zs_db_close(&other);
+
+    other = open_db(0);
+    ASSERT_OK(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "y", 1);
+    zs_db_close(&other);
+    zs_db_close(&db);
+}
+
+static void test_write_abort(void)
+{
+    /* An aborted transaction leaves no visible records, and the ROLLBACK it
+     * appends is what stops a LATER commit's span enclosing them (F-21). */
+    struct zs_db *db = fresh_db();
+    struct zs_txn *txn = NULL;
+    char got[512];
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "keep", 4, "1", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "gone", 4, "2", 1, 0));
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_NULL(txn);
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "keep=1");
+
+    /* A commit after the abort: its records are live, the aborted ones are not.
+     * Without the ROLLBACK record this span would begin where the aborted records
+     * begin, and enclose them. */
+    ASSERT_OK(zs_db_store(db, "after", 5, "3", 1, 0));
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "after=3|keep=1");
+
+    /* And after reopening, which replays the file from scratch. */
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(0);
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "after=3|keep=1");
+
+    /* An empty transaction commits and aborts cleanly, leaving no trace. */
+    long before = 0;
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, db->uuid, 1, 0);
+    before = filesize(name);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_EQ(filesize(name), before);
+
+    zs_db_close(&db);
+}
+
+static void test_write_rollover(void)
+{
+    /* D-9a: a writer moves to a new file when the active file exceeds
+     * rollover_size.  Rollover is cheap -- a new header and nothing else, since
+     * the writer never appends a pointer section to an unordered file (D-11). */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char got[4096];
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 2048;         /* small, so a few writes cross it */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char val[256];
+    memset(val, 'v', sizeof(val));
+    for (int i = 0; i < 40; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
+    }
+
+    /* Several generations now exist, all unordered (nothing converts them yet). */
+    ASSERT(db->snap->nfiles > 1);
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        ASSERT(zsi_file_is_unordered(db->snap->files[i]));
+        ASSERT_EQU(db->snap->files[i]->nptrs, 0u);    /* D-11 */
+    }
+
+    /* Every record still reads back, across the file boundaries. */
+    for (int i = 0; i < 40; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "k%03d", i);
+        if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s missing after rollover\n", k);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+        ASSERT_EQU(vl, sizeof(val));
+    }
+
+    /* And the scan yields exactly 40, in order. */
+    got[0] = '\0';
+    size_t count = 0;
+    struct zs_cursor *c = NULL;
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED));
+    const char *k, *v;
+    size_t kl, vl;
+    char prev[16] = "";
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        char cur[16];
+        memcpy(cur, k, kl); cur[kl] = '\0';
+        if (prev[0]) ASSERT(strcmp(prev, cur) < 0);
+        snprintf(prev, sizeof(prev), "%s", cur);
+        count++;
+    }
+    zs_cursor_abort(&c);
+    ASSERT_EQU(count, 40u);
+
+    zs_db_close(&db);
+}
+
+static void test_write_unclean_rollover(void)
+{
+    /* D-9/R-4: an active file that is not clean is never appended to.  The writer
+     * moves to a new generation instead, so no chain is built on a boundary that
+     * failed to validate. */
+    struct zs_db *db = fresh_db();
+    char name[ZSI_NAME_MAX];
+    char got[512];
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    zsi_name_format(name, db->uuid, 1, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Append garbage behind the library's back, as a crash would leave. */
+    int fd = open(dbpath(name), O_WRONLY | O_APPEND);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(write(fd, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8), 8);
+    close(fd);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT(!zsi_unordered_is_clean(db->snap->files[0]));
+
+    /* The next write creates generation 2 rather than appending. */
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_EQU(db->snap->nfiles, 2u);
+    ASSERT_EQU(db->snap->files[1]->hdr.start, 2u);
+
+    /* Generation 1's committed record survives; the garbage is invisible. */
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=1|b=2");
+
+    zs_db_close(&db);
+}
+
+static void test_write_ancestors(void)
+{
+    /* Every row of F-17's table, checked in the bytes rather than through a
+     * round-trip, because the omission rule is what a peer implementation has to
+     * match exactly. */
+    struct zs_db *db = fresh_db();
+    struct zsi_rec r;
+    ASSERT_NOT_NULL(db);
+
+    /* Row 1: a new key written into the active file -- ancestor is its own
+     * generation, so OMITTED. */
+    ASSERT_OK(zs_db_store(db, "k", 1, "v1", 2, 0));
+    struct zsi_file *f = db->snap->files[0];
+    size_t off;
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* no ancestor stored */
+    ASSERT_EQU(r.ancestor, 1u);                     /* resolves to file start */
+
+    /* Row 2: the same key updated again in the SAME file -- the file holding what
+     * it supersedes is this one, so still OMITTED, and the record costs 4 bytes
+     * of header rather than 8 (F-17a). */
+    ASSERT_OK(zs_db_store(db, "k", 1, "v2", 2, 0));
+    f = db->snap->files[0];
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_EQ(r.type, ZSI_KEYVALUE);
+    ASSERT_MEM_EQ(r.val, "v2", 2);
+    zs_db_close(&db);
+
+    /* Row 3: a key last written in an OLDER file -- that file's start, which is
+     * lower, so STORED. */
+    clear_db();
+    { static const struct kv p[] = {{"k","old"},{NULL,NULL}};
+      put_inorder_kv(1, 1, p); }
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "new", 3, 0));
+
+    f = db->snap->files[db->snap->nfiles - 1];
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    ASSERT_EQ(r.type, ZSI_KEYVALUE_ANC);            /* stored */
+    ASSERT_EQU(r.ancestor, 1u);                     /* the older file's START */
+
+    /* A deletion of a key from an older file stores its ancestor too. */
+    ASSERT_OK(zs_db_delete(db, "k", 1, 0));
+    f = db->snap->files[db->snap->nfiles - 1];
+    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
+                             f->hdr.start, &r));
+    /* the newest version is now in this same file, so the ancestor is this
+     * file's start and is omitted again */
+    ASSERT_EQ(r.type, ZSI_DELETION);
+    ASSERT_NULL(r.val);
+
+    zs_db_close(&db);
+}
+
+static void test_write_encoding_boundaries(void)
+{
+    /* T-4's encoding boundaries, driven through the public API so the writer's
+     * form selection is what is being tested. */
+    struct zs_db *db = fresh_db();
+    const char *v;
+    size_t vl;
+    ASSERT_NOT_NULL(db);
+
+    char k255[256], k256[257];
+    memset(k255, 'a', 255); k255[255] = '\0';
+    memset(k256, 'b', 256); k256[256] = '\0';
+
+    char *v65535 = malloc(65535), *v65536 = malloc(65536);
+    ASSERT_NOT_NULL(v65535);
+    ASSERT_NOT_NULL(v65536);
+    memset(v65535, 'x', 65535);
+    memset(v65536, 'y', 65536);
+
+    ASSERT_OK(zs_db_store(db, k255, 255, "s", 1, 0));
+    ASSERT_OK(zs_db_store(db, k256, 256, "b", 1, 0));
+    ASSERT_OK(zs_db_store(db, "v1", 2, v65535, 65535, 0));
+    ASSERT_OK(zs_db_store(db, "v2", 2, v65536, 65536, 0));
+
+    /* Keys containing embedded NULs (F-13). */
+    const char knul[] = { 'n', '\0', 'u', '\0', 'l' };
+    const char vnul[] = { '\0', 'V', '\0' };
+    ASSERT_OK(zs_db_store(db, knul, 5, vnul, 3, 0));
+
+    /* A record landing exactly on an 8-byte boundary: keylen 3, vallen 0 gives
+     * roundup8(4 + 3 + 1 + 0 + 1) = 16, and keylen 2 vallen 0 gives exactly 8. */
+    ASSERT_OK(zs_db_store(db, "ab", 2, "", 0, 0));
+
+    /* All read back. */
+    ASSERT_OK(zs_db_fetch(db, k255, 255, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_OK(zs_db_fetch(db, k256, 256, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_OK(zs_db_fetch(db, "v1", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 65535u);
+    ASSERT_OK(zs_db_fetch(db, "v2", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 65536u);
+    ASSERT_OK(zs_db_fetch(db, knul, 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 3u);
+    ASSERT_MEM_EQ(v, vnul, 3);
+    ASSERT_OK(zs_db_fetch(db, "ab", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 0u);
+
+    /* And it all survives a reopen, which replays the file from scratch and so
+     * re-parses every form the writer chose (F-15). */
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, k256, 256, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_OK(zs_db_fetch(db, "v2", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 65536u);
+    ASSERT_OK(zs_db_fetch(db, knul, 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, vnul, 3);
+
+    free(v65535);
+    free(v65536);
+    zs_db_close(&db);
+}
+
+static void test_api_three_forms(void)
+{
+    /* A-0: every flag exercised through all three entry points -- database,
+     * transaction and cursor -- and asserted to behave IDENTICALLY.  The zs_db_*
+     * forms are literally wrappers, so a divergence would mean the wrapper had
+     * grown its own logic. */
+    struct zs_db *db;
+    struct zs_txn *txn = NULL;
+    const char *v;
+    size_t vl;
+
+    /* ZS_IFNOTEXIST */
+    db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "1", 1, ZS_IFNOTEXIST));
+    ASSERT_EQ(zs_db_store(db, "k", 1, "2", 1, ZS_IFNOTEXIST), ZS_EXISTS);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_EQ(zs_txn_store(txn, "k", 1, "3", 1, ZS_IFNOTEXIST), ZS_EXISTS);
+    ASSERT_OK(zs_txn_store(txn, "j", 1, "3", 1, ZS_IFNOTEXIST));
+    ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "1", 1);
+
+    /* ZS_IFEXIST */
+    ASSERT_OK(zs_db_store(db, "k", 1, "upd", 3, ZS_IFEXIST));
+    ASSERT_EQ(zs_db_store(db, "nope", 4, "x", 1, ZS_IFEXIST), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_EQ(zs_txn_store(txn, "nope", 4, "x", 1, ZS_IFEXIST), ZS_NOTFOUND);
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* ZS_IFEXIST composes with delete to mean "delete only if present" (A-1b). */
+    ASSERT_OK(zs_db_delete(db, "k", 1, ZS_IFEXIST));
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_delete(db, "k", 1, ZS_IFEXIST), ZS_NOTFOUND);
+
+    /* ZS_FETCHNEXT: the record AFTER the given key, through both forms. */
+    ASSERT_OK(zs_db_store(db, "a", 1, "A", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "B", 1, 0));
+    ASSERT_OK(zs_db_store(db, "c", 1, "C", 1, 0));
+
+    const char *k2;
+    size_t kl2;
+    ASSERT_OK(zs_db_fetch(db, "a", 1, &k2, &kl2, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_EQU(kl2, 1u);
+    ASSERT_MEM_EQ(k2, "b", 1);
+
+    ASSERT_OK(zs_db_begin_txn(db, 1, &txn));
+    ASSERT_OK(zs_txn_fetch(txn, "a", 1, &k2, &kl2, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k2, "b", 1);
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* past the last key */
+    ASSERT_EQ(zs_db_fetch(db, "zz", 2, &k2, &kl2, &v, &vl, ZS_FETCHNEXT),
+              ZS_NOTFOUND);
+
+    zs_db_close(&db);
+}
+
+static void test_api_cursor_replace(void)
+{
+    /* A cursor from a database owns an implicit transaction; replace writes at
+     * the cursor's current key, and commit ends the transaction. */
+    struct zs_db *db = fresh_db();
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    char got[512];
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "a", 1);
+    ASSERT_OK(zs_cursor_replace(c, "ONE", 3, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "b", 1);
+    ASSERT_OK(zs_cursor_delete(c, 0));      /* a replace with NULL (A-1b) */
+    ASSERT_OK(zs_cursor_commit(&c));
+    ASSERT_NULL(c);
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=ONE|c=3");
+
+    /* An aborted cursor discards its writes. */
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_OK(zs_cursor_replace(c, "zzz", 3, 0));
+    ASSERT_OK(zs_cursor_abort(&c));
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=ONE|c=3");
+
+    /* Replacing before the first next is a usage error, not a silent no-op. */
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, 0));
+    ASSERT_EQ(zs_cursor_replace(c, "x", 1, 0), ZS_BADUSAGE);
+    ASSERT_OK(zs_cursor_abort(&c));
+
+    zs_db_close(&db);
+}
+
+static void test_api_readonly(void)
+{
+    /* A-5: ZS_SHARED is read-only and MUST NOT write. */
+    struct zs_db *db = fresh_db();
+    struct zs_txn *txn = NULL;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    setup.flags = ZS_SHARED;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    ASSERT_EQ(zs_db_store(db, "x", 1, "y", 1, 0), ZS_READONLY);
+    ASSERT_EQ(zs_db_delete(db, "k", 1, 0), ZS_READONLY);
+    ASSERT_EQ(zs_db_begin_txn(db, 0, &txn), ZS_READONLY);
+    ASSERT_NULL(txn);
+
+    /* Reads work. */
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
+
+    /* A read transaction works. */
+    ASSERT_OK(zs_db_begin_txn(db, 1, &txn));
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQ(zs_txn_store(txn, "x", 1, "y", 1, 0), ZS_READONLY);
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    zs_db_close(&db);
+}
+
+static void test_api_pointer_lifetime(void)
+{
+    /* A-4: a pointer from zs_db_fetch stays valid until the NEXT call on that
+     * handle.  Records from a mapping are stable for the snapshot's life; a
+     * record from a transaction's pending array is not, so the wrapper copies it
+     * -- and this is the case that would dangle if it did not.
+     *
+     * Run under ASan, where a violation is caught rather than merely observed to
+     * work by luck. */
+    struct zs_db *db = fresh_db();
+    const char *v;
+    size_t vl;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "value", 5, 0));
+
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 5u);
+    ASSERT_MEM_EQ(v, "value", 5);
+
+    /* Still readable before the next call. */
+    ASSERT_MEM_EQ(v, "value", 5);
+
+    /* A transaction's pointers live as long as the transaction. */
+    struct zs_txn *txn = NULL;
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "pend", 4, "fromtxn", 7, 0));
+    const char *pv;
+    size_t pvl;
+    ASSERT_OK(zs_txn_fetch(txn, "pend", 4, NULL, NULL, &pv, &pvl, 0));
+    ASSERT_MEM_EQ(pv, "fromtxn", 7);
+    /* more writes, then re-read the earlier pointer */
+    ASSERT_OK(zs_txn_store(txn, "other", 5, "z", 1, 0));
+    ASSERT_MEM_EQ(pv, "fromtxn", 7);
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -6802,6 +7405,18 @@ static struct test_entry tests[] = {
     { "test_read_seek_and_flags",       test_read_seek_and_flags },
     { "test_read_prefix_across_files",  test_read_prefix_across_files },
     { "test_read_model",                test_read_model },
+
+    { "test_write_basic",               test_write_basic },
+    { "test_write_txn_isolation",       test_write_txn_isolation },
+    { "test_write_abort",               test_write_abort },
+    { "test_write_rollover",            test_write_rollover },
+    { "test_write_unclean_rollover",    test_write_unclean_rollover },
+    { "test_write_ancestors",           test_write_ancestors },
+    { "test_write_encoding_boundaries", test_write_encoding_boundaries },
+    { "test_api_three_forms",           test_api_three_forms },
+    { "test_api_cursor_replace",        test_api_cursor_replace },
+    { "test_api_readonly",              test_api_readonly },
+    { "test_api_pointer_lifetime",      test_api_pointer_lifetime },
 
     { NULL, NULL }
 };

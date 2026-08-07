@@ -1345,6 +1345,33 @@ static int zsi_file_open(const char *dir, const char *name,
     return ZS_OK;
 }
 
+/* Re-stat and re-map after appending, so bytes written through a separate
+ * descriptor become visible through this object.
+ *
+ * Needed because a writer maintains the active file's index incrementally
+ * (D-13b) and the index holds offsets that must be readable.  Only ever called
+ * on a file nobody else is reading -- see the refcount guard at the call site --
+ * because replacing a mapping under a live reader is exactly what G-6 forbids. */
+static int zsi_file_remap(struct zsi_file *f)
+{
+    struct stat sb;
+
+    if (fstat(f->fd, &sb) < 0) return ZS_IOERROR;
+    if ((size_t)sb.st_size == f->size) return ZS_OK;
+
+    if (f->base) { munmap((void *)f->base, f->maplen); f->base = NULL; f->maplen = 0; }
+    f->size = (size_t)sb.st_size;
+
+    if (f->size) {
+        void *m = mmap(NULL, f->size, PROT_READ, MAP_SHARED, f->fd, 0);
+        if (m == MAP_FAILED) { f->size = 0; return ZS_IOERROR; }
+        f->base = (const char *)m;
+        f->maplen = f->size;
+    }
+
+    return ZS_OK;
+}
+
 /* Which kind of file this is, from the header alone.
  *
  * The two kinds are exhaustive and distinguishable before reading anything else,
@@ -3035,6 +3062,71 @@ static int zsi_check_writable(struct zs_db *db)
     return db->readonly ? ZS_READONLY : ZS_OK;
 }
 
+/* Create generation 1: a 72-byte header and no spans, which F-26h makes a legal
+ * empty file (D-8a).
+ *
+ * C-6: after creating a DATA FILE the directory is fdatasync'd, otherwise the
+ * name may be absent after a crash even though the file's contents are durable. */
+static int zsi_create_active(struct zs_db *db, uint32_t gen)
+{
+    char name[ZSI_NAME_MAX], path[PATH_MAX], hdr[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = gen;
+    h.end = 0;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+
+    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    if (!cs) return ZS_BADUSAGE;
+    zsi_header_encode(hdr, &h, cs);
+
+    zsi_name_format(name, db->uuid, gen, 0);
+    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
+
+    /* O_EXCL: creating a file IS publishing it (D-8), so a collision would mean
+     * another writer allocated the same generation -- which D-9b makes
+     * impossible, and which must therefore fail loudly rather than truncate. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return ZS_IOERROR;
+
+    ssize_t n = write(fd, hdr, sizeof(hdr));
+    if (n != (ssize_t)sizeof(hdr)) { close(fd); return ZS_IOERROR; }
+    if (!db->nosync && fdatasync(fd) < 0) { close(fd); return ZS_IOERROR; }
+    close(fd);
+
+    if (!db->nosync) {
+        int dfd = open(db->dir, O_RDONLY);
+        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+    }
+
+    return ZS_OK;
+}
+
+/* Refresh db->snap.  Used by open and by every zs_db_* call that needs a current
+ * view; a transaction holds its own snapshot for its lifetime. */
+static int zsi_db_refresh(struct zs_db *db)
+{
+    struct zsi_snapshot *s = NULL;
+    int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
+                              db->compar, db->external_csum, db->nocsum, &s);
+    if (r != ZS_OK) return r;
+
+    zsi_snapshot_release(&db->snap);
+    db->snap = s;
+
+    if (!db->have_uuid && s->nfiles) {
+        memcpy(db->uuid, s->files[0]->hdr.uuid, 16);
+        db->have_uuid = true;
+    }
+
+    return ZS_OK;
+}
+
 /********** READ PATH *************/
 
 /* Every read draws on the same set of SOURCES, ordered newest to oldest (D-14):
@@ -3342,25 +3434,500 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 
 /********** WRITE PATH *************/
 
-/* The transaction arm of the per-file cursor.
+/* A transaction's own uncommitted records: owned copies, sorted by key.
  *
- * A write transaction's uncommitted records are the highest-priority source in
- * D-14's table, and they are presented through the same interface as a file so
- * the merge needs no special case.  Until the transaction type exists these
- * report an exhausted source, which is exactly right for a read transaction: it
- * has no pending records, so the arm is not merely a placeholder. */
+ * They are the highest-priority source in D-14's table, visible to subsequent
+ * reads on the same transaction and to nothing else until commit (A-1a). */
+struct zsi_pending {
+    char   *key;  size_t keylen;
+    char   *val;  size_t vallen;      /* val == NULL is a deletion (A-1) */
+};
+
+struct zs_txn {
+    struct zs_db        *db;
+    struct zsi_snapshot *snap;        /* the transaction's fixed snapshot */
+    bool                 readonly;
+    bool                 holds_write_lock;
+
+    struct zsi_pending  *pend;
+    size_t               npend, apend;
+
+    /* Backing for pointers returned by this transaction's reads, so A-4's
+     * lifetime promise holds for records that came from the pending array rather
+     * than from a mapping. */
+    char                *retbuf;
+    size_t               retalloc;
+};
+
+static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
+                           size_t *pos)
+{
+    size_t lo = 0, hi = txn->npend;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = txn->db->compar(txn->pend[mid].key, txn->pend[mid].keylen,
+                                key, keylen);
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    *pos = lo;
+    if (lo < txn->npend
+        && txn->db->compar(txn->pend[lo].key, txn->pend[lo].keylen,
+                           key, keylen) == 0)
+        return ZS_OK;
+
+    return ZS_NOTFOUND;
+}
+
+static void zsi_pend_clear(struct zs_txn *txn)
+{
+    for (size_t i = 0; i < txn->npend; i++) {
+        free(txn->pend[i].key);
+        free(txn->pend[i].val);
+    }
+    txn->npend = 0;
+}
+
+/* Record a write.  val == NULL is a deletion; a non-NULL zero-length value is an
+ * empty value, and the two are distinct states (A-1, F-14). */
+static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
+                        const char *val, size_t vallen)
+{
+    size_t pos;
+    bool found = (zsi_pend_search(txn, key, keylen, &pos) == ZS_OK);
+
+    char *kcopy = NULL, *vcopy = NULL;
+    if (!found) {
+        kcopy = malloc(keylen);
+        if (!kcopy) return ZS_INTERNAL;
+        memcpy(kcopy, key, keylen);
+    }
+    if (val) {
+        vcopy = malloc(vallen ? vallen : 1);
+        if (!vcopy) { free(kcopy); return ZS_INTERNAL; }
+        if (vallen) memcpy(vcopy, val, vallen);
+    }
+
+    if (found) {
+        free(txn->pend[pos].val);
+        txn->pend[pos].val = vcopy;
+        txn->pend[pos].vallen = val ? vallen : 0;
+        return ZS_OK;
+    }
+
+    if (txn->npend == txn->apend) {
+        size_t want = txn->apend ? txn->apend * 2 : 16;
+        struct zsi_pending *p = realloc(txn->pend, want * sizeof(*p));
+        if (!p) { free(kcopy); free(vcopy); return ZS_INTERNAL; }
+        txn->pend = p;
+        txn->apend = want;
+    }
+
+    memmove(txn->pend + pos + 1, txn->pend + pos,
+            (txn->npend - pos) * sizeof(*txn->pend));
+    txn->pend[pos].key = kcopy;
+    txn->pend[pos].keylen = keylen;
+    txn->pend[pos].val = vcopy;
+    txn->pend[pos].vallen = val ? vallen : 0;
+    txn->npend++;
+
+    return ZS_OK;
+}
+
+/* The transaction arm of the per-file cursor (declared in PER-FILE CURSOR).
+ *
+ * Presenting pending records through the same interface as a file is what lets
+ * D-14g work by sorting rather than by a special case in the merge. */
 static int zsi_txn_cur_load(struct zsi_fcur *fc)
 {
-    if (!fc->txn) { fc->exhausted = true; return ZS_OK; }
-    fc->exhausted = true;
+    struct zs_txn *txn = fc->txn;
+
+    if (!txn || fc->ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
+
+    struct zsi_pending *p = &txn->pend[fc->ti];
+    memset(&fc->cur, 0, sizeof(fc->cur));
+    fc->cur.type = p->val ? ZSI_KEYVALUE : ZSI_DELETION;
+    fc->cur.key = p->key;
+    fc->cur.keylen = p->keylen;
+    fc->cur.val = p->val;
+    fc->cur.vallen = p->vallen;
+    fc->exhausted = false;
+
     return ZS_OK;
 }
 
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
 {
-    (void)key;
-    (void)keylen;
-    fc->ti = 0;
+    size_t pos = 0;
+
+    if (fc->txn) zsi_pend_search(fc->txn, key, keylen, &pos);
+    fc->ti = pos;
+}
+
+/* Append bytes to a file descriptor, retrying a short write. */
+static int zsi_write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return ZS_IOERROR;
+        }
+        if (n == 0) return ZS_IOERROR;
+        off += (size_t)n;
+    }
+
+    return ZS_OK;
+}
+
+/* Decide the ancestor for a record about to be written (F-16, F-17).
+ *
+ * The ancestor is the START of the range of the file holding the superseded
+ * record (F-16a) -- not its end.  Since start <= end, D-19's containment test then
+ * errs toward RETAINING a tombstone rather than dropping one, so an imprecise
+ * ancestor costs disk space and not correctness.
+ *
+ * F-17: it is omitted exactly when it equals the containing file's start.  That
+ * single rule covers every row of the table -- a new key, a key rewritten in the
+ * same file, and a key last written in an older file -- and F-17a notes why the
+ * decoder never needs to know which case applied.
+ *
+ * Returns the ancestor generation.  The caller omits it when it equals active. */
+static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
+                                 uint32_t active_start,
+                                 const char *key, size_t keylen)
+{
+    /* Search newest to oldest for the file that currently holds this key.  The
+     * active file included: a key rewritten within it takes the active start,
+     * which F-17 then omits. */
+    for (size_t i = snap->nfiles; i-- > 0; ) {
+        struct zsi_fcur fc;
+        struct zsi_rec r;
+
+        zsi_fcur_init_file(&fc, snap->files[i], db->compar);
+        if (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK)
+            return snap->files[i]->hdr.start;
+    }
+
+    /* A key nobody holds is a create: its ancestor is its own generation, which
+     * is the active file's start, and so is omitted. */
+    return active_start;
+}
+
+/* Choose the file a write transaction will append to (D-9).
+ *
+ * While holding the write lock, a writer MUST either append to a CLEAN active
+ * file, or create a new unordered file whose generation is exactly one higher,
+ * write a valid header, and append there.
+ *
+ * D-9a: it moves on when the active file is not clean, or when it exceeds
+ * rollover_size.  Rollover is cheap -- a new header and nothing else, since the
+ * writer never appends a pointer section to an unordered file (D-11).
+ *
+ * D-10 and R-4: an unclean file is not repaired.  Because it is not clean the
+ * writer moves on, so no chain is ever built on an untrustworthy boundary. */
+static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
+{
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    char name[ZSI_NAME_MAX], path[PATH_MAX];
+
+    if (act && zsi_unordered_is_clean(act)
+            && act->size < db->rollover_size) {
+        snprintf(path, sizeof(path), "%s", act->fname);
+        int fd = open(path, O_WRONLY | O_APPEND);
+        if (fd < 0) return ZS_IOERROR;
+        *fdp = fd;
+        *genp = act->hdr.start;
+        return ZS_OK;
+    }
+
+    /* A new generation, one above the highest PRESENT (D-9b), so a superseded
+     * file's generation is never reissued. */
+    struct zsi_fileset fs;
+    int r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
+    if (r != ZS_OK) return r;
+
+    uint32_t next;
+    r = zsi_fileset_next_gen(&fs, &next);
+    zsi_fileset_fini(&fs);
+    if (r != ZS_OK) return r;           /* ZS_FULL past 0xFFFFFFFF (D-9c) */
+
+    r = zsi_create_active(db, next);
+    if (r != ZS_OK) return r;
+
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) return r;
+
+    zsi_name_format(name, db->uuid, next, 0);
+    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
+    int fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return ZS_IOERROR;
+
+    *fdp = fd;
+    *genp = next;
+    return ZS_OK;
+}
+
+/* Commit: two gates (C-7).
+ *
+ *   1. append the span's data records, then fdatasync;
+ *   2. append the terminator, then fdatasync again.
+ *
+ * fdatasync rather than fsync because appending changes only the metadata needed
+ * to read the data back, which fdatasync is required to flush.
+ *
+ * Together the gates make "a valid terminator implies its data is durable" a
+ * guarantee of the filesystem (C-7a).  The cost is two syncs per TRANSACTION, not
+ * per record, which is the reason zs_txn_* exists alongside the single-operation
+ * zs_db_* calls (C-7b).
+ *
+ * C-7c: ZS_NOSYNC omits BOTH gates.  Atomicity survives, because a torn tail is
+ * still detectable (F-22); durability does not, and neither does C-7a's ordering
+ * guarantee. */
+static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
+                              bool rollback_only, size_t base_off,
+                              size_t **offs_out, size_t *noffs_out)
+{
+    struct zs_db *db = txn->db;
+    char *span = NULL;
+    size_t spanlen = 0, alloc = 0;
+    size_t *offs = NULL, noffs = 0;
+    int r = ZS_OK;
+
+    if (offs_out) { *offs_out = NULL; *noffs_out = 0; }
+
+    if (!rollback_only && txn->npend) {
+        offs = malloc(txn->npend * sizeof(*offs));
+        if (!offs) return ZS_INTERNAL;
+    }
+
+    if (!rollback_only) {
+        for (size_t i = 0; i < txn->npend; i++) {
+            struct zsi_pending *p = &txn->pend[i];
+
+            uint32_t anc = zsi_ancestor_for(db, txn->snap, active_start,
+                                            p->key, p->keylen);
+            bool store_anc = (anc != active_start);      /* F-17 */
+
+            size_t n = zsi_rec_encoded_len(p->keylen, p->vallen,
+                                           p->val == NULL, store_anc);
+            if (!n) { free(span); free(offs); return ZS_BADUSAGE; }
+
+            if (spanlen + n > alloc) {
+                size_t want = alloc ? alloc * 2 : 4096;
+                while (want < spanlen + n) want *= 2;
+                char *q = realloc(span, want);
+                if (!q) { free(span); free(offs); return ZS_INTERNAL; }
+                span = q;
+                alloc = want;
+            }
+
+            zsi_rec_encode(span + spanlen, p->key, p->keylen, p->val, p->vallen,
+                           store_anc, anc);
+            if (offs) offs[noffs++] = base_off + spanlen;
+            spanlen += n;
+        }
+    }
+
+    /* Gate 1: the data records, then a sync.  If this fails, no terminator was
+     * written, so the transaction plainly did not happen (C-7a). */
+    if (spanlen) {
+        r = zsi_write_all(fd, span, spanlen);
+        if (r != ZS_OK) { free(span); free(offs); return r; }
+    }
+
+    if (!db->nosync && !rollback_only) {
+        if (fdatasync(fd) < 0) { free(span); free(offs); return ZS_IOERROR; }
+    }
+
+    /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may or
+     * may not be durable -- and either outcome is correct, so the error is
+     * reported and nothing else is done.
+     *
+     * An implementation MUST NOT retry a failed sync and treat success as
+     * evidence the data survived: a second call can succeed after the dirty pages
+     * were discarded.  Retrying a failed syscall is the reflex, which is why this
+     * says so at the call site rather than only in the spec. */
+    char term[ZSI_TERMLEN_LONG];
+    size_t termlen = zsi_term_encoded_len((uint64_t)spanlen);
+    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
+
+    zsi_term_encode(term, (uint64_t)spanlen, rollback_only,
+                    span ? span : "", cs, db->create_csum_id);
+
+    r = zsi_write_all(fd, term, termlen);
+    free(span);
+    if (r != ZS_OK) { free(offs); return r; }
+
+    /* C-8: an aborted transaction appends a ROLLBACK and syncs NEITHER gate.  If
+     * a crash loses it the active file is simply no longer clean, so the next
+     * writer moves to a new file and reaches the same state.  Nothing is being
+     * promised to a caller, so there is nothing to make durable. */
+    if (!db->nosync && !rollback_only) {
+        if (fdatasync(fd) < 0) { free(offs); return ZS_IOERROR; }
+    }
+
+    if (offs_out) { *offs_out = offs; *noffs_out = noffs; }
+    else free(offs);
+
+    return ZS_OK;
+}
+
+static void zsi_txn_free(struct zs_txn *txn)
+{
+    if (!txn) return;
+
+    zsi_pend_clear(txn);
+    free(txn->pend);
+    free(txn->retbuf);
+    zsi_snapshot_release(&txn->snap);
+    free(txn);
+}
+
+static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
+{
+    struct zs_txn *txn;
+    int r;
+
+    if (!shared) {
+        r = zsi_check_writable(db);
+        if (r != ZS_OK) return r;
+        if (db->write_txn) return ZS_BADUSAGE;      /* one at a time */
+    }
+
+    txn = zsi_zmalloc(sizeof(*txn));
+    if (!txn) return ZS_INTERNAL;
+    txn->db = db;
+    txn->readonly = shared;
+
+    if (!shared) {
+        /* The write lock is held for the whole transaction (C-1).  A read
+         * transaction takes NO lock (C-2, G-4). */
+        r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
+                          db->nonblocking ? ZS_NONBLOCKING : 0);
+        if (r != ZS_OK) { free(txn); return r; }
+        txn->holds_write_lock = true;
+
+        /* Refresh only after the lock: the set may have changed while we waited,
+         * and appending to a stale view of the active file would append to a file
+         * another writer has already moved past. */
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) {
+            zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+            free(txn);
+            return r;
+        }
+    }
+
+    txn->snap = db->snap;
+    txn->snap->refcount++;
+
+    if (!shared) db->write_txn = txn;
+
+    *out = txn;
+    return ZS_OK;
+}
+
+static int zsi_txn_commit(struct zs_txn *txn)
+{
+    struct zs_db *db = txn->db;
+    int fd = -1, r;
+    uint32_t gen = 0;
+    size_t *offs = NULL, noffs = 0;
+
+    if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
+
+    /* Nothing to write: no span, no syncs, no rollover.  An empty transaction is
+     * not an error and must not leave a trace. */
+    if (txn->npend == 0) {
+        db->write_txn = NULL;
+        zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+        zsi_txn_free(txn);
+        return ZS_OK;
+    }
+
+    r = zsi_writer_active(db, &fd, &gen);
+    if (r != ZS_OK) goto out;
+
+    /* The snapshot may have been replaced by a rollover, and the ancestor search
+     * must see the file set as it is now. */
+    zsi_snapshot_release(&txn->snap);
+    txn->snap = db->snap;
+    txn->snap->refcount++;
+
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    size_t base_off = act ? act->size : 0;
+
+    r = zsi_txn_write_span(txn, fd, gen, false, base_off, &offs, &noffs);
+    close(fd);
+    fd = -1;
+    if (r != ZS_OK) goto out;
+
+    /* D-13b: a writer is a reader that also maintains the active file's index
+     * INCREMENTALLY.  It already knows every record it appended, so it folds them
+     * in rather than rescanning a file it is writing -- which matters because a
+     * rescan is O(active file) per commit, making a bulk load quadratic.
+     *
+     * Only when this handle is the sole holder of the snapshot.  A cursor opened
+     * from the same handle shares the object, and replacing its mapping or
+     * mutating its index underneath would be exactly the in-place mutation of
+     * something a reader is reading that G-6 forbids.  With a sharer present the
+     * fallback is a full refresh, which builds a NEW snapshot and leaves the old
+     * one untouched. */
+    if (act && offs && db->snap->refcount == 1
+        && act->hdr.start == gen && act->index) {
+        r = zsi_file_remap(act);
+        if (r == ZS_OK) {
+            act->complete = act->size;
+            for (size_t i = 0; i < noffs && r == ZS_OK; i++)
+                r = zsi_index_insert(act->index, db->compar, offs[i]);
+        }
+        /* A failure here is not fatal to the commit -- the data is on disk and
+         * durable.  Fall back to a rebuild so this handle's view is correct. */
+        if (r != ZS_OK) r = zsi_db_refresh(db);
+    } else {
+        r = zsi_db_refresh(db);
+    }
+
+out:
+    free(offs);
+    if (fd >= 0) close(fd);
+    db->write_txn = NULL;
+    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+    zsi_txn_free(txn);
+    return r;
+}
+
+static int zsi_txn_abort(struct zs_txn *txn)
+{
+    struct zs_db *db = txn->db;
+    int fd = -1, r = ZS_OK;
+    uint32_t gen = 0;
+
+    if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
+
+    /* F-21: without a ROLLBACK, a later commit's span would enclose the aborted
+     * records and make them live.  That is the only reason the record exists, and
+     * it is why an abort that wrote nothing needs no record at all. */
+    if (txn->npend) {
+        r = zsi_writer_active(db, &fd, &gen);
+        if (r == ZS_OK) {
+            r = zsi_txn_write_span(txn, fd, gen, true, 0, NULL, NULL);
+            close(fd);
+            fd = -1;
+            if (r == ZS_OK) r = zsi_db_refresh(db);
+        }
+    }
+
+    if (fd >= 0) close(fd);
+    db->write_txn = NULL;
+    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+    zsi_txn_free(txn);
+    return r;
 }
 
 /********** CONVERSION *************/
@@ -3384,71 +3951,6 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
  * ever appended past a boundary that failed to validate, so a spurious terminator
  * in trailing garbage -- which a checksum can never wholly exclude -- cannot
  * become the foundation of a later chain.  Generations are cheap. */
-
-/* Create generation 1: a 72-byte header and no spans, which F-26h makes a legal
- * empty file (D-8a).
- *
- * C-6: after creating a DATA FILE the directory is fdatasync'd, otherwise the
- * name may be absent after a crash even though the file's contents are durable. */
-static int zsi_create_active(struct zs_db *db, uint32_t gen)
-{
-    char name[ZSI_NAME_MAX], path[PATH_MAX], hdr[ZSI_HEADER_LEN];
-    struct zsi_header h;
-
-    memset(&h, 0, sizeof(h));
-    h.version_read = ZSI_VERSION_READ;
-    h.version_write = ZSI_VERSION_WRITE;
-    h.flags = (uint16_t)db->create_csum_id;
-    memcpy(h.uuid, db->uuid, 16);
-    h.start = gen;
-    h.end = 0;
-    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
-
-    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
-    if (!cs) return ZS_BADUSAGE;
-    zsi_header_encode(hdr, &h, cs);
-
-    zsi_name_format(name, db->uuid, gen, 0);
-    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
-
-    /* O_EXCL: creating a file IS publishing it (D-8), so a collision would mean
-     * another writer allocated the same generation -- which D-9b makes
-     * impossible, and which must therefore fail loudly rather than truncate. */
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) return ZS_IOERROR;
-
-    ssize_t n = write(fd, hdr, sizeof(hdr));
-    if (n != (ssize_t)sizeof(hdr)) { close(fd); return ZS_IOERROR; }
-    if (!db->nosync && fdatasync(fd) < 0) { close(fd); return ZS_IOERROR; }
-    close(fd);
-
-    if (!db->nosync) {
-        int dfd = open(db->dir, O_RDONLY);
-        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
-    }
-
-    return ZS_OK;
-}
-
-/* Refresh db->snap.  Used by open and by every zs_db_* call that needs a current
- * view; a transaction holds its own snapshot for its lifetime. */
-static int zsi_db_refresh(struct zs_db *db)
-{
-    struct zsi_snapshot *s = NULL;
-    int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
-                              db->compar, db->external_csum, db->nocsum, &s);
-    if (r != ZS_OK) return r;
-
-    zsi_snapshot_release(&db->snap);
-    db->snap = s;
-
-    if (!db->have_uuid && s->nfiles) {
-        memcpy(db->uuid, s->files[0]->hdr.uuid, 16);
-        db->have_uuid = true;
-    }
-
-    return ZS_OK;
-}
 
 /* Every file of a database MUST carry the same UUID and the same comparator name
  * (F-11).  The comparator determines key order and hence the meaning of the
@@ -3631,6 +4133,376 @@ int zs_db_close(struct zs_db **dbp)
 }
 
 /********** PUBLIC API *************/
+
+/* A-0: every read and write entry point exists in three forms -- on the database,
+ * on a transaction, and via a cursor -- and all three take flags.  The zs_db_*
+ * forms are convenience wrappers that open an implicit single-operation
+ * transaction, implemented LITERALLY as wrappers so the wrapped path is the only
+ * path and there is no operation reachable one way but not another.
+ *
+ * A-2: there is no yield call and no yield flags, because readers hold no lock and
+ * so have nothing to yield.  A-3: there is no MVCC flag, because snapshot
+ * isolation is the only read mode.  twom has both; porting them here would be
+ * copying an answer to a question this design does not ask. */
+
+/* A-4: pointers returned by a zs_db_* call stay valid until the next call on that
+ * handle.  Records read from a mapped file are stable for the snapshot's life, so
+ * those are returned directly; a record from a transaction's pending array dies
+ * with the implicit transaction, so it is copied into handle-owned scratch.  This
+ * is the only case that needs a buffer. */
+static int zsi_db_retain(struct zs_db *db, const struct zsi_rec *r,
+                         const char **keyp, size_t *keylenp,
+                         const char **valp, size_t *vallenp)
+{
+    size_t need = r->keylen + (r->val ? r->vallen : 0) + 2;
+
+    if (need > db->retalloc) {
+        char *p = realloc(db->retbuf, need);
+        if (!p) return ZS_INTERNAL;
+        db->retbuf = p;
+        db->retalloc = need;
+    }
+
+    memcpy(db->retbuf, r->key, r->keylen);
+    db->retbuf[r->keylen] = '\0';
+    if (r->val && r->vallen)
+        memcpy(db->retbuf + r->keylen + 1, r->val, r->vallen);
+    db->retbuf[r->keylen + 1 + (r->val ? r->vallen : 0)] = '\0';
+
+    if (keyp) *keyp = db->retbuf;
+    if (keylenp) *keylenp = r->keylen;
+    if (valp) *valp = db->retbuf + r->keylen + 1;
+    if (vallenp) *vallenp = r->val ? r->vallen : 0;
+
+    return ZS_OK;
+}
+
+/* transactions */
+
+int zs_db_begin_txn(struct zs_db *db, int shared, struct zs_txn **txnp)
+{
+    if (!db || !txnp) return ZS_BADUSAGE;
+    *txnp = NULL;
+    return zsi_txn_begin(db, shared != 0, txnp);
+}
+
+int zs_txn_commit(struct zs_txn **txnp)
+{
+    struct zs_txn *txn;
+
+    if (!txnp || !*txnp) return ZS_BADUSAGE;
+    txn = *txnp;
+    *txnp = NULL;
+    return zsi_txn_commit(txn);
+}
+
+int zs_txn_abort(struct zs_txn **txnp)
+{
+    struct zs_txn *txn;
+
+    if (!txnp || !*txnp) return ZS_BADUSAGE;
+    txn = *txnp;
+    *txnp = NULL;
+    return zsi_txn_abort(txn);
+}
+
+/* fetch */
+
+int zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
+                 const char **keyp, size_t *keylenp,
+                 const char **valp, size_t *vallenp, int flags)
+{
+    struct zsi_rec r;
+    int rc;
+
+    if (!txn || !key) return ZS_BADUSAGE;
+    if (keylen < 1) return ZS_BADUSAGE;
+
+    /* ZS_FETCHNEXT: return the record AFTER the given key.  A cursor seeked to
+     * the key with ZS_SKIPROOT is exactly that, so it shares the merge rather than
+     * reimplementing "next". */
+    if (flags & ZS_FETCHNEXT) {
+        struct zs_cursor *c = NULL;
+        rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
+                             key, keylen, ZS_SKIPROOT, &c);
+        if (rc != ZS_OK) return rc;
+        rc = zsi_cursor_next(c, &r);
+        if (rc == ZS_OK) {
+            if (keyp) *keyp = r.key;
+            if (keylenp) *keylenp = r.keylen;
+            if (valp) *valp = r.val;
+            if (vallenp) *vallenp = r.vallen;
+        } else {
+            rc = ZS_NOTFOUND;
+        }
+        zsi_cursor_free(c);
+        return rc;
+    }
+
+    rc = zsi_lookup(txn->db, txn->snap, txn->readonly ? NULL : txn,
+                    key, keylen, &r);
+    if (rc != ZS_OK) return rc;
+
+    if (keyp) *keyp = r.key;
+    if (keylenp) *keylenp = r.keylen;
+    if (valp) *valp = r.val;
+    if (vallenp) *vallenp = r.vallen;
+    return ZS_OK;
+}
+
+int zs_db_fetch(struct zs_db *db, const char *key, size_t keylen,
+                const char **keyp, size_t *keylenp,
+                const char **valp, size_t *vallenp, int flags)
+{
+    struct zs_txn *txn = NULL;
+    struct zsi_rec r;
+    int rc;
+
+    if (!db || !key) return ZS_BADUSAGE;
+
+    rc = zs_db_begin_txn(db, 1, &txn);
+    if (rc != ZS_OK) return rc;
+
+    const char *k = NULL, *v = NULL;
+    size_t kl = 0, vl = 0;
+    rc = zs_txn_fetch(txn, key, keylen, &k, &kl, &v, &vl, flags);
+
+    if (rc == ZS_OK) {
+        r.key = k; r.keylen = kl;
+        r.val = v; r.vallen = vl;
+        r.type = ZSI_KEYVALUE;
+        rc = zsi_db_retain(db, &r, keyp, keylenp, valp, vallenp);
+    }
+
+    zs_txn_abort(&txn);
+    return rc;
+}
+
+/* store */
+
+int zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
+                 const char *val, size_t vallen, int flags)
+{
+    struct zsi_rec r;
+    int rc;
+
+    if (!txn || !key) return ZS_BADUSAGE;
+    if (keylen < 1) return ZS_BADUSAGE;             /* F-14 */
+    if (txn->readonly) return ZS_READONLY;          /* A-5 */
+
+    /* ZS_IFNOTEXIST / ZS_IFEXIST are evaluated against the transaction's own
+     * view, so they compose with earlier writes in the same transaction (A-1a). */
+    if (flags & (ZS_IFNOTEXIST | ZS_IFEXIST)) {
+        rc = zsi_lookup(txn->db, txn->snap, txn, key, keylen, &r);
+        if ((flags & ZS_IFNOTEXIST) && rc == ZS_OK) return ZS_EXISTS;
+        if ((flags & ZS_IFEXIST) && rc == ZS_NOTFOUND) return ZS_NOTFOUND;
+        if (rc != ZS_OK && rc != ZS_NOTFOUND) return rc;
+    }
+
+    return zsi_pend_set(txn, key, keylen, val, vallen);
+}
+
+int zs_db_store(struct zs_db *db, const char *key, size_t keylen,
+                const char *val, size_t vallen, int flags)
+{
+    struct zs_txn *txn = NULL;
+    int rc;
+
+    if (!db || !key) return ZS_BADUSAGE;
+
+    rc = zs_db_begin_txn(db, 0, &txn);
+    if (rc != ZS_OK) return rc;
+
+    rc = zs_txn_store(txn, key, keylen, val, vallen, flags);
+    if (rc != ZS_OK) {
+        zs_txn_abort(&txn);
+        return rc;
+    }
+
+    return zs_txn_commit(&txn);
+}
+
+/* foreach */
+
+int zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
+                   zs_cb *p, zs_cb *cb, void *rock, int flags)
+{
+    struct zs_cursor *c = NULL;
+    struct zsi_rec r;
+    int rc;
+
+    if (!txn || !cb) return ZS_BADUSAGE;
+
+    rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
+                         prefixlen ? prefix : NULL, prefixlen, flags, &c);
+    if (rc != ZS_OK) return rc;
+
+    while ((rc = zsi_cursor_next(c, &r)) == ZS_OK) {
+        /* p is a predicate: when supplied, cb runs only where it returns
+         * non-zero.  Matches the cyrusdb convention the other backends use. */
+        if (p && !p(rock, r.key, r.keylen, r.val, r.vallen)) continue;
+        int cr = cb(rock, r.key, r.keylen, r.val, r.vallen);
+        if (cr) { rc = cr; goto out;  }
+    }
+
+    if (rc == ZS_DONE) rc = ZS_OK;
+
+out:
+    zsi_cursor_free(c);
+    return rc;
+}
+
+int zs_db_foreach(struct zs_db *db, const char *prefix, size_t prefixlen,
+                  zs_cb *p, zs_cb *cb, void *rock, int flags)
+{
+    struct zs_txn *txn = NULL;
+    int rc;
+
+    if (!db || !cb) return ZS_BADUSAGE;
+
+    rc = zs_db_begin_txn(db, 1, &txn);
+    if (rc != ZS_OK) return rc;
+
+    rc = zs_txn_foreach(txn, prefix, prefixlen, p, cb, rock, flags);
+    zs_txn_abort(&txn);
+    return rc;
+}
+
+/* cursors */
+
+int zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
+                        struct zs_cursor **curp, int flags)
+{
+    if (!txn || !curp) return ZS_BADUSAGE;
+    *curp = NULL;
+    return zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
+                           keylen ? key : NULL, keylen, flags, curp);
+}
+
+int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
+                       struct zs_cursor **curp, int flags)
+{
+    struct zs_txn *txn = NULL;
+    int rc;
+
+    if (!db || !curp) return ZS_BADUSAGE;
+    *curp = NULL;
+
+    /* An implicit transaction, owned by the cursor: a cursor from a database
+     * needs somewhere for its snapshot to live, and zs_cursor_commit/abort is
+     * what ends it. */
+    rc = zs_db_begin_txn(db, (flags & ZS_SHARED) ? 1 : 0, &txn);
+    if (rc != ZS_OK) return rc;
+
+    rc = zsi_cursor_open(db, txn->readonly ? NULL : txn, txn->snap,
+                         keylen ? key : NULL, keylen, flags, curp);
+    if (rc != ZS_OK) { zs_txn_abort(&txn); return rc; }
+
+    (*curp)->txn = txn;
+    (*curp)->owns_txn = true;
+    return ZS_OK;
+}
+
+int zs_cursor_next(struct zs_cursor *cur,
+                   const char **keyp, size_t *keylenp,
+                   const char **valp, size_t *vallenp)
+{
+    struct zsi_rec r;
+    int rc;
+
+    if (!cur) return ZS_BADUSAGE;
+
+    rc = zsi_cursor_next(cur, &r);
+    if (rc != ZS_OK) return rc;
+
+    if (keyp) *keyp = r.key;
+    if (keylenp) *keylenp = r.keylen;
+    if (valp) *valp = r.val;
+    if (vallenp) *vallenp = r.vallen;
+    return ZS_OK;
+}
+
+int zs_cursor_replace(struct zs_cursor *cur, const char *val, size_t vallen,
+                      int flags)
+{
+    if (!cur) return ZS_BADUSAGE;
+    if (!cur->have_emitted) return ZS_BADUSAGE;     /* nothing to replace */
+    if (!cur->txn || cur->txn->readonly) return ZS_READONLY;
+
+    return zs_txn_store(cur->txn, cur->emitted.key, cur->emitted.keylen,
+                        val, vallen, flags);
+}
+
+int zs_cursor_commit(struct zs_cursor **curp)
+{
+    struct zs_cursor *c;
+    int rc = ZS_OK;
+
+    if (!curp || !*curp) return ZS_BADUSAGE;
+    c = *curp;
+    *curp = NULL;
+
+    if (c->owns_txn && c->txn) {
+        struct zs_txn *txn = c->txn;
+        c->txn = NULL;
+        rc = zsi_txn_commit(txn);
+    }
+
+    zsi_cursor_free(c);
+    return rc;
+}
+
+int zs_cursor_abort(struct zs_cursor **curp)
+{
+    struct zs_cursor *c;
+    int rc = ZS_OK;
+
+    if (!curp || !*curp) return ZS_BADUSAGE;
+    c = *curp;
+    *curp = NULL;
+
+    if (c->owns_txn && c->txn) {
+        struct zs_txn *txn = c->txn;
+        c->txn = NULL;
+        rc = zsi_txn_abort(txn);
+    }
+
+    zsi_cursor_free(c);
+    return rc;
+}
+
+/* Release a cursor inside a caller-owned transaction, without touching it. */
+void zs_cursor_fini(struct zs_cursor **curp)
+{
+    if (!curp || !*curp) return;
+
+    if ((*curp)->owns_txn && (*curp)->txn) {
+        struct zs_txn *txn = (*curp)->txn;
+        (*curp)->txn = NULL;
+        zsi_txn_abort(txn);
+    }
+
+    zsi_cursor_free(*curp);
+    *curp = NULL;
+}
+
+/* utility */
+
+int zs_db_sync(struct zs_db *db)
+{
+    struct zsi_file *act;
+
+    if (!db) return ZS_BADUSAGE;
+
+    act = zsi_snapshot_active(db->snap);
+    if (!act) return ZS_OK;
+
+    int fd = open(act->fname, O_WRONLY);
+    if (fd < 0) return ZS_IOERROR;
+    int r = fdatasync(fd) < 0 ? ZS_IOERROR : ZS_OK;
+    close(fd);
+    return r;
+}
 
 const char *zs_strerror(int r)
 {
