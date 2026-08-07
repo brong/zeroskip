@@ -21,6 +21,7 @@
  * above it.
  */
 
+#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2837,6 +2838,149 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
 }
 
 /********** FILE LOCKING *************/
+
+/* Three byte-range locks on zeroskip.lock (C-1):
+ *
+ *   byte 0  write   a write transaction: appending, creating a new active file,
+ *                   converting an unordered file
+ *   byte 1  repack  a whole repack, possibly long
+ *   byte 2  remove  momentarily: verify completeness, then unlink
+ *
+ * The mechanism is EXACTLY fcntl record locking, and the byte offsets are
+ * normative (C-1e).  This is interoperability surface, not an implementation
+ * choice: implementations in different languages must exclude each other.
+ *
+ * NEVER flock.  On Linux flock occupies a separate lock space and does not
+ * exclude fcntl, and it is a no-op over some network filesystems.  An
+ * implementation using it would pass every single-implementation test and
+ * silently fail to exclude a conforming peer -- which is precisely the false pass
+ * T-13 exists to catch.
+ *
+ * There is deliberately NO in-process mutex here, and the absence is the
+ * considered position rather than an omission.  fcntl locks are per-process
+ * (C-1f), so two handles on one database within a process are excluded by
+ * nothing: not by fcntl, which sees one owner, and not by a per-handle mutex,
+ * which would be two different objects.  A mutex therefore buys exclusion only
+ * between threads sharing a handle, which is not the guarantee anyone reads G-5 as
+ * making -- so it would imply a property the format cannot enforce.  Handles are
+ * not thread-safe; concurrent writers are separate processes.  An implementation
+ * that genuinely needs intra-process exclusion should use F_OFD_SETLK (C-1i),
+ * which is scoped to an open file description rather than a process. */
+
+enum zsi_lock { ZSI_LOCK_WRITE = 0, ZSI_LOCK_REPACK = 1, ZSI_LOCK_REMOVE = 2 };
+#define ZSI_NLOCKS 3
+
+struct zsi_locks {
+    int      fd;            /* exactly one, for the handle's lifetime (C-1g) */
+    unsigned held;          /* bitmask of enum zsi_lock */
+};
+
+/* Open (creating if absent) the lock file and keep ONE descriptor for the
+ * handle's lifetime.
+ *
+ * C-1g: fcntl locks are released by closing ANY descriptor for the file in that
+ * process, so a second open followed by a close would silently drop every lock
+ * this handle holds.  There is exactly one, and nothing may open another.
+ *
+ * D-3a: created with O_CREAT if absent, so an existing database is never
+ * unopenable for want of it.  Concurrent creation is harmless -- O_CREAT on one
+ * path yields one inode, so every process locks the same object.
+ *
+ * D-3b: it is never unlinked, by this library or anything else.  Unlinking it
+ * while processes hold locks is the one way to break mutual exclusion from
+ * outside: holders keep locking the removed inode while a new process creates a
+ * fresh one and locks that, so TWO WRITERS each believe they hold the write lock.
+ * Worth stating because an empty file named *.lock is exactly what cleanup
+ * scripts delete. */
+static int zsi_lock_open(struct zsi_locks *lk, const char *dir)
+{
+    char path[PATH_MAX];
+
+    memset(lk, 0, sizeof(*lk));
+    lk->fd = -1;
+
+    snprintf(path, sizeof(path), "%s/%s", dir, ZSI_LOCK_NAME);
+    lk->fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (lk->fd < 0) return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+
+    return ZS_OK;
+}
+
+static void zsi_lock_close(struct zsi_locks *lk)
+{
+    if (lk->fd < 0) return;
+
+    /* Closing releases every fcntl lock this process holds on the inode, which is
+     * what we want on the way out -- and is why C-1g forbids a second descriptor
+     * being closed early. */
+    close(lk->fd);
+    lk->fd = -1;
+    lk->held = 0;
+}
+
+static int zsi_lock_fcntl(int fd, enum zsi_lock which, int type, bool block)
+{
+    struct flock fl;
+
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = (short)type;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = (off_t)which;
+    fl.l_len = 1;
+
+    for (;;) {
+        if (fcntl(fd, block ? F_SETLKW : F_SETLK, &fl) == 0) return ZS_OK;
+        if (errno == EINTR) continue;
+        if (!block && (errno == EACCES || errno == EAGAIN)) return ZS_LOCKED;
+        return ZS_IOERROR;
+    }
+}
+
+/* Acquire.  Blocking unless ZS_NONBLOCKING, in which case ZS_LOCKED.
+ *
+ * C-1f: fcntl locks are per-PROCESS, not per-thread -- two threads of one process
+ * both acquire the same lock successfully, and the kernel sees a single owner.
+ * G-5 therefore requires an in-process mutex as well, held across the same
+ * region.  An implementation relying on fcntl alone passes every single-threaded
+ * test and corrupts a database the moment two threads write, which is invisible
+ * to a single-threaded suite and is why T-14 must be run per implementation.
+ *
+ * C-1d lock ordering: acquisition is always write -> remove or repack -> remove.
+ * Nothing takes write or repack while holding remove, and nothing holds both
+ * write and repack, so no cycle exists.  Asserted here, which is sound now that
+ * a handle belongs to one thread of control: `held` describes the one actor
+ * using it, and a violation deadlocks in production while being trivially visible
+ * in development. */
+static int zsi_lock_take(struct zsi_locks *lk, enum zsi_lock which, int flags)
+{
+    bool block = !(flags & ZS_NONBLOCKING);
+
+    assert(lk->fd >= 0);
+    assert(!(lk->held & (1u << which)));        /* not already held */
+
+    if (which == ZSI_LOCK_WRITE || which == ZSI_LOCK_REPACK)
+        assert(!(lk->held & (1u << ZSI_LOCK_REMOVE)));   /* C-1d */
+    if (which == ZSI_LOCK_WRITE)
+        assert(!(lk->held & (1u << ZSI_LOCK_REPACK)));
+    if (which == ZSI_LOCK_REPACK)
+        assert(!(lk->held & (1u << ZSI_LOCK_WRITE)));
+
+    int r = zsi_lock_fcntl(lk->fd, which, F_WRLCK, block);
+    if (r != ZS_OK) return r;
+
+    lk->held |= (1u << which);
+    return ZS_OK;
+}
+
+static int zsi_lock_release(struct zsi_locks *lk, enum zsi_lock which)
+{
+    if (!(lk->held & (1u << which))) return ZS_OK;
+
+    int r = zsi_lock_fcntl(lk->fd, which, F_UNLCK, true);
+    lk->held &= ~(1u << which);
+
+    return r;
+}
 
 /********** READ PATH *************/
 

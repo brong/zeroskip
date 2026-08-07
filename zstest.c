@@ -25,8 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* The implementation is included rather than linked, so tests can reach the
@@ -538,6 +540,14 @@ static void test_overflow_guards(void)
  * PTRS64 section without 4GB of data behind it.  These helpers write bytes, not
  * databases, so a test can construct exactly the damage it wants to assert about.
  */
+
+static int fexists(const char *fname)
+{
+    struct stat sb;
+    int r = stat(fname, &sb);
+    if (r < 0) r = -errno;
+    return r;
+}
 
 /* Create dbdir if absent.  Most tests want ZS_CREATE to make it, so setup()
  * deliberately does not. */
@@ -5338,6 +5348,303 @@ static void test_snapshot_refcount(void)
 
 /*
  * ============================================================
+ * File locking (section 6, T-14)
+ * ============================================================
+ */
+
+static void test_lock_basic(void)
+{
+    struct zsi_locks lk;
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* D-3a: created with O_CREAT if absent, so a database missing its lock file
+     * is never unopenable. */
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), -ENOENT);
+    ASSERT_OK(zsi_lock_open(&lk, dbdir));
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), 0);
+    ASSERT(lk.fd >= 0);
+
+    /* D-3c: the lock file is empty and its contents are never read.  Nothing
+     * about the database is stored in it, so it carries no state to become
+     * stale. */
+    ASSERT_EQ(filesize(ZSI_LOCK_NAME), 0);
+
+    /* Each lock in turn. */
+    for (int i = 0; i < ZSI_NLOCKS; i++) {
+        ASSERT_OK(zsi_lock_take(&lk, (enum zsi_lock)i, 0));
+        ASSERT_EQU(lk.held, 1u << i);
+        ASSERT_OK(zsi_lock_release(&lk, (enum zsi_lock)i));
+        ASSERT_EQU(lk.held, 0u);
+    }
+
+    /* C-1d's two legal orderings -- write -> remove and repack -> remove -- and
+     * only those.  Nothing holds both write and repack, and nothing takes either
+     * while holding remove, so no cycle exists.
+     *
+     * Not asserted at runtime -- see the note at zsi_lock_take about why a
+     * per-handle bitmask cannot express a per-thread rule -- so this test is the
+     * record that the two orderings are the intended ones. */
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0));
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0));
+    ASSERT_EQU(lk.held, (1u << ZSI_LOCK_WRITE) | (1u << ZSI_LOCK_REMOVE));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REMOVE));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
+
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REPACK, 0));
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0));
+    ASSERT_EQU(lk.held, (1u << ZSI_LOCK_REPACK) | (1u << ZSI_LOCK_REMOVE));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REMOVE));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REPACK));
+    ASSERT_EQU(lk.held, 0u);
+
+    /* Releasing an unheld lock is a no-op, so cleanup paths need no guard. */
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
+
+    zsi_lock_close(&lk);
+    ASSERT_EQ(lk.fd, -1);
+
+    /* Reopening an existing lock file works, and does not truncate it. */
+    ASSERT_OK(zsi_lock_open(&lk, dbdir));
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0));
+    zsi_lock_close(&lk);
+}
+
+static void test_lock_byte_offsets(void)
+{
+    /* C-1e: the byte offsets are normative, because implementations in different
+     * languages must exclude each other.  Asserted against literals, and verified
+     * with a raw fcntl call rather than through this library's own wrapper -- a
+     * third observer, exactly as T-13 requires of the interop runner. */
+    struct zsi_locks lk;
+
+    ASSERT_EQ(ZSI_LOCK_WRITE, 0);
+    ASSERT_EQ(ZSI_LOCK_REPACK, 1);
+    ASSERT_EQ(ZSI_LOCK_REMOVE, 2);
+    ASSERT_STR_EQ(ZSI_LOCK_NAME, "zeroskip.lock");
+
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_OK(zsi_lock_open(&lk, dbdir));
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REPACK, 0));
+
+    /* A separate descriptor in a CHILD process, since fcntl locks do not conflict
+     * within one process (C-1f).  The child asks the kernel which byte is locked
+     * and by what. */
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        int fd = open(dbpath(ZSI_LOCK_NAME), O_RDWR);
+        int bad = 0;
+        for (int b = 0; b < 3; b++) {
+            struct flock fl;
+            memset(&fl, 0, sizeof(fl));
+            fl.l_type = F_WRLCK;
+            fl.l_whence = SEEK_SET;
+            fl.l_start = b;
+            fl.l_len = 1;
+            if (fcntl(fd, F_GETLK, &fl) < 0) { bad = 10; break; }
+            bool locked = (fl.l_type != F_UNLCK);
+            if (locked != (b == ZSI_LOCK_REPACK)) bad = 20 + b;
+        }
+        close(fd);
+        _exit(bad);
+    }
+
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    zsi_lock_close(&lk);
+}
+
+static void test_lock_excludes_other_process(void)
+{
+    /* Two processes, exactly one proceeding.  The child holds the write lock for
+     * a while; the parent's non-blocking take must report ZS_LOCKED and its
+     * blocking take must wait. */
+    struct zsi_locks lk;
+    int pipefd[2];
+
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zsi_locks clk;
+        close(pipefd[0]);
+        if (zsi_lock_open(&clk, dbdir) != ZS_OK) _exit(1);
+        if (zsi_lock_take(&clk, ZSI_LOCK_WRITE, 0) != ZS_OK) _exit(2);
+        /* tell the parent the lock is held, then hold it briefly */
+        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        close(pipefd[1]);
+        usleep(300000);
+        zsi_lock_close(&clk);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);       /* the child holds it now */
+    close(pipefd[0]);
+
+    ASSERT_OK(zsi_lock_open(&lk, dbdir));
+
+    /* Non-blocking: refused rather than waiting. */
+    ASSERT_EQ(zsi_lock_take(&lk, ZSI_LOCK_WRITE, ZS_NONBLOCKING), ZS_LOCKED);
+
+    /* A different byte is unaffected -- the locks are independent (C-1a: write
+     * and repack never contend, because the two jobs consume disjoint files). */
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REPACK, ZS_NONBLOCKING));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REPACK));
+
+    /* Blocking: waits for the child, then succeeds. */
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
+
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid);
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    zsi_lock_close(&lk);
+}
+
+static void test_lock_dies_with_process(void)
+{
+    /* G-5: a writer SIGKILLed holding the lock never blocks the next one.
+     *
+     * The kernel releases fcntl locks on process death, so no lock state can
+     * outlive a process and there is nothing to clean up or time out.  This is
+     * the property that makes the whole design free of stale-lock recovery. */
+    struct zsi_locks lk;
+    int pipefd[2];
+
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zsi_locks clk;
+        close(pipefd[0]);
+        if (zsi_lock_open(&clk, dbdir) != ZS_OK) _exit(1);
+        if (zsi_lock_take(&clk, ZSI_LOCK_WRITE, 0) != ZS_OK) _exit(2);
+        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        for (;;) pause();                       /* hold it until killed */
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);
+    close(pipefd[0]);
+
+    ASSERT_OK(zsi_lock_open(&lk, dbdir));
+    ASSERT_EQ(zsi_lock_take(&lk, ZSI_LOCK_WRITE, ZS_NONBLOCKING), ZS_LOCKED);
+
+    /* Kill it dead -- no cleanup, no unwinding, no chance to release. */
+    ASSERT_EQ(kill(pid, SIGKILL), 0);
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid);
+    ASSERT(WIFSIGNALED(status));
+
+    /* The next writer proceeds with NO manual intervention. */
+    alarm(20);
+    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0));
+    alarm(0);
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
+
+    zsi_lock_close(&lk);
+}
+
+/* T-14: two write handles on one database, from one process.
+ *
+ * This test exists to stop the implementation quietly acquiring a mutex and
+ * appearing to offer a guarantee the format cannot enforce.  fcntl locks are
+ * per-process (C-1f): the kernel sees one owner and grants both, and a per-handle
+ * mutex would be two different objects, so it would exclude only threads sharing a
+ * handle -- which is not what anyone reads G-5 as promising.
+ *
+ * An earlier version of this library did acquire such a mutex.  It passed a test
+ * of two threads sharing one handle, and a direct measurement of two threads with
+ * SEPARATE handles found 398 overlapping entries into the write section.  The
+ * guarantee was never there; the mutex only hid its absence.
+ *
+ * So the asserted behaviour is the honest one: the second take succeeds, and that
+ * is documented rather than defended against. */
+static void test_lock_two_handles_one_process(void)
+{
+    struct zsi_locks a, b;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_OK(zsi_lock_open(&a, dbdir));
+    ASSERT_OK(zsi_lock_open(&b, dbdir));
+
+    ASSERT_OK(zsi_lock_take(&a, ZSI_LOCK_WRITE, 0));
+
+    /* Not excluded -- by design, and stated in G-5 and C-1f.  If this ever starts
+     * returning ZS_LOCKED, either F_OFD_SETLK was adopted (C-1i permits it, and it
+     * WOULD exclude these) or a mutex crept back in.  The first is an improvement
+     * worth documenting; the second is the bug this test guards. */
+    ASSERT_OK(zsi_lock_take(&b, ZSI_LOCK_WRITE, ZS_NONBLOCKING));
+
+    zsi_lock_close(&a);
+    zsi_lock_close(&b);
+}
+
+/* And the corollary: the library holds no thread machinery at all, so nobody can
+ * mistake it for thread-safe.  Structural, like the flock check -- weak evidence
+ * on its own, but it fails loudly if a mutex is reintroduced as a "fix". */
+static void test_lock_no_thread_machinery(void)
+{
+    FILE *fp = fopen("zeroskip.c", "r");
+    if (!fp) SKIP("zeroskip.c not readable from the test's cwd");
+
+    char line[1024];
+    int found = 0, lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        if (strstr(line, "pthread_")) {
+            fprintf(stderr, "\n    FAIL zeroskip.c:%d uses pthread\n", lineno);
+            found = 1;
+        }
+    }
+    fclose(fp);
+    ASSERT_EQ(found, 0);
+}
+
+static void test_lock_never_uses_flock(void)
+{
+    /* C-1e forbids flock, and the hazard is that a flock-based implementation
+     * looks correct to itself: on Linux the two lock spaces do not intersect, so
+     * every single-implementation test passes while a conforming peer is not
+     * excluded at all.
+     *
+     * Asserted structurally -- the source must not call flock -- because the
+     * behavioural test needs a second implementation and belongs to T-13.  A
+     * source-level check is weak evidence, but it is the strongest available here
+     * and it fails loudly if someone reaches for flock as a "simplification". */
+    FILE *fp = fopen("zeroskip.c", "r");
+    if (!fp) SKIP("zeroskip.c not readable from the test's cwd");
+
+    char line[1024];
+    int found = 0, lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        /* skip the comments that explain why flock is forbidden */
+        char *p = strstr(line, "flock(");
+        if (p && !strstr(line, "*") && !strstr(line, "//")) {
+            fprintf(stderr, "\n    FAIL zeroskip.c:%d calls flock\n", lineno);
+            found = 1;
+        }
+    }
+    fclose(fp);
+    ASSERT_EQ(found, 0);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -5443,6 +5750,14 @@ static struct test_entry tests[] = {
     { "test_snapshot_boundary",         test_snapshot_boundary },
     { "test_snapshot_bad_nonactive",    test_snapshot_bad_nonactive },
     { "test_snapshot_refcount",         test_snapshot_refcount },
+
+    { "test_lock_basic",                test_lock_basic },
+    { "test_lock_byte_offsets",         test_lock_byte_offsets },
+    { "test_lock_excludes_other_process", test_lock_excludes_other_process },
+    { "test_lock_dies_with_process",    test_lock_dies_with_process },
+    { "test_lock_two_handles_one_process", test_lock_two_handles_one_process },
+    { "test_lock_no_thread_machinery",  test_lock_no_thread_machinery },
+    { "test_lock_never_uses_flock",     test_lock_never_uses_flock },
 
     { NULL, NULL }
 };

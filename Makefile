@@ -30,7 +30,6 @@ UNAME_S := $(shell uname -s)
 # (mmap, fcntl locking, PATH_MAX).  BSDs need neither.
 ifeq ($(UNAME_S),Linux)
 CFLAGS += -D_GNU_SOURCE
-LDLIBS += -lpthread
 endif
 ifeq ($(UNAME_S),Darwin)
 CFLAGS += -D_DARWIN_C_SOURCE
