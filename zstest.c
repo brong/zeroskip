@@ -5309,14 +5309,20 @@ static void test_snapshot_bad_nonactive(void)
     char junk[ZSI_HEADER_LEN];
     memset(junk, 0xFF, sizeof(junk));
 
-    /* Corrupt the ACTIVE (highest, unordered) file: tolerated. */
+    /* Corrupt the ACTIVE (highest, unordered) file: tolerated, and NOT reported.
+     *
+     * D-10 makes this an ordinary post-crash state, so reporting it would cry wolf
+     * after every crash -- which is how a real report comes to be ignored.  The
+     * contrast with the non-active case below is the whole point. */
     clear_db();
     put_inorder(1, 1, k);
     put_unordered(2, k);
     zsi_name_format(name, test_uuid, 2, 0);
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
+    report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
-                                TEST_EXTERNAL_CSUM, false, NULL, &s));
+                                TEST_EXTERNAL_CSUM, false, counting_error, &s));
+    ASSERT_EQ(report_count, 0);
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
     ASSERT_EQU(s->files[1]->complete, 0u);

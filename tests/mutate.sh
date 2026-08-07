@@ -65,8 +65,8 @@ mutant() {
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
     fi
 
-    rm -f zstest
-    if ! make zstest EXTRA_CFLAGS=-O0 >"$WORK/build.log" 2>&1; then
+    rm -f zstest zstest-crash
+    if ! make zstest zstest-crash EXTRA_CFLAGS=-O0 >"$WORK/build.log" 2>&1; then
         printf '  %-46s BUILD FAILED (inconclusive)\n' "$name"
         sed 's/^/        /' "$WORK/build.log" | grep -m2 error
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
@@ -80,13 +80,21 @@ mutant() {
     # A timeout is itself a catch -- the suite hanging IS the detection -- but it
     # is reported distinctly, because "hangs" and "fails an assertion" are
     # different evidence about the tests.
-    ./zstest >"$WORK/run.log" 2>&1 &
-    local pid=$!
-    ( sleep 25; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
-    local wd=$!
-    wait $pid
-    local rc=$?
-    kill $wd 2>/dev/null
+    # BOTH binaries.  An earlier version ran only ./zstest, which left every
+    # property tested solely in zstest-crash -- the whole snapshot-gap and
+    # sync-failure surface -- unprotected by mutation testing.  The C-4 "ENOENT is
+    # fatal" mutant went uncaught for exactly that reason.
+    local rc=0
+    for bin in ./zstest ./zstest-crash; do
+        ZS_TEST_NO_FORK= "$bin" >"$WORK/run.log" 2>&1 &
+        local pid=$!
+        ( sleep 40; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
+        local wd=$!
+        wait $pid
+        rc=$?
+        kill $wd 2>/dev/null
+        [ "$rc" -ne 0 ] && break
+    done
 
     if [ "$rc" -eq 0 ]; then
         if [ "$expect" = equivalent ]; then
@@ -271,10 +279,16 @@ mutant "C-4h: unbounded retries" catch \
 # D-10a: a non-active file with a bad header is an error; only the active file
 # gets D-10 tolerance.  Getting the position test backwards either loses committed
 # data or refuses to open after an ordinary crash.
-mutant "D-10a: bad non-active header tolerated" catch \
-  's/            if \(!f->hdr_valid && !is_last\) \{/            if (false \&\& !is_last) {/'
+# D-10a as amended by D-10b: a non-active file with an invalid header is REPORTED,
+# not fatal.  Suppressing the report makes it silent, which is the hazard the rule
+# actually names.
+mutant "D-10a: bad non-active header not reported" catch \
+  's/            if \(!f->hdr_valid && !is_last && report\)\n                report\("non-active file has an invalid header",\n                       "file=<%s>", f->fname\);/            \/* report suppressed *\//'
 
-mutant "D-10: bad active header rejected" catch \
+# D-10: the ACTIVE file has an ordinary invalid header after a crash, and it must
+# NOT be reported -- reporting it would cry wolf every time, which is how a real
+# report comes to be ignored.
+mutant "D-10: active bad header reported too" catch \
   's/            bool is_last = \(i \+ 1 == fs.nresolved\);/            bool is_last = false;/'
 
 # Step 4 must build an index for every unordered file, or a reader sees an empty

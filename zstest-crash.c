@@ -807,18 +807,33 @@ static void test_crash_after_invalid_terminator(void)
  * ------------------------------------------------------------------------- */
 
 static int gap_removals;        /* files unlinked inside the gap */
-static char gap_victim[PATH_MAX];
+static char gap_victim[PATH_MAX];   /* a RESOLVED file, so step 3 hits ENOENT */
+static char gap_victim2[PATH_MAX];
+static char gap_staged[PATH_MAX];   /* the superseding output, pre-built */
+static char gap_published[PATH_MAX];
 
 static void snapshot_gap(const char *dir)
 {
-    /* Called between C-4's resolve and open.  Remove a file the scan just saw --
-     * exactly what a packer retiring a superseded input does -- so step 3 is
-     * guaranteed to meet an ENOENT. */
+    /* Called between C-4's resolve and open, and it must reproduce a whole packer
+     * step: PUBLISH a superseding output, then retire the inputs.
+     *
+     * Removing a superseded file is not enough, and an earlier version of this test
+     * did exactly that -- so the resolved set never contained the removed file,
+     * step 3 never opened it, no ENOENT ever happened, and the test passed without
+     * touching the retry path.  A mutant making ENOENT fatal went uncaught, which
+     * is how the hole was found.
+     *
+     * The victims here ARE in the resolved set at scan time, and the output that
+     * supersedes them appears only now -- which is precisely the interleaving C-4b
+     * is about. */
     (void)dir;
-    if (gap_victim[0] && unlink(gap_victim) == 0) {
-        gap_removals++;
-        gap_victim[0] = '\0';      /* once, so the retry can succeed */
-    }
+    if (!gap_staged[0]) return;
+
+    if (rename(gap_staged, gap_published) != 0) return;
+    if (unlink(gap_victim) == 0) gap_removals++;
+    if (gap_victim2[0] && unlink(gap_victim2) == 0) gap_removals++;
+
+    gap_staged[0] = '\0';          /* once, so the retry can succeed */
 }
 
 static void test_snapshot_gap_retry(void)
@@ -826,17 +841,17 @@ static void test_snapshot_gap_retry(void)
     /* C-4a/C-4b: a file removed between scanning the directory and opening the
      * files must surface as a retry that converges, never as a partial snapshot.
      *
-     * FORCED, not raced.  An earlier version raced a remover against 300 snapshots
-     * and took the retry path zero times -- asserting nothing while appearing to
-     * cover the case.
+     * FORCED, not raced -- an earlier version raced a remover against 300 snapshots
+     * and took the retry path zero times.
      *
-     * The victim is chosen deterministically rather than searched for.  An earlier
-     * attempt searched for "any file whose removal leaves a tiling set", which
-     * picked the OLDEST file and lost its data -- the very mistake D-23a exists to
-     * document: tiling is measured from the oldest surviving generation, so
-     * deleting the oldest merely raises that floor.  Here the repack output is
-     * published WITHOUT retiring its inputs, so each input is unambiguously
-     * superseded. */
+     * And the forcing has to be a whole packer step.  A second version removed only
+     * a SUPERSEDED file, which the resolved set does not contain, so step 3 never
+     * opened it and the retry still never ran.  That version passed while a mutant
+     * making ENOENT fatal went uncaught -- the tell that it was asserting nothing.
+     *
+     * So: build the superseding output, hide it under a staging name the scan
+     * ignores, and in the gap publish it and retire the two inputs that WERE
+     * resolved.  Step 3 then meets an ENOENT it cannot avoid. */
     total++;
 
     fresh_dir();
@@ -871,7 +886,7 @@ static void test_snapshot_gap_retry(void)
     }
     zs_db_close(&db);
 
-    /* Conversion turns generations 1 and 2 into in-order files. */
+    /* Convert, so generations 1 and 2 are in-order files and both are RESOLVED. */
     db = open_db(0);
     CHECK(db != NULL, "reopen for convert");
     {
@@ -880,54 +895,33 @@ static void test_snapshot_gap_retry(void)
         CHECK(zs_txn_commit(&t) == ZS_OK, "commit");
     }
 
-    /* Publish a repack output WITHOUT retiring the inputs, so [1-1] is
-     * unambiguously superseded by [1-2]. */
     size_t nio = 0;
     while (nio < db->snap->nfiles && !zsi_file_is_unordered(db->snap->files[nio]))
         nio++;
     CHECK(nio >= 2, "only %zu in-order files after conversion", nio);
 
+    /* Build the [1-2] output, then hide it under a staging name so the scan does
+     * not see it -- restoring the directory to its pre-repack state. */
     CHECK(zsi_repack_merge(db, db->snap, 0, 2) == ZS_OK, "merge");
-    CHECK(zsi_db_refresh(db) == ZS_OK, "refresh");
-
-    char victim_name[ZSI_NAME_MAX];
-    zsi_name_format(victim_name, uuid, 1, 1);
-    snprintf(gap_victim, sizeof(gap_victim), "%s/%s", dbdir, victim_name);
-    CHECK(fexists(gap_victim) == 0, "%s is not present", victim_name);
-
-    /* And confirm it really is superseded, by the same interval test D-23a
-     * requires -- so this test cannot repeat the mistake it was written to avoid. */
-    {
-        struct zsi_fileset fs;
-        CHECK(zsi_fileset_scan(dbdir, &uuid, &fs) == ZS_OK, "scan");
-        uint32_t lo = 0, hi = 0;
-        for (size_t i = 0; i < fs.nall; i++) {
-            uint32_t s0 = fs.all[i].start;
-            uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
-            if (i == 0 || s0 < lo) lo = s0;
-            if (e0 > hi) hi = e0;
-        }
-        size_t w = 0;
-        for (size_t i = 0; i < fs.nall; i++)
-            if (strcmp(fs.all[i].name, victim_name)) fs.all[w++] = fs.all[i];
-        fs.nall = w;
-        CHECK(zsi_fileset_resolve(&fs) == ZS_OK, "the reduced set does not tile");
-        uint32_t nlo = 0, nhi = 0;
-        for (size_t i = 0; i < fs.nall; i++) {
-            uint32_t s0 = fs.all[i].start;
-            uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
-            if (i == 0 || s0 < nlo) nlo = s0;
-            if (e0 > nhi) nhi = e0;
-        }
-        zsi_fileset_fini(&fs);
-        CHECK(nlo == lo && nhi == hi,
-              "the victim is not superseded: interval %u-%u becomes %u-%u",
-              lo, hi, nlo, nhi);
-    }
-
     zs_db_close(&db);
 
-    /* Take a snapshot with the gap armed. */
+    char outname[ZSI_NAME_MAX];
+    zsi_name_format(outname, uuid, 1, 2);
+    snprintf(gap_published, sizeof(gap_published), "%s/%s", dbdir, outname);
+    snprintf(gap_staged, sizeof(gap_staged), "%s/zeroskip.tmp.gap", dbdir);
+    CHECK(rename(gap_published, gap_staged) == 0, "stage the output");
+
+    zsi_name_format(outname, uuid, 1, 1);
+    snprintf(gap_victim, sizeof(gap_victim), "%s/%s", dbdir, outname);
+    zsi_name_format(outname, uuid, 2, 2);
+    snprintf(gap_victim2, sizeof(gap_victim2), "%s/%s", dbdir, outname);
+
+    CHECK(fexists(gap_victim) == 0, "[1-1] missing");
+    CHECK(fexists(gap_victim2) == 0, "[2-2] missing");
+    CHECK(fexists(gap_staged) == 0, "the staged output is missing");
+
+    /* Take a snapshot with the gap armed.  The scan resolves [1-1], [2-2] and the
+     * active file; the gap then publishes [1-2] and removes both inputs. */
     gap_removals = 0;
     zs_hook_snapshot_gap = snapshot_gap;
 
@@ -938,10 +932,16 @@ static void test_snapshot_gap_retry(void)
     alarm(0);
     zs_hook_snapshot_gap = NULL;
 
-    CHECK(gap_removals == 1, "the gap hook removed %d files, wanted 1",
+    CHECK(gap_removals == 2, "the gap removed %d resolved files, wanted 2",
           gap_removals);
     CHECK(r == ZS_OK, "the retry did not converge: %s", zs_strerror(r));
     CHECK(s != NULL, "no snapshot");
+
+    /* The converged snapshot is the POST-repack set, not a partial one. */
+    CHECK(s->nfiles == 2, "converged on %zu files, wanted 2", s->nfiles);
+    CHECK(s->files[0]->hdr.start == 1 && s->files[0]->hdr.end == 2,
+          "first file is %u-%u, wanted 1-2",
+          s->files[0]->hdr.start, s->files[0]->hdr.end);
     zsi_snapshot_release(&s);
 
     /* Nothing was lost. */
