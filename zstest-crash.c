@@ -154,6 +154,12 @@ static void hooks_reset(void)
  * Scratch directories
  * ------------------------------------------------------------------------- */
 
+static int fexists(const char *p)
+{
+    struct stat sb;
+    return stat(p, &sb) < 0 ? -errno : 0;
+}
+
 static void fresh_dir(void)
 {
     char cmd[PATH_MAX + 32];
@@ -796,6 +802,161 @@ static void test_crash_after_invalid_terminator(void)
     fprintf(stderr, "  crash after an invalid terminator        ok\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * T-10b: the snapshot protocol's gap, forced rather than raced
+ * ------------------------------------------------------------------------- */
+
+static int gap_removals;        /* files unlinked inside the gap */
+static char gap_victim[PATH_MAX];
+
+static void snapshot_gap(const char *dir)
+{
+    /* Called between C-4's resolve and open.  Remove a file the scan just saw --
+     * exactly what a packer retiring a superseded input does -- so step 3 is
+     * guaranteed to meet an ENOENT. */
+    (void)dir;
+    if (gap_victim[0] && unlink(gap_victim) == 0) {
+        gap_removals++;
+        gap_victim[0] = '\0';      /* once, so the retry can succeed */
+    }
+}
+
+static void test_snapshot_gap_retry(void)
+{
+    /* C-4a/C-4b: a file removed between scanning the directory and opening the
+     * files must surface as a retry that converges, never as a partial snapshot.
+     *
+     * FORCED, not raced.  An earlier version raced a remover against 300 snapshots
+     * and took the retry path zero times -- asserting nothing while appearing to
+     * cover the case.
+     *
+     * The victim is chosen deterministically rather than searched for.  An earlier
+     * attempt searched for "any file whose removal leaves a tiling set", which
+     * picked the OLDEST file and lost its data -- the very mistake D-23a exists to
+     * document: tiling is measured from the oldest surviving generation, so
+     * deleting the oldest merely raises that floor.  Here the repack output is
+     * published WITHOUT retiring its inputs, so each input is unambiguously
+     * superseded. */
+    total++;
+
+    fresh_dir();
+    hooks_reset();
+
+    struct zs_db *db = open_db(ZS_CREATE);
+    CHECK(db != NULL, "create");
+    zsi_uuid_t uuid;
+    memcpy(uuid, db->uuid, 16);
+
+    /* Three generations, each forced by making the active file unclean (D-9). */
+    for (int i = 0; i < 3; i++) {
+        char k[8];
+        snprintf(k, sizeof(k), "k%d", i);
+        CHECK(zs_db_store(db, k, strlen(k), "v", 1, 0) == ZS_OK, "store %s", k);
+
+        if (i < 2) {
+            char name[ZSI_NAME_MAX], path[PATH_MAX];
+            zsi_name_format(name, uuid, (uint32_t)(i + 1), 0);
+            snprintf(path, sizeof(path), "%s/%s", dbdir, name);
+            int fd = open(path, O_WRONLY | O_APPEND);
+            CHECK(fd >= 0, "append to %s", name);
+            if (write(fd, "\336\255\276\357\336\255\276\357", 8) != 8) {
+                close(fd);
+                CHECK(0, "append");
+            }
+            close(fd);
+            zs_db_close(&db);
+            db = open_db(0);
+            CHECK(db != NULL, "reopen after garbage");
+        }
+    }
+    zs_db_close(&db);
+
+    /* Conversion turns generations 1 and 2 into in-order files. */
+    db = open_db(0);
+    CHECK(db != NULL, "reopen for convert");
+    {
+        struct zs_txn *t = NULL;
+        CHECK(zs_db_begin_txn(db, 0, &t) == ZS_OK, "begin");
+        CHECK(zs_txn_commit(&t) == ZS_OK, "commit");
+    }
+
+    /* Publish a repack output WITHOUT retiring the inputs, so [1-1] is
+     * unambiguously superseded by [1-2]. */
+    size_t nio = 0;
+    while (nio < db->snap->nfiles && !zsi_file_is_unordered(db->snap->files[nio]))
+        nio++;
+    CHECK(nio >= 2, "only %zu in-order files after conversion", nio);
+
+    CHECK(zsi_repack_merge(db, db->snap, 0, 2) == ZS_OK, "merge");
+    CHECK(zsi_db_refresh(db) == ZS_OK, "refresh");
+
+    char victim_name[ZSI_NAME_MAX];
+    zsi_name_format(victim_name, uuid, 1, 1);
+    snprintf(gap_victim, sizeof(gap_victim), "%s/%s", dbdir, victim_name);
+    CHECK(fexists(gap_victim) == 0, "%s is not present", victim_name);
+
+    /* And confirm it really is superseded, by the same interval test D-23a
+     * requires -- so this test cannot repeat the mistake it was written to avoid. */
+    {
+        struct zsi_fileset fs;
+        CHECK(zsi_fileset_scan(dbdir, &uuid, &fs) == ZS_OK, "scan");
+        uint32_t lo = 0, hi = 0;
+        for (size_t i = 0; i < fs.nall; i++) {
+            uint32_t s0 = fs.all[i].start;
+            uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
+            if (i == 0 || s0 < lo) lo = s0;
+            if (e0 > hi) hi = e0;
+        }
+        size_t w = 0;
+        for (size_t i = 0; i < fs.nall; i++)
+            if (strcmp(fs.all[i].name, victim_name)) fs.all[w++] = fs.all[i];
+        fs.nall = w;
+        CHECK(zsi_fileset_resolve(&fs) == ZS_OK, "the reduced set does not tile");
+        uint32_t nlo = 0, nhi = 0;
+        for (size_t i = 0; i < fs.nall; i++) {
+            uint32_t s0 = fs.all[i].start;
+            uint32_t e0 = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
+            if (i == 0 || s0 < nlo) nlo = s0;
+            if (e0 > nhi) nhi = e0;
+        }
+        zsi_fileset_fini(&fs);
+        CHECK(nlo == lo && nhi == hi,
+              "the victim is not superseded: interval %u-%u becomes %u-%u",
+              lo, hi, nlo, nhi);
+    }
+
+    zs_db_close(&db);
+
+    /* Take a snapshot with the gap armed. */
+    gap_removals = 0;
+    zs_hook_snapshot_gap = snapshot_gap;
+
+    struct zsi_snapshot *s = NULL;
+    alarm(30);
+    int r = zsi_snapshot_take(dbdir, &uuid, zsi_compar_default, NULL, false,
+                              NULL, &s);
+    alarm(0);
+    zs_hook_snapshot_gap = NULL;
+
+    CHECK(gap_removals == 1, "the gap hook removed %d files, wanted 1",
+          gap_removals);
+    CHECK(r == ZS_OK, "the retry did not converge: %s", zs_strerror(r));
+    CHECK(s != NULL, "no snapshot");
+    zsi_snapshot_release(&s);
+
+    /* Nothing was lost. */
+    char state[512];
+    CHECK(read_state(state, sizeof(state)), "reopen after the gap");
+    for (int i = 0; i < 3; i++) {
+        char want[16];
+        snprintf(want, sizeof(want), "k%d=v", i);
+        CHECK(strstr(state, want) != NULL, "lost %s: '%s'", want, state);
+    }
+
+    passed++;
+    fprintf(stderr, "  snapshot gap retry converges (C-4b)      ok\n");
+}
+
 /* ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -819,6 +980,7 @@ int main(int argc, char **argv)
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },
         { "crash_after_invalid_terminator", test_crash_after_invalid_terminator },
+        { "snapshot_gap_retry",             test_snapshot_gap_retry },
         { NULL, NULL }
     };
 

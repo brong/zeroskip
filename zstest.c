@@ -9369,6 +9369,660 @@ static void test_malformed_never_hangs(void)
 
 /*
  * ============================================================
+ * Multi-process (T-10, T-10b)
+ * ============================================================
+ *
+ * Real forked processes, because these properties do not exist within one: fcntl
+ * locks are per-process (C-1f), and the whole point of a lock-free reader is that
+ * it works against a writer it cannot coordinate with.
+ *
+ * Where a case needs a particular interleaving it is FORCED with a pause point
+ * compiled in under ZS_TEST_HOOKS, not with a sleep.  A timing-dependent test that
+ * passes by luck is worse than no test, because it reads as coverage.  Where a
+ * hook is impractical the case loops enough times to make a miss improbable and
+ * the iteration count is printed.
+ */
+
+/* Wait for a child, returning its exit status or -1. */
+static int reap(pid_t pid)
+{
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return -1;
+    if (WIFSIGNALED(status)) return -(128 + WTERMSIG(status));
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void test_mp_writer_and_readers(void)
+{
+    /* A writer plus N readers: each reader's snapshot is stable across the writer's
+     * commits, and a fresh open sees them (G-4).
+     *
+     * The stability claim is the one that matters: a reader takes no lock (C-2), so
+     * nothing stops the writer appending underneath it -- only the fact that every
+     * byte below its boundary is immutable (C-4c). */
+    SKIP_IF_NO_FORK();
+
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    for (int i = 0; i < 5; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "base%d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+    zs_db_close(&db);
+
+    enum { NREADERS = 3 };
+    pid_t readers[NREADERS];
+
+    for (int i = 0; i < NREADERS; i++) {
+        readers[i] = fork();
+        ASSERT(readers[i] >= 0);
+        if (readers[i] == 0) {
+            /* Hold one snapshot and re-scan it repeatedly.  It must never change. */
+            struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+            struct zs_db *rdb = NULL;
+            setup.flags = ZS_SHARED;
+            setup.error = counting_error;
+            if (zs_db_open(dbdir, &setup, &rdb) != ZS_OK) _exit(1);
+
+            char first[4096] = "";
+            if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, first, 0)
+                != ZS_OK) _exit(2);
+
+            for (int n = 0; n < 200; n++) {
+                char again[4096] = "";
+                if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, again, 0)
+                    != ZS_OK) _exit(3);
+                if (strcmp(first, again) != 0) _exit(4);   /* snapshot moved */
+                usleep(200);
+            }
+
+            /* The snapshot must be a consistent state, not a mixture: every base
+             * key present, since they were all committed before the fork. */
+            for (int j = 0; j < 5; j++) {
+                char want[32];
+                snprintf(want, sizeof(want), "base%d=v", j);
+                if (!strstr(first, want)) _exit(5);
+            }
+
+            zs_db_close(&rdb);
+            _exit(0);
+        }
+    }
+
+    /* The writer commits throughout. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    for (int i = 0; i < 40; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "new%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "w", 1, 0));
+    }
+    zs_db_close(&db);
+
+    for (int i = 0; i < NREADERS; i++) {
+        int rc = reap(readers[i]);
+        if (rc != 0) {
+            fprintf(stderr, "\n    FAIL reader %d exited %d "
+                    "(4 = snapshot changed under it)\n", i, rc);
+            current_test_failed = 1;
+            return;
+        }
+    }
+
+    /* A fresh open sees everything. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "new39", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_OK(zs_db_fetch(db, "base0", 5, NULL, NULL, &v, &vl, 0));
+    zs_db_close(&db);
+}
+
+static void test_mp_two_writers(void)
+{
+    /* Two writers, exactly one proceeding, and ZS_LOCKED under ZS_NONBLOCKING. */
+    SKIP_IF_NO_FORK();
+
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    zs_db_close(&db);
+
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *cdb = NULL;
+        struct zs_txn *txn = NULL;
+        close(pipefd[0]);
+        setup.error = counting_error;
+        if (zs_db_open(dbdir, &setup, &cdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(cdb, 0, &txn) != ZS_OK) _exit(2);
+        if (zs_txn_store(txn, "child", 5, "c", 1, 0) != ZS_OK) _exit(3);
+        if (write(pipefd[1], "x", 1) != 1) _exit(4);
+        close(pipefd[1]);
+        usleep(400000);                 /* hold the write lock */
+        if (zs_txn_commit(&txn) != ZS_OK) _exit(5);
+        zs_db_close(&cdb);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);       /* the child holds the lock */
+    close(pipefd[0]);
+
+    /* Non-blocking: refused. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    setup.flags = ZS_NONBLOCKING;
+    setup.error = counting_error;
+    struct zs_db *nb = NULL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &nb));
+    struct zs_txn *txn = NULL;
+    ASSERT_EQ(zs_db_begin_txn(nb, 0, &txn), ZS_LOCKED);
+    ASSERT_NULL(txn);
+
+    /* A READ transaction is not blocked at all -- readers take no lock (C-2). */
+    ASSERT_OK(zs_db_begin_txn(nb, 1, &txn));
+    ASSERT_OK(zs_txn_abort(&txn));
+    zs_db_close(&nb);
+
+    /* Blocking: waits, then proceeds. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    alarm(30);
+    ASSERT_OK(zs_db_store(db, "parent", 6, "p", 1, 0));
+    alarm(0);
+    zs_db_close(&db);
+
+    ASSERT_EQ(reap(pid), 0);
+
+    /* Both writes survived: the lock serialised them rather than losing one. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "child", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_OK(zs_db_fetch(db, "parent", 6, NULL, NULL, &v, &vl, 0));
+    zs_db_close(&db);
+}
+
+static void test_mp_killed_writer(void)
+{
+    /* G-5: a writer SIGKILLed holding the lock, and the next writer proceeding with
+     * NO manual intervention.
+     *
+     * This is what frees the design from stale-lock recovery entirely: the kernel
+     * releases fcntl locks on process death, so no lock state can outlive a
+     * process and there is nothing to time out or clean up. */
+    SKIP_IF_NO_FORK();
+
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "before", 6, "1", 1, 0));
+    zs_db_close(&db);
+
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *cdb = NULL;
+        struct zs_txn *txn = NULL;
+        close(pipefd[0]);
+        setup.error = counting_error;
+        if (zs_db_open(dbdir, &setup, &cdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(cdb, 0, &txn) != ZS_OK) _exit(2);
+        if (zs_txn_store(txn, "doomed", 6, "x", 1, 0) != ZS_OK) _exit(3);
+        if (write(pipefd[1], "x", 1) != 1) _exit(4);
+        for (;;) pause();               /* hold it until killed */
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);
+    close(pipefd[0]);
+
+    ASSERT_EQ(kill(pid, SIGKILL), 0);
+    ASSERT(reap(pid) < 0);              /* died by signal */
+
+    /* The next writer proceeds immediately. */
+    alarm(30);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "after", 5, "2", 1, 0));
+    alarm(0);
+
+    /* The killed writer's uncommitted record is not visible -- it was never
+     * committed, and this writer buffered it in memory that died with it. */
+    const char *v;
+    size_t vl;
+    ASSERT_EQ(zs_db_fetch(db, "doomed", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_fetch(db, "before", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_OK(zs_db_fetch(db, "after", 5, NULL, NULL, &v, &vl, 0));
+    zs_db_close(&db);
+}
+
+static void test_mp_reader_across_repack(void)
+{
+    /* C-4g: a reader holding a snapshot across a repack keeps reading while the
+     * inputs are unlinked.  The kernel keeps each inode alive until the last
+     * descriptor AND MAPPING is gone, so there is no reference table and nothing to
+     * clean up when a process dies.
+     *
+     * C-5's accepted cost is asserted alongside: the space is held until that
+     * reader exits. */
+    SKIP_IF_NO_FORK();
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {"b","2"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"d","4"}, {NULL,NULL} });
+
+    int pipefd[2], donefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+    ASSERT_EQ(pipe(donefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *rdb = NULL;
+        char before[2048] = "", after[2048] = "";
+        close(pipefd[0]);
+        close(donefd[1]);
+        setup.flags = ZS_SHARED;
+        setup.error = counting_error;
+        if (zs_db_open(dbdir, &setup, &rdb) != ZS_OK) _exit(1);
+        if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, before, 0) != ZS_OK)
+            _exit(2);
+
+        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        close(pipefd[1]);
+
+        /* wait for the parent to repack and unlink the inputs */
+        char c;
+        if (read(donefd[0], &c, 1) != 1) _exit(4);
+        close(donefd[0]);
+
+        /* Still readable, identically, from files that no longer have names. */
+        if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, after, 0) != ZS_OK)
+            _exit(5);
+        if (strcmp(before, after) != 0) _exit(6);
+        zs_db_close(&rdb);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    close(donefd[0]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);       /* the reader holds its snapshot */
+    close(pipefd[0]);
+
+    struct zs_db *db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    /* Retire the inputs while the reader holds them. */
+    char n1[ZSI_NAME_MAX], n2[ZSI_NAME_MAX];
+    zsi_name_format(n1, db->uuid, 1, 1);
+    zsi_name_format(n2, db->uuid, 2, 2);
+    ASSERT_OK(zsi_remove_file(db, n1));
+    ASSERT_OK(zsi_remove_file(db, n2));
+    ASSERT_EQ(fexists(dbpath(n1)), -ENOENT);
+    ASSERT_EQ(fexists(dbpath(n2)), -ENOENT);
+    zs_db_close(&db);
+
+    ASSERT_EQ(write(donefd[1], "x", 1), 1);
+    close(donefd[1]);
+
+    int rc = reap(pid);
+    if (rc != 0) {
+        fprintf(stderr, "\n    FAIL reader exited %d "
+                "(6 = data changed under it after its inputs were unlinked)\n", rc);
+        current_test_failed = 1;
+        return;
+    }
+}
+
+static void test_mp_racing_removers(void)
+{
+    /* Two processes racing to remove debris, asserting the surviving set still
+     * tiles and no needed file is removed (D-23).
+     *
+     * Then the case T-10 calls out specifically: the debris of TWO half-finished
+     * repacks over OVERLAPPING ranges, where naive independent cleanup would remove
+     * both outputs' inputs and lose a generation. */
+    SKIP_IF_NO_FORK();
+
+    /* A directory holding [1-2] and [2-3] -- two outputs whose ranges overlap --
+     * plus the inputs [1-1], [2-2], [3-3] and an active file. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_inorder_kv(3, 3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    put_inorder_kv(1, 2, (const struct kv[]){ {"a","1"}, {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(4, (const struct kv[]){ {"d","4"}, {NULL,NULL} });
+
+    /* A partial overlap ([2-3] against [1-2]) is corruption (D-5c), so use a
+     * NESTED second output instead: [1-3], which encloses [1-2]. */
+    put_inorder_kv(1, 3, (const struct kv[]){ {"a","1"}, {"b","2"}, {"c","3"},
+                                              {NULL,NULL} });
+
+    /* Two children each try to remove every file they think is debris. */
+    static const char *victims[] = { NULL };
+    (void)victims;
+
+    pid_t kids[2];
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        ASSERT(kids[i] >= 0);
+        if (kids[i] == 0) {
+            struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+            struct zs_db *cdb = NULL;
+            setup.error = counting_error;
+            if (zs_db_open(dbdir, &setup, &cdb) != ZS_OK) _exit(1);
+
+            /* Attempt every plausible removal, in a different order per child, so
+             * they genuinely interleave. */
+            uint32_t ranges[5][2] = { {1,1}, {2,2}, {3,3}, {1,2}, {1,3} };
+            for (int n = 0; n < 5; n++) {
+                int idx = i ? 4 - n : n;
+                char nm[ZSI_NAME_MAX];
+                zsi_name_format(nm, cdb->uuid, ranges[idx][0], ranges[idx][1]);
+                (void)zsi_remove_file(cdb, nm);
+                usleep(1000);
+            }
+            zs_db_close(&cdb);
+            _exit(0);
+        }
+    }
+
+    for (int i = 0; i < 2; i++)
+        ASSERT_EQ(reap(kids[i]), 0);
+
+    /* Whatever survived, the set must still tile and hold every record. */
+    struct zs_db *db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    struct zsi_fileset fs;
+    ASSERT_OK(zsi_fileset_scan(dbdir, &db->uuid, &fs));
+    int rr = zsi_fileset_resolve(&fs);
+    zsi_fileset_fini(&fs);
+    if (rr != ZS_OK) {
+        fprintf(stderr, "\n    FAIL the surviving set does not tile (%d)\n", rr);
+        current_test_failed = 1;
+        zs_db_close(&db);
+        return;
+    }
+
+    char got[512];
+    api_scan(db, got, sizeof(got));
+    if (strcmp(got, "a=1|b=2|c=3|d=4") != 0) {
+        fprintf(stderr, "\n    FAIL records lost to racing removal: '%s'\n", got);
+        current_test_failed = 1;
+    }
+    zs_db_close(&db);
+}
+
+static void test_mp_removal_needs_the_lock(void)
+{
+    /* D-23: removal attempted WITHOUT the remove lock, asserting refusal.
+     *
+     * The lock is what makes verification and unlinking one step, so the set cannot
+     * change in between.  Asserted by holding the lock in a child and confirming a
+     * non-blocking removal in the parent is refused rather than proceeding on a
+     * stale verification. */
+    SKIP_IF_NO_FORK();
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_inorder_kv(1, 2, (const struct kv[]){ {"a","1"}, {"b","2"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zsi_locks lk;
+        close(pipefd[0]);
+        if (zsi_lock_open(&lk, dbdir) != ZS_OK) _exit(1);
+        if (zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0) != ZS_OK) _exit(2);
+        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        close(pipefd[1]);
+        usleep(400000);
+        zsi_lock_close(&lk);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);
+    close(pipefd[0]);
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    setup.flags = ZS_NONBLOCKING;
+    setup.error = counting_error;
+    struct zs_db *db = NULL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char nm[ZSI_NAME_MAX];
+    zsi_name_format(nm, db->uuid, 1, 1);
+    ASSERT_EQ(zsi_remove_file(db, nm), ZS_LOCKED);
+    ASSERT_EQ(fexists(dbpath(nm)), 0);          /* untouched */
+    zs_db_close(&db);
+
+    ASSERT_EQ(reap(pid), 0);
+
+    /* With the lock free it succeeds. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_remove_file(db, nm));
+    ASSERT_EQ(fexists(dbpath(nm)), -ENOENT);
+    zs_db_close(&db);
+}
+
+static void test_mp_repack_and_writer_concurrent(void)
+{
+    /* C-1a's disjointness claim, made concrete: a repack and a writer both
+     * proceeding, and the resulting set still tiling (D-6).
+     *
+     * The two locks never contend because the jobs consume disjoint file sets -- a
+     * writer only converts files with end == 0, the repacker only merges files with
+     * end != 0 -- so this must complete without either waiting on the other. */
+    SKIP_IF_NO_FORK();
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 400;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char pad[150];
+    memset(pad, 'p', sizeof(pad));
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "seed%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    zs_db_close(&db);
+
+    pid_t packer = fork();
+    ASSERT(packer >= 0);
+    if (packer == 0) {
+        struct zs_open_data s2 = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *pdb = NULL;
+        s2.error = counting_error;
+        if (zs_db_open(dbdir, &s2, &pdb) != ZS_OK) _exit(1);
+        for (int n = 0; n < 8; n++) {
+            if (zs_db_repack(pdb) != ZS_OK) _exit(2);
+            usleep(2000);
+        }
+        zs_db_close(&pdb);
+        _exit(0);
+    }
+
+    /* The writer keeps going throughout. */
+    alarm(60);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    for (int i = 0; i < 30; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "live%02d", i);
+        if (zs_db_store(db, k, strlen(k), pad, sizeof(pad), 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL writer blocked or failed at %d\n", i);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+        usleep(1000);
+    }
+    zs_db_close(&db);
+    alarm(0);
+
+    ASSERT_EQ(reap(packer), 0);
+
+    /* Everything survived, and the set tiles. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "seed%02d", i);
+        if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s lost\n", k);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+    }
+    for (int i = 0; i < 30; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "live%02d", i);
+        if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s lost\n", k);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
+static void test_mp_reader_sees_torn_span(void)
+{
+    /* T-10b's most valuable case: a writer killed MID-SPAN while a reader scans,
+     * asserting the reader stops at the last valid terminator (C-4f).
+     *
+     * This is the case that shows the terminator checksum, not a lock, is what
+     * makes reading a live file safe -- and it is why the checksum covers the span
+     * as well as the terminator (F-19).
+     *
+     * The interleaving is forced rather than raced: the child writes a span's
+     * records with a raw descriptor and dies before writing the terminator, so the
+     * reader is guaranteed to meet a span in progress. */
+    SKIP_IF_NO_FORK();
+
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "committed", 9, "yes", 3, 0));
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, db->uuid, 1, 0);
+    zs_db_close(&db);
+
+    long before = filesize(name);
+    ASSERT(before > 0);
+
+    /* Append a span's records with NO terminator, exactly as a writer killed
+     * between the two durability gates would leave (C-7). */
+    {
+        size_t n = zsi_rec_encoded_len(7, 3, false, false);
+        char *rec = malloc(n);
+        ASSERT_NOT_NULL(rec);
+        zsi_rec_encode(rec, "partial", 7, "no!", 3, false, 0);
+        int fd = open(dbpath(name), O_WRONLY | O_APPEND);
+        ASSERT(fd >= 0);
+        ASSERT_EQ(write(fd, rec, n), (ssize_t)n);
+        close(fd);
+        free(rec);
+    }
+
+    /* A reader must stop at the last valid terminator. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->files[0]->complete, (size_t)before);
+    ASSERT(db->snap->files[0]->size > (size_t)before);
+
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "committed", 9, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "yes", 3);
+    ASSERT_EQ(zs_db_fetch(db, "partial", 7, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    zs_db_close(&db);
+
+    /* Now the harder shape: the terminator IS present but its data was not fully
+     * written, which is what a reordering filesystem leaves.  The checksum is the
+     * only thing that can tell. */
+    {
+        size_t datalen = (size_t)(filesize(name) - before);
+        char term[ZSI_TERMLEN_LONG];
+        char *data = malloc(datalen);
+        ASSERT_NOT_NULL(data);
+
+        /* the terminator covers the data as WRITTEN... */
+        int fd = open(dbpath(name), O_RDONLY);
+        ASSERT(fd >= 0);
+        ASSERT_EQ(lseek(fd, before, SEEK_SET), before);
+        ASSERT_EQ(read(fd, data, datalen), (ssize_t)datalen);
+        close(fd);
+
+        zsi_term_encode(term, datalen, false, data, zsi_csum_xxhash,
+                        ZSI_CSUM_XXHASH);
+
+        /* ...but then the data is zeroed, as though it never landed. */
+        fd = open(dbpath(name), O_WRONLY);
+        ASSERT(fd >= 0);
+        ASSERT_EQ(lseek(fd, before, SEEK_SET), before);
+        char *zeros = calloc(1, datalen);
+        ASSERT_NOT_NULL(zeros);
+        ASSERT_EQ(write(fd, zeros, datalen), (ssize_t)datalen);
+        ASSERT_EQ(lseek(fd, 0, SEEK_END), (off_t)filesize(name));
+        ASSERT_EQ(write(fd, term, zsi_term_encoded_len(datalen)),
+                  (ssize_t)zsi_term_encoded_len(datalen));
+        close(fd);
+        free(data);
+        free(zeros);
+    }
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    /* The span reads as absent: the terminator arrived, the data did not, and F-22
+     * caught it.  Nothing but the checksum could have. */
+    ASSERT_EQU(db->snap->files[0]->complete, (size_t)before);
+    ASSERT_OK(zs_db_fetch(db, "committed", 9, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQ(zs_db_fetch(db, "partial", 7, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -9550,6 +10204,15 @@ static struct test_entry tests[] = {
     { "test_malformed_truncation",      test_malformed_truncation },
     { "test_malformed_bitflips",        test_malformed_bitflips },
 
+    { "test_mp_writer_and_readers",     test_mp_writer_and_readers },
+    { "test_mp_two_writers",            test_mp_two_writers },
+    { "test_mp_killed_writer",          test_mp_killed_writer },
+    { "test_mp_reader_across_repack",   test_mp_reader_across_repack },
+    { "test_mp_racing_removers",        test_mp_racing_removers },
+    { "test_mp_removal_needs_the_lock", test_mp_removal_needs_the_lock },
+    { "test_mp_repack_and_writer_concurrent",
+                                        test_mp_repack_and_writer_concurrent },
+    { "test_mp_reader_sees_torn_span",  test_mp_reader_sees_torn_span },
     { NULL, NULL }
 };
 

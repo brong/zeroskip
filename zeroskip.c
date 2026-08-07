@@ -64,11 +64,21 @@ int     (*zs_hook_unlink)(const char *) = NULL;
 #define ZS_RENAME(a, b)       (zs_hook_rename ? zs_hook_rename((a), (b)) \
                                               : rename((a), (b)))
 #define ZS_UNLINK(p)          (zs_hook_unlink ? zs_hook_unlink(p) : unlink(p))
+
+/* A pause point between C-4's step 2 (resolve) and step 3 (open), so a test can
+ * force the interleaving C-4b is about -- a file removed after the scan saw it.
+ * Racing for that window does not reliably hit it: a first attempt raced 300 times
+ * and never once took the retry path, which is a test that reads as coverage
+ * without providing any. */
+void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
+#define ZS_SNAPSHOT_GAP(dir)  do { if (zs_hook_snapshot_gap) \
+                                       zs_hook_snapshot_gap(dir); } while (0)
 #else
 #define ZS_WRITE(fd, buf, n)  write((fd), (buf), (n))
 #define ZS_FDATASYNC(fd)      fdatasync(fd)
 #define ZS_RENAME(a, b)       rename((a), (b))
 #define ZS_UNLINK(p)          unlink(p)
+#define ZS_SNAPSHOT_GAP(dir)  do { } while (0)
 #endif
 
 /********** TUNING *************/
@@ -2843,6 +2853,9 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                 return ZS_INTERNAL;
             }
         }
+
+        /* Between step 2 and step 3.  Nothing in a shipped build. */
+        ZS_SNAPSHOT_GAP(dir);
 
         bool retry = false;
         for (size_t i = 0; i < fs.nresolved && !retry; i++) {
