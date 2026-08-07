@@ -87,7 +87,7 @@ PUBLIC API          the three entry-point forms
 Each of these has cost someone an afternoon. They are load-bearing.
 
 - **`zsi_csum_xxhash` does not short-circuit on empty input**, unlike twom's equivalent. F-26g requires the engine's value for empty input, and a zero-record in-order file depends on it.
-- **The default comparator does not call `memcmp`.** `memcmp` only promises a sign and says nothing about keys of differing length, and `char` signedness varies by platform (F-11a).
+- **The default comparator compares through `unsigned char *`, and orders by length when the common prefix is equal** (F-11a). `memcmp` alone is not enough — it says nothing about keys of differing length, so a key and its own prefix come out wrong — and its return *magnitude* is unspecified, so only the sign may be used. The platform hazard is comparing plain `char`, whose signedness varies: that misorders keys above `0x7F` on ARM versus x86 and produces pointer sections the other platform cannot read, silently, past every ASCII test.
 - **`zsi_type_valid` is a `switch`, not a bit-property computation.** F-12's table is normative; a computed predicate is a second specification that can drift.
 - **Repack writes a record even when a newer file already shadows the key.** Being shadowed does not permit dropping it; only D-19 does. The retained record carries the chain's reach, which no other file records (D-19a).
 - **A failed `fdatasync` is never retried.** A second call can succeed after the dirty pages were discarded, so treating success as proof of durability is wrong (C-7a).

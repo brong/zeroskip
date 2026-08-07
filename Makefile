@@ -69,11 +69,21 @@ endif
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
 # Object files
+#
+# -Wno-unused-function is scaffolding for bottom-up development: the internal
+# helpers land section by section, and until the public API is implemented some
+# of them genuinely have no caller in the library build.  zstest reaches them
+# all (it includes zeroskip.c), so they are not untested, merely not yet wired.
+# REMOVE THIS once the PUBLIC API section is complete -- a warning-free build
+# without it is the acceptance criterion for that task, and leaving it in would
+# hide genuinely dead code from then on.
+LIBCFLAGS = $(CFLAGS) -Wno-unused-function
+
 zeroskip.o: zeroskip.c zeroskip.h xxhash.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(LIBCFLAGS) -c -o $@ $<
 
 zeroskip.pic.o: zeroskip.c zeroskip.h xxhash.h
-	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
+	$(CC) $(LIBCFLAGS) -fPIC -c -o $@ $<
 
 # Static library
 libzeroskip.a: zeroskip.o
@@ -89,8 +99,13 @@ $(LINKNAME): zeroskip.pic.o
 zstool: zstool.c zeroskip.h libzeroskip.a
 	$(CC) $(CFLAGS) -o $@ zstool.c libzeroskip.a $(LDLIBS)
 
-zstest: zstest.c zeroskip.h libzeroskip.a
-	$(CC) $(CFLAGS) -o $@ zstest.c libzeroskip.a $(LDLIBS)
+# zstest #includes zeroskip.c rather than linking the library, so it can assert
+# against internal statics -- the interoperability constants of T-2c have to be
+# checked against literals at the level where they are computed, not through the
+# public API where a compensating pair of bugs would cancel out.  It therefore
+# must NOT also link libzeroskip.a.
+zstest: zstest.c zeroskip.c zeroskip.h xxhash.h
+	$(CC) $(CFLAGS) -o $@ zstest.c $(LDLIBS)
 
 zsbench: zsbench.c zeroskip.h libzeroskip.a
 	$(CC) $(CFLAGS) -o $@ zsbench.c libzeroskip.a $(LDLIBS)
