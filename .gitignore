@@ -6,6 +6,7 @@
 *.dSYM/
 zstool
 zstest
+zstest-crash
 zsbench
 zeroskip.pc
 
