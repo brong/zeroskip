@@ -1,0 +1,291 @@
+# Conformance map
+
+**T-11.** Every normative requirement in
+[`doc/specification.md`](specification.md)
+mapped to the test that enforces it. A requirement with no test is a gap to
+close, and is listed as one rather than left as a blank cell — a blank reads as
+"covered" to the next reader.
+
+Test names are `zstest` functions with the `test_` prefix stripped, except:
+`crash/x` is a `zstest-crash` case, `tool.sh` is `tests/tool.sh`, `corpus` is
+`tests/corpus/`, and `zsbench` names a benchmark that produces the number.
+
+A citation means **a test whose source cites that requirement**, not necessarily
+the only or the strongest one. Most rows were found by scanning the test sources
+for requirement labels, which is why the tests carry them in comments; the rows
+that scanning could not attribute were filled in by hand.
+
+| | |
+|---|---|
+| Requirements | 197 |
+| With an enforcing test | 188 |
+| Gaps, each with a reason | 9 |
+
+Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
+this table against the spec and fails if a label here is missing from the spec or
+a spec label is missing here.
+
+## Guarantees (`G-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `G-0` | Nothing in the format depends on `mmap`, on pointer-sized integers, | **none** |
+| `G-0a` | Every integer in every structure is little-endian (F-1), including | `interop_constants_uuid` |
+| `G-0b` | Any arithmetic on a length, count or offset **read from a file** MUST | `file_bounds`, `interop_constants_uuid`, `overflow_guards`, +1 more |
+| `G-1` | Append-only. No committed byte is ever mutated and no file is ever | `crash/crash_at_every_call` |
+| `G-2` | Commit atomicity. Once `zs_txn_commit` returns `ZS_OK`, the whole | `crash/crash_at_every_call, crash/sync_failure_gate1, crash/sync_failure_gate2` |
+| `G-3` | Always reopens. Any state a crash can produce MUST open in bounded | `check_noncanonical`, `open_bad_nonactive`, `record_canonical`, +2 more |
+| `G-4` | Snapshot isolation, lock-free reads. A read transaction sees a fixed | `mp_writer_and_readers`, `write_txn_isolation` |
+| `G-5` | One writer. At most one writer per database, enforced by an `fcntl` | `lock_dies_with_process`, `lock_two_handles_one_process`, `mp_killed_writer` |
+| `G-6` | No shared mutable state. Nothing a reader may be reading is ever | `mp_reader_across_repack, snapshot_refcount` |
+| `G-7` | Read paths agree. Point lookups and range scans resolve visibility | `corpus_engine_from_file_not_config`, `fcur_uniform`, `read_arrangements`, +3 more |
+
+## On-disk format (`F-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `F-1` | Integers are little-endian. | `le_accessors` |
+| `F-2` | Every record begins at an offset that is a multiple of 8 and | `crash/crash_leaves_unaligned_length`, `overflow_guards`, `record_roundtrip` |
+| `F-3` | Offsets and pointers are absolute byte offsets from the file start. | `header_byte_layout, inorder_ptrs64` |
+| `F-4` | The checksum field is always the **last 4 bytes** of the structure | `header_checksum` |
+| `F-5` | Exactly three checksum engines exist: | `corpus`, `interop_constants_csum` |
+| `F-5a` | The engine id is recorded in each file header, so every file is | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `open_engine_selection` |
+| `F-5b` | Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the | `interop_constants_csum` |
+| `F-5c` | Engine 0 weakens G-2 and G-3, because F-22's property — that a | `header_checksum`, `span_engine_zero`, `terminator_detects_tear` |
+| `F-5d` | Engine 2 makes a file readable only by a caller supplying the same | `corpus` |
+| `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_records_checksum`, `span_terminator_without_data` |
+| `F-6` | A reader MUST validate all 16 bytes, not a prefix. | `magic` |
+| `F-6a` | The magic is **not valid UTF-8**: `0x89` lies in the continuation-byte | `magic`, `staging_names` |
+| `F-7` | Split read and write versions let an older library determine that it | `header_versions` |
+| `F-8` | Reserved fields MUST be written as zero and MUST be ignored on read. | `header_reserved` |
+| `F-9` | Generations start at 1, so `end == 0` is never a legitimate | `filename_rejections`, `header_bounds_and_ranges`, `header_checksum` |
+| `F-10` | An unordered file holds **exactly one** generation: `start` is that | `header_roundtrip` |
+| `F-11` | Every file of a database MUST carry the same UUID and the same | `open_comparator_agreement` |
+| `F-11a` | The default comparator. Compare `min(alen, blen)` bytes as | `index_binary_keys`, `index_ordered_traversal`, `interop_constants_compar`, +1 more |
+| `F-11b` | The default comparator's recorded name is the ASCII string | `corpus`, `header_roundtrip`, `interop_constants_compar`, +2 more |
+| `F-12` | The table above is normative: any byte not in it is invalid, | `span_progress`, `type_byte_validity` |
+| `F-12a` | Each bit is meaningful in isolation: `type & IsBig` selects the wide | `type_byte_validity` |
+| `F-12b` | Each data shape has exactly two forms, one storing an ancestor and | `record_roundtrip` |
+| `F-12c` | A 32-bit ancestor fits inside the padding the big forms already | `record_byte_layout_big` |
+| `F-13` | Lengths are authoritative; keys and values MAY contain NUL bytes, | `corpus`, `index_binary_keys`, `interop_constants_compar`, +4 more |
+| `F-14` | A key MUST be at least 1 byte. An empty value is legal and distinct | `malformed_never_hangs`, `record_bounds`, `record_byte_layout`, +2 more |
+| `F-15` | Encoding is canonical: an implementation MUST use the short form | `corpus`, `dump_shows_rollback`, `header_roundtrip`, +5 more |
+| `F-16` | Every record that casts a shadow MUST know the generation at which | `write_ancestors, repack_v1_ancestor_v3_value` |
+| `F-16a` | The stored value is the **`start` of the range of the file holding | `write_ancestors` |
+| `F-16b` | There is **no guarantee the ancestor is numerically close**: a key | `repack_d18_table` |
+| `F-16c` | The ancestor is absolute precisely so it never needs | `repack_v1_ancestor_v3_value` |
+| `F-17` | The ancestor is **omitted exactly when it equals the containing | `check_noncanonical`, `inorder_roundtrip`, `record_canonical`, +3 more |
+| `F-17a` | The two conditions "this is a later occurrence in the file" and | `write_ancestors` |
+| `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
+| `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
+| `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
+| `F-22` | Because the checksum covers the span **and** the terminator, a | `crash/crash_nosync_mode`, `mp_reader_sees_torn_span`, `span_terminator_without_data`, +2 more |
+| `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_bad_length`, `span_basic` |
+| `F-24` | An unordered file is **complete** at its last valid span, whether | `check_noncanonical`, `check_unclean_reported`, `corpus_engine_from_file_not_config`, +3 more |
+| `F-24a` | An in-order file has no equivalent notion, because it is written | `inorder_kind_rules` |
+| `F-25` | Visibility is per span, not a watermark: a rolled-back span may sit | `dump_shows_rollback`, `span_rollback` |
+| `F-26` | Pointers reference every record in the file, sorted by key | `check_out_of_order_pointers` |
+| `F-26a` | The trailer's back pointer is what locates the section, so nothing | **none** |
+| `F-26b` | The pointer-section checksum covers everything from the start of the | **none** |
+| `F-26c` | Encoding is canonical: `PTRS32` MUST be used when every record | `corpus`, `dump_shows_rollback`, `inorder_empty`, +1 more |
+| `F-26d` | The narrow section is padded with zeroes to a multiple of 8 so the | `inorder_trailer_negatives`, `inorder_widths_and_padding` |
+| `F-26e` | The records checksum covers the region from the end of the header to | `check_records_checksum`, `inorder_records_checksum` |
+| `F-26f` | The records checksum is verified lazily — by | `check_records_checksum`, `inorder_records_checksum`, `open_is_o1_in_records` |
+| `F-26g` | `count` MAY be **zero**. An in-order file with no records is legal | `fcur_empty_sources`, `file_open_inorder`, `inorder_empty`, +3 more |
+| `F-26h` | An **unordered** file may equally hold no records: an active file | `fcur_empty_sources`, `file_open_unordered`, `index_empty`, +3 more |
+| `F-27` | Every pointer MUST be 8-aligned and lie between the header and the | `inorder_trailer_negatives` |
+| `F-28` | `zs_db_check_consistency` MUST verify that an in-order file's | `check_out_of_order_pointers` |
+| `F-29` | Progress rule. Iteration computes the next offset from the current | `corpus_engine_from_file_not_config`, `malformed_never_hangs`, `span_progress` |
+| `F-30` | Every length, offset and pointer MUST be bounds-checked against the | **none** |
+| `F-31` | Opening an in-order file is O(1): validate the header, read the | `open_is_o1_in_records` |
+
+## Database layout (`D-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `D-0` | The `<uuid>` in a filename is the **36-character lowercase hyphenated | `interop_constants_uuid` |
+| `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_lexical_order`, `filename_rejections`, `filenames` |
+| `D-1a` | Data files carry **no extension**. An unordered file's name is | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
+| `D-2` | `zeroskip-*` matches data files only and `zeroskip.*` matches | `filename_rejections`, `fileset_ignores_foreign`, `staging_names` |
+| `D-3` | `zeroskip.lock` MUST be a distinct file that is never replaced. | `staging_names` |
+| `D-3a` | It is created with the database (D-8a), and is created on open with | `lock_basic`, `open_lock_file_recreated` |
+| `D-3b` | It MUST NOT be unlinked — not by the library, and not by anything | `never_unlinks_the_lock_file` |
+| `D-3c` | The lock file is empty and its contents are never read. Nothing about | `lock_basic` |
+| `D-4` | A file participates if its name matches `zeroskip-<uuid>-*` for this | `filename_rejections`, `fileset_ignores_foreign` |
+| `D-4a` | On first open the UUID is not yet known, so it is **discovered**: take | `fileset_uuid_discovery`, `open_create`, `open_uuid_mismatch` |
+| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_lexical_order`, `filename_prefix_property`, `filename_rejections`, +1 more |
+| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_lexical_order`, `filename_prefix_property`, `fileset_overlap_table` |
+| `D-5b` | The rule requires an unordered file's name to sort before the in-order | `fileset_first_vs_last` |
+| `D-5c` | A **partial** overlap, where neither range contains the other, cannot | `fileset_gaps`, `mp_racing_removers` |
+| `D-6` | Completeness. A set is complete if and only if the scan of D-5 consumes | `convert_steady_state`, `fileset_gaps`, `mp_repack_and_writer_concurrent`, +1 more |
+| `D-7` | `readdir` is not atomic, so a scan may miss an entry and produce a set | `fileset_gaps` |
+| `D-8` | Creating a file **is** publishing it, since the directory is the truth. | `open_create` |
+| `D-8a` | Creating a database. With `ZS_CREATE` and no existing directory, or a | `file_open_unordered`, `fileset_ignores_foreign`, `open_create`, +2 more |
+| `D-9` | An active file is **clean** if it has a valid header and zero or more | `check_unclean_reported`, `crash/crash_after_invalid_terminator`, `crash/snapshot_gap_retry`, +4 more |
+| `D-9a` | A writer moves to a new file when the active file is not clean, or | `write_rollover` |
+| `D-9b` | The next generation is one above the highest present in the directory. | `fileset_next_gen` |
+| `D-9c` | Generations are never reused and never reset, not even by a repack | `fileset_next_gen`, `header_roundtrip` |
+| `D-10` | An active file with a corrupt header or zero length is treated as a | `file_bad_header`, `file_zero_length`, `open_bad_nonactive`, +3 more |
+| `D-10a` | A **non-active** file with an invalid header MUST be **reported** | `file_bad_header`, `open_bad_nonactive`, `snapshot_bad_nonactive` |
+| `D-10b` | An earlier version of D-10a made this fatal, which contradicts D-10 | `open_bad_nonactive`, `snapshot_bad_nonactive` |
+| `D-11` | The writer never appends a pointer section to an unordered file. When | `write_rollover` |
+| `D-12` | Immediate conversion. A writer that finds a **non-active unordered | `api_pointer_lifetime`, `conversion_avoids_the_repack_lock`, `convert_basic`, +2 more |
+| `D-12a` | This is what keeps the steady state at **exactly one unordered file, | `convert_basic`, `convert_steady_state`, `write_rollover` |
+| `D-12b` | A writer MUST convert **oldest first**. That keeps the generation | `convert_backlog_oldest_first` |
+| `D-12c` | Conversion never takes the repack lock. It renames its output in | `conversion_avoids_the_repack_lock` |
+| `D-12d` | Each conversion is bounded by `rollover_size` — sort the keys, write | `zsbench (store, rollover Nk)` |
+| `D-13` | The private index MUST support point lookup, lower-bound seek and | `index_ordered_traversal` |
+| `D-13a` | It reflects **committed spans only**, and for each key only its | `index_committed_only` |
+| `D-13b` | A **writer is a reader that also maintains the active file's index | `index_delta` |
+| `D-13c` | No shared state is mutated in place anywhere in the design: files are | `mp_reader_across_repack` |
+| `D-13d` | The cost is that each snapshot replays the unordered files it | `zsbench (snapshot open)` |
+| `D-14` | Within a file the newest version of a key wins — the highest offset | `index_newest_per_key`, `read_deletion_hides_older`, `read_newest_wins`, +1 more |
+| `D-14a` | Point lookups, cursors and range scans MUST all resolve visibility | `fcur_uniform` |
+| `D-14b` | Searching one file for a key: | `fcur_empty_sources`, `index_empty`, `inorder_empty`, +1 more |
+| `D-14c` | Ancestors are **not** consulted by any read. They exist solely for | `reads_never_consult_ancestors` |
+| `D-14d` | Point lookup Walk the sources in priority order; in each, search | `inorder_probe_ends_agrees`, `zsbench` |
+| `D-14e` | Iteration A cursor holds one **per-file cursor** per source, each | `fcur_deletions_visible`, `fcur_empty_sources`, `open_uuid_mismatch`, +2 more |
+| `D-14f` | Because the tie-break is part of the sort, cursors on the emitted key | `read_d14f_duplicate_across_three_files`, `read_prefix_across_files` |
+| `D-14g` | The write transaction's own records sort as though they had a | **none** |
+| `D-14h` | A per-file cursor never yields the same key twice: an in-order file | `fcur_no_duplicate_keys`, `index_delta_shadows_base`, `index_newest_per_key` |
+| `D-14i` | Picking the next record is O(1) and re-sorting one cursor is O(k) | `read_cursor_invariant` |
+| `D-15` | The repacker **never touches the active file**, and never touches an | `repack_never_touches_unordered`, `repack_selection` |
+| `D-16` | The repacker works **only on in-order files**; converting unordered | `corpus`, `repack_cascade`, `repack_never_touches_unordered`, +1 more |
+| `D-16a` | The two jobs divide by whether a file has an `end`, which is what | `mp_repack_and_writer_concurrent` |
+| `D-16b` | A cascade writes one output for the whole selected set, not one per | `repack_selection`, `zsbench` |
+| `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_backlog_oldest_first` |
+| `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
+| `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `inorder_roundtrip`, +1 more |
+| `D-17a` | Ancestors are copied verbatim; nothing is renumbered and no | `repack_v1_ancestor_v3_value` |
+| `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_v1_ancestor_v3_value` |
+| `D-18` | Per key: | `repack_d18_table`, `repack_v1_ancestor_v3_value` |
+| `D-19` | A key is removed entirely if and only if its latest version is a | `repack_d18_table` |
+| `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_resurrection` |
+| `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
+| `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
+| `D-21` | The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to | `repack_selection` |
+| `D-22` | The output may legitimately contain **zero records**, in the form | `inorder_empty`, `repack_empty_output` |
+| `D-23` | Removing a data file — a converted unordered file, repack inputs, or | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
+| `D-23a` | Tiling alone is **not** a sufficient test, because D-6 measures | `crash/snapshot_gap_retry` |
+| `D-24` | `zs_db_should_repack` reports whether D-16 currently has work. | `repack_selection` |
+
+## Concurrency and durability (`C-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `C-1` | Three byte-range locks on `zeroskip.lock`: | `lock_basic, lock_byte_offsets` |
+| `C-1a` | The write and repack locks never contend, because the two jobs | `conversion_avoids_the_repack_lock`, `lock_excludes_other_process`, `mp_repack_and_writer_concurrent` |
+| `C-1b` | Publishing a new file needs **no lock at all**: `rename` into the | `mp_repack_and_writer_concurrent` |
+| `C-1c` | The **remove** lock makes verifying completeness and unlinking one | `mp_removal_needs_the_lock` |
+| `C-1d` | Lock ordering. Acquisition is always write → remove or | `lock_basic` |
+| `C-1e` | The primitive and the byte offsets are normative, because | `lock_byte_offsets`, `lock_never_uses_flock` |
+| `C-1f` | `fcntl` locks are per-process, not per-thread: two threads of one | `lock_byte_offsets`, `lock_dies_with_process`, `lock_two_handles_one_process`, +1 more |
+| `C-1g` | `fcntl` locks are released by closing **any** descriptor for the file | `one_lock_descriptor` |
+| `C-1h` | Locks across databases. C-1d orders the locks within one database. | **none** |
+| `C-1i` | An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only | **none** |
+| `C-2` | Readers take **no lock**. | `mp_two_writers`, `mp_writer_and_readers` |
+| `C-3` | A file is published by writing it under a staging name, then | `convert_basic, mp_reader_across_repack` |
+| `C-4` | Taking a snapshot. The protocol is: | `crash/crash_after_invalid_terminator`, `file_open_failures`, `fileset_gaps`, +1 more |
+| `C-4a` | Completeness. Step 2's tiling check *is* the completeness proof: every | `crash/snapshot_gap_retry` |
+| `C-4b` | Why a retry suffices. `readdir` may miss entries, and a file may be | `crash/snapshot_gap_retry` |
+| `C-4c` | Immutability of what was opened. In-order files are never modified. | `mp_writer_and_readers`, `snapshot_boundary` |
+| `C-4d` | Every index is private (D-13c), so a snapshot needs no synchronisation | `mp_writer_and_readers` |
+| `C-4f` | Concurrent visibility. A reader scanning the active file may meet a | `mp_reader_sees_torn_span`, `span_terminator_without_data`, `terminator_detects_tear` |
+| `C-4g` | Lifetime. Once its descriptors are open a packer may (subject to | `mp_reader_across_repack`, `snapshot_refcount` |
+| `C-4h` | Termination. A retry happens only when the file set changed during | `snapshot_retries_and_bounds` |
+| `C-5` | The accepted cost of C-4g is that disk space is held until the last | `mp_reader_across_repack` |
+| `C-6` | Directory durability. After creating a **data file** (a new active | `crash/dirsync_justifies_c6` |
+| `C-6a` | A directory sync is **not** required after `unlink`. If a removed name | `crash/dirsync_justifies_c6` |
+| `C-7` | Two gates per commit. Under default durability a commit is: | `crash/crash_at_every_call`, `mp_reader_sees_torn_span`, `zsbench` |
+| `C-7a` | Together the gates make "a valid terminator implies its data is | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
+| `C-7b` | The cost is two syncs per commit rather than one. It is paid per | `zsbench (store, N per txn)` |
+| `C-7c` | `ZS_NOSYNC` omits **both** gates. Atomicity survives, because a torn | `crash/crash_nosync_mode` |
+| `C-8` | An aborted transaction appends a `ROLLBACK` and syncs **neither** gate. | `write_abort` |
+
+## Open and recovery (`R-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `R-1` | Open is C-4: scan the directory, resolve enclosures, check the tiling, | `open_create, crash/crash_at_every_call` |
+| `R-2` | Live data is the union of records in spans with `COMMIT` terminators; | `span_rollback` |
+| `R-3` | A reader MUST NOT write. Opening a damaged database read-only is | `convert_readonly_does_nothing`, `corpus_engine_from_file_not_config`, `open_readonly_no_side_effects`, +1 more |
+| `R-4` | There is no in-place repair. A file that is not clean is simply | `crash/crash_after_invalid_terminator`, `span_bad_header_and_kind`, `span_torn_tail`, +1 more |
+| `R-5` | A crash during a repack or conversion leaves either a staging file, | `snapshot_resolves_overlap`, `staging_names` |
+
+## C binding (`A-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `A-0` | Every read and write entry point exists in three forms — on the | `api_three_forms` |
+| `A-1` | `store` with `val == NULL` writes a deletion; with a non-NULL | `record_byte_layout`, `span_basic`, `tool.sh`, +1 more |
+| `A-1a` | A write inside a transaction is visible to subsequent reads on that | `tool.sh`, `write_txn_isolation` |
+| `A-1b` | The `*_delete` forms are **macros** over `store` and | `api_cursor_replace`, `api_three_forms`, `write_basic` |
+| `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
+| `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
+| `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime` |
+| `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
+| `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
+| `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
+
+## Conformance suite (`T-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `T-0` | The corpus is language-neutral. `tests/corpus/` holds data files | `corpus`, `dump_shows_rollback` |
+| `T-0a` | Driver contract. Each implementation MUST provide a small executable | `dump_line_format`, `tool.sh` |
+| `T-1` | to T-11 are per-implementation tests , run | `corpus`, `dump_shows_rollback`, `open_with_uuid`, +1 more |
+| `T-2` | Magic and versions. All 16 magic bytes required (F-6); each | `magic_designed_corruptions`, `staging_names` |
+| `T-2a` | The trailer. Opening an in-order file depends entirely on it, so: the | `index_many`, `inorder_trailer_negatives` |
+| `T-2b` | Type byte validity. All 256 byte values fed as a record type, asserting | `header_bounds_and_ranges`, `type_byte_validity` |
+| `T-2c` | Interoperability constants. The values two implementations must agree on | `filenames`, `overflow_guards`, `strerror` |
+| `T-3` | Malformed input. Every golden file truncated at *every byte offset*, | `corpus_engine_from_file_not_config`, `malformed_bitflips`, `malformed_truncation`, +1 more |
+| `T-4` | Behavioural. Ordering, prefix scans, cursor replace, | `header_bounds_and_ranges`, `read_model`, `terminator_long_span`, +1 more |
+| `T-5` | Model-based. Randomised operation sequences against an in-memory | `open_uuid_mismatch`, `read_model`, `read_prefix_across_files` |
+| `T-5a` | Read paths under every file arrangement. The same assertions driven | `inorder_probe_ends_agrees`, `open_uuid_mismatch`, `read_arrangements` |
+| `T-5b` | Cursor mechanics. The sorted-array invariant of D-14e asserted after | `open_uuid_mismatch`, `read_cursor_invariant`, `read_d14f_duplicate_across_three_files` |
+| `T-6` | File states and encoding. That `end == 0` and `end != 0` files are | `check_noncanonical`, `index_many`, `inorder_kind_rules`, +4 more |
+| `T-7` | Ancestors and repacking. For every arrangement of create, update and | `convert_readonly_does_nothing` |
+| `T-8` | Crash injection. A test build interposes `write`, `fdatasync`, `rename` | `crash/crash_after_invalid_terminator`, `crash/crash_leaves_unaligned_length`, `crash/sync_failure_every_point` |
+| `T-8a` | Sync failure. The case C-7a exists for, which no crash test reaches: | `crash/dirsync_justifies_c6` |
+| `T-9` | File set discovery. That the set and every range are derived from | `fcur_deletions_visible`, `filename_prefix_property`, `fileset_first_vs_last`, +3 more |
+| `T-10` | Multi-process. Real forked processes. A writer plus *N* readers | `malformed_never_hangs`, `mp_racing_removers` |
+| `T-10a` | Steady state. That the number of unordered files returns to one after | `api_pointer_lifetime`, `convert_backlog_oldest_first`, `convert_steady_state` |
+| `T-10b` | The snapshot protocol. Each step of C-4 attacked directly, since these | `crash/crash_after_invalid_terminator`, `malformed_never_hangs`, `mp_reader_sees_torn_span` |
+| `T-11` | Traceability. `doc/conformance.md` maps every normative requirement | this document |
+| `T-12` | to T-14 are cross-implementation tests , | **none** |
+| `T-12a` | Byte-for-byte agreement. Given the same UUID and the same operation | `corpus_encode_byte_identical` — Local half only: byte-identical output from the same operations. The cross-implementation half needs a second implementation. |
+| `T-13` | Cross-implementation concurrency. The tests most likely to find real | **none** |
+| `T-14` | Two handles in one process. Two write handles on one database from a | `lock_two_handles_one_process` — Repurposed by the spec amendment in 6282469: asserts the implementation does NOT claim exclusion it cannot provide. |
+
+## Gaps
+
+Each of these is a deliberate, explained absence rather than an oversight.
+
+- **`G-0`** — Architectural: nothing in the format depends on mmap. This implementation *does* mmap, so it cannot demonstrate the alternative. A second implementation reading with ordinary reads is what would establish it (T-12).
+- **`F-26a`** — Not yet attributed.
+- **`F-26b`** — Not yet attributed.
+- **`F-30`** — Not yet attributed.
+- **`D-14g`** — Not yet attributed.
+- **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
+- **`C-1i`** — Not implemented. F_OFD_SETLK is permitted but only after verifying platform behaviour, and this implementation uses F_SETLK.
+- **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
+- **`T-13`** — Needs a second implementation. zstool provides hold-write for it.
+
+## What this implementation does not claim
+
+- **`C-1i`** `F_OFD_SETLK` is not used. The spec permits it, but only after
+  verifying on the target platform that it conflicts with `F_SETLK`.
+- **Engine 2** is outside the shared corpus (F-5d): a file written under a
+  caller-supplied checksum is readable only by a caller supplying the same
+  function, so it cannot be validated by anyone else.
+- **Thread-safe handles.** Removed from the spec in `6282469` after measurement
+  showed the in-process mutex did not deliver what G-5 appeared to promise.
+  Concurrent writers must be separate processes.
+- **A ROLLBACK span is never written**, only read. This writer buffers a
+  transaction and writes at commit, so an abort has nothing on disk to void.
+  Both writers are conforming; the trade is that a transaction must fit in
+  memory.
+- **The cross-implementation tests** (`T-12`, `T-13`) need a second
+  implementation. Everything they depend on — the language-neutral corpus and
+  the driver contract — is in place.
+

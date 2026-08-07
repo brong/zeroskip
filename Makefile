@@ -68,7 +68,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check check-noprobe crashtest test asan leaks mutate bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check check-noprobe crashtest conformance test asan leaks mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -119,6 +119,13 @@ check: zstest zstool zstest-crash
 	./zstest
 	./zstest-crash
 	./tests/tool.sh
+	./tests/conformance.sh
+
+# T-11: check doc/conformance.md against the spec in both directions, and that
+# every test it cites still exists.  A citation is only evidence while the test it
+# names is still there.
+conformance:
+	./tests/conformance.sh
 
 test: check
 

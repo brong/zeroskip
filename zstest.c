@@ -10023,6 +10023,300 @@ static void test_mp_reader_sees_torn_span(void)
 
 /*
  * ============================================================
+ * Negative and structural requirements (T-11 gap closing)
+ * ============================================================
+ *
+ * Requirements of the form "never do X" and "X is not consulted".  They are easy to
+ * leave untested precisely because there is nothing to observe when they hold --
+ * which is why the conformance map made them visible.
+ */
+
+static void test_never_unlinks_the_lock_file(void)
+{
+    /* D-3b: the lock file MUST NOT be unlinked, by this library or anything else.
+     *
+     * Unlinking it while processes hold locks is the one way to break mutual
+     * exclusion from outside: holders keep locking the removed inode while a new
+     * process creates a fresh one and locks that, so TWO WRITERS each believe they
+     * hold the write lock.  Worth a test because an empty file named *.lock is
+     * exactly what a cleanup script deletes.
+     *
+     * Asserted two ways: the source never unlinks that name, and a full workload
+     * leaves it in place. */
+    FILE *fp = fopen("zeroskip.c", "r");
+    if (!fp) SKIP("zeroskip.c not readable from the test's cwd");
+
+    char line[1024];
+    int lineno = 0, found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        /* any unlink whose argument mentions the lock name */
+        if (strstr(line, "UNLINK") && strstr(line, "LOCK_NAME")) {
+            fprintf(stderr, "\n    FAIL zeroskip.c:%d unlinks the lock file\n",
+                    lineno);
+            found = 1;
+        }
+    }
+    fclose(fp);
+    ASSERT_EQ(found, 0);
+
+    /* And behaviourally: a workload including conversion and repack leaves it. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 400;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    char pad[150];
+    memset(pad, 'p', sizeof(pad));
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    while (zs_db_should_repack(db)) ASSERT_OK(zs_db_repack(db));
+    zs_db_close(&db);
+
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), 0);
+}
+
+static void test_one_lock_descriptor(void)
+{
+    /* C-1g: fcntl locks are released by closing ANY descriptor for the file in that
+     * process, so an implementation MUST hold exactly one for the handle's lifetime
+     * and MUST NOT open a second.
+     *
+     * The hazard is silent: a second open followed by a close drops every lock the
+     * handle holds, and nothing reports it.  Asserted structurally, since the
+     * behavioural version would need the bug present to observe. */
+    FILE *fp = fopen("zeroskip.c", "r");
+    if (!fp) SKIP("zeroskip.c not readable from the test's cwd");
+
+    char line[1024];
+    int opens = 0;
+    while (fgets(line, sizeof(line), fp))
+        if (strstr(line, "ZSI_LOCK_NAME") && strstr(line, "path")) opens++;
+    fclose(fp);
+
+    /* Exactly one place builds the lock file's path: zsi_lock_open. */
+    ASSERT_EQ(opens, 1);
+
+    /* And a handle holds exactly one descriptor for it. */
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    ASSERT(db->locks.fd >= 0);
+    int fd = db->locks.fd;
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+    ASSERT_EQ(db->locks.fd, fd);           /* unchanged by a transaction */
+    zs_db_close(&db);
+}
+
+static void test_reads_never_consult_ancestors(void)
+{
+    /* D-14c: ancestors are NOT consulted by any read.  They exist solely for
+     * repacking (F-16), so a lookup never follows a chain.
+     *
+     * Asserted by making every ancestor a lie: hand-built files whose ancestor
+     * fields point at nonsense generations.  If a read consulted them it would
+     * follow a chain into a file that does not exist; because it does not, the
+     * answers are unchanged. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    char got[256];
+
+    clear_db();
+
+    /* Generation 5 with ancestors naming generations 1 and 99 -- one below the
+     * file, one far above anything present. */
+    ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "A", 1, true, 1);
+    ib_rec(&b, "b", 1, "B", 1, true, 99);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 5, 5);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    put_unordered_kv(6, (const struct kv[]){ {"c","C"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Both keys read normally, and the scan is complete. */
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "A", 1);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "B", 1);
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=A|b=B|c=C");
+
+    /* A deletion with a nonsense ancestor still hides the key -- the tombstone is
+     * honoured on its own terms, not by chasing its ancestor. */
+    zs_db_close(&db);
+    put_unordered_kv(7, (const struct kv[]){ {NULL,NULL} });
+    ib_init(&b, 7, 7, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, NULL, 0, true, 12345);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 7, 7);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    zs_db_close(&db);
+}
+
+static void test_no_yield_and_no_mvcc(void)
+{
+    /* A-2: there is no yield call and no yield flags, because readers hold no lock
+     * and so have nothing to yield.  A-3: there is no MVCC flag, because snapshot
+     * isolation is the only read mode.
+     *
+     * twom has both.  Porting them here would be copying an answer to a question
+     * this design does not ask, and a structural check is what stops that happening
+     * by reflex during a later port. */
+    FILE *fp = fopen("zeroskip.h", "r");
+    if (!fp) SKIP("zeroskip.h not readable from the test's cwd");
+
+    char line[1024];
+    int bad = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "yield") && !strstr(line, "no yield")
+            && line[0] != ' ' && line[0] != '*') {
+            fprintf(stderr, "\n    FAIL zeroskip.h declares a yield entry point\n");
+            bad = 1;
+        }
+        if (strstr(line, "ZS_MVCC")) {
+            fprintf(stderr, "\n    FAIL zeroskip.h declares an MVCC flag\n");
+            bad = 1;
+        }
+    }
+    fclose(fp);
+    ASSERT_EQ(bad, 0);
+
+    /* And snapshot isolation is what a read transaction gets, unconditionally: a
+     * second handle's commits are invisible to an open read transaction (A-3). */
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "before", 6, "1", 1, 0));
+
+    struct zs_txn *rd = NULL;
+    ASSERT_OK(zs_db_begin_txn(db, 1, &rd));
+
+    struct zs_db *other = open_db(0);
+    ASSERT_NOT_NULL(other);
+    ASSERT_OK(zs_db_store(other, "during", 6, "2", 1, 0));
+    zs_db_close(&other);
+
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_txn_fetch(rd, "before", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQ(zs_txn_fetch(rd, "during", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_txn_abort(&rd));
+    zs_db_close(&db);
+}
+
+static void test_conversion_avoids_the_repack_lock(void)
+{
+    /* D-12c: conversion never takes the repack lock.  It renames its output in
+     * without any lock (C-1b) and takes the remove lock only momentarily, so a
+     * WRITER NEVER WAITS ON A REPACK -- which is C-1a's practical consequence.
+     *
+     * Asserted by holding the repack lock in a child and confirming a writer's
+     * conversion still completes. */
+    SKIP_IF_NO_FORK();
+
+    struct zs_db *db = NULL;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    put_unordered_kv(1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zsi_locks lk;
+        close(pipefd[0]);
+        if (zsi_lock_open(&lk, dbdir) != ZS_OK) _exit(1);
+        if (zsi_lock_take(&lk, ZSI_LOCK_REPACK, 0) != ZS_OK) _exit(2);
+        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        close(pipefd[1]);
+        usleep(500000);
+        zsi_lock_close(&lk);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    char c;
+    ASSERT_EQ(read(pipefd[0], &c, 1), 1);       /* the repack lock is held */
+    close(pipefd[0]);
+
+    /* A write, which converts before finishing (D-12), must not block on it. */
+    alarm(20);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+    alarm(0);
+
+    /* The conversion happened despite the repack lock being held. */
+    zsi_name_format(name, db->uuid, 1, 1);
+    ASSERT_EQ(fexists(dbpath(name)), 0);
+    zs_db_close(&db);
+
+    ASSERT_EQ(reap(pid), 0);
+}
+
+static void test_open_is_o1_in_records(void)
+{
+    /* F-31: opening an in-order file is O(1) -- validate the header, read the
+     * 16-byte trailer, verify the pointer-section checksum, use the pointers.  The
+     * records region is NOT touched, and its checksum is verified only on demand
+     * (F-26f).
+     *
+     * Asserted by corrupting the records region and confirming the open succeeds:
+     * an open that read the records would have to notice. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    for (int i = 0; i < 50; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ib_rec(&b, k, strlen(k), "value", 5, false, 0);
+    }
+    ib_finish(&b);
+
+    /* Damage a value byte deep in the records region. */
+    b.buf[ZSI_HEADER_LEN + 40] ^= 0xFF;
+
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(report_count, 0);          /* open said nothing: it never looked */
+
+    /* On demand, it is found. */
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -10213,6 +10507,16 @@ static struct test_entry tests[] = {
     { "test_mp_repack_and_writer_concurrent",
                                         test_mp_repack_and_writer_concurrent },
     { "test_mp_reader_sees_torn_span",  test_mp_reader_sees_torn_span },
+
+    { "test_never_unlinks_the_lock_file", test_never_unlinks_the_lock_file },
+    { "test_one_lock_descriptor",       test_one_lock_descriptor },
+    { "test_reads_never_consult_ancestors",
+                                        test_reads_never_consult_ancestors },
+    { "test_no_yield_and_no_mvcc",      test_no_yield_and_no_mvcc },
+    { "test_conversion_avoids_the_repack_lock",
+                                        test_conversion_avoids_the_repack_lock },
+    { "test_open_is_o1_in_records",     test_open_is_o1_in_records },
+
     { NULL, NULL }
 };
 
