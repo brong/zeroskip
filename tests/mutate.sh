@@ -32,6 +32,9 @@
 # made once already while writing this.
 
 set -u
+set +m          # no async job-control messages: a crashing mutant's
+                # "Segmentation fault" line would otherwise print next to an
+                # unrelated mutant's result and appear to belong to it
 cd "$(dirname "$0")/.." || exit 1
 
 FILTER="${1:-}"
@@ -62,7 +65,13 @@ mutant() {
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
     fi
 
-    if ./zstest >"$WORK/run.log" 2>&1; then
+    # Run detached from the shell's job control, so a crashing mutant does not
+    # print an async "Segmentation fault" line that lands next to an unrelated
+    # mutant's result and misattributes it.
+    ./zstest >"$WORK/run.log" 2>&1
+    local rc=$?
+
+    if [ "$rc" -eq 0 ]; then
         if [ "$expect" = equivalent ]; then
             printf '  %-46s equivalent (as documented)\n' "$name"
             equivalent=$((equivalent + 1))
@@ -70,16 +79,22 @@ mutant() {
             printf '  %-46s NOT CAUGHT  <-- test gap\n' "$name"
             missed=$((missed + 1))
         fi
+    elif [ "$expect" = equivalent ]; then
+        printf '  %-46s CAUGHT but marked equivalent -- reclassify\n' "$name"
+        missed=$((missed + 1))
+    elif [ "$rc" -gt 128 ]; then
+        # Killed by a signal rather than failing an assertion.  Still detected,
+        # but worth naming: it means the mutation corrupts memory before any
+        # assertion runs, so the suite is catching it by crashing rather than by
+        # checking.  Usually a sign the mutant breaks an invariant the tests rely
+        # on to even execute -- not a problem, but not the same evidence.
+        printf '  %-46s caught by crash (signal %d)\n' "$name" "$((rc - 128))"
+        caught=$((caught + 1))
     else
         local where
         where=$(grep -m1 'FAIL' "$WORK/run.log" | sed 's/^ *//; s/^FAIL //')
-        if [ "$expect" = equivalent ]; then
-            printf '  %-46s CAUGHT but marked equivalent -- reclassify\n' "$name"
-            missed=$((missed + 1))
-        else
-            printf '  %-46s caught: %s\n' "$name" "$where"
-            caught=$((caught + 1))
-        fi
+        printf '  %-46s caught: %s\n' "$name" "$where"
+        caught=$((caught + 1))
     fi
     cp "$BAK" zeroskip.c
 }
@@ -169,6 +184,103 @@ mutant "F-9: start==0 allowed" catch \
 
 mutant "encoder: no memset (dirty padding)" catch \
   's/    memset\(buf, 0, ZSI_HEADER_LEN\);\n\n    memcpy\(buf \+ ZSI_HDR_OFF_MAGIC/    memcpy(buf + ZSI_HDR_OFF_MAGIC/'
+
+echo
+echo "records and terminators (Task 4)"
+
+mutant "type: computed instead of tabled" catch \
+  's/    switch \(type\) \{\n    case ZSI_KEYVALUE:/    if (type \& 0xC0) return false;\n    return true;\n    switch (type) {\n    case ZSI_KEYVALUE:/'
+
+mutant "type: 0x00 accepted" catch \
+  's/    case ZSI_PTRS64:\n        return true;\n    \}\n\n    return false;/    case ZSI_PTRS64:\n    case 0x00:\n        return true;\n    }\n\n    return false;/'
+
+mutant "type: reserved bit ignored" catch \
+  's/static bool zsi_type_valid\(uint8_t type\)\n\{\n    switch \(type\) \{/static bool zsi_type_valid(uint8_t type)\n{\n    type \&= 0x3F;\n    switch (type) {/'
+
+mutant "keylen boundary: 256 stays short" catch \
+  's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        hdr = big \? ZSI_HDRLEN_BIGDELETION/bool big = keylen > 256\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);\n\n    if (isdelete) {\n        hdr = big ? ZSI_HDRLEN_BIGDELETION/'
+
+mutant "vallen boundary: 65536 stays short" catch \
+  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        if \(big\) return store_ancestor/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > 65536);\n\n    if (isdelete) {\n        if (big) return store_ancestor/'
+
+# Changes BOTH zsi_rec_type_for and zsi_rec_encoded_len, so the two stay
+# consistent with each other and the mutant is a plausible bug rather than an
+# internally contradictory state.  Mutating only one made the encoder write at big
+# offsets into a short-length buffer, so it was "caught" by a heap overflow --
+# detected, but not by any assertion, and therefore no evidence about the tests.
+mutant "ancestor promotes to big form" catch \
+  's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);/bool big = store_ancestor || keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);/g'
+
+mutant "lengths include the NUL terminators" catch \
+  's/        if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0, \&body)) return 0;/'
+
+mutant "vallen stored at +3 not +2" catch \
+  's/            zsi_put16\(buf \+ 2, \(uint16_t\)vallen\);/            zsi_put16(buf + 3, (uint16_t)vallen);/'
+
+mutant "big keylen at +16, vallen at +8" catch \
+  's/            zsi_put64\(buf \+ 8, \(uint64_t\)keylen\);\n            zsi_put64\(buf \+ 16, \(uint64_t\)vallen\);/            zsi_put64(buf + 16, (uint64_t)keylen);\n            zsi_put64(buf + 8, (uint64_t)vallen);/'
+
+mutant "short ancestor at +2 not +4" catch \
+  's/            if \(store_ancestor\) \{\n                zsi_put32\(buf \+ 4, ancestor\);\n                body = ZSI_HDRLEN_KEYVALUE_ANC;/            if (store_ancestor) {\n                zsi_put32(buf + 2, ancestor);\n                body = ZSI_HDRLEN_KEYVALUE_ANC;/'
+
+mutant "encoder: no memset (dirty record padding)" catch \
+  's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/'
+
+# The explicit NUL writes are redundant with the memset that precedes them: it
+# covers the whole record, and both NUL positions are inside it.  So removing
+# either changes nothing observable.  They stay in the source because they state
+# F-13's "key NUL value NUL" structure at the point it is built, and because
+# narrowing the memset to just the padding -- a plausible future optimisation --
+# would make them load-bearing again.
+mutant "no NUL after value" equivalent \
+  's/buf\[body \+ keylen \+ 1 \+ vallen\] = /(void)0; \/\/ /'
+
+mutant "no NUL after key" equivalent \
+  's/    buf\[body \+ keylen\] = /    (void)0; \/\/ /'
+
+# ...and the pairing that proves the claim above: with the memset gone AND the
+# NUL writes gone, the trailing NULs really are absent and a test must object.
+mutant "no memset and no NULs" catch \
+  's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/; s/buf\[body \+ keylen \+ 1 \+ vallen\] = /(void)0; \/\/ /; s/    buf\[body \+ keylen\] = /    (void)0; \/\/ /'
+
+mutant "omitted ancestor resolves to 0" catch \
+  's/    ancestor = hasanc \? zsi_get32\(buf \+ 4\) : file_start;/    ancestor = hasanc ? zsi_get32(buf + 4) : 0;/'
+
+mutant "F-14: zero keylen allowed" catch \
+  's/    if \(keylen < 1\) return ZS_BADFORMAT;             \/\* F-14 \*\//    \/* F-14 check removed *\//'
+
+mutant "decode: total not bounded by len" catch \
+  's/    if \(total > len\) return ZS_BADFORMAT;/    \/* bound removed *\//'
+
+mutant "decode: unchecked keylen+vallen" catch \
+  's/        if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return ZS_BADFORMAT;/        body = keylen + vallen + 2;/'
+
+mutant "decode: data record accepts COMMIT" catch \
+  's/    if \(!\(type & ZSI_HASKEY\)\) return ZS_BADFORMAT;   \/\* not a data record \*\//    \/* family check removed *\//'
+
+mutant "terminator: span boundary off by one" catch \
+  's/    return spanlen <= ZSI_SHORT_SPANLEN_MAX \? ZSI_TERMLEN_SHORT\n                                            : ZSI_TERMLEN_LONG;/    return spanlen < ZSI_SHORT_SPANLEN_MAX ? ZSI_TERMLEN_SHORT\n                                          : ZSI_TERMLEN_LONG;/'
+
+mutant "terminator csum: span only, not terminator" catch \
+  's/        zsi_put32\(buf \+ 4, zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                                     buf, ZSI_TERMLEN_SHORT - 4\)\);/        zsi_put32(buf + 4, csum(spandata, (size_t)spanlen));/'
+
+mutant "terminator: rollback bit dropped" catch \
+  's/        buf\[0\] = \(char\)\(rollback \? ZSI_ROLLBACK : ZSI_COMMIT\);/        buf[0] = (char)ZSI_COMMIT;/'
+
+mutant "terminator: long spanlen at +16" catch \
+  's/        zsi_put64\(buf \+ 8, spanlen\);/        zsi_put64(buf + 16, spanlen);/'
+
+mutant "terminator: long csum at +16 not +20" catch \
+  's/        zsi_put32\(buf \+ 20, zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                                      buf, ZSI_TERMLEN_LONG - 4\)\);/        zsi_put32(buf + 16, zsi_csum2(csum, csum_id, spandata, (size_t)spanlen,\n                                      buf, ZSI_TERMLEN_LONG - 4));/'
+
+# The data-loss bug this task originally shipped with: rejecting a decodable but
+# non-canonical record.  Combined with F-24 that discards every committed record
+# after it, which G-3 forbids.  The mutant restores the bug; a test must object.
+mutant "decode: reject non-canonical (data loss)" catch \
+  's/    \/\* The ancestor: stored when HasAncestor, otherwise the containing file.s/    if (big \&\& keylen <= ZSI_SHORT_KEYLEN_MAX\n            \&\& (isdelete || vallen <= ZSI_SHORT_VALLEN_MAX))\n        return ZS_BADFORMAT;\n\n    \/* The ancestor: stored when HasAncestor, otherwise the containing file'"'"'s/'
+
+mutant "canonical: ancestor==start not flagged" catch \
+  's/    if \(anc_stored && r->ancestor == file_start\) return false;/    \/* F-17 check removed *\//'
 
 echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \

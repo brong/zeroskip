@@ -94,6 +94,7 @@ Each of these has cost someone an afternoon. They are load-bearing.
 - **A failed `fdatasync` is never retried.** A second call can succeed after the dirty pages were discarded, so treating success as proof of durability is wrong (C-7a).
 - **The lock file is never unlinked**, and `flock` is never used. Both silently break mutual exclusion (D-3b, C-1e).
 - **The terminator checksum, not a lock, is what makes reading a live file safe** (C-4f). It covers the span *and* the terminator, so a terminator whose data has not landed reads as absent.
+- **Decoding accepts non-canonical records and terminators; it does not reject them.** A big form whose lengths would have fitted the short form, or a stored ancestor equal to the file's own `start`, is something a conforming writer never produces (F-15, F-17) — but rejecting it on read would be a *data-loss* bug. A record that fails to validate makes an unordered file complete at that point (F-24), discarding everything after it, and G-3 forbids corruption costing committed data. So a peer with a canonicalisation bug would silently cost us every record it wrote after its first non-canonical one. `zsi_rec_is_canonical` / `zsi_term_is_canonical` exist so `zs_db_check_consistency` reports the divergence while still reading the data, which is the precedent T-6 sets explicitly.
 
 ## Testing
 

@@ -565,6 +565,462 @@ static unsigned zsi_header_engine_id(const char *buf)
 
 /********** RECORDS *************/
 
+/* The type byte is a bitfield of six independent properties (section 4.4).
+ * Each bit is meaningful in isolation: IsBig selects the wide layout in all
+ * three families, HasAncestor says whether the ancestor field is present, and
+ * IsDelete means negation -- whether of a key or of a span.  A decoder reads a
+ * record's shape from the bits (F-12a). */
+#define ZSI_HASKEY      0x01    /* a data record: carries a key */
+#define ZSI_ISDELETE    0x02    /* negation -- of a key, or of a span */
+#define ZSI_ISBIG       0x04    /* wide length fields */
+#define ZSI_HASANCESTOR 0x08    /* an ancestor generation is stored */
+#define ZSI_SPANTERM    0x10    /* ends a span */
+#define ZSI_POINTERS    0x20    /* begins a pointer section */
+
+/* The fourteen legal type bytes (F-12), and no others.  Bits 0x40 and 0x80 are
+ * reserved and always zero. */
+#define ZSI_KEYVALUE         0x01   /* HasKey                               */
+#define ZSI_DELETION         0x03   /* HasKey IsDelete                      */
+#define ZSI_BIGKEYVALUE      0x05   /* HasKey IsBig                         */
+#define ZSI_BIGDELETION      0x07   /* HasKey IsDelete IsBig                */
+#define ZSI_KEYVALUE_ANC     0x09   /* HasKey HasAncestor                   */
+#define ZSI_DELETION_ANC     0x0B   /* HasKey IsDelete HasAncestor          */
+#define ZSI_BIGKEYVALUE_ANC  0x0D   /* HasKey IsBig HasAncestor             */
+#define ZSI_BIGDELETION_ANC  0x0F   /* HasKey IsDelete IsBig HasAncestor    */
+#define ZSI_COMMIT           0x10   /* SpanTerminator                       */
+#define ZSI_ROLLBACK         0x12   /* SpanTerminator IsDelete              */
+#define ZSI_COMMIT_LONG      0x14   /* SpanTerminator IsBig                 */
+#define ZSI_ROLLBACK_LONG    0x16   /* SpanTerminator IsDelete IsBig        */
+#define ZSI_PTRS32           0x20   /* Pointers                             */
+#define ZSI_PTRS64           0x24   /* Pointers IsBig                       */
+
+/* True for exactly the fourteen types above and nothing else, including 0x00.
+ *
+ * Written as an explicit switch rather than as a bit-property computation.  The
+ * table in F-12 is normative, and a computed predicate would be a second
+ * specification that can drift from it -- a bitfield admits far more values than
+ * it defines, and the near-misses are what matter: two family bits set at once,
+ * HasAncestor without HasKey, IsDelete with Pointers, either reserved bit set.
+ * Each is a plausible result of a single flipped bit in a valid type, and each
+ * must be rejected rather than half-interpreted (T-2b). */
+static bool zsi_type_valid(uint8_t type)
+{
+    switch (type) {
+    case ZSI_KEYVALUE:
+    case ZSI_DELETION:
+    case ZSI_BIGKEYVALUE:
+    case ZSI_BIGDELETION:
+    case ZSI_KEYVALUE_ANC:
+    case ZSI_DELETION_ANC:
+    case ZSI_BIGKEYVALUE_ANC:
+    case ZSI_BIGDELETION_ANC:
+    case ZSI_COMMIT:
+    case ZSI_ROLLBACK:
+    case ZSI_COMMIT_LONG:
+    case ZSI_ROLLBACK_LONG:
+    case ZSI_PTRS32:
+    case ZSI_PTRS64:
+        return true;
+    }
+
+    return false;
+}
+
+/* Encoding limits (F-15).  The short form is mandatory whenever the lengths fit,
+ * so these are not tuning knobs -- they are part of the format. */
+#define ZSI_SHORT_KEYLEN_MAX  255        /* one byte */
+#define ZSI_SHORT_VALLEN_MAX  65535      /* two bytes */
+#define ZSI_SHORT_SPANLEN_MAX 0xFFFFFF   /* three bytes */
+
+/* Fixed header sizes per shape, from section 4.5's diagrams. */
+#define ZSI_HDRLEN_KEYVALUE        4
+#define ZSI_HDRLEN_KEYVALUE_ANC    8
+#define ZSI_HDRLEN_DELETION        4
+#define ZSI_HDRLEN_DELETION_ANC    8
+#define ZSI_HDRLEN_BIGKEYVALUE    24
+#define ZSI_HDRLEN_BIGDELETION    16
+#define ZSI_TERMLEN_SHORT          8
+#define ZSI_TERMLEN_LONG          24
+
+struct zsi_rec {
+    uint8_t     type;
+    const char *key;    size_t keylen;
+    const char *val;    size_t vallen;   /* val == NULL for a deletion */
+    uint32_t    ancestor;                /* always resolved, never raw (F-17) */
+    size_t      len;                     /* total on-disk bytes, multiple of 8 */
+};
+
+struct zsi_term {
+    uint8_t     type;
+    uint64_t    spanlen;
+    uint32_t    csum;
+    size_t      len;                     /* 8 or 24 */
+};
+
+static bool zsi_rec_is_delete(const struct zsi_rec *r)
+{
+    return (r->type & ZSI_ISDELETE) != 0;
+}
+
+/* Bytes a data record will occupy, or 0 if the inputs cannot be encoded.
+ *
+ * The big form is chosen by key or value length only, never by the ancestor:
+ * the ancestor is 4 bytes whenever it is present, and in the big forms it fits
+ * inside padding the shape already carries, so HasAncestor costs nothing there
+ * (F-12c).  In the short forms it adds 4 bytes. */
+static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
+                                  bool store_ancestor)
+{
+    size_t hdr, body;
+
+    if (keylen < 1) return 0;           /* F-14: a key is at least 1 byte */
+
+    bool big = keylen > ZSI_SHORT_KEYLEN_MAX
+            || (!isdelete && vallen > ZSI_SHORT_VALLEN_MAX);
+
+    if (isdelete) {
+        hdr = big ? ZSI_HDRLEN_BIGDELETION
+                  : (store_ancestor ? ZSI_HDRLEN_DELETION_ANC
+                                    : ZSI_HDRLEN_DELETION);
+        /* key NUL, no value at all */
+        if (!zsi_add_sz(keylen, 1, &body)) return 0;
+    } else {
+        hdr = big ? ZSI_HDRLEN_BIGKEYVALUE
+                  : (store_ancestor ? ZSI_HDRLEN_KEYVALUE_ANC
+                                    : ZSI_HDRLEN_KEYVALUE);
+        /* key NUL value NUL (F-13: stored lengths exclude the terminators) */
+        if (!zsi_add3_sz(keylen, vallen, 2, &body)) return 0;
+    }
+
+    size_t total;
+    if (!zsi_add_sz(hdr, body, &total)) return 0;
+    return zsi_roundup8(total);
+}
+
+/* Which of the eight data types the given shape encodes as (F-15).  Split out so
+ * the encoder and the tests agree on it by construction. */
+static uint8_t zsi_rec_type_for(size_t keylen, size_t vallen, bool isdelete,
+                                bool store_ancestor)
+{
+    bool big = keylen > ZSI_SHORT_KEYLEN_MAX
+            || (!isdelete && vallen > ZSI_SHORT_VALLEN_MAX);
+
+    if (isdelete) {
+        if (big) return store_ancestor ? ZSI_BIGDELETION_ANC : ZSI_BIGDELETION;
+        return store_ancestor ? ZSI_DELETION_ANC : ZSI_DELETION;
+    }
+
+    if (big) return store_ancestor ? ZSI_BIGKEYVALUE_ANC : ZSI_BIGKEYVALUE;
+    return store_ancestor ? ZSI_KEYVALUE_ANC : ZSI_KEYVALUE;
+}
+
+/* Encode a data record into buf, which must hold zsi_rec_encoded_len bytes.
+ *
+ * val == NULL encodes a deletion (A-1); a non-NULL zero-length value encodes an
+ * empty value, which is a distinct state.  store_ancestor is decided by the
+ * caller per F-17 -- omit exactly when the ancestor equals the containing file's
+ * start generation.
+ *
+ * Every pad byte is zeroed, not just the tail padding.  Canonical encoding means
+ * byte-for-byte reproducibility across implementations (T-12a), and an
+ * uninitialised pad byte breaks that while being invisible to every test that
+ * reads back through the decoder. */
+static void zsi_rec_encode(char *buf, const char *key, size_t keylen,
+                           const char *val, size_t vallen,
+                           bool store_ancestor, uint32_t ancestor)
+{
+    bool isdelete = (val == NULL);
+    if (isdelete) vallen = 0;
+
+    uint8_t type = zsi_rec_type_for(keylen, vallen, isdelete, store_ancestor);
+    size_t total = zsi_rec_encoded_len(keylen, vallen, isdelete, store_ancestor);
+    size_t body;
+
+    memset(buf, 0, total);
+    buf[0] = (char)type;
+
+    if (type & ZSI_ISBIG) {
+        if (isdelete) {
+            /* BIGDELETION      +0 type, +1 pad(7),  +8 keylen, +16 key NUL
+             * BIGDELETION_ANC  +0 type, +1 pad(3),  +4 ancestor, +8 keylen,
+             *                  +16 key NUL */
+            if (store_ancestor) zsi_put32(buf + 4, ancestor);
+            zsi_put64(buf + 8, (uint64_t)keylen);
+            body = ZSI_HDRLEN_BIGDELETION;
+        } else {
+            /* BIGKEYVALUE      +0 type, +1 pad(7), +8 keylen, +16 vallen,
+             *                  +24 key NUL value NUL
+             * BIGKEYVALUE_ANC  +0 type, +1 pad(3), +4 ancestor, +8 keylen,
+             *                  +16 vallen, +24 key NUL value NUL */
+            if (store_ancestor) zsi_put32(buf + 4, ancestor);
+            zsi_put64(buf + 8, (uint64_t)keylen);
+            zsi_put64(buf + 16, (uint64_t)vallen);
+            body = ZSI_HDRLEN_BIGKEYVALUE;
+        }
+    } else {
+        buf[1] = (char)(unsigned char)keylen;
+        if (isdelete) {
+            /* DELETION      +0 type, +1 keylen, +2 pad(2), +4 key NUL
+             * DELETION_ANC  +0 type, +1 keylen, +2 pad(2), +4 ancestor,
+             *               +8 key NUL */
+            if (store_ancestor) {
+                zsi_put32(buf + 4, ancestor);
+                body = ZSI_HDRLEN_DELETION_ANC;
+            } else {
+                body = ZSI_HDRLEN_DELETION;
+            }
+        } else {
+            /* KEYVALUE      +0 type, +1 keylen, +2 vallen, +4 key NUL value NUL
+             * KEYVALUE_ANC  +0 type, +1 keylen, +2 vallen, +4 ancestor,
+             *               +8 key NUL value NUL */
+            zsi_put16(buf + 2, (uint16_t)vallen);
+            if (store_ancestor) {
+                zsi_put32(buf + 4, ancestor);
+                body = ZSI_HDRLEN_KEYVALUE_ANC;
+            } else {
+                body = ZSI_HDRLEN_KEYVALUE;
+            }
+        }
+    }
+
+    /* Key and value are contiguous, separated by a NUL, with a further NUL after
+     * the value, then zero padding to the next multiple of 8.  Both are
+     * therefore usable in place as C strings, while the stored lengths remain
+     * authoritative and may themselves contain NULs (F-13). */
+    memcpy(buf + body, key, keylen);
+    buf[body + keylen] = '\0';
+    if (!isdelete) {
+        if (vallen) memcpy(buf + body + keylen + 1, val, vallen);
+        buf[body + keylen + 1 + vallen] = '\0';
+    }
+}
+
+/* Decode the data record at buf[0..len), resolving its ancestor against the
+ * containing file's start generation (F-17).
+ *
+ * Records carry no checksum of their own; the span terminator covers them
+ * (F-19), so nothing is verified here.  What is checked is structure: the type
+ * byte, every length bounded and overflow-free, and the total within len.
+ *
+ * Returns ZS_BADFORMAT for anything that does not decode.  On success out->len is
+ * the record's total on-disk size, which the caller uses to advance -- and which
+ * F-29 requires it verify is strictly greater than zero before doing so. */
+static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
+                          struct zsi_rec *out)
+{
+    if (len < 1) return ZS_BADFORMAT;
+
+    uint8_t type = (uint8_t)buf[0];
+    if (!zsi_type_valid(type)) return ZS_BADFORMAT;
+    if (!(type & ZSI_HASKEY)) return ZS_BADFORMAT;   /* not a data record */
+
+    bool isdelete = (type & ZSI_ISDELETE) != 0;
+    bool big      = (type & ZSI_ISBIG) != 0;
+    bool hasanc   = (type & ZSI_HASANCESTOR) != 0;
+
+    size_t hdr, keylen = 0, vallen = 0;
+    uint32_t ancestor;
+
+    /* Read the fixed header only after confirming it is present.  Every read
+     * below is inside a bound already checked. */
+    if (big) {
+        hdr = isdelete ? ZSI_HDRLEN_BIGDELETION : ZSI_HDRLEN_BIGKEYVALUE;
+        if (len < hdr) return ZS_BADFORMAT;
+
+        uint64_t k = zsi_get64(buf + 8);
+        /* On a 32-bit host a 64-bit length may not fit in size_t at all, which
+         * is a bounds failure rather than something to truncate into. */
+        if (k > (uint64_t)SIZE_MAX) return ZS_BADFORMAT;
+        keylen = (size_t)k;
+
+        if (!isdelete) {
+            uint64_t v = zsi_get64(buf + 16);
+            if (v > (uint64_t)SIZE_MAX) return ZS_BADFORMAT;
+            vallen = (size_t)v;
+        }
+    } else {
+        hdr = isdelete ? (hasanc ? ZSI_HDRLEN_DELETION_ANC : ZSI_HDRLEN_DELETION)
+                       : (hasanc ? ZSI_HDRLEN_KEYVALUE_ANC : ZSI_HDRLEN_KEYVALUE);
+        if (len < hdr) return ZS_BADFORMAT;
+
+        keylen = (size_t)(unsigned char)buf[1];
+        if (!isdelete) vallen = (size_t)zsi_get16(buf + 2);
+    }
+
+    if (keylen < 1) return ZS_BADFORMAT;             /* F-14 */
+
+    /* Note what is NOT checked here: whether the encoding is canonical (F-15).
+     *
+     * A big record whose lengths would have fitted the short form is
+     * non-canonical, and a conforming writer never produces one -- but decoding
+     * MUST still accept it.  Rejecting would be a data-loss bug, because of how
+     * two rules compose: a record that fails to validate makes an unordered file
+     * complete at that point (F-24), discarding everything after it, and G-3
+     * forbids corruption costing *committed* data.  A peer implementation with a
+     * canonicalisation bug would therefore cost us every record it wrote after
+     * the first non-canonical one, silently.
+     *
+     * The spec puts this in check_consistency instead (T-6 says exactly that for
+     * the analogous non-canonical ancestor), which reports the divergence while
+     * still reading the data.  zsi_rec_is_canonical below is what that uses. */
+
+    /* The ancestor: stored when HasAncestor, otherwise the containing file's
+     * start.  The caller never sees "not stored" -- that is the whole point of
+     * F-17's rule, and it is why decoding never needs to establish whether a
+     * record is the first occurrence of its key (F-17a). */
+    ancestor = hasanc ? zsi_get32(buf + 4) : file_start;
+
+    /* Total size, every term overflow-checked (G-0b).  keylen + vallen + 2 is
+     * exactly the expression that turns a bounds check into a bypass when it
+     * wraps. */
+    size_t body, total;
+    if (isdelete) {
+        if (!zsi_add_sz(keylen, 1, &body)) return ZS_BADFORMAT;
+    } else {
+        if (!zsi_add3_sz(keylen, vallen, 2, &body)) return ZS_BADFORMAT;
+    }
+    if (!zsi_add_sz(hdr, body, &total)) return ZS_BADFORMAT;
+    total = zsi_roundup8(total);
+    if (total == 0) return ZS_BADFORMAT;             /* roundup8 saturated */
+    if (total > len) return ZS_BADFORMAT;
+
+    out->type     = type;
+    out->keylen   = keylen;
+    out->key      = buf + hdr;
+    out->ancestor = ancestor;
+    out->len      = total;
+
+    if (isdelete) {
+        out->val    = NULL;
+        out->vallen = 0;
+    } else {
+        out->val    = buf + hdr + keylen + 1;
+        out->vallen = vallen;
+    }
+
+    return ZS_OK;
+}
+
+/* Bytes a terminator will occupy: 8 while the span fits in three bytes, 24
+ * beyond that (F-15). */
+static size_t zsi_term_encoded_len(uint64_t spanlen)
+{
+    return spanlen <= ZSI_SHORT_SPANLEN_MAX ? ZSI_TERMLEN_SHORT
+                                            : ZSI_TERMLEN_LONG;
+}
+
+/* Encode a terminator over a span whose data bytes are spandata[0..spanlen).
+ *
+ * The checksum covers the span's data followed by the terminator's own bytes up
+ * to the checksum field (F-19).  Because it covers both, a terminator that
+ * reaches disk without its data fails validation and reads as absent: a torn
+ * tail is always detectable (F-22).  Recovery depends on that, and so does
+ * reading a file a writer is still appending to (C-4f) -- the checksum supplies
+ * the ordering guarantee that no memory barrier can provide between independent
+ * processes sharing a mapping. */
+static void zsi_term_encode(char *buf, uint64_t spanlen, bool rollback,
+                            const char *spandata, zs_csum *csum, unsigned csum_id)
+{
+    size_t len = zsi_term_encoded_len(spanlen);
+
+    memset(buf, 0, len);
+
+    if (len == ZSI_TERMLEN_SHORT) {
+        /* +0 type, +1 span length (3 bytes), +4 checksum */
+        buf[0] = (char)(rollback ? ZSI_ROLLBACK : ZSI_COMMIT);
+        zsi_put24(buf + 1, (uint32_t)spanlen);
+        zsi_put32(buf + 4, zsi_csum2(csum, csum_id, spandata, (size_t)spanlen,
+                                     buf, ZSI_TERMLEN_SHORT - 4));
+    } else {
+        /* +0 type, +1 pad(7), +8 span length, +16 pad(4), +20 checksum */
+        buf[0] = (char)(rollback ? ZSI_ROLLBACK_LONG : ZSI_COMMIT_LONG);
+        zsi_put64(buf + 8, spanlen);
+        zsi_put32(buf + 20, zsi_csum2(csum, csum_id, spandata, (size_t)spanlen,
+                                      buf, ZSI_TERMLEN_LONG - 4));
+    }
+}
+
+/* Decode the terminator at buf[0..len).  Does not verify the checksum -- the
+ * caller has the span's data and does that (see zsi_unordered_replay).
+ *
+ * Terminators are only ever found by scanning forward from the header (F-20).
+ * Nothing reads them backwards, because the pointer section is located by its own
+ * trailer, so a long terminator needs no marker in its second half. */
+static int zsi_term_decode(const char *buf, size_t len, struct zsi_term *out)
+{
+    if (len < 1) return ZS_BADFORMAT;
+
+    uint8_t type = (uint8_t)buf[0];
+    if (!zsi_type_valid(type)) return ZS_BADFORMAT;
+    if (!(type & ZSI_SPANTERM)) return ZS_BADFORMAT;
+
+    if (type & ZSI_ISBIG) {
+        if (len < ZSI_TERMLEN_LONG) return ZS_BADFORMAT;
+        out->spanlen = zsi_get64(buf + 8);
+        out->csum    = zsi_get32(buf + 20);
+        out->len     = ZSI_TERMLEN_LONG;
+
+        /* A long terminator over a span that would have fitted the short form is
+         * non-canonical (F-15) but decodes: see zsi_term_is_canonical, and the
+         * note in zsi_rec_decode about why rejecting it here would discard
+         * committed data. */
+    } else {
+        if (len < ZSI_TERMLEN_SHORT) return ZS_BADFORMAT;
+        out->spanlen = zsi_get24(buf + 1);
+        out->csum    = zsi_get32(buf + 4);
+        out->len     = ZSI_TERMLEN_SHORT;
+    }
+
+    out->type = type;
+    return ZS_OK;
+}
+
+static bool zsi_term_is_rollback(const struct zsi_term *t)
+{
+    return (t->type & ZSI_ISDELETE) != 0;
+}
+
+/* Whether a decoded record uses the encoding F-15 requires for its contents.
+ *
+ * Reads never consult this.  Rejecting non-canonical input on read would lose
+ * committed data, because a record that fails to validate makes an unordered file
+ * complete at that point (F-24) and G-3 forbids that costing committed data --
+ * so a peer with a canonicalisation bug would silently cost us everything it
+ * wrote after its first non-canonical record.
+ *
+ * zs_db_check_consistency consults it instead, which reports the divergence while
+ * still reading the data.  T-6 sets that precedent explicitly for the ancestor
+ * case below.
+ *
+ * file_start is the containing file's start generation: F-17 requires the
+ * ancestor be omitted exactly when it equals that value, so a record storing an
+ * ancestor equal to it is non-canonical even though it decodes identically. */
+static bool zsi_rec_is_canonical(const struct zsi_rec *r, uint32_t file_start)
+{
+    bool isdelete = zsi_rec_is_delete(r);
+    bool anc_stored = (r->type & ZSI_HASANCESTOR) != 0;
+
+    /* the shape F-15 requires for these lengths */
+    if (r->type != zsi_rec_type_for(r->keylen, r->vallen, isdelete, anc_stored))
+        return false;
+
+    /* F-17: stored exactly when it differs from the file's start */
+    if (anc_stored && r->ancestor == file_start) return false;
+
+    /* and the total must be the canonical rounded length */
+    if (r->len != zsi_rec_encoded_len(r->keylen, r->vallen, isdelete, anc_stored))
+        return false;
+
+    return true;
+}
+
+/* Whether a decoded terminator uses the width F-15 requires for its span.
+ * Reported, not enforced, for the same reason as records. */
+static bool zsi_term_is_canonical(const struct zsi_term *t)
+{
+    return t->len == zsi_term_encoded_len(t->spanlen);
+}
+
 /********** POINTER SECTION *************/
 
 /********** FILE OBJECT *************/
