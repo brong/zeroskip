@@ -224,7 +224,7 @@ a spec label is missing here.
 | `P-6` | The magic is the 16 bytes | `idxcache_header_byte_layout` |
 | `P-7` | A table's checksums use **the engine named by the covered data file's | `idxcache_uses_file_engine` |
 | `P-8` | `valid_upto` is the data-file offset the table covers. It MUST be a | `idxcache_valid_upto_is_span_boundary` |
-| `P-9` | The offsets are the record offsets of every distinct key committed | `idxcache_matches_full_build`, `idxcache_open_agrees` |
+| `P-9` | The offsets are the record offsets of every distinct key committed | `idxcache_matches_full_build`, `idxcache_open_agrees`, `corpus_index_table` |
 | `P-10` | `term_off` is the offset of the terminator immediately below | `idxcache_rejects_bad_term_binding` |
 | `P-11` | A reader MUST use a table only if **all** of the following hold, and | `idxcache_rejection_rules` |
 | `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_replays_the_suffix`, `idxcache_open_agrees` |

@@ -5704,6 +5704,57 @@ int zs_db_dump(struct zs_db *db, int detail)
     return ZS_OK;
 }
 
+/* T-0a: the pointer table, as text a runner can compare byte for byte.
+ *
+ * Validation goes through the same loader the read path uses, so what this
+ * reports is the real acceptance decision (P-11) rather than a second parser
+ * that could disagree with it -- which is the failure mode a separate dumper
+ * would introduce, and nobody would notice until two implementations argued.
+ *
+ * Never an error: no cache directory, no table, and a rejected table are all
+ * states to report, because a table is never required. */
+int zs_db_index_dump(struct zs_db *db)
+{
+    struct zsi_idxcfg cfg;
+
+    if (!db) return ZS_BADUSAGE;
+
+    cfg.dir = db->index_dir;
+    cfg.threshold = db->index_threshold;
+
+    if (!db->index_dir) {
+        printf("INDEXDIR none\n");
+        return ZS_OK;
+    }
+
+    printf("INDEXDIR set threshold=%zu\n", db->index_threshold);
+
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        struct zsi_file *f = db->snap->files[i];
+        char name[ZSI_NAME_MAX];
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+
+        /* P-1: only unordered files have tables. */
+        if (!zsi_file_is_unordered(f) || !f->hdr_valid) continue;
+
+        zsi_name_format_index(name, f->hdr.uuid, f->hdr.start);
+
+        if (zsi_idx_load(f, &cfg, db->compar_name, db->nocsum,
+                         &base, &nbase, &vu, &to, &tc) != ZS_OK) {
+            printf("TABLE %s state=absent\n", name);
+            continue;
+        }
+
+        printf("TABLE %s state=usable generation=%08X valid_upto=%zu"
+               " term_off=%zu term_csum=%08X nptrs=%zu\n",
+               name, f->hdr.start, vu, to, tc, nbase);
+        free(base);
+    }
+
+    return ZS_OK;
+}
+
 /********** OPEN AND CLOSE *************/
 
 /* OPENING IS RECOVERY; there is no separate pass (section 7).

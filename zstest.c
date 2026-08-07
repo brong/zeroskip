@@ -11330,6 +11330,98 @@ static void test_idxcache_sweeps_dead_generations(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* T-0/P-11: a case shipping a pointer table must have it LOADED, not merely
+ * present.
+ *
+ * The corpus exists to prove a format is shared.  A validator that writes its own
+ * table and compares nothing has proved only that it agrees with itself, which is
+ * exactly the failure T-12a exists to prevent for data files -- so the shipped
+ * bytes have to be the ones under test.
+ *
+ * The corpus must not be mutated by validating it (R-3 is why the other corpus
+ * tests open ZS_SHARED).  Two things keep that true here: after loading a table
+ * cached_upto equals complete, so P-13's threshold cannot fire; and the threshold
+ * is set absurdly high anyway, so a REJECTED table cannot cause a publish
+ * either. */
+static void test_corpus_index_table(void)
+{
+    char cases[32][64];
+    size_t ncases = corpus_cases(cases, 32);
+    size_t checked = 0;
+
+    if (!ncases) SKIP("no corpus (run make corpus)");
+
+    for (size_t i = 0; i < ncases; i++) {
+        char dir[PATH_MAX], txtpath[PATH_MAX], idxdir[PATH_MAX];
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *db = NULL;
+        struct zsi_file *f;
+        struct zsi_idxcfg cfg;
+        char *txt, *line, sub[64];
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+
+        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
+        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
+
+        txt = slurp(txtpath, NULL);
+        if (!txt) continue;
+
+        line = strstr(txt, "\nindexdir ");
+        if (!line) { free(txt); continue; }
+        if (sscanf(line + 10, "%63s", sub) != 1) { free(txt); continue; }
+        free(txt);
+
+        snprintf(idxdir, sizeof(idxdir), "%s/%s", dir, sub);
+        cfg.dir = idxdir;
+        cfg.threshold = (size_t)1 << 40;
+
+        setup.flags = ZS_SHARED;
+        setup.index_dir = idxdir;
+        setup.index_threshold = cfg.threshold;
+        ASSERT_OK(zs_db_open(dir, &setup, &db));
+
+        f = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(f);
+
+        /* The shipped table is accepted, and describes the file it ships with. */
+        ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc));
+        ASSERT_EQU(vu, (unsigned long long)f->complete);
+        ASSERT(nbase > 0);
+
+        /* And the index the open built from it agrees with a full replay, which
+         * is what makes "accepted" mean something. */
+        {
+            size_t *cached = NULL, ncached = 0;
+            size_t *fresh = NULL, nfresh = 0;
+
+            ASSERT(f->cached_upto > ZSI_HEADER_LEN);   /* it really was used */
+            ASSERT_OK(zsi_index_flatten(f->index, db->compar, &cached, &ncached));
+            ASSERT_EQU(ncached, nbase);
+
+            ASSERT_OK(zsi_index_build(f, db->compar, false));
+            ASSERT_OK(zsi_index_flatten(f->index, db->compar, &fresh, &nfresh));
+            ASSERT_EQU(nfresh, ncached);
+            for (size_t j = 0; j < nfresh; j++) {
+                ASSERT_EQU(cached[j], fresh[j]);
+                ASSERT_EQU(base[j], fresh[j]);
+            }
+
+            free(cached);
+            free(fresh);
+        }
+
+        free(base);
+        ASSERT_OK(zs_db_close(&db));
+        checked++;
+    }
+
+    /* A corpus with no such case would make this test read as coverage while
+     * exercising nothing. */
+    ASSERT(checked > 0);
+}
+
 /* P-7: the table records the engine the DATA FILE names, not the one this handle
  * would choose for a file it creates.
  *
@@ -11690,6 +11782,7 @@ static struct test_entry tests[] = {
                                         test_idxcache_only_unordered_files },
     { "test_idxcache_sweeps_dead_generations",
                                         test_idxcache_sweeps_dead_generations },
+    { "test_corpus_index_table",        test_corpus_index_table },
     { "test_idxcache_uses_file_engine", test_idxcache_uses_file_engine },
     { "test_idxcache_valid_upto_is_span_boundary",
                                         test_idxcache_valid_upto_is_span_boundary },

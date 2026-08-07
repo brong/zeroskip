@@ -52,6 +52,35 @@ file.
 | `expect files` | every following line is a filename that must be present |
 | `expect get <keyhex> <valhex\|NOTFOUND>` | one point lookup |
 | `expect check <OK\|FAILED>` | the result of the consistency checks |
+| `indexdir <subdir>` | the case ships a pointer table cache (spec section 8) in this subdirectory of the case |
+| `expect index` | every following line is one line of the pointer-table report, in the format below |
+
+### Cases with a pointer table
+
+A case carrying `indexdir` ships a published pointer table (spec section 8)
+alongside the data files, in the named subdirectory. It is a **subdirectory**
+rather than the case directory itself because P-2 forbids the cache directory
+from being the database directory, so a case that mixed them could not be opened
+the way it was built.
+
+The `expect index` block is the report a driver produces from
+`index-dump`:
+
+```
+INDEXDIR set threshold=<bytes>
+TABLE <name> state=usable generation=<8 hex> valid_upto=<n> term_off=<n> term_csum=<8 hex> nptrs=<n>
+```
+
+with `state=absent` in place of the rest when no usable table exists. The
+threshold is an implementation choice and is echoed rather than required to
+match; everything on a `TABLE` line is fixed by the format and must.
+
+Shipping the table's bytes is the point: an implementation that merely writes a
+table of its own has proved nothing. **Loading ours** is what distinguishes a
+shared format from a coincidentally similar one. An implementation that chooses
+not to support the cache at all is still conforming — it must ignore the
+subdirectory and produce every other `expect` unchanged, which is the property
+that keeps the cache optional (spec section 8).
 
 Engine 2 is deliberately **absent**: a file written under it is readable only by a
 caller supplying the same function, so it cannot be part of a shared corpus

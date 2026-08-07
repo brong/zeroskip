@@ -151,6 +151,12 @@ int  zs_db_repack(struct zs_db *db);
 bool zs_db_should_repack(struct zs_db *db);
 int  zs_db_check_consistency(struct zs_db *db);
 int  zs_db_dump(struct zs_db *db, int detail);
+
+/* Print the pointer table (spec section 8) covering each unordered file, as
+ * text, for the interop runner to compare.  ZS_OK even when the cache is off or
+ * no table exists: a table is never required, so its absence is a state to
+ * report rather than an error. */
+int  zs_db_index_dump(struct zs_db *db);
 int  zs_db_sync(struct zs_db *db);
 const char *zs_strerror(int r);
 

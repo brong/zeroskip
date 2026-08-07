@@ -102,6 +102,10 @@ static int usage(void)
         "  convert                force conversion of non-active unordered files\n"
         "  repack                 force one repack\n"
         "  hold-write --for MS    take the write lock and hold it\n"
+        "  index-dump             print the pointer table state (spec section 8)\n"
+        "\n"
+        "  --index-dir PATH       enable the pointer table cache for this run;\n"
+        "                         MUST NOT be the database directory (P-2)\n"
         "\n"
         "Keys and values are hex, so embedded NULs and newlines survive the\n"
         "comparison an interop runner makes.\n"
@@ -117,7 +121,7 @@ int main(int argc, char **argv)
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     const char *dir, *cmd;
-    const char *uuid = NULL, *prefix = NULL;
+    const char *uuid = NULL, *prefix = NULL, *index_dir = NULL;
     int detail = 0, engine = -1;
     long hold_ms = 0;
     int r;
@@ -133,9 +137,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--detail") && i + 1 < argc) detail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--for") && i + 1 < argc)    hold_ms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--engine") && i + 1 < argc)  engine = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--index-dir") && i + 1 < argc) index_dir = argv[++i];
     }
 
     setup.error = tool_error;
+
+    /* The pointer table cache (spec section 8).  The interop runner needs it so
+     * one implementation can publish a table another reads -- which is the only
+     * way to test that the format is really shared rather than merely written.
+     * A threshold of one byte, because a corpus case is far smaller than any
+     * sensible default and would otherwise never publish anything. */
+    setup.index_dir = index_dir;
+    if (index_dir) setup.index_threshold = 1;
 
     /* Everything but `create` opens an existing database.  `check` and the read
      * commands could open read-only, but `convert` and `repack` must not, and a
@@ -251,6 +264,10 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "dump")) {
         r = zs_db_dump(db, detail);
         if (r != ZS_OK) oops("dump", r);
+
+    } else if (!strcmp(cmd, "index-dump")) {
+        r = zs_db_index_dump(db);
+        if (r != ZS_OK) oops("index-dump", r);
 
     } else if (!strcmp(cmd, "check")) {
         r = zs_db_check_consistency(db);

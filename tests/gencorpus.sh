@@ -49,6 +49,7 @@ begin_case() {
     mkdir -p "$CASE"
     DB="$CASE/db"
     TXT="$CASE/case.txt"
+    IDXDIR=""
     : > "$TXT"
     echo "  $1"
 }
@@ -67,6 +68,16 @@ finish_case() {
         $TOOL "$DB" scan
         echo ""
         echo "expect check $($TOOL "$DB" check)"
+
+        # The pointer table cache (spec section 8), when the case has one.  Its
+        # bytes are shipped so a peer can prove it reads OUR table rather than
+        # merely writing a table of its own -- which is the only way to tell a
+        # shared format from a coincidentally similar one.
+        if [ -n "$IDXDIR" ]; then
+            echo ""
+            echo "expect index"
+            $TOOL "$DB" index-dump --index-dir "$IDXDIR"
+        fi
     } >> "$TXT"
 
     # The data files live beside case.txt, not in a subdirectory: an implementation
@@ -252,7 +263,27 @@ if [ "$SKIP" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 11. engine0: the same shape with no checksums (F-5, F-5c).
+# 11a. cached-index: a published pointer table beside the data (spec section 8).
+# ---------------------------------------------------------------------------
+# The cache lives in a SUBDIRECTORY, not beside the data files: P-2 forbids the
+# cache directory from being the database directory, so a case that put them
+# together could not be opened the way it was built.
+begin_case cached-index
+if [ "$SKIP" -eq 0 ]; then
+    IDXDIR="$CASE/index"
+    mkdir -p "$IDXDIR"
+    hdr "A published pointer table over the active file (spec section 8)." 1
+    emit "indexdir index"
+    emit ""
+    $TOOL "$DB" create --uuid "$UUID" --index-dir "$IDXDIR"
+    $TOOL "$DB" store 61 3031 --index-dir "$IDXDIR"; emit "op store 61 3031"
+    $TOOL "$DB" store 62 3032 --index-dir "$IDXDIR"; emit "op store 62 3032"
+    $TOOL "$DB" store 61 3033 --index-dir "$IDXDIR"; emit "op store 61 3033"
+    finish_case
+fi
+
+# ---------------------------------------------------------------------------
+# 12. engine0: the same shape with no checksums (F-5, F-5c).
 # ---------------------------------------------------------------------------
 begin_case engine0
 if [ "$SKIP" -eq 0 ]; then
