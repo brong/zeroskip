@@ -8479,6 +8479,504 @@ static void test_dump_shows_rollback(void)
 
 /*
  * ============================================================
+ * The golden corpus (T-0, T-1, and T-12a's local half)
+ * ============================================================
+ *
+ * Two directions, and the second is the sharper one.
+ *
+ * DECODE: open each checked-in case and check its expectations.  Catches a reader
+ * that disagrees with the format.  Opened ZS_SHARED, so validating the corpus
+ * cannot modify it -- a decode test that converted or repacked would rewrite the
+ * contract it is checking.
+ *
+ * ENCODE: replay the recorded operations into an empty directory and compare the
+ * result BYTE FOR BYTE.  This catches divergence in padding, in ancestor omission,
+ * in the choice of short versus big form, and in checksum seeding -- before that
+ * divergence becomes a compatibility rule nobody meant to make.  It is only
+ * possible because encoding is canonical (F-15, F-26c) and nothing time-varying
+ * enters the format.
+ */
+
+#define CORPUS_DIR "tests/corpus"
+
+static char *slurp(const char *path, size_t *lenp)
+{
+    struct stat sb;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    if (fstat(fd, &sb) < 0) { close(fd); return NULL; }
+
+    char *buf = malloc((size_t)sb.st_size + 1);
+    if (!buf) { close(fd); return NULL; }
+    ssize_t n = read(fd, buf, (size_t)sb.st_size);
+    close(fd);
+    if (n != sb.st_size) { free(buf); return NULL; }
+    buf[n] = '\0';
+    if (lenp) *lenp = (size_t)n;
+    return buf;
+}
+
+static size_t unhex_into(const char *in, char *out, size_t outmax)
+{
+    size_t n = strlen(in);
+    if (n % 2 || n / 2 > outmax) return (size_t)-1;
+    for (size_t i = 0; i < n / 2; i++) {
+        int v = 0;
+        for (int j = 0; j < 2; j++) {
+            char c = in[i * 2 + j];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return (size_t)-1;
+            v = (v << 4) | d;
+        }
+        out[i] = (char)v;
+    }
+    return n / 2;
+}
+
+/* Collect a scan as "<keyhex> <valhex>\n" lines, which is the corpus format.
+ *
+ * Bounds-checked, and the buffer is heap-allocated by the caller: the
+ * encoding-boundaries case holds 65536-byte values, which is 131072 hex
+ * characters, and an earlier fixed 4KB stack buffer overflowed here.  A test
+ * harness that can corrupt its own stack reports the wrong thing, so the check
+ * matters as much as the size. */
+struct hexbuf {
+    char  *buf;
+    size_t len, cap;
+    bool   overflow;
+};
+
+static int corpus_scan_cb(void *rock, const char *key, size_t keylen,
+                          const char *val, size_t vallen)
+{
+    struct hexbuf *h = rock;
+    size_t need = (keylen + vallen) * 2 + 3;
+
+    if (h->len + need >= h->cap) { h->overflow = true; return 0; }
+
+    for (size_t i = 0; i < keylen; i++)
+        h->len += (size_t)sprintf(h->buf + h->len, "%02x", (unsigned char)key[i]);
+    h->buf[h->len++] = ' ';
+    for (size_t i = 0; i < vallen; i++)
+        h->len += (size_t)sprintf(h->buf + h->len, "%02x", (unsigned char)val[i]);
+    h->buf[h->len++] = '\n';
+    h->buf[h->len] = '\0';
+    return 0;
+}
+
+/* List a directory's zeroskip-* names, sorted, newline separated. */
+static void list_data_files(const char *dir, char *out, size_t outlen)
+{
+    char names[64][ZSI_NAME_MAX];
+    size_t n = 0;
+    DIR *d = opendir(dir);
+    struct dirent *de;
+
+    out[0] = '\0';
+    if (!d) return;
+    while ((de = readdir(d)) && n < 64)
+        if (!strncmp(de->d_name, "zeroskip-", 9))
+            snprintf(names[n++], ZSI_NAME_MAX, "%s", de->d_name);
+    closedir(d);
+
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char t[ZSI_NAME_MAX];
+                memcpy(t, names[i], ZSI_NAME_MAX);
+                memcpy(names[i], names[j], ZSI_NAME_MAX);
+                memcpy(names[j], t, ZSI_NAME_MAX);
+            }
+
+    size_t used = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t need = strlen(names[i]) + 2;
+        if (used + need >= outlen) break;
+        used += (size_t)snprintf(out + used, outlen - used, "%s\n", names[i]);
+    }
+}
+
+/* Extract a section from case.txt: everything after "expect <what>" up to the next
+ * blank-line-then-directive or end. */
+static void corpus_section(const char *txt, const char *what, char *out,
+                           size_t outlen)
+{
+    char needle[64];
+    snprintf(needle, sizeof(needle), "expect %s\n", what);
+    out[0] = '\0';
+
+    const char *p = strstr(txt, needle);
+    if (!p) return;
+    p += strlen(needle);
+
+    size_t used = 0;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        if (len == 0) break;                        /* blank line ends it */
+        if (!strncmp(p, "expect ", 7)) break;
+        if (!strncmp(p, "op ", 3)) break;
+        if (used + len + 2 >= outlen) break;
+        memcpy(out + used, p, len);
+        used += len;
+        out[used++] = '\n';
+        out[used] = '\0';
+        if (!eol) break;
+        p = eol + 1;
+    }
+}
+
+/* Every case directory name, sorted. */
+static size_t corpus_cases(char names[][64], size_t max)
+{
+    DIR *d = opendir(CORPUS_DIR);
+    struct dirent *de;
+    size_t n = 0;
+
+    if (!d) return 0;
+    while ((de = readdir(d)) && n < max) {
+        if (de->d_name[0] == '.') continue;
+        if (!strcmp(de->d_name, "README.md")) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), CORPUS_DIR "/%s/case.txt", de->d_name);
+        if (fexists(path) != 0) continue;
+        snprintf(names[n++], 64, "%s", de->d_name);
+    }
+    closedir(d);
+
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char t[64];
+                memcpy(t, names[i], 64);
+                memcpy(names[i], names[j], 64);
+                memcpy(names[j], t, 64);
+            }
+    return n;
+}
+
+static void test_corpus_decode(void)
+{
+    char cases[32][64];
+    size_t ncases = corpus_cases(cases, 32);
+
+    if (!ncases) SKIP("no corpus (run make corpus)");
+
+    for (size_t i = 0; i < ncases; i++) {
+        char dir[PATH_MAX], txtpath[PATH_MAX];
+        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
+        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
+
+        char *txt = slurp(txtpath, NULL);
+        if (!txt) {
+            fprintf(stderr, "\n    FAIL %s: no case.txt\n", cases[i]);
+            current_test_failed = 1;
+            return;
+        }
+
+        /* ZS_SHARED so validating cannot mutate the corpus. */
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *db = NULL;
+        setup.flags = ZS_SHARED;
+        int r = zs_db_open(dir, &setup, &db);
+        if (r != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s: open returned %d (%s)\n",
+                    cases[i], r, zs_strerror(r));
+            current_test_failed = 1;
+            free(txt);
+            return;
+        }
+
+        /* Heap-allocated and generous: a case may hold 64KB values, which is
+         * 128KB of hex per record. */
+        size_t cap = 1u << 20;
+        char *want = malloc(cap), *gotbuf = malloc(cap);
+        ASSERT_NOT_NULL(want);
+        ASSERT_NOT_NULL(gotbuf);
+
+        /* expect files */
+        corpus_section(txt, "files", want, cap);
+        list_data_files(dir, gotbuf, cap);
+        if (want[0] && strcmp(want, gotbuf) != 0) {
+            fprintf(stderr, "\n    FAIL %s files\n      want %s      got  %s",
+                    cases[i], want, gotbuf);
+            current_test_failed = 1;
+            goto casefail;
+        }
+
+        /* expect scan */
+        corpus_section(txt, "scan", want, cap);
+        struct hexbuf hb = { gotbuf, 0, cap, false };
+        gotbuf[0] = '\0';
+        r = zs_db_foreach(db, NULL, 0, NULL, corpus_scan_cb, &hb, 0);
+        if (r != ZS_OK) {
+            fprintf(stderr, "\n    FAIL %s scan returned %d\n", cases[i], r);
+            current_test_failed = 1;
+            goto casefail;
+        }
+        if (hb.overflow) {
+            fprintf(stderr, "\n    FAIL %s scan overflowed the buffer\n",
+                    cases[i]);
+            current_test_failed = 1;
+            goto casefail;
+        }
+        if (strcmp(want, gotbuf) != 0) {
+            fprintf(stderr, "\n    FAIL %s scan mismatch (%zu vs %zu bytes)\n",
+                    cases[i], strlen(want), strlen(gotbuf));
+            current_test_failed = 1;
+            goto casefail;
+        }
+
+        /* expect check */
+        const char *ck = strstr(txt, "expect check ");
+        if (ck) {
+            bool want_ok = !strncmp(ck + 13, "OK", 2);
+            int cr = zs_db_check_consistency(db);
+            if (want_ok != (cr == ZS_OK)) {
+                fprintf(stderr, "\n    FAIL %s check: wanted %s, got %d\n",
+                        cases[i], want_ok ? "OK" : "FAILED", cr);
+                current_test_failed = 1;
+                goto casefail;
+            }
+        }
+
+        free(want);
+        free(gotbuf);
+        zs_db_close(&db);
+        free(txt);
+        continue;
+
+casefail:
+        free(want);
+        free(gotbuf);
+        zs_db_close(&db);
+        free(txt);
+        return;
+    }
+}
+
+/* Replay a case's `op` lines into dir.  Returns false if the case uses something
+ * this replayer does not implement, which is reported rather than skipped
+ * silently. */
+static bool corpus_replay(const char *txt, const char *dir, const char *uuid,
+                          int engine)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *batch = NULL;
+    char kbuf[70000], vbuf[70000];
+
+    setup.flags = ZS_CREATE | (engine == 0 ? ZS_CSUM_NONE : ZS_CSUM_XXHASH);
+    if (zs_db_open_with_uuid(dir, &setup, uuid, &db) != ZS_OK) return false;
+
+    const char *p = txt;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        char line[140000];
+        if (len >= sizeof(line)) return false;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        p = eol ? eol + 1 : NULL;
+
+        char *arg = NULL;
+        bool in_batch = (batch != NULL);
+        char *verb = line;
+
+        if (!strncmp(line, "op ", 3)) verb = line + 3;
+        else if (!in_batch) continue;       /* a header line or an expectation */
+
+        arg = strchr(verb, ' ');
+        if (arg) *arg++ = '\0';
+
+        if (!strcmp(verb, "batch")) {
+            if (zs_db_begin_txn(db, 0, &batch) != ZS_OK) return false;
+        } else if (!strcmp(verb, "end")) {
+            if (zs_txn_commit(&batch) != ZS_OK) return false;
+            batch = NULL;
+        } else if (!strcmp(verb, "store")) {
+            char *sp = arg ? strchr(arg, ' ') : NULL;
+            size_t kl, vl = 0;
+            if (sp) *sp++ = '\0';
+            kl = unhex_into(arg ? arg : "", kbuf, sizeof(kbuf));
+            if (kl == (size_t)-1) return false;
+            if (sp) {
+                vl = unhex_into(sp, vbuf, sizeof(vbuf));
+                if (vl == (size_t)-1) return false;
+            }
+            int r = batch ? zs_txn_store(batch, kbuf, kl, vbuf, vl, 0)
+                          : zs_db_store(db, kbuf, kl, vbuf, vl, 0);
+            if (r != ZS_OK) return false;
+        } else if (!strcmp(verb, "delete")) {
+            size_t kl = unhex_into(arg ? arg : "", kbuf, sizeof(kbuf));
+            if (kl == (size_t)-1) return false;
+            int r = batch ? zs_txn_store(batch, kbuf, kl, NULL, 0, 0)
+                          : zs_db_delete(db, kbuf, kl, 0);
+            if (r != ZS_OK && r != ZS_NOTFOUND) return false;
+        } else if (!strcmp(verb, "garbage")) {
+            /* Append raw bytes to the newest data file, as a torn write leaves. */
+            size_t n = unhex_into(arg ? arg : "", vbuf, sizeof(vbuf));
+            if (n == (size_t)-1) return false;
+            char names[64][ZSI_NAME_MAX];
+            size_t nn = 0;
+            DIR *d = opendir(dir);
+            struct dirent *de;
+            if (!d) return false;
+            while ((de = readdir(d)) && nn < 64)
+                if (!strncmp(de->d_name, "zeroskip-", 9))
+                    snprintf(names[nn++], ZSI_NAME_MAX, "%s", de->d_name);
+            closedir(d);
+            if (!nn) return false;
+            for (size_t i = 0; i < nn; i++)
+                for (size_t j = i + 1; j < nn; j++)
+                    if (strcmp(names[i], names[j]) > 0) {
+                        char t[ZSI_NAME_MAX];
+                        memcpy(t, names[i], ZSI_NAME_MAX);
+                        memcpy(names[i], names[j], ZSI_NAME_MAX);
+                        memcpy(names[j], t, ZSI_NAME_MAX);
+                    }
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", dir, names[nn - 1]);
+            /* Close and reopen around the raw append, so the handle's snapshot is
+             * rebuilt from what is actually on disk. */
+            zs_db_close(&db);
+            int fd = open(path, O_WRONLY | O_APPEND);
+            if (fd < 0) return false;
+            if (write(fd, vbuf, n) != (ssize_t)n) { close(fd); return false; }
+            close(fd);
+            setup.flags = engine == 0 ? ZS_CSUM_NONE : ZS_CSUM_XXHASH;
+            if (zs_db_open(dir, &setup, &db) != ZS_OK) return false;
+        } else if (!strcmp(verb, "convert")) {
+            struct zs_txn *t = NULL;
+            if (zs_db_begin_txn(db, 0, &t) != ZS_OK) return false;
+            if (zs_txn_commit(&t) != ZS_OK) return false;
+        } else if (!strcmp(verb, "repack")) {
+            if (zs_db_repack(db) != ZS_OK) return false;
+        } else {
+            return false;                   /* an op we do not implement */
+        }
+    }
+
+    if (batch) return false;                /* unterminated */
+    zs_db_close(&db);
+    return true;
+}
+
+static void test_corpus_encode_byte_identical(void)
+{
+    /* T-12a's local half: the same UUID and the same operations must produce
+     * IDENTICAL FILES.  Sharper than reading each other's output, because it
+     * catches divergence before it becomes a compatibility rule. */
+    char cases[32][64];
+    size_t ncases = corpus_cases(cases, 32);
+
+    if (!ncases) SKIP("no corpus (run make corpus)");
+
+    for (size_t i = 0; i < ncases; i++) {
+        char dir[PATH_MAX], txtpath[PATH_MAX], out[PATH_MAX];
+        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
+        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
+        snprintf(out, sizeof(out), "%s/replay-%s", basedir, cases[i]);
+
+        char *txt = slurp(txtpath, NULL);
+        ASSERT_NOT_NULL(txt);
+
+        /* uuid and engine from the header. */
+        char uuid[64] = "";
+        int engine = 1;
+        const char *u = strstr(txt, "uuid ");
+        if (u) sscanf(u, "uuid %63s", uuid);
+        const char *e = strstr(txt, "engine ");
+        if (e) sscanf(e, "engine %d", &engine);
+
+        if (!uuid[0]) {
+            fprintf(stderr, "\n    FAIL %s: no uuid in case.txt\n", cases[i]);
+            current_test_failed = 1;
+            free(txt);
+            return;
+        }
+
+        if (!corpus_replay(txt, out, uuid, engine)) {
+            fprintf(stderr, "\n    FAIL %s: replay failed\n", cases[i]);
+            current_test_failed = 1;
+            free(txt);
+            return;
+        }
+        free(txt);
+
+        /* Compare every data file byte for byte. */
+        char names[4096];
+        list_data_files(dir, names, sizeof(names));
+        char *save = NULL;
+        for (char *nm = strtok_r(names, "\n", &save); nm;
+             nm = strtok_r(NULL, "\n", &save)) {
+            char a[PATH_MAX], b[PATH_MAX];
+            size_t alen = 0, blen = 0;
+            snprintf(a, sizeof(a), "%s/%s", dir, nm);
+            snprintf(b, sizeof(b), "%s/%s", out, nm);
+
+            char *abuf = slurp(a, &alen);
+            char *bbuf = slurp(b, &blen);
+            if (!abuf || !bbuf) {
+                fprintf(stderr, "\n    FAIL %s: %s missing in replay\n",
+                        cases[i], nm);
+                current_test_failed = 1;
+                free(abuf); free(bbuf);
+                return;
+            }
+            if (alen != blen || memcmp(abuf, bbuf, alen) != 0) {
+                fprintf(stderr, "\n    FAIL %s: %s differs (%zu vs %zu bytes)\n",
+                        cases[i], nm, alen, blen);
+                for (size_t k = 0; k < (alen < blen ? alen : blen); k++)
+                    if (abuf[k] != bbuf[k]) {
+                        fprintf(stderr, "      first difference at byte %zu: "
+                                "corpus 0x%02X, replay 0x%02X\n", k,
+                                (unsigned char)abuf[k], (unsigned char)bbuf[k]);
+                        break;
+                    }
+                current_test_failed = 1;
+                free(abuf); free(bbuf);
+                return;
+            }
+            free(abuf);
+            free(bbuf);
+        }
+    }
+}
+
+static void test_corpus_engine_from_file_not_config(void)
+{
+    /* F-5a/A-6: a file's engine comes from its OWN header, not the reader's
+     * configuration.  The engine0 case is opened by a handle configured for
+     * xxHash and must still read correctly. */
+    char dir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    snprintf(dir, sizeof(dir), CORPUS_DIR "/engine0");
+    if (fexists(dir) != 0) SKIP("no engine0 corpus case");
+
+    setup.flags = ZS_SHARED | ZS_CSUM_XXHASH;
+    ASSERT_OK(zs_db_open(dir, &setup, &db));
+
+    /* The file records engine 0 regardless of the flag. */
+    ASSERT_EQ(db->create_csum_id, ZSI_CSUM_XXHASH);
+    ASSERT_EQ(db->snap->files[0]->csum_id, ZSI_CSUM_NONE);
+
+    /* And its records read. */
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "01", 2);
+
+    zs_db_close(&db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -8649,6 +9147,12 @@ static struct test_entry tests[] = {
     { "test_check_unclean_reported",    test_check_unclean_reported },
     { "test_dump_line_format",          test_dump_line_format },
     { "test_dump_shows_rollback",       test_dump_shows_rollback },
+
+    { "test_corpus_decode",             test_corpus_decode },
+    { "test_corpus_encode_byte_identical",
+                                        test_corpus_encode_byte_identical },
+    { "test_corpus_engine_from_file_not_config",
+                                        test_corpus_engine_from_file_not_config },
 
     { NULL, NULL }
 };

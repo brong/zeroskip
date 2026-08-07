@@ -1,0 +1,29 @@
+# A merged multi-generation in-order file, after a repack.
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op store 31 7631
+op garbage deadbeefdeadbeef
+op store 32 7632
+op garbage deadbeefdeadbeef
+op store 33 7633
+op garbage deadbeefdeadbeef
+op store 34 7634
+op garbage deadbeefdeadbeef
+op store 39 7639
+op convert
+op repack
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001-00000004
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000005
+
+expect scan
+31 7631
+32 7632
+33 7633
+34 7634
+39 7639
+
+expect check OK

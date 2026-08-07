@@ -1,0 +1,16 @@
+# A deletion, and an empty value -- which are distinct states (A-1).
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op store 6b6565 76616c
+op store 656d7074 
+op delete 6b6565
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001
+
+expect scan
+656d7074 
+
+expect check OK

@@ -1,0 +1,20 @@
+# Keys and values containing NUL and newline; lengths are authoritative.
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op store 00 00
+op store 000a00 0a000a
+op store 6100 006100
+op store ff00ff 00ff00
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001
+
+expect scan
+00 00
+000a00 0a000a
+6100 006100
+ff00ff 00ff00
+
+expect check OK

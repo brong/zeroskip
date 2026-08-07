@@ -90,7 +90,8 @@ static int usage(void)
     fprintf(stderr,
         "usage: zstool <dir> <command> [args]\n"
         "\n"
-        "  create [--uuid U]      create a database, optionally with a given UUID\n"
+        "  create [--uuid U] [--engine 0|1]\n"
+        "                         create a database\n"
         "  store KEYHEX VALHEX    one transaction, one store\n"
         "  delete KEYHEX          one transaction, one delete\n"
         "  batch                  a script on stdin, all in ONE transaction\n"
@@ -117,7 +118,7 @@ int main(int argc, char **argv)
     struct zs_db *db = NULL;
     const char *dir, *cmd;
     const char *uuid = NULL, *prefix = NULL;
-    int detail = 0;
+    int detail = 0, engine = -1;
     long hold_ms = 0;
     int r;
 
@@ -131,6 +132,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix = argv[++i];
         else if (!strcmp(argv[i], "--detail") && i + 1 < argc) detail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--for") && i + 1 < argc)    hold_ms = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--engine") && i + 1 < argc)  engine = atoi(argv[++i]);
     }
 
     setup.error = tool_error;
@@ -140,6 +142,12 @@ int main(int argc, char **argv)
      * uniform open keeps the tool's behaviour predictable for a runner. */
     if (!strcmp(cmd, "create")) {
         setup.flags = ZS_CREATE;
+        /* Which engine files this database's creator writes (A-6).  Engine 2 is
+         * deliberately unreachable from here: a file written under it is readable
+         * only by a caller supplying the same function, so it cannot appear in a
+         * shared corpus (F-5d). */
+        if (engine == 0) setup.flags |= ZS_CSUM_NONE;
+        else if (engine == 1) setup.flags |= ZS_CSUM_XXHASH;
         r = uuid ? zs_db_open_with_uuid(dir, &setup, uuid, &db)
                  : zs_db_open(dir, &setup, &db);
         if (r != ZS_OK) oops("create", r);

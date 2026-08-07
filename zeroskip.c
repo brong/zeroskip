@@ -3695,6 +3695,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
  * still detectable (F-22); durability does not, and neither does C-7a's ordering
  * guarantee. */
 static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
+                              zs_csum *cs, unsigned csum_id,
                               bool rollback_only, size_t base_off,
                               size_t **offs_out, size_t *noffs_out)
 {
@@ -3760,10 +3761,17 @@ static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
      * says so at the call site rather than only in the spec. */
     char term[ZSI_TERMLEN_LONG];
     size_t termlen = zsi_term_encoded_len((uint64_t)spanlen);
-    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
 
+    /* The engine is the ACTIVE FILE'S, not this handle's.
+     *
+     * A-6: a ZS_CSUM_* flag chooses the engine for files this handle CREATES; it
+     * never overrides what an existing file records, because each file's engine
+     * comes from its own header (F-5a).  Using the handle's engine to checksum a
+     * span appended to a file that records a different one is silent data loss:
+     * the terminator validates under neither engine, so the next reader rejects
+     * the span (F-22 doing exactly its job) and every record in it vanishes. */
     zsi_term_encode(term, (uint64_t)spanlen, rollback_only,
-                    span ? span : "", cs, db->create_csum_id);
+                    span ? span : "", cs, csum_id);
 
     r = zsi_write_all(fd, term, termlen);
     free(span);
@@ -3868,7 +3876,19 @@ static int zsi_txn_commit(struct zs_txn *txn)
     struct zsi_file *act = zsi_snapshot_active(db->snap);
     size_t base_off = act ? act->size : 0;
 
-    r = zsi_txn_write_span(txn, fd, gen, false, base_off, &offs, &noffs);
+    /* The engine the file we are appending to records (A-6, F-5a).  A file whose
+     * header did not validate has no engine to honour, so a newly created file's
+     * engine is used instead -- but that case cannot arise here, because an
+     * unclean file is never appended to (D-9). */
+    zs_csum *cs = act && act->hdr_valid
+                ? act->csum
+                : zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    unsigned csum_id = act && act->hdr_valid ? act->csum_id
+                                             : db->create_csum_id;
+    if (!cs) { r = ZS_BADUSAGE; goto out; }
+
+    r = zsi_txn_write_span(txn, fd, gen, cs, csum_id, false, base_off,
+                           &offs, &noffs);
     close(fd);
     fd = -1;
     if (r != ZS_OK) goto out;

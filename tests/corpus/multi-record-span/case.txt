@@ -1,0 +1,20 @@
+# One transaction holding several records, so a multi-record span exists.
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op batch
+store 6b31 7631
+store 6b32 7632
+store 6b33 7633
+op end
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001
+
+expect scan
+6b31 7631
+6b32 7632
+6b33 7633
+
+expect check OK

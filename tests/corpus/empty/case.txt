@@ -1,0 +1,12 @@
+# A newly created database: one active file, a 72-byte header, no spans.
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001
+
+expect scan
+
+expect check OK
