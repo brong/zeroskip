@@ -22,6 +22,13 @@
 #               could catch it.  Recorded here so nobody adds a bogus test
 #               chasing one.  (For example, unsigned wraparound already produces
 #               roundup8's saturating answer, so dropping its guard is a no-op.)
+#   SUBSUMED    the mutation IS observable in principle, but every input the
+#               suite constructs is rejected by a sibling check first, so no
+#               existing test isolates it.  Distinct from EQUIVALENT: a
+#               sufficiently contrived file would tell them apart.  Each group of
+#               subsumed checks must be paired with a combined mutant removing
+#               the whole group, so the defence is demonstrated even where the
+#               individual layers are not.
 #   PATTERN     the perl pattern no longer matches the source.  These patterns
 #               are tied to exact source text and WILL rot when the code is
 #               refactored -- fix the pattern, do not delete the mutant.
@@ -75,12 +82,15 @@ mutant() {
         if [ "$expect" = equivalent ]; then
             printf '  %-46s equivalent (as documented)\n' "$name"
             equivalent=$((equivalent + 1))
+        elif [ "$expect" = subsumed ]; then
+            printf '  %-46s subsumed by a sibling check (as documented)\n' "$name"
+            equivalent=$((equivalent + 1))
         else
             printf '  %-46s NOT CAUGHT  <-- test gap\n' "$name"
             missed=$((missed + 1))
         fi
-    elif [ "$expect" = equivalent ]; then
-        printf '  %-46s CAUGHT but marked equivalent -- reclassify\n' "$name"
+    elif [ "$expect" = equivalent ] || [ "$expect" = subsumed ]; then
+        printf '  %-46s CAUGHT but marked %s -- reclassify\n' "$name" "$expect"
         missed=$((missed + 1))
     elif [ "$rc" -gt 128 ]; then
         # Killed by a signal rather than failing an assertion.  Still detected,
@@ -231,6 +241,81 @@ mutant "parse: metadata matches data pattern" catch \
 
 mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
+
+echo
+echo "pointer section (Task 9)"
+
+# F-26g: the empty in-order file.  Every property of it is pinned, because it is
+# byte-identical every time it is produced and other implementations must agree.
+# F-26g: an empty records region checksums to the ENGINE'S value for empty input,
+# not to zero.  This is the trap twom's csum_null-style short-circuit sets.
+mutant "empty file: records csum forced to zero" catch \
+  's/    zsi_put32\(buf \+ seclen \+ 8, records_csum\);/    zsi_put32(buf + seclen + 8, n ? records_csum : 0);/'
+
+mutant "empty file: PTRS64 when count is 0" catch \
+  's/    bool wide = records_end > 0xFFFFFFFFu;/    bool wide = n == 0 || records_end > 0xFFFFFFFFu;/'
+
+# F-26b: the section checksum covers section + padding + back pointer + records
+# checksum, up to the checksum field itself.
+mutant "section csum: covers section only" catch \
+  's/    zsi_put32\(buf \+ seclen \+ 12, csum\(buf, seclen \+ 12\)\);/    zsi_put32(buf + seclen + 12, csum(buf, seclen));/'
+
+mutant "section csum: not verified on load" catch \
+  's/    if \(f->csum\(cbase, covered\) != sec_csum\) return ZS_BADCHECKSUM;/    (void)cbase; (void)covered;/'
+
+# F-26f: the records checksum is verified on DEMAND, never on open, which must
+# stay O(1).  Verifying it on open makes opening proportional to file size.
+mutant "records csum: verified on open" catch \
+  's/    f->records_csum = rec_csum;/    f->records_csum = rec_csum;\n    { size_t rl = ptr_off - ZSI_HEADER_LEN;\n      const char *rp = zsi_file_at(f, ZSI_HEADER_LEN, rl);\n      if (f->csum(rp ? rp : "", rl) != rec_csum) return ZS_BADCHECKSUM; }/'
+
+mutant "records csum: over the wrong region" catch \
+  's/    size_t len = f->ptr_off - ZSI_HEADER_LEN;/    size_t len = f->ptr_off;/'
+
+# F-26a: the back pointer is plain data, but must be bounds-checked and aligned.
+mutant "back pointer: alignment not checked" subsumed \
+  's/    if \(back % 8 != 0\) return ZS_BADFORMAT;/    \/* alignment check removed *\//'
+
+mutant "back pointer: lower bound not checked" subsumed \
+  's/    if \(back < ZSI_HEADER_LEN\) return ZS_BADFORMAT;/    \/* lower bound removed *\//'
+
+mutant "back pointer: may overlap the trailer" subsumed \
+  's/    if \(sec_end > f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (sec_end > f->size) return ZS_BADFORMAT;/'
+
+mutant "section type: anything accepted" subsumed \
+  's/    else                         return ZS_BADFORMAT;/    else                         wide = false;/'
+
+# The section length must exactly account for the rest of the file.
+mutant "section length: bound not equality" subsumed \
+  's/    if \(want_end != f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (want_end > f->size - ZSI_TRAILER_LEN) return ZS_BADFORMAT;/'
+
+# ...and the combined mutant: strip the WHOLE back-pointer validation group at
+# once, so nothing structural stands between a corrupt trailer and the pointer
+# array.  Each layer above is individually subsumed by its siblings; this shows
+# the group as a whole is load-bearing rather than uniformly redundant.
+mutant "back pointer: no validation at all" catch \
+  's/    if \(back < ZSI_HEADER_LEN\) return ZS_BADFORMAT;\n    if \(back % 8 != 0\) return ZS_BADFORMAT;/    \/* all back pointer checks removed *\//; s/    if \(sec_end > f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (sec_end > f->size) return ZS_BADFORMAT;/; s/    else                         return ZS_BADFORMAT;/    else                         wide = false;/; s/    if \(want_end != f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (want_end > f->size) return ZS_BADFORMAT;/'
+
+# F-27: every pointer 8-aligned and inside the records region.
+mutant "F-27: pointer bounds not checked" catch \
+  's/        if \(off >= ptr_off\) return ZS_BADFORMAT;/        \/* upper bound removed *\//'
+
+mutant "F-27: pointer alignment not checked" catch \
+  's/        if \(off % 8 != 0\) return ZS_BADFORMAT;/        \/* alignment removed *\//'
+
+# F-26d: the narrow section pads to a multiple of 8 so the trailer is aligned.
+mutant "F-26d: no padding to 8" catch \
+  's/    return zsi_roundup8\(total\);\n\}/    return total;\n}/'
+
+# F-26c: PTRS32 whenever the offsets fit, so encoding is canonical.
+mutant "F-26c: always PTRS64" catch \
+  's/    bool wide = records_end > 0xFFFFFFFFu;/    bool wide = true;/'
+
+# The search must be a lower bound over a strictly ordered array.
+mutant "search: probe returns wrong end" catch \
+  's/        if \(c > 0\) \{\n            \*idx = f->nptrs;            \/\* past every key \*\/\n            return ZS_OK;\n        \}/        if (c > 0) {\n            *idx = f->nptrs - 1;\n            return ZS_OK;\n        }/'
+
+mutant "search: exact flag never set" catch \
+  's/        \*exact = \(compar\(r.key, r.keylen, key, keylen\) == 0\);/        *exact = false;/'
 
 echo
 echo "private index (Task 8)"

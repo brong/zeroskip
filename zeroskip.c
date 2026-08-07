@@ -1162,8 +1162,6 @@ static bool zsi_term_is_canonical(const struct zsi_term *t)
     return t->len == zsi_term_encoded_len(t->spanlen);
 }
 
-/********** POINTER SECTION *************/
-
 /********** FILE OBJECT *************/
 
 /* One open, mapped data file.
@@ -1197,6 +1195,7 @@ struct zsi_file {
     size_t            ptr_off;
     uint64_t          nptrs;
     bool              ptr_wide;
+    uint32_t          records_csum;   /* from the trailer; verified on demand */
 };
 
 /* Bounds-checked access to file data (F-30).
@@ -1532,6 +1531,328 @@ static int zsi_unordered_replay(struct zsi_file *f, bool nocsum,
 static bool zsi_unordered_is_clean(const struct zsi_file *f)
 {
     return f->hdr_valid && f->complete == f->size;
+}
+
+/********** POINTER SECTION *************/
+
+/* An in-order file always ends with a pointer section followed by a 16-byte
+ * trailer; an unordered file never has either (section 4.9).  So:
+ *
+ *     in-order   [header][records][pointer section][trailer]
+ *     unordered  [header](span)*
+ *
+ * An in-order file has no spans and no terminators.  Every record in it is live
+ * by construction, and it is written whole under a temporary name and renamed
+ * only once finished (D-21), so a commit record would assert nothing that is not
+ * already guaranteed.
+ *
+ *     PTRS32 (0x20)                        narrow
+ *       +0    1      type
+ *       +1    3      pad
+ *       +4    4      count (uint32)
+ *       +8    4xN    record offsets (uint32)
+ *             .      pad with zeroes to a multiple of 8
+ *
+ *     PTRS64 (0x24)                        wide
+ *       +0    1      type
+ *       +1    7      pad
+ *       +8    8      count (uint64)
+ *       +16   8xN    record offsets (uint64)
+ *
+ * The trailer is a FIXED 16 bytes, always, so it can be read without knowing
+ * anything else about the file:
+ *
+ *     filesize-16   8   offset of the start of the pointer section
+ *     filesize-8    4   checksum of the records region
+ *     filesize-4    4   checksum of the pointer section
+ */
+
+#define ZSI_TRAILER_LEN 16
+
+/* 72 header + 8 empty PTRS32 + 16 trailer.  A file shorter than this cannot be a
+ * valid in-order file (F-26g). */
+#define ZSI_INORDER_MIN (ZSI_HEADER_LEN + 8 + ZSI_TRAILER_LEN)
+
+/* Bytes a pointer section occupies, including F-26d's padding.  Returns 0 if the
+ * count cannot be represented. */
+static size_t zsi_ptrs_section_len(uint64_t count, bool wide)
+{
+    size_t hdr = wide ? 16 : 8;
+    size_t per = wide ? 8 : 4;
+    size_t body, total;
+
+    if (count > SIZE_MAX / per) return 0;
+    body = (size_t)count * per;
+    if (!zsi_add_sz(hdr, body, &total)) return 0;
+
+    /* The narrow section is padded with zeroes to a multiple of 8 so the trailer
+     * begins 8-aligned (F-2).  The pad is 0 or 4 bytes and the checksum covers
+     * it.  The wide section is always a multiple of 8 already. */
+    return zsi_roundup8(total);
+}
+
+/* The record offset at index i.  i must be < f->nptrs; the caller has already
+ * bounds-checked the array as a whole in zsi_ptrs_load. */
+static uint64_t zsi_ptrs_at(const struct zsi_file *f, uint64_t i)
+{
+    size_t hdr = f->ptr_wide ? 16 : 8;
+    size_t per = f->ptr_wide ? 8 : 4;
+    const char *p = f->base + f->ptr_off + hdr + (size_t)i * per;
+
+    return f->ptr_wide ? zsi_get64(p) : (uint64_t)zsi_get32(p);
+}
+
+/* Read the trailer and pointer section and validate the file's structure.
+ *
+ * O(1) (F-31): validate the header, read the 16-byte trailer, verify the
+ * pointer-section checksum, use the pointers.  The records region is never
+ * touched here -- its checksum is verified only on demand (F-26f), because
+ * opening must not be proportional to the file's size.
+ *
+ * Order matters, and F-26a and F-26b are what make it safe:
+ *
+ *   - the trailer is at a fixed size and a fixed position, so it needs no prior
+ *     knowledge of the file;
+ *   - the back pointer inside it is plain data, read before anything is
+ *     verified, so there is no circularity -- a wrong value yields a failed
+ *     checksum rather than a wrong interpretation;
+ *   - the back pointer is 8 bytes wide even in a narrow file, because a
+ *     variable-size trailer could not be read without first knowing which size
+ *     it was.
+ */
+static int zsi_ptrs_load(struct zsi_file *f)
+{
+    if (!f->hdr_valid) return ZS_BADFORMAT;
+    if (zsi_header_is_unordered(&f->hdr)) return ZS_BADUSAGE;
+
+    /* Enough for a header and a trailer at minimum.  The 96-byte floor is
+     * enforced implicitly by the back-pointer bounds below, which require at
+     * least an 8-byte section between them. */
+    if (f->size < ZSI_HEADER_LEN + ZSI_TRAILER_LEN) return ZS_BADFORMAT;
+
+    const char *tr = zsi_file_at(f, f->size - ZSI_TRAILER_LEN, ZSI_TRAILER_LEN);
+    if (!tr) return ZS_BADFORMAT;
+
+    uint64_t back = zsi_get64(tr);
+    uint32_t rec_csum = zsi_get32(tr + 8);
+    uint32_t sec_csum = zsi_get32(tr + 12);
+
+    /* The back pointer must land inside the file, after the header, and leave
+     * room for at least the smallest section before the trailer.  It must also
+     * be 8-aligned (F-2), which a corrupt value usually is not. */
+    if (back < ZSI_HEADER_LEN) return ZS_BADFORMAT;
+    if (back % 8 != 0) return ZS_BADFORMAT;
+    if (back > (uint64_t)SIZE_MAX) return ZS_BADFORMAT;
+
+    size_t ptr_off = (size_t)back;
+    size_t sec_end;
+    if (!zsi_add_sz(ptr_off, 8, &sec_end)) return ZS_BADFORMAT;
+    if (sec_end > f->size - ZSI_TRAILER_LEN) return ZS_BADFORMAT;
+
+    const char *sec = zsi_file_at(f, ptr_off, 8);
+    if (!sec) return ZS_BADFORMAT;
+
+    uint8_t type = (uint8_t)sec[0];
+    bool wide;
+    if (type == ZSI_PTRS32)      wide = false;
+    else if (type == ZSI_PTRS64) wide = true;
+    else                         return ZS_BADFORMAT;
+
+    /* F-26b: the section checksum covers everything from the start of the
+     * section up to the checksum field itself -- the section, its padding, the
+     * back pointer, and the records checksum.  F-4 with no special case.
+     *
+     * Verified BEFORE the count is trusted, so a corrupt count cannot steer the
+     * bounds arithmetic below. */
+    size_t covered = (f->size - 4) - ptr_off;
+    const char *cbase = zsi_file_at(f, ptr_off, covered);
+    if (!cbase) return ZS_BADFORMAT;
+    if (f->csum(cbase, covered) != sec_csum) return ZS_BADCHECKSUM;
+
+    uint64_t count;
+    if (wide) {
+        const char *c = zsi_file_at(f, ptr_off, 16);
+        if (!c) return ZS_BADFORMAT;
+        count = zsi_get64(c + 8);
+    } else {
+        count = (uint64_t)zsi_get32(sec + 4);
+    }
+
+    size_t seclen = zsi_ptrs_section_len(count, wide);
+    if (seclen == 0) return ZS_BADFORMAT;
+
+    size_t want_end;
+    if (!zsi_add_sz(ptr_off, seclen, &want_end)) return ZS_BADFORMAT;
+
+    /* The section plus the trailer must be exactly the rest of the file.  An
+     * equality rather than a bound: anything else means the count and the file
+     * size disagree, which no conforming writer produces. */
+    if (want_end != f->size - ZSI_TRAILER_LEN) return ZS_BADFORMAT;
+
+    f->ptr_off = ptr_off;
+    f->nptrs = count;
+    f->ptr_wide = wide;
+    f->records_csum = rec_csum;
+
+    /* F-27: every pointer must be 8-aligned and lie between the header and the
+     * pointer section.  With count == 0 this loop runs zero times and the
+     * requirement is vacuous, which is exactly right (F-26g). */
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t off = zsi_ptrs_at(f, i);
+        if (off < ZSI_HEADER_LEN) return ZS_BADFORMAT;
+        if (off >= ptr_off) return ZS_BADFORMAT;
+        if (off % 8 != 0) return ZS_BADFORMAT;
+    }
+
+    return ZS_OK;
+}
+
+/* Verify the records-region checksum (F-26e).
+ *
+ * Called on demand only -- by zs_db_check_consistency, or by a caller that
+ * chooses to -- never on open, which stays O(1) (F-26f).  This is the only thing
+ * that detects a record body corrupted in place in an in-order file: there are no
+ * span terminators to notice it, so without this the corruption is invisible. */
+static int zsi_ptrs_verify_records(struct zsi_file *f)
+{
+    size_t len = f->ptr_off - ZSI_HEADER_LEN;
+    const char *p = zsi_file_at(f, ZSI_HEADER_LEN, len);
+
+    if (!p && len) return ZS_BADFORMAT;
+
+    /* An empty records region checksums to the engine's value for empty input,
+     * not to zero (F-26g).  Passing "" rather than NULL keeps that path
+     * identical to any other zero-length checksum. */
+    if (f->csum(p ? p : "", len) != f->records_csum) return ZS_BADCHECKSUM;
+
+    return ZS_OK;
+}
+
+/* Decode the record at pointer index i. */
+static int zsi_ptrs_rec(struct zsi_file *f, uint64_t i, struct zsi_rec *out)
+{
+    uint64_t off = zsi_ptrs_at(f, i);
+    const char *b = zsi_file_at(f, (size_t)off, 1);
+
+    if (!b) return ZS_BADFORMAT;
+    return zsi_rec_decode(b, f->ptr_off - (size_t)off, f->hdr.start, out);
+}
+
+/* An implementation MAY probe the first and last pointers before the rest, which
+ * rejects an out-of-range key in two comparisons rather than the log2(n) a plain
+ * binary search takes to walk to an end (D-14d).
+ *
+ * This is a search STRATEGY, not a way of avoiding the search: those two pointers
+ * still have to be dereferenced and their keys compared, so it is the same kind
+ * of work, just less of it.  It needs no cached metadata and cannot change the
+ * answer -- which T-5a checks by running the same assertions with it compiled
+ * out. */
+#ifndef ZSI_PROBE_ENDS
+#define ZSI_PROBE_ENDS 1
+#endif
+
+/* Binary search for key.  Sets *idx to the first index whose key is >= key, and
+ * *exact to whether it matches.
+ *
+ * With nptrs == 0 this sets *idx = 0 and *exact = false: an ordinary case, not a
+ * special one (F-26g, D-14b).  Because a repack emits exactly one record per key
+ * (D-17), keys in an in-order file are unique and the array is a strict ordering,
+ * so a plain lower bound is correct. */
+static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
+                           const char *key, size_t keylen,
+                           uint64_t *idx, bool *exact)
+{
+    struct zsi_rec r;
+
+    *idx = 0;
+    *exact = false;
+    if (f->nptrs == 0) return ZS_OK;
+
+#if ZSI_PROBE_ENDS
+    {
+        if (zsi_ptrs_rec(f, 0, &r) != ZS_OK) return ZS_BADFORMAT;
+        int c = compar(key, keylen, r.key, r.keylen);
+        if (c <= 0) {
+            *idx = 0;
+            *exact = (c == 0);
+            return ZS_OK;
+        }
+
+        if (zsi_ptrs_rec(f, f->nptrs - 1, &r) != ZS_OK) return ZS_BADFORMAT;
+        c = compar(key, keylen, r.key, r.keylen);
+        if (c > 0) {
+            *idx = f->nptrs;            /* past every key */
+            return ZS_OK;
+        }
+        if (c == 0) {
+            *idx = f->nptrs - 1;
+            *exact = true;
+            return ZS_OK;
+        }
+    }
+#endif
+
+    uint64_t lo = 0, hi = f->nptrs;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if (zsi_ptrs_rec(f, mid, &r) != ZS_OK) return ZS_BADFORMAT;
+        if (compar(r.key, r.keylen, key, keylen) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    *idx = lo;
+    if (lo < f->nptrs) {
+        if (zsi_ptrs_rec(f, lo, &r) != ZS_OK) return ZS_BADFORMAT;
+        *exact = (compar(r.key, r.keylen, key, keylen) == 0);
+    }
+
+    return ZS_OK;
+}
+
+/* Build a pointer section and trailer for records already laid down.
+ *
+ * offs must be sorted by key ascending, and records_end is where the section
+ * begins -- the offset just past the last record.  Returns a malloc'd buffer the
+ * caller writes and frees.
+ *
+ * Width by F-26c: PTRS32 when every record offset fits in 32 bits, and since all
+ * records precede the section, that is equivalent to the section's own offset
+ * fitting.  Canonical, so two implementations produce identical bytes. */
+static int zsi_ptrs_build(const uint64_t *offs, size_t n, size_t records_end,
+                          uint32_t records_csum, zs_csum *csum,
+                          char **out, size_t *outlen)
+{
+    bool wide = records_end > 0xFFFFFFFFu;
+    size_t seclen = zsi_ptrs_section_len((uint64_t)n, wide);
+    size_t total;
+
+    if (seclen == 0) return ZS_INTERNAL;
+    if (!zsi_add_sz(seclen, ZSI_TRAILER_LEN, &total)) return ZS_INTERNAL;
+
+    char *buf = zsi_zmalloc(total);      /* zeroed: F-26d's padding, and F-2 */
+    if (!buf) return ZS_INTERNAL;
+
+    if (wide) {
+        buf[0] = (char)ZSI_PTRS64;
+        zsi_put64(buf + 8, (uint64_t)n);
+        for (size_t i = 0; i < n; i++)
+            zsi_put64(buf + 16 + i * 8, offs[i]);
+    } else {
+        buf[0] = (char)ZSI_PTRS32;
+        zsi_put32(buf + 4, (uint32_t)n);
+        for (size_t i = 0; i < n; i++)
+            zsi_put32(buf + 8 + i * 4, (uint32_t)offs[i]);
+    }
+
+    /* Trailer: back pointer, then the records checksum, then the section
+     * checksum -- which covers everything before it (F-26b). */
+    zsi_put64(buf + seclen, (uint64_t)records_end);
+    zsi_put32(buf + seclen + 8, records_csum);
+    zsi_put32(buf + seclen + 12, csum(buf, seclen + 12));
+
+    *out = buf;
+    *outlen = total;
+    return ZS_OK;
 }
 
 /********** PRIVATE INDEX *************/

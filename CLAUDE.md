@@ -62,9 +62,9 @@ CHECKSUMS           three engines
 FILENAMES           D-0/D-1 format and parse
 FILE HEADER         72-byte header
 RECORDS             14 type bytes, ancestors, terminators
-POINTER SECTION     section + trailer, binary search
 FILE OBJECT         open, mmap, kind detection, the one bounds-checked accessor
 UNORDERED FILE      span chain replay, complete-at
+POINTER SECTION     section + trailer, binary search  (needs an open file)
 PRIVATE INDEX       base+delta ordered index
 PER-FILE CURSOR     uniform seek/next over both kinds
 FILE SET            readdir, D-5 resolution, D-6 tiling

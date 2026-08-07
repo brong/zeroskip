@@ -2081,6 +2081,85 @@ static int sb_write(struct sb *s, const char *name)
     return writefile(name, s->buf, s->len);
 }
 
+/*
+ * Building in-order files by hand.
+ *
+ * ib_rec appends records in the order given -- the caller is responsible for
+ * supplying them in key order, exactly as a repack would, so a test can also
+ * build a file that is deliberately out of order.
+ */
+struct ib {
+    char    *buf;
+    size_t   len, alloc;
+    uint64_t offs[256];
+    size_t   n;
+    unsigned engine;
+};
+
+static void ib_init(struct ib *b, uint32_t start, uint32_t end, unsigned engine)
+{
+    b->alloc = 8192;
+    b->buf = malloc(b->alloc);
+    assert(b->buf);
+    b->n = 0;
+    b->engine = engine;
+
+    char hdr[ZSI_HEADER_LEN];
+    make_header(hdr, start, end, engine);
+    memcpy(b->buf, hdr, ZSI_HEADER_LEN);
+    b->len = ZSI_HEADER_LEN;
+}
+
+static void ib_free(struct ib *b) { free(b->buf); b->buf = NULL; }
+
+static void ib_rec(struct ib *b, const char *key, size_t keylen,
+                   const char *val, size_t vallen, bool anc, uint32_t ancgen)
+{
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, anc);
+    assert(n > 0);
+    while (b->len + n > b->alloc) {
+        b->alloc *= 2;
+        b->buf = realloc(b->buf, b->alloc);
+        assert(b->buf);
+    }
+    assert(b->n < 256);
+    b->offs[b->n++] = b->len;
+    zsi_rec_encode(b->buf + b->len, key, keylen, val, vallen, anc, ancgen);
+    b->len += n;
+}
+
+/* Close the file: append the pointer section and trailer. */
+static void ib_finish(struct ib *b)
+{
+    zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
+    uint32_t rc = cs(b->buf + ZSI_HEADER_LEN, b->len - ZSI_HEADER_LEN);
+    char *sec = NULL;
+    size_t seclen = 0;
+
+    assert(zsi_ptrs_build(b->offs, b->n, b->len, rc, cs, &sec, &seclen) == ZS_OK);
+    while (b->len + seclen > b->alloc) {
+        b->alloc *= 2;
+        b->buf = realloc(b->buf, b->alloc);
+        assert(b->buf);
+    }
+    memcpy(b->buf + b->len, sec, seclen);
+    b->len += seclen;
+    free(sec);
+}
+
+/* Write, open and load.  Leaves the open file in *fp. */
+static int ib_load(struct ib *b, uint32_t start, uint32_t end,
+                   struct zsi_file **fp)
+{
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, start, end);
+    if (mkdbdir() != 0) return -1;
+    if (writefile(name, b->buf, b->len) != 0) return -1;
+    if (zsi_file_open(dbdir, name, start, TEST_EXTERNAL_CSUM, fp) != ZS_OK)
+        return -1;
+    return zsi_ptrs_load(*fp);
+}
+
 /* Replay collector: records the keys a replay presented, in order. */
 struct collected {
     char   key[64][64];
@@ -3728,6 +3807,539 @@ static void test_index_many(void)
 
 /*
  * ============================================================
+ * Pointer section and trailer (T-2a, part of T-6)
+ * ============================================================
+ */
+
+static void test_inorder_empty(void)
+{
+    /* F-26g: a zero-record in-order file is legal and expected -- a repack that
+     * drops every key produces one (D-22).  Three properties are pinned:
+     *
+     *   - it is EXACTLY 96 bytes: 72 header, 8-byte PTRS32 with count 0, 16-byte
+     *     trailer.  Asserted against the literal, so a layout change fails here;
+     *   - it is PTRS32, since F-26c's condition holds vacuously with no offsets,
+     *     making the file byte-identical every time it is produced;
+     *   - its records checksum is the engine's value for EMPTY INPUT, not zero.
+     */
+    struct ib b;
+    struct zsi_file *f = NULL;
+
+    ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    ASSERT_EQU(b.len, 96u);
+
+    ASSERT_EQ(ib_load(&b, 5, 5, &f), ZS_OK);
+    ASSERT_EQU(f->size, 96u);
+    ASSERT_EQU(f->nptrs, 0u);
+    ASSERT(!f->ptr_wide);
+    ASSERT_EQU(f->ptr_off, (size_t)ZSI_HEADER_LEN);
+    ASSERT_EQ((unsigned char)f->base[ZSI_HEADER_LEN], ZSI_PTRS32);
+
+    /* Not zero: 0x38D394C2 is XXH3-64's low half over empty input. */
+    ASSERT_EQU(f->records_csum, 0x38D394C2u);
+    ASSERT_OK(zsi_ptrs_verify_records(f));
+
+    /* Searching it is an ordinary case, not a special one (D-14b). */
+    uint64_t idx;
+    bool exact;
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "any", 3, &idx, &exact));
+    ASSERT_EQU(idx, 0u);
+    ASSERT(!exact);
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "", 0, &idx, &exact));
+    ASSERT_EQU(idx, 0u);
+    ASSERT(!exact);
+    zsi_file_close(&f);
+
+    /* Byte-identical every time it is produced. */
+    struct ib b2;
+    ib_init(&b2, 5, 5, ZSI_CSUM_XXHASH);
+    ib_finish(&b2);
+    ASSERT_EQU(b2.len, b.len);
+    ASSERT_MEM_EQ(b2.buf, b.buf, b.len);
+    ib_free(&b2);
+
+    /* Under engine 0 the records checksum is zero, because that engine writes
+     * zeros for everything -- which is a different thing from the empty-input
+     * value above, and the contrast is the point. */
+    struct ib b0;
+    ib_init(&b0, 5, 5, ZSI_CSUM_NONE);
+    ib_finish(&b0);
+    ASSERT_EQU(b0.len, 96u);
+    ASSERT_EQ(ib_load(&b0, 5, 5, &f), ZS_OK);
+    ASSERT_EQU(f->records_csum, 0u);
+    ASSERT_OK(zsi_ptrs_verify_records(f));
+    zsi_file_close(&f);
+    ib_free(&b0);
+
+    ib_free(&b);
+}
+
+static void test_inorder_roundtrip(void)
+{
+    struct ib b;
+    struct zsi_file *f = NULL;
+    struct zsi_rec r;
+
+    /* Records in key order, one per key, as a repack emits (D-17). */
+    ib_init(&b, 1, 4, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "alpha", 5, "1", 1, false, 0);
+    ib_rec(&b, "beta", 4, "2", 2, false, 0);
+    ib_rec(&b, "gamma", 5, NULL, 0, true, 2);      /* a retained tombstone */
+    ib_rec(&b, "delta", 5, "444", 3, false, 0);    /* deliberately out of order */
+    ib_finish(&b);
+
+    ASSERT_EQ(ib_load(&b, 1, 4, &f), ZS_OK);
+    ASSERT_EQU(f->nptrs, 4u);
+    ASSERT(!f->ptr_wide);
+    ASSERT_OK(zsi_ptrs_verify_records(f));
+
+    /* Every pointer resolves to the record it was built from. */
+    ASSERT_OK(zsi_ptrs_rec(f, 0, &r));
+    ASSERT_MEM_EQ(r.key, "alpha", 5);
+    ASSERT_OK(zsi_ptrs_rec(f, 2, &r));
+    ASSERT_MEM_EQ(r.key, "gamma", 5);
+    ASSERT_NULL(r.val);                            /* the tombstone */
+    ASSERT_EQU(r.ancestor, 2u);                    /* stored, and below start */
+    ASSERT_OK(zsi_ptrs_rec(f, 3, &r));
+    ASSERT_MEM_EQ(r.key, "delta", 5);
+
+    /* A record with no stored ancestor decodes to the file's start (F-17). */
+    ASSERT_OK(zsi_ptrs_rec(f, 0, &r));
+    ASSERT_EQU(r.ancestor, 1u);
+
+    zsi_file_close(&f);
+    ib_free(&b);
+}
+
+static void test_inorder_search(void)
+{
+    struct ib b;
+    struct zsi_file *f = NULL;
+    uint64_t idx;
+    bool exact;
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    static const char *keys[] = { "b", "d", "f", "h", "j" };
+    for (size_t i = 0; i < 5; i++)
+        ib_rec(&b, keys[i], 1, "v", 1, false, 0);
+    ib_finish(&b);
+    ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
+
+    /* Exact hits at every position, including both ends. */
+    for (size_t i = 0; i < 5; i++) {
+        ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, keys[i], 1,
+                                  &idx, &exact));
+        ASSERT(exact);
+        ASSERT_EQU(idx, i);
+    }
+
+    /* Misses land on the first key greater than the target. */
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "a", 1, &idx, &exact));
+    ASSERT(!exact); ASSERT_EQU(idx, 0u);
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "c", 1, &idx, &exact));
+    ASSERT(!exact); ASSERT_EQU(idx, 1u);
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "i", 1, &idx, &exact));
+    ASSERT(!exact); ASSERT_EQU(idx, 4u);
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "z", 1, &idx, &exact));
+    ASSERT(!exact); ASSERT_EQU(idx, 5u);            /* past every key */
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "", 0, &idx, &exact));
+    ASSERT(!exact); ASSERT_EQU(idx, 0u);
+    zsi_file_close(&f);
+    ib_free(&b);
+
+    /* One record, and two records: the sizes where an off-by-one in the probe or
+     * the bisection shows up. */
+    for (size_t n = 1; n <= 2; n++) {
+        ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+        for (size_t i = 0; i < n; i++)
+            ib_rec(&b, keys[i * 2], 1, "v", 1, false, 0);
+        ib_finish(&b);
+        ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
+        ASSERT_EQU(f->nptrs, n);
+
+        ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "b", 1, &idx, &exact));
+        ASSERT(exact); ASSERT_EQU(idx, 0u);
+        ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "a", 1, &idx, &exact));
+        ASSERT(!exact); ASSERT_EQU(idx, 0u);
+        ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "z", 1, &idx, &exact));
+        ASSERT(!exact); ASSERT_EQU(idx, n);
+        zsi_file_close(&f);
+        ib_free(&b);
+    }
+}
+
+static void test_inorder_trailer_negatives(void)
+{
+    /* T-2a.  Opening an in-order file depends entirely on the trailer, so each of
+     * these must be rejected rather than read.  Every case rewrites the section
+     * checksum where the damage would otherwise be caught by it, so each asserts
+     * the structural rule it names rather than incidentally tripping the
+     * checksum. */
+    struct ib b;
+    struct zsi_file *f = NULL;
+    char name[ZSI_NAME_MAX];
+
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "1", 1, false, 0);
+    ib_rec(&b, "b", 1, "2", 1, false, 0);
+    ib_finish(&b);
+
+    size_t full = b.len;
+    char *orig = malloc(full);
+    ASSERT_NOT_NULL(orig);
+    memcpy(orig, b.buf, full);
+
+    /* Re-checksum the section after damaging it, so only the structural rule can
+     * reject.  cover = [ptr_off, size-4). */
+    size_t ptr_off = zsi_get64(orig + full - 16);
+
+    struct { const char *what; long long backptr; } bad[] = {
+        { "past the end of the file",   (long long)full + 8 },
+        { "before the header",          8 },
+        { "at the header",              ZSI_HEADER_LEN - 8 },
+        { "not 8-aligned",              (long long)ptr_off + 4 },
+        { "inside the trailer",         (long long)full - 8 },
+        { "overlapping the trailer",    (long long)full - 16 }
+    };
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        memcpy(b.buf, orig, full);
+        zsi_put64(b.buf + full - 16, (uint64_t)bad[i].backptr);
+        /* recompute the section checksum over whatever the back pointer now
+         * designates, where that is even inside the file */
+        if (bad[i].backptr >= 0 && (size_t)bad[i].backptr < full - 4) {
+            size_t cov = (full - 4) - (size_t)bad[i].backptr;
+            zsi_put32(b.buf + full - 4,
+                      zsi_csum_xxhash(b.buf + bad[i].backptr, cov));
+        }
+        ASSERT_EQ(writefile(name, b.buf, full), 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        if (zsi_ptrs_load(f) == ZS_OK) {
+            fprintf(stderr, "\n    FAIL back pointer %s accepted\n", bad[i].what);
+            current_test_failed = 1;
+            zsi_file_close(&f);
+            goto done;
+        }
+        zsi_file_close(&f);
+    }
+
+    /* A back pointer to a byte that is neither PTRS32 nor PTRS64. */
+    memcpy(b.buf, orig, full);
+    zsi_put64(b.buf + full - 16, ZSI_HEADER_LEN);   /* points at a data record */
+    {
+        size_t cov = (full - 4) - ZSI_HEADER_LEN;
+        zsi_put32(b.buf + full - 4,
+                  zsi_csum_xxhash(b.buf + ZSI_HEADER_LEN, cov));
+    }
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_close(&f);
+
+    /* A file shorter than header plus trailer, at every length. */
+    for (size_t len = 0; len < ZSI_HEADER_LEN + ZSI_TRAILER_LEN; len += 8) {
+        ASSERT_EQ(writefile(name, orig, len), 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        ASSERT(zsi_ptrs_load(f) != ZS_OK);
+        zsi_file_close(&f);
+    }
+
+    /* A corrupted pad byte inside the section is caught by the section checksum
+     * (F-26d says the checksum covers the padding). */
+    memcpy(b.buf, orig, full);
+    ASSERT(full - ZSI_TRAILER_LEN > ptr_off + 8);
+    b.buf[full - ZSI_TRAILER_LEN - 1] ^= 0x01;
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADCHECKSUM);
+    zsi_file_close(&f);
+
+    /* A corrupted count: caught by the section checksum, and if the checksum is
+     * recomputed, by the section-length equality. */
+    memcpy(b.buf, orig, full);
+    zsi_put32(b.buf + ptr_off + 4, 9999);
+    {
+        size_t cov = (full - 4) - ptr_off;
+        zsi_put32(b.buf + full - 4, zsi_csum_xxhash(b.buf + ptr_off, cov));
+    }
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_close(&f);
+
+    /* A pointer outside the records region (F-27), with the checksum fixed up. */
+    memcpy(b.buf, orig, full);
+    zsi_put32(b.buf + ptr_off + 8, (uint32_t)(full - 8));   /* into the trailer */
+    {
+        size_t cov = (full - 4) - ptr_off;
+        zsi_put32(b.buf + full - 4, zsi_csum_xxhash(b.buf + ptr_off, cov));
+    }
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_close(&f);
+
+    /* A pointer that is not 8-aligned (F-27). */
+    memcpy(b.buf, orig, full);
+    zsi_put32(b.buf + ptr_off + 8, ZSI_HEADER_LEN + 4);
+    {
+        size_t cov = (full - 4) - ptr_off;
+        zsi_put32(b.buf + full - 4, zsi_csum_xxhash(b.buf + ptr_off, cov));
+    }
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_close(&f);
+
+done:
+    free(orig);
+    ib_free(&b);
+}
+
+static void test_inorder_records_checksum(void)
+{
+    /* F-26e/F-26f: a record body corrupted IN PLACE is detectable, but only on
+     * demand.  Nothing else in an in-order file would notice -- there are no span
+     * terminators here -- which is why this checksum exists at all. */
+    struct ib b;
+    struct zsi_file *f = NULL;
+    char name[ZSI_NAME_MAX];
+    struct zsi_rec r;
+
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_finish(&b);
+
+    /* Damage a value byte, leaving every length and pointer intact. */
+    size_t voff = ZSI_HEADER_LEN + 4 + 1 + 1;       /* first value byte */
+    b.buf[voff] = 'V';
+
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+
+    /* Opening succeeds and stays O(1): the records region is never read. */
+    ASSERT_OK(zsi_ptrs_load(f));
+    ASSERT_EQU(f->nptrs, 2u);
+
+    /* Records still read -- with the corrupted value, undetected so far. */
+    ASSERT_OK(zsi_ptrs_rec(f, 0, &r));
+    ASSERT_MEM_EQ(r.val, "Value", 5);
+
+    /* And the on-demand check reports it. */
+    ASSERT_EQ(zsi_ptrs_verify_records(f), ZS_BADCHECKSUM);
+    zsi_file_close(&f);
+
+    /* Undamaged, the same check passes. */
+    ib_free(&b);
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_finish(&b);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_ptrs_load(f));
+    ASSERT_OK(zsi_ptrs_verify_records(f));
+    zsi_file_close(&f);
+    ib_free(&b);
+}
+
+static void test_inorder_widths_and_padding(void)
+{
+    struct ib b;
+    struct zsi_file *f = NULL;
+
+    /* F-26c: a file whose offsets all fit is written as PTRS32.  F-26d: the
+     * narrow section pads to a multiple of 8, so the pad is 4 bytes for an odd
+     * count and 0 for an even one.  Both cases round-trip. */
+    for (size_t n = 1; n <= 4; n++) {
+        ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+        for (size_t i = 0; i < n; i++) {
+            char k[8];
+            snprintf(k, sizeof(k), "k%zu", i);
+            ib_rec(&b, k, strlen(k), "v", 1, false, 0);
+        }
+        size_t records_end = b.len;
+        ib_finish(&b);
+
+        /* section = 8 + 4n, rounded up to 8 */
+        size_t expect_sec = ((8 + 4 * n) + 7) & ~(size_t)7;
+        ASSERT_EQU(b.len, records_end + expect_sec + ZSI_TRAILER_LEN);
+        ASSERT_EQ((unsigned char)b.buf[records_end], ZSI_PTRS32);
+
+        /* the pad, where there is one, is zero */
+        if ((8 + 4 * n) % 8 != 0) {
+            ASSERT_EQ((unsigned char)b.buf[records_end + 8 + 4 * n], 0);
+            ASSERT_EQ((unsigned char)b.buf[records_end + 8 + 4 * n + 3], 0);
+        }
+
+        ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
+        ASSERT_EQU(f->nptrs, n);
+        ASSERT(!f->ptr_wide);
+        ASSERT_OK(zsi_ptrs_verify_records(f));
+        zsi_file_close(&f);
+        ib_free(&b);
+    }
+}
+
+static void test_inorder_ptrs64(void)
+{
+    /* A hand-constructed PTRS64 file, so the wide form is covered without writing
+     * 4GB of real data (T-6).  The section states its own width, so a reader must
+     * honour what it says rather than inferring from the file size. */
+    struct zsi_file *f = NULL;
+    char name[ZSI_NAME_MAX];
+    struct zsi_rec r;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_name_format(name, test_uuid, 1, 1);
+
+    /* Two records, then a wide section by hand. */
+    size_t reclen = zsi_rec_encoded_len(1, 1, false, false);
+    size_t records_end = ZSI_HEADER_LEN + 2 * reclen;
+    size_t seclen = 16 + 2 * 8;
+    size_t total = records_end + seclen + ZSI_TRAILER_LEN;
+
+    char *buf = calloc(1, total);
+    ASSERT_NOT_NULL(buf);
+    make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN, "a", 1, "1", 1, false, 0);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, "b", 1, "2", 1, false, 0);
+
+    buf[records_end] = (char)ZSI_PTRS64;
+    zsi_put64(buf + records_end + 8, 2);
+    zsi_put64(buf + records_end + 16, ZSI_HEADER_LEN);
+    zsi_put64(buf + records_end + 24, ZSI_HEADER_LEN + reclen);
+
+    zsi_put64(buf + records_end + seclen, (uint64_t)records_end);
+    zsi_put32(buf + records_end + seclen + 8,
+              zsi_csum_xxhash(buf + ZSI_HEADER_LEN, records_end - ZSI_HEADER_LEN));
+    zsi_put32(buf + total - 4, zsi_csum_xxhash(buf + records_end, seclen + 12));
+
+    ASSERT_EQ(writefile(name, buf, total), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_OK(zsi_ptrs_load(f));
+    ASSERT(f->ptr_wide);
+    ASSERT_EQU(f->nptrs, 2u);
+    ASSERT_EQU(zsi_ptrs_at(f, 0), (uint64_t)ZSI_HEADER_LEN);
+    ASSERT_EQU(zsi_ptrs_at(f, 1), (uint64_t)(ZSI_HEADER_LEN + reclen));
+
+    ASSERT_OK(zsi_ptrs_rec(f, 0, &r));
+    ASSERT_MEM_EQ(r.key, "a", 1);
+    ASSERT_OK(zsi_ptrs_rec(f, 1, &r));
+    ASSERT_MEM_EQ(r.key, "b", 1);
+    ASSERT_OK(zsi_ptrs_verify_records(f));
+
+    uint64_t idx;
+    bool exact;
+    ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "b", 1, &idx, &exact));
+    ASSERT(exact);
+    ASSERT_EQU(idx, 1u);
+
+    zsi_file_close(&f);
+    free(buf);
+}
+
+static void test_inorder_kind_rules(void)
+{
+    /* Loading a pointer section from an UNORDERED file is a usage error: it has
+     * none, and the kind is knowable from the header alone (section 2). */
+    struct sb s;
+    struct zsi_file *f = NULL;
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_term(&s, false);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT(zsi_file_is_unordered(f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADUSAGE);
+    zsi_file_close(&f);
+    sb_free(&s);
+
+    /* And a pointers block is present exactly when end != 0 (T-6): an in-order
+     * file loads one, an unordered file has none. */
+    struct ib b;
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "1", 1, false, 0);
+    ib_finish(&b);
+    ASSERT_EQ(ib_load(&b, 3, 3, &f), ZS_OK);
+    ASSERT(!zsi_file_is_unordered(f));
+    ASSERT_EQU(f->nptrs, 1u);
+    zsi_file_close(&f);
+    ib_free(&b);
+}
+
+static void test_inorder_probe_ends_agrees(void)
+{
+    /* D-14d's first-and-last probe is a search strategy and cannot change the
+     * answer.  Here the probe path is compared against a plain bisection over the
+     * same file, for keys below the first, above the last, equal to each end, and
+     * in between -- which is what T-5a asks for at the read-path level and is
+     * cheaper to assert directly. */
+    struct ib b;
+    struct zsi_file *f = NULL;
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    static const char *keys[] = { "c", "e", "g", "i", "k", "m" };
+    for (size_t i = 0; i < 6; i++)
+        ib_rec(&b, keys[i], 1, "v", 1, false, 0);
+    ib_finish(&b);
+    ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
+
+    for (unsigned ch = 'a'; ch <= 'o'; ch++) {
+        char k = (char)ch;
+        uint64_t got_idx;
+        bool got_exact;
+        ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, &k, 1,
+                                  &got_idx, &got_exact));
+
+        /* An independent plain bisection, written here rather than reused, so it
+         * cannot share a bug with the implementation. */
+        uint64_t lo = 0, hi = f->nptrs;
+        while (lo < hi) {
+            uint64_t mid = lo + (hi - lo) / 2;
+            struct zsi_rec r;
+            ASSERT_OK(zsi_ptrs_rec(f, mid, &r));
+            if (zsi_compar_default(r.key, r.keylen, &k, 1) < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        bool want_exact = false;
+        if (lo < f->nptrs) {
+            struct zsi_rec r;
+            ASSERT_OK(zsi_ptrs_rec(f, lo, &r));
+            want_exact = (zsi_compar_default(r.key, r.keylen, &k, 1) == 0);
+        }
+
+        if (got_idx != lo || got_exact != want_exact) {
+            fprintf(stderr, "\n    FAIL key '%c': probe gave (%llu,%d), "
+                    "bisection (%llu,%d)\n", (char)ch,
+                    (unsigned long long)got_idx, (int)got_exact,
+                    (unsigned long long)lo, (int)want_exact);
+            current_test_failed = 1;
+            zsi_file_close(&f);
+            ib_free(&b);
+            return;
+        }
+    }
+
+    zsi_file_close(&f);
+    ib_free(&b);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -3802,6 +4414,16 @@ static struct test_entry tests[] = {
                                         test_index_delta_merge_with_duplicates },
     { "test_index_binary_keys",         test_index_binary_keys },
     { "test_index_many",                test_index_many },
+
+    { "test_inorder_empty",             test_inorder_empty },
+    { "test_inorder_roundtrip",         test_inorder_roundtrip },
+    { "test_inorder_search",            test_inorder_search },
+    { "test_inorder_trailer_negatives", test_inorder_trailer_negatives },
+    { "test_inorder_records_checksum",  test_inorder_records_checksum },
+    { "test_inorder_widths_and_padding", test_inorder_widths_and_padding },
+    { "test_inorder_ptrs64",            test_inorder_ptrs64 },
+    { "test_inorder_kind_rules",        test_inorder_kind_rules },
+    { "test_inorder_probe_ends_agrees", test_inorder_probe_ends_agrees },
 
     { NULL, NULL }
 };

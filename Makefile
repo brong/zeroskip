@@ -69,7 +69,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check test asan leaks mutate bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check check-noprobe test asan leaks mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -120,6 +120,14 @@ check: zstest
 	./zstest
 
 test: check
+
+# D-14d's first-and-last probe is a search strategy that cannot change any
+# answer, so the whole suite must pass with it compiled out (T-5a).  Cheap
+# insurance against it quietly becoming load-bearing.
+check-noprobe:
+	$(MAKE) clean
+	$(MAKE) zstest EXTRA_CFLAGS="-DZSI_PROBE_ENDS=0"
+	./zstest
 
 # T-3 requires the suite to run under ASan and UBSan.  -O1 keeps frame pointers
 # and line numbers useful without making the fuzz cases unbearably slow.
