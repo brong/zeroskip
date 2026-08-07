@@ -2990,7 +2990,355 @@ static int zsi_lock_release(struct zsi_locks *lk, enum zsi_lock which)
     return r;
 }
 
+/********** DATABASE HANDLE *************/
+
+struct zs_db {
+    char        *dir;
+    uint32_t     flags;
+    zsi_uuid_t   uuid;
+    bool         have_uuid;
+
+    zs_compar   *compar;
+    char         compar_name[ZSI_COMPAR_NAME_LEN];
+    zs_csum     *external_csum;
+    unsigned     create_csum_id;    /* engine for files THIS handle creates */
+    size_t       rollover_size;
+    void       (*error)(const char *msg, const char *fmt, ...);
+
+    bool         readonly;          /* ZS_SHARED (A-5) */
+    bool         nocsum;            /* ZS_NOCSUM (F-5e) */
+    bool         nosync;            /* ZS_NOSYNC (C-7c) */
+    bool         nonblocking;
+
+    struct zsi_locks     locks;
+    struct zsi_snapshot *snap;      /* current snapshot for zs_db_* calls */
+    struct zs_txn       *write_txn;
+
+    /* Backing for pointers returned by the non-transactional calls, whose
+     * implicit transaction has ended by the time the caller sees them (A-4). */
+    char        *retbuf;
+    size_t       retalloc;
+};
+
+static void zsi_default_error(const char *msg, const char *fmt, ...)
+{
+    (void)msg;
+    (void)fmt;
+}
+
+/* Every mutating internal entry point starts here rather than scattering the
+ * check.  R-3: a reader MUST NOT write, and opening a damaged database read-only
+ * is side-effect-free -- no conversion, no repack, no new active file, no
+ * removal.  There is no shared cache for it to update either (D-13c). */
+static int zsi_check_writable(struct zs_db *db)
+{
+    return db->readonly ? ZS_READONLY : ZS_OK;
+}
+
 /********** READ PATH *************/
+
+/* Every read draws on the same set of SOURCES, ordered newest to oldest (D-14):
+ *
+ *   highest   the current write transaction's uncommitted records
+ *   then      each data file, by start generation DESCENDING
+ *
+ * Within a file the newest version of a key wins; across sources, the first
+ * record found in that order wins.  If that record is a deletion, the key does not
+ * exist.
+ *
+ * D-14a: point lookups, cursors and range scans ALL resolve visibility by this
+ * one rule, which is what makes it impossible for them to disagree (G-7).  Both
+ * live here, over the same per-file cursors, for that reason -- a second
+ * resolution path would be a second set of bugs. */
+
+/* D-14d, point lookup.  Walk the sources in priority order; in each, search for
+ * the key by D-14b; stop at the first source that HAS it.  That record decides the
+ * answer -- its value, or absence if it is a deletion.
+ *
+ * A source that does not have the key is skipped, and NO SOURCE MAY BE SKIPPED FOR
+ * ANY OTHER REASON.  No bloom filter, no cached key range, nothing: the cost is
+ * proportional to the number of files, which is why keeping that count low is the
+ * point of the repack policy (D-16) rather than something to optimise around here.
+ *
+ * D-14c: ancestors are not consulted.  They exist solely for repacking, so a
+ * lookup never follows a chain. */
+static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
+                      struct zs_txn *txn, const char *key, size_t keylen,
+                      struct zsi_rec *out)
+{
+    struct zsi_fcur fc;
+
+    if (keylen < 1) return ZS_BADUSAGE;         /* F-14 */
+
+    /* The transaction first: its writes are visible to its own reads and to
+     * nothing else until commit (A-1a). */
+    if (txn) {
+        memset(&fc, 0, sizeof(fc));
+        fc.kind = ZSI_SRC_TXN;
+        fc.txn = txn;
+        fc.compar = db->compar;
+        fc.gen = ZSI_GEN_TXN;
+
+        int r = zsi_fcur_find(&fc, key, keylen, out);
+        if (r == ZS_OK) return zsi_rec_is_delete(out) ? ZS_NOTFOUND : ZS_OK;
+        if (r != ZS_NOTFOUND) return r;
+    }
+
+    /* Then each file, newest first.  The snapshot is sorted ascending, so this
+     * walks it backwards. */
+    for (size_t i = snap->nfiles; i-- > 0; ) {
+        zsi_fcur_init_file(&fc, snap->files[i], db->compar);
+
+        int r = zsi_fcur_find(&fc, key, keylen, out);
+        if (r == ZS_OK) return zsi_rec_is_delete(out) ? ZS_NOTFOUND : ZS_OK;
+        if (r != ZS_NOTFOUND) return r;
+    }
+
+    return ZS_NOTFOUND;
+}
+
+/* D-14e, iteration.  A cursor holds one per-file cursor per source, each
+ * traversable in comparator order, held in an array kept sorted by:
+ *
+ *     current key ascending, then generation descending.
+ *
+ * The tie-break is not decoration.  Because equal keys sort by generation
+ * descending, every cursor positioned on the emitted key is CONTIGUOUS FROM THE
+ * FRONT of the array and element 0 is the newest -- which is what makes step 3 a
+ * complete treatment of duplicates rather than a heuristic (D-14f). */
+struct zs_cursor {
+    struct zs_db     *db;
+    struct zs_txn    *txn;          /* owning txn, or NULL for an implicit one */
+    struct zsi_snapshot *snap;
+    bool              owns_txn;
+
+    struct zsi_fcur  *cur;
+    size_t            ncur;
+
+    char             *prefix;
+    size_t            prefixlen;
+
+    /* ZS_SKIPROOT needs the start key kept, since the prefix buffer is only
+     * populated for ZS_CURSOR_PREFIX and the two flags are independent. */
+    char             *skiproot_key;
+    size_t            skiproot_keylen;
+
+    uint32_t          flags;
+
+    bool              started;
+    bool              done;
+
+    /* the last record handed out, and its owning source */
+    struct zsi_rec    emitted;
+    bool              have_emitted;
+};
+
+/* Order two per-file cursors: exhausted last, then key ascending, then generation
+ * descending.  D-14g gives the transaction ZSI_GEN_TXN so its records win equal
+ * keys with no special case here. */
+static int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
+                         const struct zsi_fcur *b)
+{
+    if (a->exhausted && b->exhausted) return 0;
+    if (a->exhausted) return 1;
+    if (b->exhausted) return -1;
+
+    int r = c->db->compar(a->cur.key, a->cur.keylen, b->cur.key, b->cur.keylen);
+    if (r) return r;
+
+    if (a->gen == b->gen) return 0;
+    return a->gen > b->gen ? -1 : 1;        /* higher generation first */
+}
+
+static void zsi_cur_sort(struct zs_cursor *c)
+{
+    /* Insertion sort: the array is small by design (D-16 keeps the file count
+     * low), and it is almost always already sorted. */
+    for (size_t i = 1; i < c->ncur; i++) {
+        struct zsi_fcur t = c->cur[i];
+        size_t j = i;
+        while (j > 0 && zsi_cur_order(c, &c->cur[j - 1], &t) > 0) {
+            c->cur[j] = c->cur[j - 1];
+            j--;
+        }
+        c->cur[j] = t;
+    }
+}
+
+/* D-14e step 5: advance element 0, then move it down to its new position.
+ *
+ * Its key only ever increases, so this is a single insertion into an
+ * already-sorted array, and it stops as soon as it is no longer greater than its
+ * neighbour.  O(k) worst case, and usually O(1) because the advanced cursor stays
+ * at or near the front (D-14i). */
+static void zsi_cur_resort_head(struct zs_cursor *c)
+{
+    if (c->ncur < 2) return;
+
+    struct zsi_fcur t = c->cur[0];
+    size_t j = 0;
+    while (j + 1 < c->ncur && zsi_cur_order(c, &t, &c->cur[j + 1]) > 0) {
+        c->cur[j] = c->cur[j + 1];
+        j++;
+    }
+    c->cur[j] = t;
+}
+
+static void zsi_cursor_free(struct zs_cursor *c)
+{
+    if (!c) return;
+    free(c->cur);
+    free(c->prefix);
+    free(c->skiproot_key);
+    free(c);
+}
+
+/* D-14e step 1: seek every per-file cursor to the start point, so its current
+ * record is the first with key >= the start key -- or mark it exhausted, which is
+ * immediately the case for a source holding no records.  Then sort. */
+static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
+                           struct zsi_snapshot *snap,
+                           const char *key, size_t keylen,
+                           uint32_t flags, struct zs_cursor **out)
+{
+    struct zs_cursor *c = zsi_zmalloc(sizeof(*c));
+    if (!c) return ZS_INTERNAL;
+
+    c->db = db;
+    c->txn = txn;
+    c->snap = snap;
+    c->flags = flags;
+
+    size_t n = snap->nfiles + (txn ? 1 : 0);
+    if (n) {
+        c->cur = zsi_zmalloc(n * sizeof(*c->cur));
+        if (!c->cur) { zsi_cursor_free(c); return ZS_INTERNAL; }
+    }
+
+    for (size_t i = 0; i < snap->nfiles; i++)
+        zsi_fcur_init_file(&c->cur[c->ncur++], snap->files[i], db->compar);
+
+    if (txn) {
+        struct zsi_fcur *fc = &c->cur[c->ncur++];
+        memset(fc, 0, sizeof(*fc));
+        fc->kind = ZSI_SRC_TXN;
+        fc->txn = txn;
+        fc->compar = db->compar;
+        fc->gen = ZSI_GEN_TXN;
+    }
+
+    if ((flags & ZS_SKIPROOT) && key && keylen) {
+        c->skiproot_key = malloc(keylen);
+        if (!c->skiproot_key) { zsi_cursor_free(c); return ZS_INTERNAL; }
+        memcpy(c->skiproot_key, key, keylen);
+        c->skiproot_keylen = keylen;
+    }
+
+    if (flags & ZS_CURSOR_PREFIX) {
+        if (keylen) {
+            c->prefix = malloc(keylen);
+            if (!c->prefix) { zsi_cursor_free(c); return ZS_INTERNAL; }
+            memcpy(c->prefix, key, keylen);
+        }
+        c->prefixlen = keylen;
+    }
+
+    for (size_t i = 0; i < c->ncur; i++) {
+        int r = key ? zsi_fcur_seek(&c->cur[i], key, keylen)
+                    : zsi_fcur_seek_first(&c->cur[i]);
+        if (r != ZS_OK) { zsi_cursor_free(c); return r; }
+    }
+
+    zsi_cur_sort(c);
+
+    *out = c;
+    return ZS_OK;
+}
+
+/* One turn of D-14e's steps 2 through 6.  Returns ZS_OK with a record, or ZS_DONE. */
+static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
+{
+    *emit = false;
+
+    /* Step 2, take: the next record is always element 0.  O(1), with no
+     * comparison needed to find it. */
+    if (!c->ncur || c->cur[0].exhausted) return ZS_DONE;
+
+    struct zsi_rec rec = c->cur[0].cur;
+
+    /* Step 6, bound: for a prefix scan, stop when the emitted key leaves the
+     * prefix.  Checked before emitting, so the first out-of-prefix key ends the
+     * scan rather than being returned. */
+    if ((c->flags & ZS_CURSOR_PREFIX) && c->prefixlen) {
+        if (rec.keylen < c->prefixlen
+            || memcmp(rec.key, c->prefix, c->prefixlen) != 0)
+            return ZS_DONE;
+    }
+
+    /* Step 3, skip stale duplicates.  Every cursor positioned on this key is
+     * contiguous from the front and element 0 is the newest, so advancing
+     * elements 1, 2, ... while their key matches is a COMPLETE treatment.
+     *
+     * D-14f: advancing only element 0 would leave the same key at another
+     * cursor's head, to be emitted again from an OLDER version -- the value
+     * before the newest one, which is worse than a duplicate. */
+    size_t nstale = 0;
+    for (size_t i = 1; i < c->ncur; i++) {
+        if (c->cur[i].exhausted) break;
+        if (c->db->compar(c->cur[i].cur.key, c->cur[i].cur.keylen,
+                          rec.key, rec.keylen) != 0)
+            break;
+        nstale++;
+    }
+
+    for (size_t i = 1; i <= nstale; i++) {
+        int r = zsi_fcur_next(&c->cur[i]);
+        if (r != ZS_OK) return r;
+    }
+
+    /* Step 5, advance element 0 and re-sort.  Done before the caller sees the
+     * record, so the cursor is always positioned for the next call -- and the
+     * record's key and value point into the mapping, which outlives the step. */
+    int r = zsi_fcur_next(&c->cur[0]);
+    if (r != ZS_OK) return r;
+
+    if (nstale) zsi_cur_sort(c);            /* several moved: full re-sort */
+    else        zsi_cur_resort_head(c);     /* just element 0 */
+
+    /* Step 4, filter: if the record is a deletion, emit nothing.  The key is
+     * consumed either way, which is what makes a tombstone hide older versions in
+     * other files rather than merely being skipped. */
+    if (zsi_rec_is_delete(&rec)) return ZS_OK;
+
+    *out = rec;
+    *emit = true;
+    return ZS_OK;
+}
+
+static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
+{
+    for (;;) {
+        bool emit;
+        int r = zsi_cursor_step(c, out, &emit);
+        if (r != ZS_OK) return r;
+        if (emit) {
+            /* ZS_SKIPROOT: skip the first record if it matches the start key
+             * exactly.  Only the first, and only an exact match. */
+            if (!c->started && (c->flags & ZS_SKIPROOT)
+                && c->skiproot_key
+                && c->db->compar(out->key, out->keylen,
+                                 c->skiproot_key, c->skiproot_keylen) == 0) {
+                c->started = true;
+                continue;
+            }
+            c->started = true;
+            c->emitted = *out;
+            c->have_emitted = true;
+            return ZS_OK;
+        }
+        c->started = true;
+    }
+}
 
 /********** WRITE PATH *************/
 
@@ -3036,49 +3384,6 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
  * ever appended past a boundary that failed to validate, so a spurious terminator
  * in trailing garbage -- which a checksum can never wholly exclude -- cannot
  * become the foundation of a later chain.  Generations are cheap. */
-
-struct zs_db {
-    char        *dir;
-    uint32_t     flags;
-    zsi_uuid_t   uuid;
-    bool         have_uuid;
-
-    zs_compar   *compar;
-    char         compar_name[ZSI_COMPAR_NAME_LEN];
-    zs_csum     *external_csum;
-    unsigned     create_csum_id;    /* engine for files THIS handle creates */
-    size_t       rollover_size;
-    void       (*error)(const char *msg, const char *fmt, ...);
-
-    bool         readonly;          /* ZS_SHARED (A-5) */
-    bool         nocsum;            /* ZS_NOCSUM (F-5e) */
-    bool         nosync;            /* ZS_NOSYNC (C-7c) */
-    bool         nonblocking;
-
-    struct zsi_locks     locks;
-    struct zsi_snapshot *snap;      /* current snapshot for zs_db_* calls */
-    struct zs_txn       *write_txn;
-
-    /* Backing for pointers returned by the non-transactional calls, whose
-     * implicit transaction has ended by the time the caller sees them (A-4). */
-    char        *retbuf;
-    size_t       retalloc;
-};
-
-static void zsi_default_error(const char *msg, const char *fmt, ...)
-{
-    (void)msg;
-    (void)fmt;
-}
-
-/* Every mutating internal entry point starts here rather than scattering the
- * check.  R-3: a reader MUST NOT write, and opening a damaged database read-only
- * is side-effect-free -- no conversion, no repack, no new active file, no
- * removal.  There is no shared cache for it to update either (D-13c). */
-static int zsi_check_writable(struct zs_db *db)
-{
-    return db->readonly ? ZS_READONLY : ZS_OK;
-}
 
 /* Create generation 1: a 72-byte header and no spans, which F-26h makes a legal
  * empty file (D-8a).

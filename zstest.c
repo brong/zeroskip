@@ -5087,10 +5087,20 @@ static void put_inorder(uint32_t start, uint32_t end, const char *const *keys)
 {
     struct ib b;
     char name[ZSI_NAME_MAX];
+    const char *sorted[64];
+    size_t n = 0;
+
+    for (size_t i = 0; keys && keys[i]; i++) { assert(n < 64); sorted[n++] = keys[i]; }
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (zsi_compar_default(sorted[i], strlen(sorted[i]),
+                                   sorted[j], strlen(sorted[j])) > 0) {
+                const char *t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t;
+            }
 
     ib_init(&b, start, end, ZSI_CSUM_XXHASH);
-    for (size_t i = 0; keys && keys[i]; i++)
-        ib_rec(&b, keys[i], strlen(keys[i]), "v", 1, false, 0);
+    for (size_t i = 0; i < n; i++)
+        ib_rec(&b, sorted[i], strlen(sorted[i]), "v", 1, false, 0);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, start, end);
     ASSERT_EQ(mkdbdir(), 0);
@@ -5968,6 +5978,698 @@ static void test_open_uuid_mismatch(void)
 
 /*
  * ============================================================
+ * The read path (T-5, T-5a, T-5b)
+ * ============================================================
+ */
+
+/* Open a database over whatever is currently in dbdir. */
+static struct zs_db *open_db(uint32_t flags)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    setup.flags = flags;
+    setup.csum = TEST_EXTERNAL_CSUM;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
+/* Scan the whole database, joining "key=value" with '|'.  Deletions do not
+ * appear, because the merge consumes them (D-14e step 4). */
+static void db_scan(struct zs_db *db, uint32_t flags,
+                    const char *start, size_t startlen,
+                    char *out, size_t outlen)
+{
+    struct zs_cursor *c = NULL;
+    struct zsi_rec r;
+    size_t used = 0;
+
+    out[0] = '\0';
+    if (zsi_cursor_open(db, NULL, db->snap, start, startlen, flags, &c) != ZS_OK)
+        return;
+
+    while (zsi_cursor_next(c, &r) == ZS_OK) {
+        if (used + r.keylen + r.vallen + 4 >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, r.key, r.keylen);   used += r.keylen;
+        out[used++] = '=';
+        memcpy(out + used, r.val, r.vallen);   used += r.vallen;
+        out[used] = '\0';
+    }
+
+    zsi_cursor_free(c);
+}
+
+/* Look up one key, formatting the answer as "value" or "-". */
+static void db_get(struct zs_db *db, const char *key, size_t keylen,
+                   char *out, size_t outlen)
+{
+    struct zsi_rec r;
+    int rc = zsi_lookup(db, db->snap, NULL, key, keylen, &r);
+
+    if (rc != ZS_OK) { snprintf(out, outlen, "-"); return; }
+    size_t n = r.vallen < outlen - 1 ? r.vallen : outlen - 1;
+    memcpy(out, r.val, n);
+    out[n] = '\0';
+}
+
+/* A file with explicit key/value pairs, so tests can place specific versions in
+ * specific generations.  A NULL value writes a deletion. */
+struct kv { const char *k; const char *v; };
+
+static void put_unordered_kv(uint32_t gen, const struct kv *kvs)
+{
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+
+    sb_init(&s, gen, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; kvs[i].k; i++)
+        sb_rec(&s, kvs[i].k, strlen(kvs[i].k),
+               kvs[i].v, kvs[i].v ? strlen(kvs[i].v) : 0, false, 0);
+    sb_term(&s, false);
+    zsi_name_format(name, test_uuid, gen, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+}
+
+/* Sorts, because an in-order file's records ARE in key order by definition and
+ * every caller here wants a well-formed file.  A test wanting a deliberately
+ * misordered one builds it with ib_rec directly.
+ *
+ * Learned the hard way: supplying unsorted pairs produced a file whose pointer
+ * array was not a strict ordering, so the binary search silently missed keys --
+ * and the symptom (a scan in the wrong order, a lookup returning "absent") looked
+ * exactly like a merge bug. */
+static void put_inorder_kv(uint32_t start, uint32_t end, const struct kv *kvs)
+{
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    struct kv sorted[64];
+    size_t n = 0;
+
+    for (size_t i = 0; kvs[i].k; i++) {
+        assert(n < 64);
+        sorted[n++] = kvs[i];
+    }
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (zsi_compar_default(sorted[i].k, strlen(sorted[i].k),
+                                   sorted[j].k, strlen(sorted[j].k)) > 0) {
+                struct kv t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t;
+            }
+
+    ib_init(&b, start, end, ZSI_CSUM_XXHASH);
+    for (size_t i = 0; i < n; i++)
+        ib_rec(&b, sorted[i].k, strlen(sorted[i].k),
+               sorted[i].v, sorted[i].v ? strlen(sorted[i].v) : 0, false, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, start, end);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+}
+
+static void test_read_newest_wins(void)
+{
+    /* D-14: across sources, the first record found walking newest to oldest
+     * wins.  Three files each holding a version of "k", and the newest must
+     * decide -- for the point lookup AND for the scan, which is G-7. */
+    struct zs_db *db;
+    char got[256];
+
+    clear_db();
+    static const struct kv g1[] = { {"k","one"}, {"a","A"}, {NULL,NULL} };
+    static const struct kv g2[] = { {"k","two"}, {NULL,NULL} };
+    static const struct kv g3[] = { {"k","three"}, {"z","Z"}, {NULL,NULL} };
+    put_inorder_kv(1, 1, g1);
+    put_inorder_kv(2, 2, g2);
+    put_unordered_kv(3, g3);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    db_get(db, "k", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "three");
+
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=A|k=three|z=Z");
+
+    zs_db_close(&db);
+}
+
+static void test_read_deletion_hides_older(void)
+{
+    /* A deletion in a newer file hides the key entirely, even though older files
+     * still hold values (D-14).  The key is consumed either way (D-14e step 4),
+     * which is what stops the older value surfacing. */
+    struct zs_db *db;
+    char got[256];
+
+    clear_db();
+    static const struct kv g1[] = { {"a","A"}, {"k","value"}, {"z","Z"},
+                                    {NULL,NULL} };
+    static const struct kv g2[] = { {"k",NULL}, {NULL,NULL} };
+    put_inorder_kv(1, 1, g1);
+    put_unordered_kv(2, g2);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    db_get(db, "k", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "-");
+
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=A|z=Z");          /* k absent, neighbours intact */
+
+    zs_db_close(&db);
+
+    /* And a value written AFTER a deletion brings it back. */
+    static const struct kv g3[] = { {"k","again"}, {NULL,NULL} };
+    put_unordered_kv(3, g3);
+    db = open_db(0);
+    db_get(db, "k", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "again");
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "a=A|k=again|z=Z");
+    zs_db_close(&db);
+}
+
+static void test_read_d14f_duplicate_across_three_files(void)
+{
+    /* T-5b's central case, constructed directly: the same key live in THREE
+     * files at once.
+     *
+     * D-14f: advancing only element 0 would leave the same key at another
+     * cursor's head, to be emitted again from an older version.  So the failure
+     * is not merely a duplicate -- it is the key appearing three times with
+     * DESCENDING freshness, newest first then progressively staler values.
+     *
+     * The test asserts both halves: emitted once, and from the newest. */
+    struct zs_db *db;
+    char got[256];
+
+    clear_db();
+    static const struct kv g1[] = { {"dup","oldest"}, {NULL,NULL} };
+    static const struct kv g2[] = { {"dup","middle"}, {NULL,NULL} };
+    static const struct kv g3[] = { {"dup","newest"}, {NULL,NULL} };
+    put_inorder_kv(1, 1, g1);
+    put_inorder_kv(2, 2, g2);
+    put_unordered_kv(3, g3);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "dup=newest");       /* once, and the newest */
+
+    db_get(db, "dup", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "newest");
+
+    /* With neighbours either side, so a bug cannot hide behind a one-key scan. */
+    zs_db_close(&db);
+    clear_db();
+    static const struct kv h1[] = { {"aaa","a1"}, {"dup","oldest"}, {"zzz","z1"},
+                                    {NULL,NULL} };
+    static const struct kv h2[] = { {"dup","middle"}, {NULL,NULL} };
+    static const struct kv h3[] = { {"dup","newest"}, {NULL,NULL} };
+    put_inorder_kv(1, 1, h1);
+    put_inorder_kv(2, 2, h2);
+    put_unordered_kv(3, h3);
+
+    db = open_db(0);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "aaa=a1|dup=newest|zzz=z1");
+    zs_db_close(&db);
+}
+
+static void test_read_cursor_invariant(void)
+{
+    /* T-5b: the sorted-array invariant asserted after EVERY step --
+     *
+     *   - ordered by key ascending, then generation descending;
+     *   - cursors on equal keys contiguous from the front, newest first;
+     *   - element 0 is the correct next record.
+     *
+     * Checked directly against the cursor's internals, because the invariant is
+     * what makes step 3 correct; verifying only the output would pass for an
+     * implementation that got the right answer by a different, fragile route. */
+    struct zs_db *db;
+    struct zs_cursor *c = NULL;
+    struct zsi_rec r;
+
+    clear_db();
+    static const struct kv g1[] = { {"a","1"}, {"c","1"}, {"e","1"}, {NULL,NULL} };
+    static const struct kv g2[] = { {"b","2"}, {"c","2"}, {NULL,NULL} };
+    static const struct kv g3[] = { {"c","3"}, {"d","3"}, {"e","3"}, {NULL,NULL} };
+    put_inorder_kv(1, 1, g1);
+    put_inorder_kv(2, 2, g2);
+    put_unordered_kv(3, g3);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_cursor_open(db, NULL, db->snap, NULL, 0, 0, &c));
+    ASSERT_EQU(c->ncur, 3u);
+
+    int steps = 0;
+    for (;;) {
+        /* Invariant 1: ordered by key ascending then generation descending, with
+         * exhausted cursors last. */
+        for (size_t i = 1; i < c->ncur; i++) {
+            if (zsi_cur_order(c, &c->cur[i - 1], &c->cur[i]) > 0) {
+                fprintf(stderr, "\n    FAIL step %d: array out of order at %zu\n",
+                        steps, i);
+                current_test_failed = 1;
+                goto done;
+            }
+        }
+
+        /* Invariant 2: cursors on the head key are contiguous from the front and
+         * ordered newest first. */
+        if (!c->cur[0].exhausted) {
+            size_t run = 1;
+            while (run < c->ncur && !c->cur[run].exhausted
+                   && zsi_compar_default(c->cur[run].cur.key,
+                                         c->cur[run].cur.keylen,
+                                         c->cur[0].cur.key,
+                                         c->cur[0].cur.keylen) == 0)
+                run++;
+            for (size_t i = 1; i < run; i++) {
+                if (c->cur[i - 1].gen <= c->cur[i].gen) {
+                    fprintf(stderr, "\n    FAIL step %d: equal keys not "
+                            "newest-first at %zu\n", steps, i);
+                    current_test_failed = 1;
+                    goto done;
+                }
+            }
+            /* and nothing beyond the run shares the key */
+            for (size_t i = run; i < c->ncur; i++) {
+                if (c->cur[i].exhausted) break;
+                if (zsi_compar_default(c->cur[i].cur.key, c->cur[i].cur.keylen,
+                                       c->cur[0].cur.key,
+                                       c->cur[0].cur.keylen) == 0) {
+                    fprintf(stderr, "\n    FAIL step %d: key run not contiguous\n",
+                            steps);
+                    current_test_failed = 1;
+                    goto done;
+                }
+            }
+
+            /* Invariant 3: element 0 really is the smallest key present. */
+            for (size_t i = 1; i < c->ncur; i++) {
+                if (c->cur[i].exhausted) break;
+                if (zsi_compar_default(c->cur[i].cur.key, c->cur[i].cur.keylen,
+                                       c->cur[0].cur.key,
+                                       c->cur[0].cur.keylen) < 0) {
+                    fprintf(stderr, "\n    FAIL step %d: element 0 not least\n",
+                            steps);
+                    current_test_failed = 1;
+                    goto done;
+                }
+            }
+        }
+
+        if (zsi_cursor_next(c, &r) != ZS_OK) break;
+        steps++;
+        ASSERT(steps < 50);
+    }
+
+    ASSERT_EQ(steps, 5);        /* a, b, c, d, e */
+
+done:
+    zsi_cursor_free(c);
+    zs_db_close(&db);
+}
+
+static void test_read_arrangements(void)
+{
+    /* T-5a: the same assertions against every structural arrangement.  Each
+     * exercises a different combination of D-14b's search primitives, and the
+     * answers MUST be identical throughout -- which is the concrete form of
+     * G-7. */
+    static const struct kv all[] = {
+        {"a","A"}, {"b","B"}, {"c","C"}, {"d","D"}, {"e","E"}, {NULL,NULL}
+    };
+    static const char *expect = "a=A|b=B|c=C|d=D|e=E";
+    struct zs_db *db;
+    char got[256];
+
+    /* 1. one unordered file only */
+    clear_db();
+    put_unordered_kv(1, all);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+    zs_db_close(&db);
+
+    /* 2. several unordered files */
+    clear_db();
+    { static const struct kv p[] = {{"a","A"},{"b","B"},{NULL,NULL}};
+      put_unordered_kv(1, p); }
+    { static const struct kv p[] = {{"c","C"},{NULL,NULL}};
+      put_unordered_kv(2, p); }
+    { static const struct kv p[] = {{"d","D"},{"e","E"},{NULL,NULL}};
+      put_unordered_kv(3, p); }
+    db = open_db(0);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+    zs_db_close(&db);
+
+    /* 3. one in-order file only */
+    clear_db();
+    put_inorder_kv(1, 1, all);
+    db = open_db(0);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+    zs_db_close(&db);
+
+    /* 4. a mixture */
+    clear_db();
+    { static const struct kv p[] = {{"a","A"},{"c","C"},{NULL,NULL}};
+      put_inorder_kv(1, 2, p); }
+    { static const struct kv p[] = {{"b","B"},{"e","E"},{NULL,NULL}};
+      put_inorder_kv(3, 3, p); }
+    { static const struct kv p[] = {{"d","D"},{NULL,NULL}};
+      put_unordered_kv(4, p); }
+    db = open_db(0);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+    zs_db_close(&db);
+
+    /* 5. after a repack that collapsed some but not all files */
+    clear_db();
+    { static const struct kv p[] = {{"a","A"},{"b","B"},{"c","C"},{NULL,NULL}};
+      put_inorder_kv(1, 3, p); }
+    { static const struct kv p[] = {{"d","D"},{NULL,NULL}};
+      put_inorder_kv(4, 4, p); }
+    { static const struct kv p[] = {{"e","E"},{NULL,NULL}};
+      put_unordered_kv(5, p); }
+    db = open_db(0);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+    zs_db_close(&db);
+
+    /* 6. WITH AN EMPTY IN-ORDER FILE among populated ones -- where a binary
+     * search or a cursor seek is most likely to go wrong (F-26g). */
+    clear_db();
+    { static const struct kv p[] = {{"a","A"},{"b","B"},{NULL,NULL}};
+      put_inorder_kv(1, 1, p); }
+    { static const struct kv p[] = {{NULL,NULL}};
+      put_inorder_kv(2, 2, p); }                    /* empty, 96 bytes */
+    { static const struct kv p[] = {{"c","C"},{"d","D"},{NULL,NULL}};
+      put_inorder_kv(3, 3, p); }
+    { static const struct kv p[] = {{NULL,NULL}};
+      put_inorder_kv(4, 4, p); }                    /* another empty */
+    { static const struct kv p[] = {{"e","E"},{NULL,NULL}};
+      put_unordered_kv(5, p); }
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->nfiles, 5u);
+    ASSERT_EQU(db->snap->files[1]->nptrs, 0u);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, expect);
+
+    /* point lookups agree, including for keys either side of everything */
+    for (const struct kv *p = all; p->k; p++) {
+        db_get(db, p->k, strlen(p->k), got, sizeof(got));
+        if (strcmp(got, p->v) != 0) {
+            fprintf(stderr, "\n    FAIL get %s: '%s'\n", p->k, got);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+    }
+    db_get(db, "", 0, got, sizeof(got));    ASSERT_STR_EQ(got, "-");
+    db_get(db, "zz", 2, got, sizeof(got));  ASSERT_STR_EQ(got, "-");
+    db_get(db, "bb", 2, got, sizeof(got));  ASSERT_STR_EQ(got, "-");
+
+    /* 7. a database that is ONLY an empty in-order file reads as empty and
+     * iterates to zero records (F-26g). */
+    zs_db_close(&db);
+    clear_db();
+    { static const struct kv p[] = {{NULL,NULL}};
+      put_inorder_kv(1, 1, p); }
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    db_scan(db, 0, NULL, 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "");
+    db_get(db, "a", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "-");
+    zs_db_close(&db);
+}
+
+static void test_read_seek_and_flags(void)
+{
+    struct zs_db *db;
+    char got[256];
+
+    clear_db();
+    static const struct kv g[] = {
+        {"ab","1"}, {"abc","2"}, {"abd","3"}, {"b","4"}, {"bc","5"}, {NULL,NULL}
+    };
+    put_inorder_kv(1, 1, g);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Seek to a present key, an absent one between two present, before all, and
+     * after all. */
+    db_scan(db, 0, "abc", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abc=2|abd=3|b=4|bc=5");
+    db_scan(db, 0, "abcz", 4, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abd=3|b=4|bc=5");
+    db_scan(db, 0, "", 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "ab=1|abc=2|abd=3|b=4|bc=5");
+    db_scan(db, 0, "zzz", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "");
+
+    /* ZS_SKIPROOT: skip the first record if it matches exactly.  Only an exact
+     * match, and only the first. */
+    db_scan(db, ZS_SKIPROOT, "abc", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abd=3|b=4|bc=5");
+    db_scan(db, ZS_SKIPROOT, "abcz", 4, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abd=3|b=4|bc=5");   /* no exact match: nothing skipped */
+
+    /* ZS_CURSOR_PREFIX: stop when the key leaves the prefix (D-14e step 6). */
+    db_scan(db, ZS_CURSOR_PREFIX, "ab", 2, got, sizeof(got));
+    ASSERT_STR_EQ(got, "ab=1|abc=2|abd=3");
+    db_scan(db, ZS_CURSOR_PREFIX, "b", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "b=4|bc=5");
+    db_scan(db, ZS_CURSOR_PREFIX, "abc", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abc=2");
+    db_scan(db, ZS_CURSOR_PREFIX, "zz", 2, got, sizeof(got));
+    ASSERT_STR_EQ(got, "");
+    db_scan(db, ZS_CURSOR_PREFIX, "", 0, got, sizeof(got));
+    ASSERT_STR_EQ(got, "ab=1|abc=2|abd=3|b=4|bc=5");   /* empty prefix: all */
+
+    /* The two flags compose. */
+    db_scan(db, ZS_CURSOR_PREFIX | ZS_SKIPROOT, "ab", 2, got, sizeof(got));
+    ASSERT_STR_EQ(got, "abc=2|abd=3");
+
+    zs_db_close(&db);
+}
+
+static void test_read_prefix_across_files(void)
+{
+    /* A prefix scan whose members are spread across files, with a deletion inside
+     * the prefix -- so the bound, the merge and the tombstone filter all act at
+     * once. */
+    struct zs_db *db;
+    char got[256];
+
+    clear_db();
+    { static const struct kv p[] = {{"pre1","a"},{"pre2","b"},{"pre3","c"},
+                                    {"zzz","z"},{NULL,NULL}};
+      put_inorder_kv(1, 1, p); }
+    { static const struct kv p[] = {{"pre2",NULL},{"pre4","d"},{NULL,NULL}};
+      put_unordered_kv(2, p); }
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    db_scan(db, ZS_CURSOR_PREFIX, "pre", 3, got, sizeof(got));
+    ASSERT_STR_EQ(got, "pre1=a|pre3=c|pre4=d");
+    zs_db_close(&db);
+}
+
+/*
+ * T-5 model-based: randomised sequences against an in-memory reference, checked
+ * after every step by BOTH a point lookup and a full scan, cross-checked against
+ * each other.  That cross-check is the direct test for G-7 and D-14f.
+ */
+struct model {
+    char key[64][16];
+    char val[64][16];
+    bool live[64];
+    size_t n;
+};
+
+static int model_find(struct model *m, const char *k)
+{
+    for (size_t i = 0; i < m->n; i++)
+        if (strcmp(m->key[i], k) == 0) return (int)i;
+    return -1;
+}
+
+static void model_set(struct model *m, const char *k, const char *v)
+{
+    int i = model_find(m, k);
+    if (i < 0) {
+        assert(m->n < 64);
+        i = (int)m->n++;
+        snprintf(m->key[i], 16, "%s", k);
+    }
+    m->live[i] = (v != NULL);
+    if (v) snprintf(m->val[i], 16, "%s", v);
+}
+
+static int model_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static void model_scan(struct model *m, char *out, size_t outlen)
+{
+    char keys[64][16];
+    size_t n = 0;
+    for (size_t i = 0; i < m->n; i++)
+        if (m->live[i]) snprintf(keys[n++], 16, "%s", m->key[i]);
+    qsort(keys, n, 16, model_cmp);
+
+    size_t used = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        int j = model_find(m, keys[i]);
+        size_t need = strlen(keys[i]) + strlen(m->val[j]) + 3;
+        if (used + need >= outlen) break;
+        if (used) out[used++] = '|';
+        used += (size_t)snprintf(out + used, outlen - used, "%s=%s",
+                                 keys[i], m->val[j]);
+    }
+}
+
+static void test_read_model(void)
+{
+    /* The generator MUST produce the shapes that stress the merge (T-5): the same
+     * key live in several files at once, a key deleted in a newer file and present
+     * in older ones, a key whose only version is in the oldest file, and keys
+     * adjacent in comparator order but split across files.  A small key space over
+     * several generations produces all four by construction. */
+    struct model m;
+    struct zs_db *db;
+    char got[1024], want[1024];
+    unsigned seed = 12345;
+    const char *env = getenv("ZS_TEST_SEED");
+    if (env) seed = (unsigned)strtoul(env, NULL, 10);
+
+    memset(&m, 0, sizeof(m));
+    clear_db();
+
+    /* Eight generations of overlapping writes over a twelve-key space. */
+    for (uint32_t gen = 1; gen <= 8; gen++) {
+        struct kv kvs[8];
+        char kbuf[8][16], vbuf[8][16];
+        size_t n = 0;
+
+        size_t count = 1 + (seed % 5);
+        for (size_t i = 0; i < count && n < 7; i++) {
+            seed = seed * 1103515245u + 12345u;
+            unsigned which = (seed >> 16) % 12;
+            seed = seed * 1103515245u + 12345u;
+            bool del = ((seed >> 16) % 4) == 0;
+
+            snprintf(kbuf[n], 16, "k%02u", which);
+            if (del) {
+                kvs[n].k = kbuf[n];
+                kvs[n].v = NULL;
+                model_set(&m, kbuf[n], NULL);
+            } else {
+                snprintf(vbuf[n], 16, "g%ur%zu", gen, i);
+                kvs[n].k = kbuf[n];
+                kvs[n].v = vbuf[n];
+                model_set(&m, kbuf[n], vbuf[n]);
+            }
+            n++;
+        }
+        kvs[n].k = NULL;
+        kvs[n].v = NULL;
+
+        /* Alternate the file kind, so the merge sees both primitives. */
+        if (gen % 2 == 0) {
+            /* in-order files need key order and one record per key */
+            struct kv sorted[8];
+            size_t sn = 0;
+            for (size_t i = 0; i < n; i++) {
+                bool dup = false;
+                for (size_t j = i + 1; j < n; j++)
+                    if (strcmp(kvs[i].k, kvs[j].k) == 0) dup = true;
+                if (!dup) sorted[sn++] = kvs[i];
+            }
+            for (size_t i = 0; i < sn; i++)
+                for (size_t j = i + 1; j < sn; j++)
+                    if (strcmp(sorted[i].k, sorted[j].k) > 0) {
+                        struct kv t = sorted[i];
+                        sorted[i] = sorted[j];
+                        sorted[j] = t;
+                    }
+            sorted[sn].k = NULL;
+            sorted[sn].v = NULL;
+            put_inorder_kv(gen, gen, sorted);
+        } else {
+            put_unordered_kv(gen, kvs);
+        }
+
+        db = open_db(0);
+        ASSERT_NOT_NULL(db);
+
+        /* The scan must match the model exactly. */
+        db_scan(db, 0, NULL, 0, got, sizeof(got));
+        model_scan(&m, want, sizeof(want));
+        if (strcmp(got, want) != 0) {
+            fprintf(stderr, "\n    FAIL gen %u scan\n      got  %s\n      want %s\n",
+                    gen, got, want);
+            current_test_failed = 1;
+            zs_db_close(&db);
+            return;
+        }
+
+        /* And every key in the space must agree between the point lookup and the
+         * scan -- the cross-check that is the direct test for G-7. */
+        for (unsigned which = 0; which < 12; which++) {
+            char k[16], expect[32];
+            snprintf(k, sizeof(k), "k%02u", which);
+            int i = model_find(&m, k);
+            if (i >= 0 && m.live[i]) snprintf(expect, sizeof(expect), "%s", m.val[i]);
+            else                     snprintf(expect, sizeof(expect), "-");
+
+            db_get(db, k, strlen(k), got, sizeof(got));
+            if (strcmp(got, expect) != 0) {
+                fprintf(stderr, "\n    FAIL gen %u get %s: got '%s' want '%s'\n",
+                        gen, k, got, expect);
+                current_test_failed = 1;
+                zs_db_close(&db);
+                return;
+            }
+
+            /* the scan agrees with the lookup about presence */
+            char needle[32];
+            snprintf(needle, sizeof(needle), "%s=", k);
+            db_scan(db, 0, NULL, 0, want, sizeof(want));
+            bool in_scan = strstr(want, needle) != NULL;
+            bool in_get = strcmp(got, "-") != 0;
+            if (in_scan != in_get) {
+                fprintf(stderr, "\n    FAIL gen %u %s: scan=%d get=%d\n",
+                        gen, k, in_scan, in_get);
+                current_test_failed = 1;
+                zs_db_close(&db);
+                return;
+            }
+        }
+
+        zs_db_close(&db);
+    }
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -6090,6 +6792,16 @@ static struct test_entry tests[] = {
     { "test_open_bad_nonactive",        test_open_bad_nonactive },
     { "test_open_lock_file_recreated",  test_open_lock_file_recreated },
     { "test_open_uuid_mismatch",        test_open_uuid_mismatch },
+
+    { "test_read_newest_wins",          test_read_newest_wins },
+    { "test_read_deletion_hides_older", test_read_deletion_hides_older },
+    { "test_read_d14f_duplicate_across_three_files",
+                                        test_read_d14f_duplicate_across_three_files },
+    { "test_read_cursor_invariant",     test_read_cursor_invariant },
+    { "test_read_arrangements",         test_read_arrangements },
+    { "test_read_seek_and_flags",       test_read_seek_and_flags },
+    { "test_read_prefix_across_files",  test_read_prefix_across_files },
+    { "test_read_model",                test_read_model },
 
     { NULL, NULL }
 };
