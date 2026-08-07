@@ -1188,6 +1188,7 @@ struct zsi_file {
     zs_csum          *csum;       /* the engine this file's own header names */
     unsigned          csum_id;
     bool              hdr_valid;  /* false for the D-10 case */
+    bool              needs_external_csum;  /* engine 2, no function supplied */
 
     /* unordered (hdr.end == 0), filled by the UNORDERED FILE section */
     size_t            complete;   /* F-24 complete point */
@@ -1310,6 +1311,13 @@ static int zsi_file_open(const char *dir, const char *name,
          * engine is recorded inside the header the checksum protects. */
         unsigned id = zsi_header_engine_id(f->base);
         zs_csum *cs = zsi_csum_for_id(id, external_csum);
+
+        /* Engine 2 with no function supplied is a CONFIGURATION error, not
+         * corruption, and the two must not be conflated: D-10 tolerates a corrupt
+         * active file, so without this distinction an unverifiable single-file
+         * database would open as empty instead of reporting A-6. */
+        if (id == ZSI_CSUM_EXTERNAL && !external_csum)
+            f->needs_external_csum = true;
 
         /* An unknown engine, or engine 2 with no function supplied, leaves the
          * header unverifiable.  Treat it as an invalid header rather than
@@ -3014,6 +3022,308 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
 /********** CONSISTENCY *************/
 
 /********** OPEN AND CLOSE *************/
+
+/* OPENING IS RECOVERY; there is no separate pass (section 7).
+ *
+ * R-1: scan the directory, resolve enclosures, check the tiling, map the files,
+ * then replay each unordered file's spans from its start -- building the private
+ * index as it goes and stopping at the first record or terminator that fails to
+ * validate, which establishes that file's end.  All of that is C-4, which the
+ * snapshot already does, so open is mostly configuration plus one snapshot.
+ *
+ * R-4: there is no in-place repair.  A file that is not clean is simply complete
+ * at its last valid span, and the writer moves to a new generation.  Nothing is
+ * ever appended past a boundary that failed to validate, so a spurious terminator
+ * in trailing garbage -- which a checksum can never wholly exclude -- cannot
+ * become the foundation of a later chain.  Generations are cheap. */
+
+struct zs_db {
+    char        *dir;
+    uint32_t     flags;
+    zsi_uuid_t   uuid;
+    bool         have_uuid;
+
+    zs_compar   *compar;
+    char         compar_name[ZSI_COMPAR_NAME_LEN];
+    zs_csum     *external_csum;
+    unsigned     create_csum_id;    /* engine for files THIS handle creates */
+    size_t       rollover_size;
+    void       (*error)(const char *msg, const char *fmt, ...);
+
+    bool         readonly;          /* ZS_SHARED (A-5) */
+    bool         nocsum;            /* ZS_NOCSUM (F-5e) */
+    bool         nosync;            /* ZS_NOSYNC (C-7c) */
+    bool         nonblocking;
+
+    struct zsi_locks     locks;
+    struct zsi_snapshot *snap;      /* current snapshot for zs_db_* calls */
+    struct zs_txn       *write_txn;
+
+    /* Backing for pointers returned by the non-transactional calls, whose
+     * implicit transaction has ended by the time the caller sees them (A-4). */
+    char        *retbuf;
+    size_t       retalloc;
+};
+
+static void zsi_default_error(const char *msg, const char *fmt, ...)
+{
+    (void)msg;
+    (void)fmt;
+}
+
+/* Every mutating internal entry point starts here rather than scattering the
+ * check.  R-3: a reader MUST NOT write, and opening a damaged database read-only
+ * is side-effect-free -- no conversion, no repack, no new active file, no
+ * removal.  There is no shared cache for it to update either (D-13c). */
+static int zsi_check_writable(struct zs_db *db)
+{
+    return db->readonly ? ZS_READONLY : ZS_OK;
+}
+
+/* Create generation 1: a 72-byte header and no spans, which F-26h makes a legal
+ * empty file (D-8a).
+ *
+ * C-6: after creating a DATA FILE the directory is fdatasync'd, otherwise the
+ * name may be absent after a crash even though the file's contents are durable. */
+static int zsi_create_active(struct zs_db *db, uint32_t gen)
+{
+    char name[ZSI_NAME_MAX], path[PATH_MAX], hdr[ZSI_HEADER_LEN];
+    struct zsi_header h;
+
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = gen;
+    h.end = 0;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+
+    zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    if (!cs) return ZS_BADUSAGE;
+    zsi_header_encode(hdr, &h, cs);
+
+    zsi_name_format(name, db->uuid, gen, 0);
+    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
+
+    /* O_EXCL: creating a file IS publishing it (D-8), so a collision would mean
+     * another writer allocated the same generation -- which D-9b makes
+     * impossible, and which must therefore fail loudly rather than truncate. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return ZS_IOERROR;
+
+    ssize_t n = write(fd, hdr, sizeof(hdr));
+    if (n != (ssize_t)sizeof(hdr)) { close(fd); return ZS_IOERROR; }
+    if (!db->nosync && fdatasync(fd) < 0) { close(fd); return ZS_IOERROR; }
+    close(fd);
+
+    if (!db->nosync) {
+        int dfd = open(db->dir, O_RDONLY);
+        if (dfd >= 0) { fdatasync(dfd); close(dfd); }
+    }
+
+    return ZS_OK;
+}
+
+/* Refresh db->snap.  Used by open and by every zs_db_* call that needs a current
+ * view; a transaction holds its own snapshot for its lifetime. */
+static int zsi_db_refresh(struct zs_db *db)
+{
+    struct zsi_snapshot *s = NULL;
+    int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
+                              db->compar, db->external_csum, db->nocsum, &s);
+    if (r != ZS_OK) return r;
+
+    zsi_snapshot_release(&db->snap);
+    db->snap = s;
+
+    if (!db->have_uuid && s->nfiles) {
+        memcpy(db->uuid, s->files[0]->hdr.uuid, 16);
+        db->have_uuid = true;
+    }
+
+    return ZS_OK;
+}
+
+/* Every file of a database MUST carry the same UUID and the same comparator name
+ * (F-11).  The comparator determines key order and hence the meaning of the
+ * pointer section, so it is recorded per file -- there is no manifest to hold it.
+ * Opening a database whose files disagree, or whose comparator differs from the
+ * caller's, is an error rather than something to reconcile: reading a file whose
+ * pointer array was built under a different order silently returns wrong
+ * answers. */
+static int zsi_db_check_agreement(struct zs_db *db)
+{
+    for (size_t i = 0; i < db->snap->nfiles; i++) {
+        struct zsi_file *f = db->snap->files[i];
+
+        /* A-6 first, because it applies to files whose header did not validate:
+         * unverifiable for want of the caller's engine is a usage error, and must
+         * not be swallowed by D-10's tolerance of a corrupt ACTIVE file. */
+        if (f->needs_external_csum) return ZS_BADUSAGE;
+
+        if (!f->hdr_valid) continue;        /* the D-10 active-file case */
+
+        if (memcmp(f->hdr.uuid, db->uuid, 16) != 0) return ZS_BADFORMAT;
+        if (memcmp(f->hdr.compar_name, db->compar_name,
+                   ZSI_COMPAR_NAME_LEN) != 0)
+            return ZS_BADFORMAT;
+
+        /* A-6: a file recording engine 2 is readable only by a caller supplying
+         * the same function.  zsi_file_open leaves such a header invalid when it
+         * cannot resolve the engine, so this catches the case where the file is
+         * otherwise fine. */
+        if ((f->hdr.flags & ZSI_CSUM_MASK) == ZSI_CSUM_EXTERNAL
+            && !db->external_csum)
+            return ZS_BADUSAGE;
+
+        /* F-7: refuse to WRITE above our write version, while still allowing the
+         * file to be read.  The read gate is in zsi_header_decode. */
+        if (!db->readonly && f->hdr.version_write > ZSI_VERSION_WRITE)
+            return ZS_READONLY;
+    }
+
+    return ZS_OK;
+}
+
+static int zsi_db_open(const char *dir, struct zs_open_data *setup,
+                       const char *uuid_str, struct zs_db **dbp)
+{
+    struct zs_open_data defaults = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db;
+    int r;
+
+    if (!dir || !dbp) return ZS_BADUSAGE;
+    if (!setup) setup = &defaults;
+    *dbp = NULL;
+
+    db = zsi_zmalloc(sizeof(*db));
+    if (!db) return ZS_INTERNAL;
+
+    db->locks.fd = -1;
+    db->flags = setup->flags;
+    db->readonly = (setup->flags & ZS_SHARED) != 0;
+    db->nocsum = (setup->flags & ZS_NOCSUM) != 0;
+    db->nosync = (setup->flags & ZS_NOSYNC) != 0;
+    db->nonblocking = (setup->flags & ZS_NONBLOCKING) != 0;
+    db->rollover_size = setup->rollover_size ? setup->rollover_size
+                                             : ZSI_DEFAULT_ROLLOVER;
+    db->error = setup->error ? setup->error : zsi_default_error;
+    db->external_csum = setup->csum;
+    db->create_csum_id = zsi_csum_id_for_flags(setup->flags);
+
+    /* A-6: engine 2 needs a function, or files this handle creates cannot be
+     * verified by anyone including us. */
+    if (db->create_csum_id == ZSI_CSUM_EXTERNAL && !db->external_csum) {
+        free(db);
+        return ZS_BADUSAGE;
+    }
+
+    /* F-11a/F-11b: the default comparator is named "memcmp"; a caller supplying
+     * its own MUST supply a name, and names are compared byte for byte. */
+    if (setup->compar) {
+        if (!zsi_compar_name_valid(setup->compar_name)) {
+            free(db);
+            return ZS_BADUSAGE;
+        }
+        db->compar = setup->compar;
+        snprintf(db->compar_name, sizeof(db->compar_name) + 0, "%s",
+                 setup->compar_name);
+        /* snprintf NUL-terminates within 16; the field is NUL-PADDED, and
+         * zsi_zmalloc already zeroed it, so the padding is correct. */
+    } else {
+        db->compar = zsi_compar_default;
+        memcpy(db->compar_name, "memcmp", 6);
+    }
+
+    db->dir = strdup(dir);
+    if (!db->dir) { free(db); return ZS_INTERNAL; }
+
+    /* Is there anything here?  A directory that does not exist, or holds no data
+     * files, is the empty case D-8a handles. */
+    struct zsi_fileset probe;
+    r = zsi_fileset_scan(dir, NULL, &probe);
+    bool empty = (r == ZS_NOTFOUND) || (r == ZS_OK && probe.nall == 0);
+    bool discovered = (r == ZS_OK && probe.nall > 0);
+
+    if (discovered) {
+        memcpy(db->uuid, probe.uuid, 16);
+        db->have_uuid = true;
+    }
+    if (r == ZS_OK) zsi_fileset_fini(&probe);
+    else if (r != ZS_NOTFOUND) { zs_db_close(&db); return r; }
+
+    if (empty) {
+        if (!(setup->flags & ZS_CREATE)) { zs_db_close(&db); return ZS_NOTFOUND; }
+        if (db->readonly) { zs_db_close(&db); return ZS_READONLY; }
+
+        if (mkdir(dir, 0700) && errno != EEXIST) { zs_db_close(&db); return ZS_IOERROR; }
+
+        if (uuid_str) {
+            if (zsi_uuid_parse(uuid_str, db->uuid) != 0) {
+                zs_db_close(&db);
+                return ZS_BADUSAGE;
+            }
+        } else {
+            zsi_uuid_generate(db->uuid);
+        }
+        db->have_uuid = true;
+    }
+
+    /* D-3a: the lock file is created with the database, and created on open if
+     * absent, so an existing database is never unopenable for want of it.
+     *
+     * A read-only handle skips it entirely.  Readers take no lock (C-2), so they
+     * have no use for it -- and creating it would be a write, which R-3 forbids:
+     * opening a damaged database read-only must be side-effect-free, and "it only
+     * creates one small file" is exactly the kind of exception that makes a
+     * read-only mount fail or a forensic copy differ from its original. */
+    if (!db->readonly) {
+        r = zsi_lock_open(&db->locks, dir);
+        if (r != ZS_OK) { zs_db_close(&db); return r; }
+    }
+
+    if (empty) {
+        r = zsi_create_active(db, 1);
+        if (r != ZS_OK) { zs_db_close(&db); return r; }
+    }
+
+    /* R-1: the snapshot IS the recovery pass. */
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) { zs_db_close(&db); return r; }
+
+    r = zsi_db_check_agreement(db);
+    if (r != ZS_OK) { zs_db_close(&db); return r; }
+
+    *dbp = db;
+    return ZS_OK;
+}
+
+int zs_db_open(const char *dir, struct zs_open_data *setup, struct zs_db **dbp)
+{
+    return zsi_db_open(dir, setup, NULL, dbp);
+}
+
+int zs_db_open_with_uuid(const char *dir, struct zs_open_data *setup,
+                         const char *uuid_str, struct zs_db **dbp)
+{
+    return zsi_db_open(dir, setup, uuid_str, dbp);
+}
+
+int zs_db_close(struct zs_db **dbp)
+{
+    struct zs_db *db = *dbp;
+    if (!db) return ZS_OK;
+
+    zsi_snapshot_release(&db->snap);
+    zsi_lock_close(&db->locks);
+    free(db->retbuf);
+    free(db->dir);
+    free(db);
+    *dbp = NULL;
+
+    return ZS_OK;
+}
 
 /********** PUBLIC API *************/
 

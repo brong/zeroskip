@@ -5645,6 +5645,329 @@ static void test_lock_never_uses_flock(void)
 
 /*
  * ============================================================
+ * Open, create and close (section 7)
+ * ============================================================
+ */
+
+static void test_open_create(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    /* Without ZS_CREATE, a nonexistent database is ZS_NOTFOUND (D-8a). */
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_NOTFOUND);
+    ASSERT_NULL(db);
+
+    /* With it: the directory, the lock file, and generation 1 as the active file
+     * -- a 72-byte header and no spans, which F-26h makes legal. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), 0);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, db->uuid, 1, 0);
+    ASSERT_EQ(filesize(name), 72);
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT(zsi_unordered_is_clean(db->snap->files[0]));
+
+    /* The comparator name went into the header (F-11b). */
+    ASSERT_MEM_EQ(db->snap->files[0]->hdr.compar_name,
+                  "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
+
+    zsi_uuid_t created;
+    memcpy(created, db->uuid, 16);
+    ASSERT_OK(zs_db_close(&db));
+    ASSERT_NULL(db);
+
+    /* Reopening finds the same UUID, discovered from the filenames (D-4a). */
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_MEM_EQ(db->uuid, created, 16);
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* ZS_CREATE on an existing database is not an error and does not re-create. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_MEM_EQ(db->uuid, created, 16);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Closing NULL, and double close, are no-ops. */
+    ASSERT_OK(zs_db_close(&db));
+}
+
+static void test_open_with_uuid(void)
+{
+    /* zs_db_open_with_uuid exists so corpus generation is reproducible (T-1).
+     * It applies only when CREATING; opening an existing database ignores it. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open_with_uuid(dbdir, &setup, TEST_UUID_STR, &db));
+    ASSERT_MEM_EQ(db->uuid, test_uuid, 16);
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(filesize(name), 72);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopening with a DIFFERENT uuid string ignores it rather than renaming. */
+    ASSERT_OK(zs_db_open_with_uuid(dbdir, &setup,
+                                   "00000000-0000-4000-8000-000000000000", &db));
+    ASSERT_MEM_EQ(db->uuid, test_uuid, 16);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* A malformed uuid string is rejected rather than silently generated. */
+    clear_db();
+    ASSERT_EQ(zs_db_open_with_uuid(dbdir, &setup, "not-a-uuid", &db),
+              ZS_BADUSAGE);
+    ASSERT_NULL(db);
+}
+
+static int alt_compar(const char *a, size_t alen, const char *b, size_t blen)
+{
+    /* reverse byte order, so it is genuinely a different total order */
+    return -zsi_compar_default(a, alen, b, blen);
+}
+
+static void test_open_comparator_agreement(void)
+{
+    /* F-11: every file carries the comparator name, and opening a database whose
+     * comparator differs from the caller's is an error.  It has to be, because
+     * the comparator determines the meaning of a pointer section: reading one
+     * built under a different order returns wrong answers silently. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopening with a custom comparator: mismatch. */
+    setup.flags = 0;
+    setup.compar = alt_compar;
+    setup.compar_name = "reverse";
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
+    ASSERT_NULL(db);
+
+    /* A caller comparator with no name is a usage error (F-11b). */
+    setup.compar_name = NULL;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    setup.compar_name = "";
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    setup.compar_name = "seventeen chars!!";      /* 17 */
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+
+    /* A database created with a custom comparator round-trips, and then rejects
+     * the default one. */
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.compar = alt_compar;
+    setup.compar_name = "reverse";
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_MEM_EQ(db->snap->files[0]->hdr.compar_name,
+                  "reverse\0\0\0\0\0\0\0\0\0", 16);
+    ASSERT_OK(zs_db_close(&db));
+
+    setup.compar = NULL;
+    setup.compar_name = NULL;
+    setup.flags = 0;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
+}
+
+static void test_open_engine_selection(void)
+{
+    /* A-6: a ZS_CSUM_* flag chooses the engine for files this handle CREATES; it
+     * never overrides what an existing file records, since each file's engine
+     * comes from its own header (F-5a). */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE | ZS_CSUM_NONE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(db->create_csum_id, ZSI_CSUM_NONE);
+    ASSERT_EQ(db->snap->files[0]->csum_id, ZSI_CSUM_NONE);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopening with the xxhash flag reads the engine-0 file as engine 0. */
+    setup.flags = ZS_CSUM_XXHASH;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(db->create_csum_id, ZSI_CSUM_XXHASH);
+    ASSERT_EQ(db->snap->files[0]->csum_id, ZSI_CSUM_NONE);   /* from the file */
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Engine 2 without a function is a usage error (A-6). */
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_CSUM_EXTERNAL;
+    setup.csum = NULL;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    ASSERT_NULL(db);
+
+    /* With one, it works, and the file records engine 2. */
+    setup.csum = TEST_EXTERNAL_CSUM;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(db->snap->files[0]->csum_id, ZSI_CSUM_EXTERNAL);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopening those files WITHOUT the function cannot verify them. */
+    setup.flags = 0;
+    setup.csum = NULL;
+    int r = zs_db_open(dbdir, &setup, &db);
+    ASSERT(r != ZS_OK);
+    ASSERT_NULL(db);
+}
+
+static void test_open_readonly_no_side_effects(void)
+{
+    /* R-3: opening a damaged database read-only is side-effect-free -- no
+     * conversion, no repack, no new active file, no removal.  Asserted by
+     * comparing the directory listing before and after, which is the only way to
+     * check "did nothing" rather than "did nothing I thought to look for". */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    static const char *k[] = { "a", NULL };
+
+    clear_db();
+    put_inorder(1, 1, k);
+    put_unordered(2, k);
+
+    /* Make the active file unclean, which is what a crash leaves (D-10). */
+    char name[ZSI_NAME_MAX];
+    zsi_name_format(name, test_uuid, 2, 0);
+    int fd = open(dbpath(name), O_WRONLY | O_APPEND);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(write(fd, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8), 8);
+    close(fd);
+
+    /* Snapshot the directory. */
+    char before[4096] = "";
+    DIR *d = opendir(dbdir);
+    ASSERT_NOT_NULL(d);
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        strncat(before, de->d_name, sizeof(before) - strlen(before) - 2);
+        strncat(before, "\n", 2);
+    }
+    closedir(d);
+
+    setup.flags = ZS_SHARED;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT(db->readonly);
+    ASSERT_EQ(zsi_check_writable(db), ZS_READONLY);
+    ASSERT_OK(zs_db_close(&db));
+
+    char after[4096] = "";
+    d = opendir(dbdir);
+    ASSERT_NOT_NULL(d);
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        strncat(after, de->d_name, sizeof(after) - strlen(after) - 2);
+        strncat(after, "\n", 2);
+    }
+    closedir(d);
+
+    /* Same set of names, and the unclean file still unclean. */
+    ASSERT_EQ(strlen(before), strlen(after));
+
+    /* ZS_SHARED on a nonexistent database will not create one either -- not the
+     * directory, not the lock file, not generation 1 (R-3, A-5). */
+    clear_db();
+    setup.flags = ZS_SHARED | ZS_CREATE;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_READONLY);
+    ASSERT_NULL(db);
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), -ENOENT);
+}
+
+static void test_open_bad_nonactive(void)
+{
+    /* D-10a at the database level: a non-active file with an invalid header
+     * cannot be recovered, and skipping the generation would lose committed data,
+     * so the open fails rather than succeeding with less data than the caller
+     * asked for. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    static const char *k[] = { "a", NULL };
+    char junk[ZSI_HEADER_LEN];
+    char name[ZSI_NAME_MAX];
+    memset(junk, 0xFF, sizeof(junk));
+
+    clear_db();
+    put_inorder(1, 1, k);
+    put_unordered(2, k);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
+
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
+    ASSERT_NULL(db);
+
+    /* The same corruption in the ACTIVE file opens fine (D-10, G-3): any state a
+     * crash can produce must open. */
+    clear_db();
+    put_inorder(1, 1, k);
+    put_unordered(2, k);
+    zsi_name_format(name, test_uuid, 2, 0);
+    ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQU(db->snap->nfiles, 2u);
+    ASSERT(!db->snap->files[1]->hdr_valid);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And a zero-length active file. */
+    zsi_name_format(name, test_uuid, 2, 0);
+    ASSERT_EQ(writefile(name, "", 0), 0);
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+static void test_open_lock_file_recreated(void)
+{
+    /* D-3a: a database whose lock file is absent opens successfully, recreating
+     * it.  T-9 asks for this specifically -- an empty file named *.lock is
+     * exactly what a cleanup script deletes, and a database that then refused to
+     * open would be a support incident rather than a recovery. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_close(&db));
+
+    ASSERT_EQ(unlink(dbpath(ZSI_LOCK_NAME)), 0);
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), -ENOENT);
+
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), 0);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+static void test_open_uuid_mismatch(void)
+{
+    /* D-4a: files disagreeing on UUID are an error, not a majority vote. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    static const zsi_uuid_t other = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+    };
+    char othername[ZSI_NAME_MAX];
+    static const char *k[] = { "a", NULL };
+
+    clear_db();
+    put_unordered(1, k);
+    zsi_name_format(othername, other, 2, 0);
+    ASSERT_EQ(writefile(othername, "", 0), 0);
+
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
+    ASSERT_NULL(db);
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -5758,6 +6081,15 @@ static struct test_entry tests[] = {
     { "test_lock_two_handles_one_process", test_lock_two_handles_one_process },
     { "test_lock_no_thread_machinery",  test_lock_no_thread_machinery },
     { "test_lock_never_uses_flock",     test_lock_never_uses_flock },
+
+    { "test_open_create",               test_open_create },
+    { "test_open_with_uuid",            test_open_with_uuid },
+    { "test_open_comparator_agreement", test_open_comparator_agreement },
+    { "test_open_engine_selection",     test_open_engine_selection },
+    { "test_open_readonly_no_side_effects", test_open_readonly_no_side_effects },
+    { "test_open_bad_nonactive",        test_open_bad_nonactive },
+    { "test_open_lock_file_recreated",  test_open_lock_file_recreated },
+    { "test_open_uuid_mismatch",        test_open_uuid_mismatch },
 
     { NULL, NULL }
 };
