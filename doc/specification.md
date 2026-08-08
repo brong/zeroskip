@@ -94,9 +94,15 @@ whether a pointer section must be present.
 - **G-3 Always reopens.** Any state a crash can produce MUST open in bounded
   time and expose the committed data. Corruption may cost uncommitted data;
   it MUST NOT cost committed data, hang, crash, or read out of bounds.
-- **G-4 Snapshot isolation, lock-free reads.** A read transaction sees a fixed
-  snapshot and takes no lock. Readers never block a writer; a writer never
-  blocks readers.
+- **G-4 Snapshot isolation, lock-free reads.** An **explicit** read transaction
+  sees a fixed snapshot and takes no lock. Readers never block a writer; a writer
+  never blocks readers.
+
+  The non-transactional forms are deliberately not fixed in the same way: they
+  observe writes committed through their own handle as they go (D-14j), because
+  a traversal whose callback modifies the database is an ordinary pattern and a
+  fixed view makes it silently miss its own work. Nothing about that costs a
+  lock or a syscall — see D-14j for why.
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
   byte-range lock. Because the kernel releases `fcntl` locks on process death, a
   killed writer never blocks the next one; no lock state can outlive a process.
@@ -808,6 +814,31 @@ The per-file cursors are held in an array kept sorted by:
 
 > **current key ascending, then generation descending.**
 
+- **D-14j Liveness.** What a cursor observes of writes made *while it runs*
+  depends on how it was opened, and the three cases are deliberately different:
+
+  - **Inside an explicit transaction**, the file set is fixed for the cursor's
+    lifetime (G-4). A write on that same transaction is still visible, because
+    the transaction's own records are a source (D-14) — and that includes one
+    written after the cursor was opened, at a key not yet reached (A-1a).
+  - **From a database handle** (the non-transactional forms), the cursor
+    additionally observes anything **committed through that handle** while it
+    runs. A traversal whose callback writes is an ordinary pattern, and a fixed
+    view makes it silently skip its own work.
+  - **With `ZS_CURSOR_LIVE`**, it additionally observes writes committed by *other
+    processes*. This is the only one that costs: readers take no lock (C-2) and
+    have nothing to be notified by, so detecting an external write means looking
+    for it. An implementation MAY re-scan per record, and the flag exists so
+    that nobody pays for it who has not asked.
+- **D-14j-a** A source's records MUST NOT be yielded twice because of a write
+  made during the traversal. A cursor position expressed as an *index* into a
+  mutable structure is the trap here: inserting ahead of it shifts the element
+  under the index and re-yields a record. Positions into anything a write can
+  modify MUST therefore be expressed as keys, not offsets.
+- **D-14j-b** After observing a change, a cursor resumes at the first key
+  strictly after the last one it yielded. It does not re-yield, and it does not
+  skip keys that were already present.
+
 1. **Seek.** Seek every per-file cursor to the start point, so its current
    record is the first with key `>=` the start key — or mark it exhausted, which
    is immediately the case for a source holding no records (F-26g, F-26h). A
@@ -1503,6 +1534,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
 | `ZS_CURSOR_PREFIX` | foreach, cursor | treat the start key as a prefix and stop when a key leaves it |
+| `ZS_CURSOR_LIVE` | foreach, cursor | also observe writes by other processes (D-14j); costs a re-scan per record |
 | `ZS_CSUM_NONE` | open | write engine 0 into files this handle creates |
 | `ZS_CSUM_XXHASH` | open | engine 1, the default if no `ZS_CSUM_*` is given |
 | `ZS_CSUM_EXTERNAL` | open | engine 2; `zs_open_data.csum` MUST be supplied |
@@ -1524,6 +1556,10 @@ different calls, though not every flag is meaningful everywhere:
   same transaction, and to nothing else until commit. `zs_txn_fetch` and
   `zs_txn_foreach` therefore consult the transaction's own uncommitted records
   first, per D-14.
+
+  **Including a traversal already in progress**: a record written from inside a
+  `zs_txn_foreach` callback, at a key the traversal has not yet reached, MUST be
+  visible to the rest of that traversal (D-14j).
 - **A-2** There is no `yield` call and no yield flags: readers hold no lock, so
   there is nothing to yield.
 - **A-3** There is no MVCC flag. Snapshot isolation is the only read mode,
