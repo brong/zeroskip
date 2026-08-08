@@ -593,6 +593,76 @@ static void bench_index_threshold(void)
 
 /* ------------------------------------------------------------------------- */
 
+static void bench_compact(void)
+{
+    /* D-26/D-27: what compaction costs and what it reclaims.
+     *
+     * The reclamation is the number worth having.  A repack collapses duplicate
+     * versions within its inputs, but only a compaction spanning the whole
+     * generation interval can drop TOMBSTONES (D-19), so the interesting figure
+     * is how much a heavily-deleted database shrinks.
+     *
+     * Reported against a repacked baseline rather than a raw one, so the column
+     * shows what compaction adds over the repack a caller would already be
+     * running -- not the space repacking would have reclaimed anyway. */
+    char dir[1200];
+    char *val = malloc(valsize);
+    static const int deleted_pct[] = { 0, 25, 50, 75 };
+    memset(val, 'v', valsize);
+
+    printf("\n  compaction: cost and reclamation (D-26, D-27)\n");
+    printf("    %-12s %-12s %-12s %-12s %s\n",
+           "deleted %", "repacked KB", "compact KB", "reclaimed", "compact ms");
+
+    for (size_t t = 0; t < sizeof(deleted_pct) / sizeof(deleted_pct[0]); t++) {
+        snprintf(dir, sizeof(dir), "%s/compact", workdir);
+        cleanup(dir);
+
+        struct zs_db *db = open_at(dir, ZS_CREATE, 64 * 1024);
+        for (int i = 0; i < nrecs; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "key%08d", i);
+            zs_db_store(db, k, strlen(k), val, valsize, 0);
+        }
+        for (int i = 0; i < nrecs * deleted_pct[t] / 100; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "key%08d", i);
+            zs_db_delete(db, k, strlen(k), 0);
+        }
+
+        /* The baseline a caller already has: sealed and repacked as far as
+         * D-16's rule goes. */
+        zs_db_seal(db);
+        while (zs_db_should_repack(db)) zs_db_repack(db);
+        size_t repacked = dir_bytes(dir);
+
+        double t0 = now();
+        int r = zs_db_compact(db);
+        double dt = now() - t0;
+        if (r != ZS_OK) {
+            fprintf(stderr, "zsbench: compact failed: %s\n", zs_strerror(r));
+            exit(1);
+        }
+        size_t compacted = dir_bytes(dir);
+        zs_db_close(&db);
+
+        printf("    %-12d %-12.1f %-12.1f %-11.1f%% %.1f\n",
+               deleted_pct[t], (double)repacked / 1024.0,
+               (double)compacted / 1024.0,
+               repacked ? 100.0 * (double)(repacked - compacted) / (double)repacked
+                        : 0.0,
+               dt * 1000.0);
+
+        cleanup(dir);
+    }
+
+    printf("    (compaction is UNBOUNDED: it rewrites everything in one call\n"
+           "     while writers continue -- see spec open item 1 and D-29)\n");
+    free(val);
+}
+
+/* ------------------------------------------------------------------------- */
+
 static int run_selftest(void)
 {
     /* Enough to prove the harness measures a working database rather than an empty
@@ -681,6 +751,7 @@ int main(int argc, char **argv)
         bench_snapshot_open();
         bench_cached_open();
         bench_index_threshold();
+        bench_compact();
     }
 
     cleanup(workdir);

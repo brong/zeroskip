@@ -3293,7 +3293,21 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
             alloc = want;
         }
 
-        snprintf(fs->all[fs->nall].name, ZSI_NAME_MAX, "%s", de->d_name);
+        /* The length is already bounded: zsi_name_parse returned a data-file
+         * type above, which requires the name to be exactly
+         * "zeroskip-" + 36 + "-" + 8 [+ "-" + 8] with nothing trailing -- 63
+         * characters at most, against ZSI_NAME_MAX of 80.
+         *
+         * Copied with an EXPLICIT length rather than snprintf'd, because the
+         * compiler cannot see that reasoning: `d_name` is NAME_MAX-sized, so
+         * -Wformat-truncation flags the snprintf, and Cyrus builds -Werror.
+         * Suppressing the warning would leave the bound implicit; this states
+         * it where it is relied on.  The check is unreachable for the same
+         * reason it is here, in the manner of F-29's progress checks. */
+        size_t nlen = strlen(de->d_name);
+        if (nlen >= ZSI_NAME_MAX) continue;
+
+        memcpy(fs->all[fs->nall].name, de->d_name, nlen + 1);
         fs->all[fs->nall].start = start;
         fs->all[fs->nall].end = end;
         fs->nall++;
