@@ -23,49 +23,84 @@ numbers can be read side by side.
 | `full scan` | the merge cursor over whatever file set exists |
 | `store, rollover Nk` | whether a writer's inline conversion really is bounded by `rollover_size` (D-12d) |
 | `repack cascade` | one unbounded cascade (D-16b, open item 1) |
-| `snapshot open` | **open item 2's number** — see below |
+| `snapshot open` | the per-open replay cost, without a pointer table |
+| `open (cached)` | the same open with one — what spec section 8 buys |
+| `publish threshold` | what P-13's threshold trades, in both directions |
 
 The `store, one txn each` figure is dominated by `fdatasync` and therefore measures
 the *filesystem*, not zeroskip. Compare it against `store, 1000 per txn` on the same
 machine: the ratio is the cost of durability, not of this library.
 
-## Open item 2: is a shared index worth reintroducing?
+## The pointer table cache (spec section 8)
 
-The spec's second open item asks whether the per-open replay of the active file is
-worth removing, and says explicitly that the answer should not be guessed:
+The spec's second open item asked whether the per-open replay of the active file
+was worth removing, and said the answer should not be guessed. It was worth
+removing, and by more than the question implied.
 
-> Every snapshot now replays the active file, bounded by `rollover_size` but paid
-> per open. If measurement shows that cost matters, the way to share it without
-> reintroducing in-place mutation is an append-only `(key, offset)` log per file
-> published by a single aligned atomic — readers read the immutable prefix and sort
-> privately. […] Not worth building before there is a number.
+### Opening
 
-`zsbench` produces the number. A representative run (Apple M-series, APFS,
-100-byte values, a rollover large enough that nothing converts):
+Without a table, open cost is linear in the number of records in the active file
+— roughly **1.5 ms** at the 2 MB default `rollover_size`, flat at about
+0.1 µs/record. With one it is flat in absolute terms, because the replay is
+bounded by the threshold rather than by the file:
 
-| records in the active file | active file | open | per record |
+| records in the active file | active file | plain open | cached open | speedup |
+|---|---|---|---|---|
+| 250 | 31 KB | 0.06 ms | 0.08 ms | 0.8× |
+| 1 000 | 125 KB | 0.13 ms | 0.08 ms | 1.6× |
+| 4 000 | 500 KB | 0.41 ms | 0.08 ms | 4.9× |
+| 16 000 | 2 000 KB | 1.56 ms | 0.09 ms | **17.7×** |
+
+**Note the first row.** Below about 500 records the cache is a small *loss*:
+opening a table, reading it and validating it costs more than the replay it
+saves. That is the honest shape of the trade, and it is why the feature is
+opt-in rather than on by default.
+
+### Writing, which is the bigger effect
+
+A write transaction refreshes its snapshot at begin (C-4), and that refresh
+replays the active file **from the last published `valid_upto`**. With no table
+there is no published point, so every commit replays the whole file and a
+one-store-per-transaction load is quadratic. 16 000 such transactions over a
+2 MB active file:
+
+| threshold | store | open | steady-state table |
 |---|---|---|---|
-| 250 | 31 KB | 0.06 ms | 0.24 µs |
-| 1 000 | 125 KB | 0.12 ms | 0.12 µs |
-| 4 000 | 500 KB | 0.41 ms | 0.10 µs |
-| 16 000 | 2 000 KB | 1.54 ms | 0.10 µs |
+| no cache | 26.8 s | 1.60 ms | — |
+| 1 byte | 6.5 s | 0.09 ms | 125 KB |
+| 4 KB | **2.7 s** | 0.09 ms | 125 KB |
+| 32 KB | **2.8 s** | 0.10 ms | 124 KB |
+| 256 KB | 6.5 s | 0.37 ms | 112 KB |
+| 1 MB | 18.6 s | 1.33 ms | 64 KB |
 
-**Per-record cost is flat, so open cost is linear in the number of records in the
-active file.** At the 2 MB default `rollover_size` that is a ceiling of roughly
-**1.5 ms per open**.
+So the cache is a **10× improvement on writes** in this workload, not only on
+opens — and that was not the effect it was built for.
 
-How to read that:
+### Reading the threshold curve
 
-- For a long-lived handle it is irrelevant — it is paid once.
-- For a process that opens a database per request it is the dominant cost, and the
-  shared index would be worth building.
-- The ceiling is set by `rollover_size`, so a caller that opens frequently can buy
-  most of the win today by lowering it — at the cost of more files, and therefore
-  slower lookups (D-14d) and more repacking.
+It is U-shaped, and both ends are real:
 
-That last point is the one to check before writing any new code: **measure with a
-smaller `rollover_size` first.** `./zsbench` prints `store, rollover Nk` rows for
-exactly that comparison.
+- **Too low**, and every commit pays an O(records) merge and rewrites the whole
+  table. Threshold 1 byte writes roughly a gigabyte of tables over one
+  generation. It costs 2.4× the minimum rather than something catastrophic,
+  because a table is never `fsync`ed (P-14).
+- **Too high**, and the refresh replay grows without bound. This is the
+  expensive end: 1 MB costs 7× the minimum, and approaches having no cache
+  at all.
+
+The default is **32 KB**, from the flat region, capped at a quarter of
+`rollover_size` so a caller using small generations still publishes within one.
+It is an absolute byte count rather than a fraction of `rollover_size`, because
+the knee is set by how much data a replay walks — which has nothing to do with
+how large a caller lets a generation grow. An earlier `rollover_size / 8` put
+the default at 256 KB, squarely on the wrong side.
+
+### What it costs
+
+The cache directory must be scoped to the database instance (P-17): a table
+outlives an out-of-band restore of the database directory, and P-10's binding
+checks one span rather than the whole prefix. A per-boot temporary directory
+satisfies that; restoring a database from backup means discarding its tables.
 
 ## Reading the rollover rows
 

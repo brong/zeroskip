@@ -66,6 +66,36 @@ and the deleted value reappears.
 | Identical output everywhere | The same operations produce byte-identical files on any machine and in any implementation, which is what allows independent implementations to be checked against each other. |
 | Self-describing files | Every file states its own format version and how to read it, so files written by different versions sit side by side. |
 
+## The pointer table cache
+
+Finding a key in the **active file** means reading it end to end, because records
+are in arrival order with no index. That is bounded — the active file only grows
+to a couple of megabytes — but it is paid every time a process opens the database,
+and again at the start of every write.
+
+A process may write the result out: a **pointer table**, a sorted list of where
+each key lives, published into a scratch directory the caller nominates. The next
+process to come along loads it and only has to read whatever has been appended
+since. Writers and readers alike publish; whoever does the work shares it.
+
+Three things keep this from undoing anything above. The scratch directory is not
+the database, so nothing is written into the database that was not already going
+there. A table is published by writing a new file and renaming it into place,
+never by editing one, so the rule that nothing is overwritten still holds. And a
+table carries enough about the file it describes to prove it belongs to it —
+anything doubtful is ignored and the file is read the old way, so a damaged or
+stale table costs time and never correctness.
+
+It is **off unless asked for**, and the scratch directory must be one the caller
+controls: a table planted by someone else would produce wrong answers rather than
+obvious failure. It must also be discarded whenever the database directory is
+restored from a backup, since a table can outlive the file it describes.
+
+In exchange, opening a database with a large active file goes from around 1.5 ms
+to under 0.1 ms, and a workload committing one record at a time gets about ten
+times faster — the second effect being the larger one, and not the one it was
+built for. Below a few hundred records it is marginally slower than not having it.
+
 ## What it costs
 
 - **Space before merges.** Superseded and deleted records occupy space until a
@@ -78,6 +108,9 @@ and the deleted value reappears.
   continues throughout, but the I/O is real.
 - **Readers hold space open.** A file being read is not freed until the reader
   finishes, so a long-running reader keeps retired files on disk.
+- **The pointer table cache needs looking after.** It is optional and everything
+  works without it, but if used, its directory has to be scoped to the database —
+  a stale table surviving a restore is the one way it can mislead.
 
 ## Where it fits
 

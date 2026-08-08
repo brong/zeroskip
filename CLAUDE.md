@@ -66,6 +66,7 @@ FILE OBJECT         open, mmap, kind detection, the one bounds-checked accessor
 UNORDERED FILE      span chain replay, complete-at
 POINTER SECTION     section + trailer, binary search  (needs an open file)
 PRIVATE INDEX       base+delta ordered index
+POINTER TABLE CACHE spec section 8: load, publish, sweep
 PER-FILE CURSOR     uniform seek/next over both kinds
 FILE SET            readdir, D-5 resolution, D-6 tiling
 SNAPSHOT            C-4 protocol
@@ -101,6 +102,12 @@ Each of these has cost someone an afternoon. They are load-bearing.
 - **Appending uses the ACTIVE FILE's checksum engine, not the handle's.** A `ZS_CSUM_*` flag chooses the engine for files a handle *creates* and never overrides what an existing file records (A-6, F-5a). Using the handle's engine to checksum a span appended to a file recording a different one is silent data loss: the terminator validates under neither, so the next reader rejects the whole span (F-22 doing its job) and every record in it vanishes. Found by the corpus's engine-0 case, because that case is built by separate `zstool` invocations and so the second one had a different default.
 - **This writer never produces a ROLLBACK span, but the reader must handle them.** Transactions are buffered in memory and written at commit, so an abort has nothing on disk to void. C-8 and F-21 describe a *streaming* writer, for which a ROLLBACK is essential — without one, a later commit's span would enclose the aborted records. Both writers are conforming; the trade is that a transaction must fit in memory. The read path handles ROLLBACK spans anywhere (F-25) because a streaming peer produces them, and `test_dump_shows_rollback` hand-builds one for exactly that reason.
 - **Decoding accepts non-canonical records and terminators; it does not reject them.** A big form whose lengths would have fitted the short form, or a stored ancestor equal to the file's own `start`, is something a conforming writer never produces (F-15, F-17) — but rejecting it on read would be a *data-loss* bug. A record that fails to validate makes an unordered file complete at that point (F-24), discarding everything after it, and G-3 forbids corruption costing committed data. So a peer with a canonicalisation bug would silently cost us every record it wrote after its first non-canonical one. `zsi_rec_is_canonical` / `zsi_term_is_canonical` exist so `zs_db_check_consistency` reports the divergence while still reading the data, which is the precedent T-6 sets explicitly.
+- **A pointer table is checksummed with the DATA FILE's engine, not the handle's.** Same rule as appending, same reason (P-7, A-6, F-5a): a table checksummed under the handle's engine validates for nobody, so every reader silently rejects it and the cache does nothing while appearing to work.
+- **Every pointer-table rejection is `ZS_NOTFOUND`, not an error.** A table is an optimisation in a directory the database does not depend on. Reporting a corrupt one as corruption would let a file outside the database make a readable database look unreadable, which is the opposite of G-3.
+- **A pointer table is never `fsync`ed** (P-14). It is rebuildable and self-validating, and syncing it would put a third sync on a commit path C-7 defines as two.
+- **`zsi_index_flatten` does not merge the delta in place**, though that would be cheaper and would compact the index as a side effect. An index may be shared with a live `struct zsi_index_cur` holding positions into *both* arrays, and rewriting them underneath it is exactly the in-place mutation G-6 forbids.
+- **`term_off` in a pointer table is not redundant with `valid_upto`.** Terminators are located by scanning forward (F-20), so a reader given only `valid_upto` cannot find the terminator below it without performing the very replay the table exists to avoid.
+- **The publish threshold's expensive end is the HIGH one**, which is the opposite of the intuition and was wrong in the spec until measured. A write transaction refreshes its snapshot at begin (C-4), and that refresh replays from the last published point — so publishing rarely leaves the replay unbounded. 16000 single-store transactions cost 26.8s with no table and 2.7s with a 32KB threshold. Both ends of the curve cost; `doc/benchmarking.md` has it.
 
 ## Testing
 
@@ -118,6 +125,10 @@ Two mutants are marked `equivalent` rather than expected-to-be-caught, because t
 
 The perl patterns are tied to exact source text and will rot when the code is refactored. The script reports `PATTERN ROTTED` rather than silently passing; fix the pattern, don't delete the mutant.
 
+**Nothing may touch `zeroskip.c` while `mutate.sh` runs, and two runs must never overlap.** It keeps its own backup and `cp`s it back between mutants, so a concurrent edit is silently reverted and two concurrent runs corrupt each other's verdicts. Both happened while the pointer table cache was being written, and the second produced a whole run that had to be thrown away. It also runs for ten to fifteen minutes, which is long enough to be tempted.
+
+**A test must not be able to damage `tests/corpus/`.** `test_corpus_index_table` originally pointed a live cache directory at the checked-in corpus, and since a cache directory is one the library *unlinks from* (P-16), the two `sweeps` mutants deleted the golden table outright — which then made five unrelated mutants read as caught. It copies the case to scratch first. A deleted corpus file reads like a corpus that needs regenerating, which is exactly the diff `make corpus` must never be used to resolve.
+
 ## Interoperability surface
 
 Changing any of these breaks other implementations, so they need a spec change first:
@@ -127,6 +138,8 @@ Changing any of these breaks other implementations, so they need a spec change f
 - the default comparator's total order and the exact bytes of the `memcmp` name field
 - filename format: lowercase hyphenated UUID, uppercase 8-digit hex generations, **no extension** (D-1a — the unordered name must sort before the in-order name for the same generation)
 - `fcntl` record locking on `zeroskip.lock` bytes 0/1/2
+- the pointer table's 16 magic bytes, its 96-byte header layout, the offset array
+  and its trailing checksum, and the `zeroskip.index-<uuid>-<GEN8hex>` name
 - `zstool`'s output line format, which the interop runner compares as text
 
 Locks are ordered *within* one database. A caller holding locks on several databases while writing must impose its own consistent order (C-1h).
