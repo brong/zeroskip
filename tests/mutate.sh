@@ -901,6 +901,49 @@ mutant "idx: allows the database dir as the cache" catch \
   's/        if \(strcmp\(dir, setup->index_dir\) == 0\) \{\n            free\(db->dir\);\n            free\(db\);\n            return ZS_BADUSAGE;\n        \}/        \/* P-2 identical-path check removed *\//'
 
 echo
+echo "seal and compact (D-25..D-29)"
+
+# D-25a.  Both reach one in-order file; only one of them burns a generation each
+# time, and generations are finite (D-9c).  Only the generation assertion tells
+# them apart, which is why test_seal_creates_no_new_generation exists.
+mutant "seal: leaves a new active generation" catch \
+  's/    if \(r == ZS_OK\) \(void\)zsi_convert_pending\(db\);/    if (r == ZS_OK) (void)zsi_convert_pending(db);\n    if (r == ZS_OK) { int fd_ = -1; uint32_t g_ = 0;\n        if (zsi_writer_active(db, \&fd_, \&g_) == ZS_OK) close(fd_); }/'
+
+# D-25b.  Sealing an active file with no spans writes an empty in-order file and
+# consumes a generation for nothing.
+mutant "seal: seals a file with no spans" catch \
+  's/    if \(act->complete <= ZSI_HEADER_LEN\) goto out;  \/\* no valid spans \*\//    \/* D-25b removed *\//'
+
+# The write lock is the ONLY thing making it safe to convert the active file:
+# without it another writer may be appending to the file being converted.
+mutant "seal: converts without the write lock" catch \
+  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;/    r = ZS_OK;/'
+
+# A-10/R-3.  A read-only handle must not write to the database at all.
+mutant "seal: writes from a read-only handle" catch \
+  's/static int zsi_seal\(struct zs_db \*db\)\n\{\n    struct zsi_file \*act;\n    int r = zsi_check_writable\(db\);\n    if \(r != ZS_OK\) return r;/static int zsi_seal(struct zs_db *db)\n{\n    struct zsi_file *act;\n    int r = ZS_OK;/'
+
+# D-26.  Skipping the seal leaves the active generation out of the result, so the
+# database never reaches one file.
+mutant "compact: skips the seal" catch \
+  's/    r = zsi_seal\(db\);\n    if \(r != ZS_OK\) goto out;/    r = ZS_OK;/'
+
+# D-26b.  Merging the in-order PREFIX merges nothing when an unmergeable file
+# sits second -- exactly the damaged database D-28 is about.
+mutant "compact: merges the prefix, not runs" catch \
+  's/            if \(count >= 2\) \{ found = true; break; \}/            if (count >= 2 \&\& first == 0) { found = true; break; }\n            break;/'
+
+# D-28.  Returning OK regardless makes the return value meaningless exactly where
+# a caller most needs it.
+mutant "compact: reports success regardless" catch \
+  's/        r = ZS_BADFORMAT;\n    \}\n\nout:\n    zsi_lock_release\(&db->locks, ZSI_LOCK_REPACK\);/        r = ZS_OK;\n    }\n\nout:\n    zsi_lock_release(\&db->locks, ZSI_LOCK_REPACK);/'
+
+# C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
+# in-process assertion catches it from the other side.
+mutant "compact: takes the write lock outermost" catch \
+  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    \/\* Steps 1 and 2/    r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) return r;\n\n    \/* Steps 1 and 2/'
+
+echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"
 

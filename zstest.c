@@ -148,8 +148,15 @@ static int cb_failures = 0;
  *
  * Nothing is lost: on Linux the leak target uses LeakSanitizer, which has no such
  * problem and runs the whole suite. */
+/* A NON-EMPTY value disables them.  The distinction is load-bearing: the shell
+ * idiom `ZS_TEST_NO_FORK= cmd` sets the variable to the empty string rather than
+ * unsetting it, so a plain non-NULL test reads that as "disabled" -- the
+ * opposite of what it looks like at the call site.  tests/mutate.sh used exactly
+ * that idiom, and every fork test was silently skipped under mutation testing
+ * until this was found by a lock mutant that no non-forking test could catch. */
 #define SKIP_IF_NO_FORK() do { \
-    if (getenv("ZS_TEST_NO_FORK")) SKIP("fork tests disabled (ZS_TEST_NO_FORK)"); \
+    const char *nf_ = getenv("ZS_TEST_NO_FORK"); \
+    if (nf_ && *nf_) SKIP("fork tests disabled (ZS_TEST_NO_FORK)"); \
 } while (0)
 
 /*
@@ -12119,6 +12126,66 @@ static void test_compact_readonly(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* D-25: sealing takes the write lock, and that lock is the ONLY thing making it
+ * safe to convert the active file -- without it another writer may be appending
+ * to the file being converted.
+ *
+ * Unobservable in one process: nothing else holds the lock, so removing it
+ * changes nothing a single-threaded suite can see.  A peer plus ZS_NONBLOCKING
+ * makes it deterministic rather than a timing measurement: while the child holds
+ * the write lock, a nonblocking seal MUST report ZS_LOCKED, and a seal that
+ * never takes the lock reports ZS_OK instead. */
+static void test_seal_waits_for_the_write_lock(void)
+{
+    SKIP_IF_NO_FORK();
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    pid_t holder;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    zs_db_close(&db);
+
+    holder = fork();
+    ASSERT(holder >= 0);
+    if (holder == 0) {
+        struct zs_open_data s2 = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *hdb = NULL;
+        struct zs_txn *txn = NULL;
+        s2.error = counting_error;
+        if (zs_db_open(dbdir, &s2, &hdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(hdb, 0, &txn) != ZS_OK) _exit(2);
+        usleep(300000);
+        zs_txn_abort(&txn);
+        zs_db_close(&hdb);
+        _exit(0);
+    }
+
+    usleep(30000);              /* let the child take the lock first */
+
+    alarm(60);
+    setup.flags = ZS_NONBLOCKING;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(zs_db_seal(db), ZS_LOCKED);
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));     /* untouched */
+    zs_db_close(&db);
+    alarm(0);
+
+    ASSERT_EQ(reap(holder), 0);
+
+    /* And once the peer is gone it succeeds, so the ZS_LOCKED above was the
+     * lock and not some unrelated refusal. */
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    zs_db_close(&db);
+}
+
 /* C-1d: compaction takes REPACK then WRITE, and never the other way round.
  *
  * A wrong order does not fail locally -- it deadlocks against a PEER holding the
@@ -12435,6 +12502,8 @@ static struct test_entry tests[] = {
     { "test_compact_reports_and_fails_on_bad_file",
                                         test_compact_reports_and_fails_on_bad_file },
     { "test_compact_readonly",          test_compact_readonly },
+    { "test_seal_waits_for_the_write_lock",
+                                        test_seal_waits_for_the_write_lock },
     { "test_compact_lock_order",        test_compact_lock_order },
 
     { NULL, NULL }
