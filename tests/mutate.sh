@@ -294,7 +294,7 @@ mutant "D-10: active bad header reported too" catch \
 # Step 4 must build an index for every unordered file, or a reader sees an empty
 # source where committed records are.
 mutant "step 4: index not built" catch \
-  's/                r = zsi_index_build\(f, compar, nocsum\);/                r = ZS_OK; (void)compar; (void)nocsum;/'
+  's/                r = zsi_index_build_cached\(f, compar, compar_name, nocsum,\n                                           idxcfg\);/                r = ZS_OK; (void)compar; (void)compar_name;\n                (void)nocsum; (void)idxcfg;/'
 
 mutant "step 4: pointers not loaded" catch \
   's/                r = zsi_ptrs_load\(f\);/                r = ZS_OK;/'
@@ -569,7 +569,7 @@ mutant "F-24: complete advanced before validation" catch \
   's/        size_t datalen = p - span_start;/        f->complete = p;\n        size_t datalen = p - span_start;/'
 
 mutant "F-24: complete set past the terminator" catch \
-  's/        f->complete = after;\n        pos = after;/        f->complete = f->size;\n        pos = after;/'
+  's/        f->complete = after;\n        f->last_term_off  = p;/        f->complete = f->size;\n        f->last_term_off  = p;/'
 
 # D-9: clean requires a VALID HEADER as well as nothing after the last span.  A
 # zero-length file has complete == size == 0 and would otherwise look clean, so a
@@ -615,7 +615,7 @@ mutant "F-29: neither decode nor walk bounds" catch \
 
 # The walk must start after the header, not at 0.
 mutant "walk starts at offset 0" catch \
-  's/    size_t pos = ZSI_HEADER_LEN;\n    f->complete = pos;/    size_t pos = 0;\n    f->complete = pos;/'
+  's/    size_t pos = from < ZSI_HEADER_LEN \? ZSI_HEADER_LEN : from;/    size_t pos = 0;/'
 
 echo
 echo "file object (Task 6)"
