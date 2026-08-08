@@ -6224,7 +6224,7 @@ int zs_db_store(struct zs_db *db, const char *key, size_t keylen,
 
 /* foreach */
 
-int zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
+int zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
                    zs_cb *p, zs_cb *cb, void *rock, int flags)
 {
     struct zs_cursor *c = NULL;
@@ -6234,7 +6234,7 @@ int zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
     if (!txn || !cb) return ZS_BADUSAGE;
 
     rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
-                         prefixlen ? prefix : NULL, prefixlen, flags, &c);
+                         startlen ? start : NULL, startlen, flags, &c);
     if (rc != ZS_OK) return rc;
 
     while ((rc = zsi_cursor_next(c, &r)) == ZS_OK) {
@@ -6252,7 +6252,7 @@ out:
     return rc;
 }
 
-int zs_db_foreach(struct zs_db *db, const char *prefix, size_t prefixlen,
+int zs_db_foreach(struct zs_db *db, const char *start, size_t startlen,
                   zs_cb *p, zs_cb *cb, void *rock, int flags)
 {
     struct zs_txn *txn = NULL;
@@ -6263,7 +6263,7 @@ int zs_db_foreach(struct zs_db *db, const char *prefix, size_t prefixlen,
     rc = zs_db_begin_txn(db, 1, &txn);
     if (rc != ZS_OK) return rc;
 
-    rc = zs_txn_foreach(txn, prefix, prefixlen, p, cb, rock, flags);
+    rc = zs_txn_foreach(txn, start, startlen, p, cb, rock, flags);
     zs_txn_abort(&txn);
     return rc;
 }

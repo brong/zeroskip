@@ -1306,7 +1306,7 @@ int  zs_db_fetch(struct zs_db *, const char *key, size_t keylen,
                  const char **valp, size_t *vallenp, int flags);
 int  zs_db_store(struct zs_db *, const char *key, size_t keylen,
                  const char *val, size_t vallen, int flags);
-int  zs_db_foreach(struct zs_db *, const char *prefix, size_t prefixlen,
+int  zs_db_foreach(struct zs_db *, const char *start, size_t startlen,
                    zs_cb *p, zs_cb *cb, void *rock, int flags);
 
 /* transactions */
@@ -1319,7 +1319,7 @@ int  zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
                   const char **valp, size_t *vallenp, int flags);
 int  zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
                   const char *val, size_t vallen, int flags);
-int  zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
+int  zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
                     zs_cb *p, zs_cb *cb, void *rock, int flags);
 
 /* cursors, from a db (implicit transaction) or inside one */
@@ -1366,7 +1366,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
 | `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
-| `ZS_CURSOR_PREFIX` | foreach, cursor | stop when the key leaves the prefix |
+| `ZS_CURSOR_PREFIX` | foreach, cursor | treat the start key as a prefix and stop when a key leaves it |
 | `ZS_CSUM_NONE` | open | write engine 0 into files this handle creates |
 | `ZS_CSUM_XXHASH` | open | engine 1, the default if no `ZS_CSUM_*` is given |
 | `ZS_CSUM_EXTERNAL` | open | engine 2; `zs_open_data.csum` MUST be supplied |

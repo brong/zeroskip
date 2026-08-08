@@ -56,7 +56,8 @@ enum zs_flagspec {
     ZS_IFEXIST       = 1<<12,  /* store:   only if present, else ZS_NOTFOUND */
     ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record AFTER the given key */
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
-    ZS_CURSOR_PREFIX = 1<<16,  /* foreach,cursor: stop when the key leaves the prefix */
+    ZS_CURSOR_PREFIX = 1<<16,  /* foreach,cursor: treat the start key as a prefix
+                                  and stop when a key leaves it */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */
@@ -85,7 +86,7 @@ struct zs_open_data {
      * which is exactly what R-3 forbids.  Not created by the library; a missing
      * or unwritable directory disables the cache rather than failing the open. */
     const char  *index_dir;        /* A-8 */
-    size_t       index_threshold;  /* A-9: 0 = rollover_size / 8 */
+    size_t       index_threshold;  /* A-9: 0 = a measured default, 32KB */
 };
 
 #define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, NULL, NULL, 0 }
@@ -105,7 +106,11 @@ int  zs_db_fetch(struct zs_db *db, const char *key, size_t keylen,
                  const char **valp, size_t *vallenp, int flags);
 int  zs_db_store(struct zs_db *db, const char *key, size_t keylen,
                  const char *val, size_t vallen, int flags);
-int  zs_db_foreach(struct zs_db *db, const char *prefix, size_t prefixlen,
+/* start/startlen is where iteration BEGINS, not a filter.  Without
+ * ZS_CURSOR_PREFIX this walks from that key to the end of the database; with it,
+ * the key is also treated as a prefix and the scan stops when a key leaves it.
+ * A NULL or zero-length start begins at the first key. */
+int  zs_db_foreach(struct zs_db *db, const char *start, size_t startlen,
                    zs_cb *p, zs_cb *cb, void *rock, int flags);
 
 /* transactions */
@@ -118,10 +123,11 @@ int  zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
                   const char **valp, size_t *vallenp, int flags);
 int  zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
                   const char *val, size_t vallen, int flags);
-int  zs_txn_foreach(struct zs_txn *txn, const char *prefix, size_t prefixlen,
+int  zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
                     zs_cb *p, zs_cb *cb, void *rock, int flags);
 
-/* cursors, from a db (implicit transaction) or inside one */
+/* cursors, from a db (implicit transaction) or inside one.  key/keylen is the
+ * seek position, and ZS_CURSOR_PREFIX additionally bounds the scan by it. */
 int  zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
                         struct zs_cursor **curp, int flags);
 int  zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
