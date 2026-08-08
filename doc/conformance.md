@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 228 |
-| With an enforcing test | 219 |
+| Requirements | 240 |
+| With an enforcing test | 231 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -243,6 +243,23 @@ a spec label is missing here.
 | `P-15` | A failure to publish MUST NOT fail the operation that triggered it. | `idxcache_publish_failure_is_not_fatal` |
 | `P-16` | A process MAY unlink tables in the cache directory whose uuid matches | `idxcache_sweeps_dead_generations` |
 | `P-17` | P-10's binding detects a data file whose covered prefix has changed. | `idxcache_rejects_bad_term_binding` |
+
+## Salvage (`S-n`)
+
+| Req | Requirement | Enforced by |
+|---|---|---|
+| `S-1` | Salvage reads a source directory and writes a **new** database | `salvage_never_writes_the_source` |
+| `S-2` | Salvage MUST NOT apply D-5's overlap resolution or D-6's tiling check. | `salvage_across_a_missing_generation` |
+| `S-3` | Files are processed **oldest first**: by `start` ascending, and for | `salvage_newest_version_wins` |
+| `S-4` | The source's comparator does not affect the output. The output is | `salvage_comparator_mismatch_reported` |
+| `S-5` | A file whose header does not validate is still processed. Its | `salvage_invalid_header` |
+| `S-6` | For an in-order file the pointer section MUST be ignored and the | `salvage_ignores_pointer_section` |
+| `S-7` | **Resynchronisation.** On reaching a span that does not validate, | `salvage_resyncs_after_a_bad_span` |
+| `S-8` | The span that failed cannot be verified — its terminator is what would | `salvage_unverified_needs_the_flag` |
+| `S-9` | A **rolled-back** span MUST NOT be recovered under any option. | `salvage_never_recovers_rollback` |
+| `S-10` | Salvage MUST report, per key, where the record it recovered may be | `salvage_reports_maybe_stale` |
+| `S-11` | Reporting MUST be structured — a kind, a location, and a key where | `salvage_event_fields` |
+| `S-12` | Salvage MUST NOT reconstruct a missing generation's contents, invent | `salvage_never_writes_the_source` |
 
 ## C binding (`A-n`)
 

@@ -22,12 +22,16 @@ protocol (§6), and open and recovery (§7). Two implementations that agree on
 these can share a directory, read each other's files, and lock against each
 other.
 
+Salvage (§9) is likewise optional, and normative only for an implementation
+that offers one — what such a tool must not do matters more than whether it
+exists.
+
 The pointer table cache (§8) is normative *when present* — implementations that
 use one must agree on its bytes, or they will reject each other's work — but it
 is optional and never load-bearing. A conforming implementation MUST produce
 identical results with it absent.
 
-**What is a binding, not a contract:** §9 gives a C API. Its *semantics* are
+**What is a binding, not a contract:** §10 gives a C API. Its *semantics* are
 normative — what `store` with no value means, what a transaction makes visible,
 what each flag does — but its spelling is not. An implementation in another
 language SHOULD express the same semantics idiomatically.
@@ -35,7 +39,7 @@ language SHOULD express the same semantics idiomatically.
 - **G-0** Nothing in the format depends on `mmap`, on pointer-sized integers,
   or on any CPU feature. An implementation MAY read files with ordinary reads
   and copy data out; `mmap` is an optimisation the format permits, not one it
-  requires. Only §9's zero-copy pointer lifetimes (A-4) assume it, and that is a
+  requires. Only §10's zero-copy pointer lifetimes (A-4) assume it, and that is a
   binding-level promise a copying implementation simply makes differently.
 - **G-0a** Every integer in every structure is little-endian (F-1), including
   lengths, counts, generations and offsets. A header checksum will not catch a
@@ -1327,7 +1331,84 @@ every byte of it.
 
 ---
 
-## 9. C binding
+## 9. Salvage
+
+Recovery of what is readable from a **damaged** directory. Everything in this
+section is OPTIONAL: an implementation that offers no salvage is fully
+conforming. What is normative is what an implementation that *does* offer it
+must and must not do — because a salvage tool that silently invents data, or
+silently resurrects a transaction that never committed, is worse than none.
+
+- **S-1** Salvage reads a source directory and writes a **new** database
+  elsewhere. It MUST NOT write to the source, take any lock on it, or unlink
+  anything in it. That is precisely what lets it read structures §5 and §7
+  refuse, and it is why R-4's "there is no in-place repair" needs no exception.
+- **S-2** Salvage MUST NOT apply D-5's overlap resolution or D-6's tiling check.
+  A gap is reported and stepped over. One missing generation makes a database
+  unopenable under §7 while every surviving file remains perfectly readable, and
+  recovering those files is the point.
+- **S-3** Files are processed **oldest first**: by `start` ascending, and for
+  equal `start` the narrower range first, since a wider one is a repack output
+  derived from it. Records are applied in that order, so the newest surviving
+  version of each key wins by construction and no separate recency pass is
+  needed (D-14).
+- **S-4** The source's comparator does not affect the output. The output is
+  ordered by the comparator the caller supplies, and recency is resolved by
+  generation and offset rather than by key order. Where a source header is
+  readable, its comparator name MUST be compared against the caller's and a
+  mismatch reported; where no header is readable there is nothing to check and
+  nothing that needs checking.
+- **S-5** A file whose header does not validate is still processed. Its
+  generation comes from its filename (D-1). Its checksum engine is determined by
+  trying each in turn and keeping the one under which a span validates — engine
+  0 matches only where a stored checksum really is zero, so it is a genuine
+  signal rather than a catch-all. Both the invalid header and the engine
+  determination MUST be reported.
+- **S-6** For an in-order file the pointer section MUST be ignored and the
+  records region walked directly. A pointer section that fails to load makes the
+  file unreadable under §7 while its records may be intact, and an in-order file
+  has no spans (F-23), so the walk is a flat record walk.
+- **S-7 Resynchronisation.** On reaching a span that does not validate, salvage
+  MUST attempt to resynchronise rather than stopping where F-24 requires a
+  reader to stop. From the failed position, step forward in 8-byte increments
+  (F-2) and attempt to decode a terminator at each. On success compute
+  `span_start = position - spanlen`; if that lands at or after the last known
+  good boundary, checksum `[span_start, position)` together with the
+  terminator's own bytes and compare against the terminator's stored checksum.
+  A match is a **verified** span, and the walk resumes from it.
+
+  This is what makes the default sound rather than a guess: everything recovered
+  after damage is checksum-verified, not merely decodable. Under F-24 one bad
+  span discards every later span in its generation, and those later spans are
+  exactly what this recovers.
+- **S-8** The span that failed cannot be verified — its terminator is what would
+  prove it — and neither can a trailing region with no valid terminator. Their
+  records MUST NOT be recovered unless explicitly requested, and every record so
+  recovered MUST be reported. Such records carry no checksum of their own:
+  F-19's terminator checksum is the only thing that ever covered them.
+- **S-9** A **rolled-back** span MUST NOT be recovered under any option. F-21
+  and F-25 make it deliberately aborted, and no conforming reader has ever shown
+  its records; recovering them would resurrect a transaction that did not
+  happen.
+- **S-10** Salvage MUST report, per key, where the record it recovered may be
+  **stale**: where that record is older than some point at which data was lost,
+  a newer version may have been among the lost bytes. A key whose winning record
+  is newer than every damage point MUST NOT be reported, so the report stays
+  small enough to act on.
+
+  The rule is deliberately conservative rather than exact. Determining which
+  keys were actually superseded would require the key set of the lost bytes,
+  which is precisely what has been lost.
+- **S-11** Reporting MUST be structured — a kind, a location, and a key where
+  one applies — rather than prose. S-10's report is the mitigation for emitting
+  a possibly stale value, so it has to be machine-readable rather than something
+  an operator parses back out of a message.
+- **S-12** Salvage MUST NOT reconstruct a missing generation's contents, invent
+  records, or repair the source.
+
+---
+
+## 10. C binding
 
 The semantics below are normative; the spelling is a C binding (§1).
 Opaque types, one 32-bit flag space, output through pointer parameters, and
@@ -1475,7 +1556,7 @@ different calls, though not every flag is meaningful everywhere:
   database is a single file and `ZS_BADFORMAT` otherwise, having merged whatever
   it could first (D-28).
 
-## 10. Conformance suite
+## 11. Conformance suite
 
 The suite has two halves. **T-1 to T-11 are per-implementation tests**, run
 inside one implementation in whatever harness suits it — for the C
@@ -1771,13 +1852,13 @@ here to the test enforcing it. A requirement with no test is a gap to close. Eac
 implementation records which requirements it passes, so partial conformance is
 visible.
 
-## 11. Non-goals
+## 12. Non-goals
 
 Multi-writer concurrency; thread-safe handles; cross-database transactions;
 secondary indexes; compression; network access; in-place value mutation. A Cyrus `cyrusdb`
 backend is a thin separate adapter, out of scope.
 
-## 12. Open items
+## 13. Open items
 
 1. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
    database while the writer continues appending. The packer lock permits one

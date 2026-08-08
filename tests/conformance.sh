@@ -33,9 +33,9 @@ for f in "$SPEC" "$MAP"; do
 done
 
 # --- labels ------------------------------------------------------------------
-spec_labels=$(grep -oE '\b(G|F|D|C|R|A|P|T)-[0-9]+[a-z]*' "$SPEC" | sort -u)
-map_labels=$(grep -oE '^\| `(G|F|D|C|R|A|P|T)-[0-9]+[a-z]*`' "$MAP" \
-             | grep -oE '(G|F|D|C|R|A|P|T)-[0-9]+[a-z]*' | sort -u)
+spec_labels=$(grep -oE '\b(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*' "$SPEC" | sort -u)
+map_labels=$(grep -oE '^\| `(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*`' "$MAP" \
+             | grep -oE '(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*' | sort -u)
 
 missing=$(comm -23 <(echo "$spec_labels") <(echo "$map_labels"))
 extra=$(comm -13 <(echo "$spec_labels") <(echo "$map_labels"))
