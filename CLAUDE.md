@@ -120,6 +120,11 @@ Each of these has cost someone an afternoon. They are load-bearing.
 - **Salvage never recovers a rolled-back span** (S-9), under any flag. Those records were deliberately aborted and no conforming reader has ever shown them.
 - **A salvaged value may be an older one.** If a key's newest version was in lost bytes, salvage emits the newest that survives and reports the key as possibly stale (S-10). The report is the mitigation, so it must not be dropped as noise — and it needs no second pass, because files are scanned oldest first and positions ascend, so the first loss is discovered before any record beyond it is applied.
 
+- **A transaction cursor arm holds the KEY it reached, not an index** (D-14j-a). The pending array is sorted and a write during a traversal inserts into it, shifting every element from the insertion point on — so an index stops referring to the record it referred to and the cursor re-yields a key it has already returned. Reported from the Cyrus integration, and silent: the traversal simply processed a record twice.
+- **`struct zsi_fcur` owns memory now, so it must not be copied casually.** `zsi_fcur_find` takes a scratch copy to share the seek logic; since the transaction arm gained an owned position key, that copy owns one too and has to be released on every exit. A struct that was trivially copyable and then grows an owned pointer is exactly where this goes wrong — `make leaks` caught it, ASan did not.
+- **A cursor takes its own snapshot reference.** It used to borrow the transaction's, which was fine while a cursor's snapshot never changed; D-14j lets a handle-live cursor swap to a newer one, and releasing a borrowed reference frees a snapshot the transaction still points at.
+- **`c->handle_live` cannot be derived from `c->txn`.** A read-only implicit transaction is passed to the cursor as NULL, so the `zs_db_*` wrapper that created it has to say so — which is why `struct zs_txn` carries `implicit`.
+
 ## Testing
 
 Tests use a custom harness with `ASSERT()`, `ASSERT_EQ()`, `ASSERT_EQU()`, `ASSERT_OK()`, `ASSERT_SIGN()`, `ASSERT_STR_EQ()`, `ASSERT_MEM_EQ()`, and `CB_`-prefixed variants for callbacks. Each test gets a fresh temp directory via `setup()`/`teardown()`; `basedir` exists, `dbdir` deliberately does not, so tests exercise `ZS_CREATE`.

@@ -12927,6 +12927,160 @@ static void test_salvage_comparator_mismatch_reported(void)
 
 /*
  * ============================================================
+ * Cursor liveness (D-14j)
+ * ============================================================
+ */
+
+static struct zs_db *live_db;
+static struct zs_txn *live_txn;
+static char live_log[512];
+
+static void live_note(const char *k, size_t kl)
+{
+    strncat(live_log, "|", sizeof(live_log) - strlen(live_log) - 1);
+    strncat(live_log, k, kl < 32 ? kl : 32);
+}
+
+/* Writes "c" -- a key the traversal has NOT yet reached -- when it sees "b". */
+static int live_db_cb(void *rock, const char *k, size_t kl,
+                      const char *v, size_t vl)
+{
+    (void)rock; (void)v; (void)vl;
+    live_note(k, kl);
+    if (kl == 1 && k[0] == 'b')
+        CB_ASSERT(zs_db_store(live_db, "c", 1, "3", 1, 0) == ZS_OK);
+    return 0;
+}
+
+static int live_txn_cb(void *rock, const char *k, size_t kl,
+                       const char *v, size_t vl)
+{
+    (void)rock; (void)v; (void)vl;
+    live_note(k, kl);
+    if (kl == 1 && k[0] == 'b')
+        CB_ASSERT(zs_txn_store(live_txn, "c", 1, "3", 1, 0) == ZS_OK);
+    return 0;
+}
+
+static void live_seed(struct zs_open_data *setup)
+{
+    setup->flags = ZS_CREATE;
+    setup->error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, setup, &live_db));
+    ASSERT_OK(zs_db_store(live_db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(live_db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(live_db, "d", 1, "4", 1, 0));
+}
+
+/* D-14j, D-14j-b: a non-transactional foreach observes writes committed through
+ * its OWN handle while it runs.  This is the cyrusdb semantic -- a traversal
+ * whose callback drops something in must see it -- and it costs nothing,
+ * because the commit already replaced the handle's snapshot. */
+static void test_cursor_sees_own_handle_writes(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+
+    live_seed(&setup);
+
+    live_log[0] = '\0';
+    ASSERT_OK(zs_db_foreach(live_db, NULL, 0, NULL, live_db_cb, NULL, 0));
+
+    /* c was written from inside the callback, at a key not yet reached, and is
+     * visible to the rest of the traversal.  And nothing is yielded twice. */
+    ASSERT_STR_EQ(live_log, "|a|b|c|d");
+
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/* D-14j: inside an EXPLICIT transaction the file set is fixed (G-4), so another
+ * handle's committed write is not visible -- but the transaction's own pending
+ * write is (A-1a), including one made during the traversal. */
+static void test_txn_cursor_sees_own_writes(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+
+    live_seed(&setup);
+
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &live_txn));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, live_txn_cb, NULL, 0));
+    ASSERT_STR_EQ(live_log, "|a|b|c|d");
+    ASSERT_OK(zs_txn_commit(&live_txn));
+
+    /* And it really did commit. */
+    {
+        const char *v;
+        size_t vl;
+        ASSERT_OK(zs_db_fetch(live_db, "c", 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 1u);
+    }
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/* D-14j-a: a write during a traversal MUST NOT cause a key to be yielded twice.
+ *
+ * The regression this guards is precise: the transaction arm used to hold an
+ * INDEX into the sorted pending array, so inserting ahead of it shifted the
+ * element under the index and re-emitted a record.  Reported from the Cyrus
+ * integration, and silent -- the traversal simply processed a record twice.
+ *
+ * "z" is pending before the walk starts, so the arm is live rather than
+ * exhausted, which is the arrangement that exposed it. */
+static void test_txn_cursor_no_duplicate_on_write(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+
+    live_seed(&setup);
+
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &live_txn));
+    ASSERT_OK(zs_txn_store(live_txn, "z", 1, "9", 1, 0));
+
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, live_txn_cb, NULL, 0));
+
+    /* Every key exactly once, in order, including the one written mid-walk. */
+    ASSERT_STR_EQ(live_log, "|a|b|c|d|z");
+
+    ASSERT_OK(zs_txn_abort(&live_txn));
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/* D-14j: an explicit READ transaction keeps its fixed view (G-4), even while the
+ * same handle commits underneath it.  This is the case cyrusdb calls a
+ * transactional read, and it must NOT become live. */
+static void test_txn_cursor_view_is_fixed(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_txn *rd = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    char seen[128] = "";
+
+    live_seed(&setup);
+
+    ASSERT_OK(zs_db_begin_txn(live_db, 1, &rd));
+    ASSERT_OK(zs_txn_begin_cursor(rd, NULL, 0, &c, 0));
+
+    /* One step, then commit "c" through the handle behind its back. */
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    strncat(seen, k, kl);
+    ASSERT_OK(zs_db_store(live_db, "c", 1, "3", 1, 0));
+
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        strncat(seen, "|", sizeof(seen) - strlen(seen) - 1);
+        strncat(seen, k, kl);
+    }
+
+    ASSERT_STR_EQ(seen, "a|b|d");        /* c is NOT visible: fixed view */
+
+    zs_cursor_fini(&c);
+    ASSERT_OK(zs_txn_abort(&rd));
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -13193,6 +13347,13 @@ static struct test_entry tests[] = {
     { "test_salvage_event_fields",      test_salvage_event_fields },
     { "test_salvage_comparator_mismatch_reported",
                                         test_salvage_comparator_mismatch_reported },
+
+    { "test_cursor_sees_own_handle_writes",
+                                        test_cursor_sees_own_handle_writes },
+    { "test_txn_cursor_sees_own_writes", test_txn_cursor_sees_own_writes },
+    { "test_txn_cursor_no_duplicate_on_write",
+                                        test_txn_cursor_no_duplicate_on_write },
+    { "test_txn_cursor_view_is_fixed",  test_txn_cursor_view_is_fixed },
 
     { NULL, NULL }
 };

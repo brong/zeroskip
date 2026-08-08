@@ -60,6 +60,10 @@ enum zs_flagspec {
                                   and stop when a key leaves it */
     ZS_SALVAGE_UNVERIFIED = 1<<17,  /* salvage: also recover records no checksum
                                        ever covered (S-8) */
+    ZS_CURSOR_LIVE   = 1<<18,  /* foreach,cursor: also observe writes committed by
+                                  OTHER processes (D-14j).  Costs a re-scan per
+                                  record; a cursor already sees writes made
+                                  through its own handle without it. */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */

@@ -3046,7 +3046,19 @@ struct zsi_fcur {
     /* kind-specific position */
     uint64_t             pi;     /* in-order: pointer array index */
     struct zsi_index_cur ic;     /* unordered: index cursor */
-    size_t               ti;     /* txn: index into its sorted pending array */
+
+    /* txn: the KEY reached, not an index into the pending array (D-14j-a).
+     *
+     * An index is the trap.  The pending array is sorted and a write during the
+     * traversal inserts into it, shifting every element from the insertion point
+     * onward -- so an index stops referring to the record it referred to, and
+     * the cursor re-yields a key it has already returned.  A key survives that,
+     * costs one binary search per step over the transaction's own pending set,
+     * and makes a write ahead of the cursor visible, which is what A-1a and
+     * cyrusdb both want. */
+    char                *tkey;   /* owned; NULL means "before the first" */
+    size_t               tkeylen;
+    bool                 tstarted;
 };
 
 /* Filled in by the WRITE PATH section, which owns struct zs_txn.  Declared here
@@ -3055,6 +3067,14 @@ struct zsi_fcur {
  * avoid. */
 static int zsi_txn_cur_load(struct zsi_fcur *fc);
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
+
+/* struct zs_txn belongs to WRITE PATH, below, so the cursor reaches it through
+ * these rather than through its fields -- the same arrangement the two above
+ * already use, and the reason the merge needs no special case for a
+ * transaction (D-14g). */
+struct zsi_snapshot;    /* SNAPSHOT, below */
+static unsigned long zsi_txn_seq(struct zs_txn *txn);
+static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap);
 
 /* Load the record at the cursor's current position, or mark it exhausted. */
 static int zsi_fcur_load(struct zsi_fcur *fc)
@@ -3125,7 +3145,12 @@ static int zsi_fcur_seek_first(struct zsi_fcur *fc)
     switch (fc->kind) {
     case ZSI_SRC_INORDER:   fc->pi = 0; break;
     case ZSI_SRC_UNORDERED: zsi_index_cur_seek_first(&fc->ic); break;
-    case ZSI_SRC_TXN:       fc->ti = 0; break;
+    case ZSI_SRC_TXN:
+        free(fc->tkey);
+        fc->tkey = NULL;
+        fc->tkeylen = 0;
+        fc->tstarted = false;
+        break;
     }
 
     return zsi_fcur_load(fc);
@@ -3141,7 +3166,20 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
         if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
         zsi_index_cur_next(fc->file->index, fc->compar, &fc->ic);
         break;
-    case ZSI_SRC_TXN:       fc->ti++; break;
+    case ZSI_SRC_TXN: {
+        /* Remember the key just yielded, so the next load finds its successor
+         * in the array as it stands THEN -- which is the whole point (D-14j-a).
+         * Copied, because the pending array may be reallocated by a write made
+         * from the callback before the next step. */
+        char *k = fc->cur.keylen ? malloc(fc->cur.keylen) : NULL;
+        if (fc->cur.keylen && !k) { fc->exhausted = true; return ZS_INTERNAL; }
+        if (k) memcpy(k, fc->cur.key, fc->cur.keylen);
+        free(fc->tkey);
+        fc->tkey = k;
+        fc->tkeylen = fc->cur.keylen;
+        fc->tstarted = true;
+        break;
+    }
     }
 
     return zsi_fcur_load(fc);
@@ -3156,6 +3194,20 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
  * Both file kinds MUST report "absent" for an empty source rather than
  * misbehaving: a binary search over a zero-length array and an index for a file
  * with no committed records are both ordinary cases. */
+/* Release anything a per-file cursor owns.
+ *
+ * Only the transaction arm owns anything -- the key it holds instead of an index
+ * (D-14j-a) -- but every arm goes through this, so a STACK-allocated fcur is
+ * cleaned up the same way as one inside a cursor.  Those are easy to miss:
+ * zsi_lookup builds one per source on the stack, and the key copy leaked from
+ * exactly there until `make leaks` said so. */
+static void zsi_fcur_fini(struct zsi_fcur *fc)
+{
+    free(fc->tkey);
+    fc->tkey = NULL;
+    fc->tkeylen = 0;
+}
+
 static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
                          struct zsi_rec *out)
 {
@@ -3181,15 +3233,27 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
 
     case ZSI_SRC_TXN: {
         /* Seek a scratch cursor and check for an exact hit, so the transaction's
-         * lookup shares the ordering logic rather than duplicating it. */
+         * lookup shares the ordering logic rather than duplicating it.
+         *
+         * The scratch is a COPY, and since D-14j-a a transaction arm owns its
+         * position key -- so the copy owns one too, and it has to be released on
+         * every exit from here.  A struct that was trivially copyable and then
+         * grows an owned pointer is exactly where this goes wrong; `make leaks`
+         * is what caught it. */
         struct zsi_fcur scratch = *fc;
         int r = zsi_fcur_seek(&scratch, key, keylen);
-        if (r != ZS_OK) return r;
-        if (scratch.exhausted) return ZS_NOTFOUND;
-        if (fc->compar(scratch.cur.key, scratch.cur.keylen, key, keylen) != 0)
-            return ZS_NOTFOUND;
-        *out = scratch.cur;
-        return ZS_OK;
+
+        if (r == ZS_OK) {
+            if (scratch.exhausted
+                || fc->compar(scratch.cur.key, scratch.cur.keylen,
+                              key, keylen) != 0)
+                r = ZS_NOTFOUND;
+            else
+                *out = scratch.cur;
+        }
+
+        zsi_fcur_fini(&scratch);
+        return r;
     }
     }
 
@@ -3970,6 +4034,7 @@ static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
         fc.gen = ZSI_GEN_TXN;
 
         int r = zsi_fcur_find(&fc, key, keylen, out);
+        zsi_fcur_fini(&fc);
         if (r == ZS_OK) return zsi_rec_is_delete(out) ? ZS_NOTFOUND : ZS_OK;
         if (r != ZS_NOTFOUND) return r;
     }
@@ -3980,6 +4045,7 @@ static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
         zsi_fcur_init_file(&fc, snap->files[i], db->compar);
 
         int r = zsi_fcur_find(&fc, key, keylen, out);
+        zsi_fcur_fini(&fc);
         if (r == ZS_OK) return zsi_rec_is_delete(out) ? ZS_NOTFOUND : ZS_OK;
         if (r != ZS_NOTFOUND) return r;
     }
@@ -4021,6 +4087,30 @@ struct zs_cursor {
     /* the last record handed out, and its owning source */
     struct zsi_rec    emitted;
     bool              have_emitted;
+
+    /* D-14j liveness.  A cursor caches each arm's current record, so it must
+     * notice when the world underneath changed:
+     *
+     *   - the transaction's pending array, by a counter (free);
+     *   - this handle's file set, by comparing our snapshot against the
+     *     handle's current one -- also free, because a commit through the same
+     *     handle already replaces it.
+     *
+     * last_key is an owned copy of the key most recently yielded, because after
+     * a refresh the record it came from may have been unmapped.  It is what
+     * D-14j-b's "resume strictly after" is measured from. */
+    unsigned long     txn_seq;
+    char             *last_key;
+    size_t            last_keylen;
+
+    /* Whether this cursor may observe the HANDLE's later commits.
+     *
+     * True for the non-transactional forms, whose enclosing transaction is one
+     * the library made for them; false inside a caller's explicit transaction,
+     * where G-4 promises a fixed file set.  It cannot be derived from c->txn,
+     * because a read-only implicit transaction is passed to the cursor as NULL
+     * -- so the wrapper that created it says so. */
+    bool              handle_live;
 };
 
 /* Order two per-file cursors: exhausted last, then key ascending, then generation
@@ -4077,6 +4167,9 @@ static void zsi_cur_resort_head(struct zs_cursor *c)
 static void zsi_cursor_free(struct zs_cursor *c)
 {
     if (!c) return;
+    for (size_t i = 0; i < c->ncur; i++) zsi_fcur_fini(&c->cur[i]);
+    zsi_snapshot_release(&c->snap);
+    free(c->last_key);
     free(c->cur);
     free(c->prefix);
     free(c->skiproot_key);
@@ -4102,7 +4195,14 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
 
     c->db = db;
     c->txn = txn;
+
+    /* The cursor takes its OWN reference rather than borrowing the
+     * transaction's.  It used to borrow, which was fine while a cursor's
+     * snapshot never changed -- but D-14j lets a handle-live cursor swap to a
+     * newer one, and releasing a borrowed reference frees a snapshot the
+     * transaction is still pointing at. */
     c->snap = snap;
+    c->snap->refcount++;
     c->flags = flags;
 
     size_t n = snap->nfiles + (txn ? 1 : 0);
@@ -4211,8 +4311,106 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
     return ZS_OK;
 }
 
+/* Re-seek every arm to just after the last key yielded, against whatever the
+ * sources hold now.  D-14j-b: resume strictly after, never re-yielding and never
+ * skipping a key that was already there. */
+static int zsi_cursor_reseek(struct zs_cursor *c)
+{
+    for (size_t i = 0; i < c->ncur; i++) {
+        int r;
+
+        if (c->last_key)
+            r = zsi_fcur_seek(&c->cur[i], c->last_key, c->last_keylen);
+        else
+            r = zsi_fcur_seek_first(&c->cur[i]);
+        if (r != ZS_OK) return r;
+
+        /* A seek lands ON the key when it is still present; that one has been
+         * yielded already. */
+        if (c->last_key && !c->cur[i].exhausted
+            && c->db->compar(c->cur[i].cur.key, c->cur[i].cur.keylen,
+                             c->last_key, c->last_keylen) == 0) {
+            r = zsi_fcur_next(&c->cur[i]);
+            if (r != ZS_OK) return r;
+        }
+    }
+
+    zsi_cur_sort(c);
+    return ZS_OK;
+}
+
+/* D-14j: has anything this cursor is allowed to observe changed since the last
+ * step?  Both checks are a comparison, not a syscall -- ZS_CURSOR_LIVE is the
+ * only case that costs, and it is opt-in. */
+static int zsi_cursor_refresh(struct zs_cursor *c)
+{
+    bool stale = false;
+
+    /* The transaction's own pending records, whether the transaction is ours or
+     * the caller's: A-1a makes a write on it visible to a traversal already in
+     * progress on it. */
+    if (c->txn && zsi_txn_seq(c->txn) != c->txn_seq) {
+        c->txn_seq = zsi_txn_seq(c->txn);
+        stale = true;
+    }
+
+    /* The file set, but only for a cursor from a DATABASE HANDLE.  Inside an
+     * explicit transaction the file set is fixed for the cursor's lifetime
+     * (G-4), which is what a transactional read promises. */
+    if (c->handle_live) {
+        if (c->flags & ZS_CURSOR_LIVE) {
+            /* The expensive case, and the reason it is a flag: readers take no
+             * lock (C-2), so another process's commit cannot announce itself and
+             * the only way to see it is to look. */
+            int r = zsi_db_refresh(c->db);
+            if (r != ZS_OK) return r;
+        }
+
+        if (c->snap != c->db->snap) {
+            struct zsi_snapshot *old = c->snap;
+
+            c->db->snap->refcount++;
+            c->snap = c->db->snap;
+            if (c->txn) zsi_txn_set_snapshot(c->txn, c->snap);
+            zsi_snapshot_release(&old);
+
+            /* The file arms point into the old snapshot's files, so they must be
+             * rebuilt rather than re-seeked. */
+            for (size_t i = 0; i < c->ncur; i++) zsi_fcur_fini(&c->cur[i]);
+            free(c->cur);
+            c->cur = NULL;
+            c->ncur = 0;
+
+            {
+                size_t n = c->snap->nfiles + (c->txn ? 1 : 0);
+                if (n) {
+                    c->cur = zsi_zmalloc(n * sizeof(*c->cur));
+                    if (!c->cur) return ZS_INTERNAL;
+                }
+                for (size_t i = 0; i < c->snap->nfiles; i++)
+                    zsi_fcur_init_file(&c->cur[c->ncur++], c->snap->files[i],
+                                       c->db->compar);
+                if (c->txn) {
+                    struct zsi_fcur *fc = &c->cur[c->ncur++];
+                    memset(fc, 0, sizeof(*fc));
+                    fc->kind = ZSI_SRC_TXN;
+                    fc->txn = c->txn;
+                    fc->compar = c->db->compar;
+                    fc->gen = ZSI_GEN_TXN;
+                }
+            }
+            stale = true;
+        }
+    }
+
+    return stale ? zsi_cursor_reseek(c) : ZS_OK;
+}
+
 static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 {
+    int rr = zsi_cursor_refresh(c);
+    if (rr != ZS_OK) return rr;
+
     for (;;) {
         bool emit;
         int r = zsi_cursor_step(c, out, &emit);
@@ -4230,6 +4428,17 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
             c->started = true;
             c->emitted = *out;
             c->have_emitted = true;
+
+            /* Owned, because a refresh before the next step may unmap the
+             * record this key points into (D-14j-b). */
+            {
+                char *k = out->keylen ? malloc(out->keylen) : NULL;
+                if (out->keylen && !k) return ZS_INTERNAL;
+                if (k) memcpy(k, out->key, out->keylen);
+                free(c->last_key);
+                c->last_key = k;
+                c->last_keylen = out->keylen;
+            }
             return ZS_OK;
         }
         c->started = true;
@@ -4253,8 +4462,18 @@ struct zs_txn {
     bool                 readonly;
     bool                 holds_write_lock;
 
+    /* Created by a zs_db_* wrapper rather than by the caller (A-0), which is
+     * what makes its cursors observe this handle's later commits (D-14j). */
+    bool                 implicit;
+
     struct zsi_pending  *pend;
     size_t               npend, apend;
+
+    /* Bumped on every change to `pend`.  A cursor over this transaction caches
+     * the arm's current record, so it needs to know when that cache is stale --
+     * and comparing a counter is free, where re-reading the array every step
+     * would not be (D-14j). */
+    unsigned long        pend_seq;
 
     /* Backing for pointers returned by this transaction's reads, so A-4's
      * lifetime promise holds for records that came from the pending array rather
@@ -4302,6 +4521,11 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
     size_t pos;
     bool found = (zsi_pend_search(txn, key, keylen, &pos) == ZS_OK);
 
+    /* Bumped up front so every early return below still counts as a change:
+     * an over-count costs one wasted reload, an under-count costs a cursor that
+     * misses a write, and only one of those is a bug (D-14j). */
+    txn->pend_seq++;
+
     char *kcopy = NULL, *vcopy = NULL;
     if (!found) {
         kcopy = malloc(keylen);
@@ -4344,13 +4568,53 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
  *
  * Presenting pending records through the same interface as a file is what lets
  * D-14g work by sorting rather than by a special case in the merge. */
+/* Resolve the transaction arm's key position to an index, NOW.
+ *
+ * Done on every load rather than once, because the pending array may have moved
+ * under us since the last step: that is the whole point of holding a key
+ * (D-14j-a).  Before the first step tkey is NULL, meaning "start at the
+ * beginning"; afterwards it is the last key yielded and the next record is the
+ * first strictly after it (D-14j-b). */
+static size_t zsi_txn_cur_index(struct zsi_fcur *fc)
+{
+    size_t pos = 0;
+
+    if (!fc->txn || !fc->tkey) return 0;        /* from the beginning */
+
+    /* An exact hit means the array still holds the key we are positioned on.
+     * After a step that key has been yielded, so the next record is the one
+     * after it (D-14j-b); after a seek it has not, so it is the answer. */
+    if (zsi_pend_search(fc->txn, fc->tkey, fc->tkeylen, &pos) == ZS_OK
+        && fc->tstarted)
+        pos++;
+
+    return pos;
+}
+
+static unsigned long zsi_txn_seq(struct zs_txn *txn)
+{
+    return txn ? txn->pend_seq : 0;
+}
+
+static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap)
+{
+    if (!txn) return;
+    zsi_snapshot_release(&txn->snap);
+    txn->snap = snap;
+    txn->snap->refcount++;
+}
+
 static int zsi_txn_cur_load(struct zsi_fcur *fc)
 {
     struct zs_txn *txn = fc->txn;
+    size_t ti;
 
-    if (!txn || fc->ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
+    if (!txn) { fc->exhausted = true; return ZS_OK; }
 
-    struct zsi_pending *p = &txn->pend[fc->ti];
+    ti = zsi_txn_cur_index(fc);
+    if (ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
+
+    struct zsi_pending *p = &txn->pend[ti];
     memset(&fc->cur, 0, sizeof(fc->cur));
     fc->cur.type = p->val ? ZSI_KEYVALUE : ZSI_DELETION;
     fc->cur.key = p->key;
@@ -4362,12 +4626,28 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
     return ZS_OK;
 }
 
+/* Seek to the first pending record with key >= the given key.
+ *
+ * Recorded as "the key before this one" rather than as a position: tstarted
+ * stays false so the next load begins at the search result, which
+ * zsi_txn_cur_index recomputes against the array as it is then. */
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
 {
-    size_t pos = 0;
+    free(fc->tkey);
+    fc->tkey = NULL;
+    fc->tkeylen = 0;
+    fc->tstarted = false;
 
-    if (fc->txn) zsi_pend_search(fc->txn, key, keylen, &pos);
-    fc->ti = pos;
+    if (!fc->txn || !key || !keylen) return;
+
+    fc->tkey = malloc(keylen);
+    if (!fc->tkey) return;              /* degrades to "from the beginning" */
+    memcpy(fc->tkey, key, keylen);
+    fc->tkeylen = keylen;
+
+    /* A seek lands ON the key if present, so the first load must NOT skip it:
+     * tstarted false makes zsi_txn_cur_index return the search position rather
+     * than one past it. */
 }
 
 /* Defined in CONVERSION.  D-12 requires a writer convert any non-active unordered
@@ -4419,8 +4699,11 @@ static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
         struct zsi_rec r;
 
         zsi_fcur_init_file(&fc, snap->files[i], db->compar);
-        if (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK)
-            return snap->files[i]->hdr.start;
+        {
+            int found = (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK);
+            zsi_fcur_fini(&fc);
+            if (found) return snap->files[i]->hdr.start;
+        }
     }
 
     /* A key nobody holds is a create: its ancestor is its own generation, which
@@ -6358,6 +6641,7 @@ int zs_db_fetch(struct zs_db *db, const char *key, size_t keylen,
 
     rc = zs_db_begin_txn(db, 1, &txn);
     if (rc != ZS_OK) return rc;
+    txn->implicit = true;   /* D-14j: its cursors follow this handle */
 
     const char *k = NULL, *v = NULL;
     size_t kl = 0, vl = 0;
@@ -6408,6 +6692,7 @@ int zs_db_store(struct zs_db *db, const char *key, size_t keylen,
 
     rc = zs_db_begin_txn(db, 0, &txn);
     if (rc != ZS_OK) return rc;
+    txn->implicit = true;   /* D-14j: its cursors follow this handle */
 
     rc = zs_txn_store(txn, key, keylen, val, vallen, flags);
     if (rc != ZS_OK) {
@@ -6433,6 +6718,7 @@ int zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
                          startlen ? start : NULL, startlen,
                          (uint32_t)flags, &c);
     if (rc != ZS_OK) return rc;
+    c->handle_live = txn->implicit;
 
     while ((rc = zsi_cursor_next(c, &r)) == ZS_OK) {
         /* p is a predicate: when supplied, cb runs only where it returns
@@ -6459,6 +6745,7 @@ int zs_db_foreach(struct zs_db *db, const char *start, size_t startlen,
 
     rc = zs_db_begin_txn(db, 1, &txn);
     if (rc != ZS_OK) return rc;
+    txn->implicit = true;   /* D-14j: its cursors follow this handle */
 
     rc = zs_txn_foreach(txn, start, startlen, p, cb, rock, flags);
     zs_txn_abort(&txn);
@@ -6472,9 +6759,13 @@ int zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
 {
     if (!txn || !curp) return ZS_BADUSAGE;
     *curp = NULL;
-    return zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
-                           keylen ? key : NULL, keylen,
-                           (uint32_t)flags, curp);
+    {
+        int r = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
+                                keylen ? key : NULL, keylen,
+                                (uint32_t)flags, curp);
+        if (r == ZS_OK) (*curp)->handle_live = txn->implicit;
+        return r;
+    }
 }
 
 int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
@@ -6499,6 +6790,7 @@ int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
 
     (*curp)->txn = txn;
     (*curp)->owns_txn = true;
+    (*curp)->handle_live = true;    /* D-14j: opened from a database handle */
     return ZS_OK;
 }
 
