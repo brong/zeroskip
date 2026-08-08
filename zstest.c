@@ -12119,6 +12119,78 @@ static void test_compact_readonly(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* C-1d: compaction takes REPACK then WRITE, and never the other way round.
+ *
+ * A wrong order does not fail locally -- it deadlocks against a PEER holding the
+ * other lock, so it needs a second process to show at all.  A child holds the
+ * write lock briefly while the parent compacts: the parent must wait for it,
+ * then complete.  alarm() bounds the wait, because a wrong order would otherwise
+ * hang the suite rather than fail it, and a hang is much worse evidence.
+ *
+ * The in-process assertion in zsi_lock_take catches the same mistake from the
+ * other side, and did: it fired the first time compaction ran, because C-1d had
+ * been amended in the spec without the assertion following. */
+static void test_compact_lock_order(void)
+{
+    SKIP_IF_NO_FORK();
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char pad[150];
+    pid_t holder;
+
+    clear_db();
+    memset(pad, 'p', sizeof(pad));
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 400;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "seed%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    ASSERT(db->snap->nfiles > 1);
+    zs_db_close(&db);
+
+    /* A peer holding the write lock for ~200ms. */
+    holder = fork();
+    ASSERT(holder >= 0);
+    if (holder == 0) {
+        struct zs_open_data s2 = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *hdb = NULL;
+        struct zs_txn *txn = NULL;
+        s2.error = counting_error;
+        if (zs_db_open(dbdir, &s2, &hdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(hdb, 0, &txn) != ZS_OK) _exit(2);
+        usleep(200000);
+        zs_txn_abort(&txn);
+        zs_db_close(&hdb);
+        _exit(0);
+    }
+
+    usleep(20000);              /* let the child take the lock first */
+
+    alarm(60);
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_compact(db));
+    alarm(0);
+
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_EQ(reap(holder), 0);
+
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "seed%02d", i);
+        ASSERT_OK(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0));
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
 /*
  * ============================================================
  * Test runner
@@ -12363,6 +12435,7 @@ static struct test_entry tests[] = {
     { "test_compact_reports_and_fails_on_bad_file",
                                         test_compact_reports_and_fails_on_bad_file },
     { "test_compact_readonly",          test_compact_readonly },
+    { "test_compact_lock_order",        test_compact_lock_order },
 
     { NULL, NULL }
 };

@@ -101,6 +101,8 @@ static int usage(void)
         "  check                  run the consistency checks\n"
         "  convert                force conversion of non-active unordered files\n"
         "  repack                 force one repack\n"
+        "  seal                   convert the active generation (D-25)\n"
+        "  compact                merge the whole database into one file (D-26)\n"
         "  hold-write --for MS    take the write lock and hold it\n"
         "  index-dump             print the pointer table state (spec section 8)\n"
         "\n"
@@ -282,6 +284,16 @@ int main(int argc, char **argv)
         if (r != ZS_OK) oops("begin", r);
         r = zs_txn_commit(&txn);
         if (r != ZS_OK) oops("commit", r);
+
+    } else if (!strcmp(cmd, "seal")) {
+        r = zs_db_seal(db);
+        if (r != ZS_OK) oops("seal", r);
+
+    } else if (!strcmp(cmd, "compact")) {
+        /* ZS_BADFORMAT means it merged what it could and something is left
+         * (D-28), which a runner needs to tell apart from an outright failure. */
+        r = zs_db_compact(db);
+        if (r != ZS_OK) oops("compact", r);
 
     } else if (!strcmp(cmd, "repack")) {
         r = zs_db_repack(db);
