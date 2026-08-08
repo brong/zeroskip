@@ -155,6 +155,12 @@ void zs_cursor_fini(struct zs_cursor **curp);
 /* utility */
 int  zs_db_repack(struct zs_db *db);
 bool zs_db_should_repack(struct zs_db *db);
+
+/* Convert the active generation, so every file in the database has a pointer
+ * section and no reader has to replay a span chain (D-25).  Bounded by
+ * rollover_size, so cheap enough to call routinely.  A no-op, not an error,
+ * when there is nothing to seal. */
+int  zs_db_seal(struct zs_db *db);
 int  zs_db_check_consistency(struct zs_db *db);
 int  zs_db_dump(struct zs_db *db, int detail);
 

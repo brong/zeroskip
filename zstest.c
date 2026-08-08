@@ -11745,6 +11745,178 @@ static void test_idxcache_valid_upto_is_span_boundary(void)
 
 /*
  * ============================================================
+ * Seal and compact (D-25 .. D-29)
+ * ============================================================
+ */
+
+/* D-25, D-25a: the active generation becomes an in-order file over the same
+ * range, and no new generation appears. */
+static void test_seal_converts_the_active_file(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    uint32_t gen;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 20; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "value", 5, 0));
+    }
+
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    ASSERT_OK(zs_db_seal(db));
+
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT_EQU(db->snap->files[0]->hdr.start, gen);
+    ASSERT_EQU(db->snap->files[0]->hdr.end, gen);
+
+    for (int i = 0; i < 20; i++) {
+        char k[32];
+        const char *v = NULL;
+        size_t vl = 0;
+        snprintf(k, sizeof(k), "key%02d", i);
+        ASSERT_OK(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 5u);
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+
+    /* The next write starts a fresh generation rather than reusing one. */
+    ASSERT_OK(zs_db_store(db, "after", 5, "x", 1, 0));
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(zsi_snapshot_active(db->snap)->hdr.start, gen + 1);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-25a: repeated sealing must not consume generations.  This is the assertion
+ * that separates converting in place from rolling over and then converting --
+ * both reach one in-order file, only one of them burns a generation each time,
+ * and generations are finite (D-9c). */
+static void test_seal_creates_no_new_generation(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    uint32_t gen;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+
+    for (int i = 0; i < 5; i++) ASSERT_OK(zs_db_seal(db));
+
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_EQU(db->snap->files[0]->hdr.start, gen);
+    ASSERT_EQU(db->snap->files[0]->hdr.end, gen);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-25b, A-10: the no-op cases, each ZS_OK and each leaving the set alone. */
+static void test_seal_noop_cases(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* A brand-new database: an active file with a header and no spans.  Sealing
+     * it would write an empty in-order file and consume a generation. */
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+
+    /* Already sealed: no active file at all. */
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+
+    /* And sealing inside an open write transaction is a usage error, not a
+     * conversion of the file that transaction is about to append to. */
+    {
+        struct zs_txn *txn = NULL;
+        ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+        ASSERT_EQ(zs_db_seal(db), ZS_BADUSAGE);
+        ASSERT_OK(zs_txn_abort(&txn));
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-10, R-3: a read-only handle must not seal. */
+static void test_seal_readonly(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    setup.flags = ZS_SHARED;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(zs_db_seal(db), ZS_READONLY);
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));   /* untouched */
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-25c: an unclean active file seals to its complete point, and the garbage
+ * does not survive into the output. */
+static void test_seal_unclean_active_file(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char name[ZSI_NAME_MAX];
+    size_t clean_size;
+    uint32_t gen;
+    int fd;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    clean_size = zsi_snapshot_active(db->snap)->size;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    fd = open(dbpath(name), O_WRONLY | O_APPEND);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(write(fd, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8), 8);
+    close(fd);
+
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(zsi_snapshot_active(db->snap)->complete, clean_size);
+    ASSERT(zsi_snapshot_active(db->snap)->size > clean_size);
+
+    ASSERT_OK(zs_db_seal(db));
+
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    {
+        const char *v = NULL;
+        size_t vl = 0;
+        ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 1u);
+        ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 1u);
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -11972,6 +12144,14 @@ static struct test_entry tests[] = {
     { "test_idxcache_uses_file_engine", test_idxcache_uses_file_engine },
     { "test_idxcache_valid_upto_is_span_boundary",
                                         test_idxcache_valid_upto_is_span_boundary },
+
+    { "test_seal_converts_the_active_file",
+                                        test_seal_converts_the_active_file },
+    { "test_seal_creates_no_new_generation",
+                                        test_seal_creates_no_new_generation },
+    { "test_seal_noop_cases",           test_seal_noop_cases },
+    { "test_seal_readonly",             test_seal_readonly },
+    { "test_seal_unclean_active_file",  test_seal_unclean_active_file },
 
     { NULL, NULL }
 };

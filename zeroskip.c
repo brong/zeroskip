@@ -5123,6 +5123,68 @@ static int zsi_convert_pending(struct zs_db *db)
     }
 }
 
+/* D-25: convert the ACTIVE file, on demand, under the write lock.
+ *
+ * D-12 skips the active file because another writer may be appending to it.  A
+ * caller holding the write lock has excluded exactly that, so the exception does
+ * not apply -- which is both why this is safe and why it must never be reachable
+ * without the lock.
+ *
+ * NO replacement active file is created (D-25a).  A conversion output covers its
+ * input's range (D-5a), so afterwards the newest file is in-order,
+ * zsi_snapshot_active returns NULL -- a state every reader already handles -- and
+ * the next write creates a new generation (D-9b).  Rolling over first and
+ * converting second reaches the same layout while consuming a generation per
+ * seal, and generations are finite (D-9c); test_seal_creates_no_new_generation
+ * is what holds that apart. */
+static int zsi_seal(struct zs_db *db)
+{
+    struct zsi_file *act;
+    int r = zsi_check_writable(db);
+    if (r != ZS_OK) return r;
+
+    /* One writer at a time: sealing under an open write transaction would
+     * convert a file that transaction is about to append to. */
+    if (db->write_txn) return ZS_BADUSAGE;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) return r;
+
+    /* Refresh under the lock: another writer may have rolled over while we
+     * waited, and sealing a stale view would convert a file already superseded. */
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) goto out;
+
+    act = zsi_snapshot_active(db->snap);
+
+    /* D-25b's three no-ops, none of them errors. */
+    if (!act) goto out;                             /* already sealed */
+
+    if (!act->hdr_valid) {                          /* D-10 */
+        db->error("active file has an invalid header; nothing to seal",
+                  "file=<%s>", act->fname);
+        goto out;
+    }
+
+    if (act->complete <= ZSI_HEADER_LEN) goto out;  /* no valid spans */
+
+    r = zsi_convert_one(db, act);
+    if (r != ZS_OK) goto out;
+
+    r = zsi_db_refresh(db);
+
+    /* A seal is a natural moment to catch up any stranded unordered file, and
+     * costs nothing when there is none (D-12).  Not fatal for the same reason it
+     * is not fatal at commit: the data is already durable and an unconverted
+     * file is a performance matter. */
+    if (r == ZS_OK) (void)zsi_convert_pending(db);
+
+out:
+    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+    return r;
+}
+
 /********** REPACK *************/
 
 /* D-15/D-16: the repacker works ONLY on in-order files.  It never touches the
@@ -5445,6 +5507,12 @@ int zs_db_repack(struct zs_db *db)
 {
     if (!db) return ZS_BADUSAGE;
     return zsi_repack(db);
+}
+
+int zs_db_seal(struct zs_db *db)
+{
+    if (!db) return ZS_BADUSAGE;
+    return zsi_seal(db);
 }
 
 bool zs_db_should_repack(struct zs_db *db)
