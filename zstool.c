@@ -74,6 +74,47 @@ static void puthex(const char *p, size_t n)
     for (size_t i = 0; i < n; i++) printf("%02x", (unsigned char)p[i]);
 }
 
+static const char *salvage_kind_name(int kind)
+{
+    switch (kind) {
+    case ZS_SALVAGE_FILE_UNREADABLE: return "file-unreadable";
+    case ZS_SALVAGE_HEADER_INVALID:  return "header-invalid";
+    case ZS_SALVAGE_ENGINE_GUESSED:  return "engine-guessed";
+    case ZS_SALVAGE_GAP:             return "gap";
+    case ZS_SALVAGE_PTRS_IGNORED:    return "ptrs-ignored";
+    case ZS_SALVAGE_SPAN_LOST:       return "span-lost";
+    case ZS_SALVAGE_SPAN_ROLLBACK:   return "span-rollback";
+    case ZS_SALVAGE_RESYNC:          return "resync";
+    case ZS_SALVAGE_KEY_UNVERIFIED:  return "key-unverified";
+    case ZS_SALVAGE_KEY_MAYBE_STALE: return "key-maybe-stale";
+    }
+    return "unknown";
+}
+
+struct salvage_tally { unsigned long stale, unverified, lost; };
+
+/* One line per event, in the driver contract's shape (T-0a).  Fields that do
+ * not apply to a kind are OMITTED rather than printed as zero, so a diff
+ * between two implementations shows a real difference rather than padding. */
+static int salvage_report(void *rock, const struct zs_salvage_event *ev)
+{
+    struct salvage_tally *t = rock;
+
+    printf("SALVAGE kind=%s", salvage_kind_name(ev->kind));
+    if (ev->file) printf(" file=%s", ev->file);
+    if (ev->generation) printf(" generation=%08X", ev->generation);
+    if (ev->length) printf(" length=%zu", ev->length);
+    if (ev->offset) printf(" offset=%zu", ev->offset);
+    if (ev->key) { printf(" key="); puthex(ev->key, ev->keylen); }
+    printf("\n");
+
+    if (ev->kind == ZS_SALVAGE_KEY_MAYBE_STALE) t->stale++;
+    if (ev->kind == ZS_SALVAGE_KEY_UNVERIFIED) t->unverified++;
+    if (ev->kind == ZS_SALVAGE_SPAN_LOST) t->lost++;
+
+    return 0;
+}
+
 static int scan_cb(void *rock, const char *key, size_t keylen,
                    const char *val, size_t vallen)
 {
@@ -103,6 +144,9 @@ static int usage(void)
         "  repack                 force one repack\n"
         "  seal                   convert the active generation (D-25)\n"
         "  compact                merge the whole database into one file (D-26)\n"
+        "  salvage TO [--unverified]\n"
+        "                         rebuild what is readable into a NEW database\n"
+        "                         at TO; never writes the source (section 9)\n"
         "  hold-write --for MS    take the write lock and hold it\n"
         "  index-dump             print the pointer table state (spec section 8)\n"
         "\n"
@@ -131,6 +175,30 @@ int main(int argc, char **argv)
     if (argc < 3) return usage();
     dir = argv[1];
     cmd = argv[2];
+
+    /* Salvage does not open the source as a database -- it cannot, since the
+     * databases worth salvaging are the ones that will not open (S-2).  So it
+     * runs before the open below rather than in the dispatch chain. */
+    if (!strcmp(cmd, "salvage")) {
+        struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+        struct salvage_tally tally = { 0, 0, 0 };
+
+        if (argc < 4) return usage();
+        for (int i = 4; i < argc; i++)
+            if (!strcmp(argv[i], "--unverified"))
+                ss.flags |= ZS_SALVAGE_UNVERIFIED;
+
+        ss.report = salvage_report;
+        ss.rock = &tally;
+        ss.error = tool_error;
+
+        r = zs_db_salvage(dir, argv[3], &ss);
+        if (r != ZS_OK) oops("salvage", r);
+
+        printf("SALVAGED stale=%lu unverified=%lu lost=%lu\n",
+               tally.stale, tally.unverified, tally.lost);
+        return 0;
+    }
 
     /* Options, wherever they appear after the command. */
     for (int i = 3; i < argc; i++) {
