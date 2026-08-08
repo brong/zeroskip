@@ -1,7 +1,7 @@
 # Seal, compact and salvage — design
 
 Date: 2026-08-07
-Status: A and B approved; C's shape approved, its detail needs its own brainstorm
+Status: all three approved. A and B ready to plan; C needs its own plan.
 
 ## Why these three together
 
@@ -13,7 +13,7 @@ sub-projects**, sequenced, not one feature:
 |---|---|---|
 | **A** | `zs_db_seal()` — convert the active generation | — |
 | **B** | `zs_db_compact()` — everything into one file | A |
-| **C** | Salvage — rebuild what is readable from a damaged directory | — |
+| **C** | `zs_db_salvage()` — rebuild what is readable from a damaged directory | — |
 
 A is small and bounded. B is unbounded and adds one merge entry point. C is the
 largest and is different in kind: it must read structures the normal path
@@ -167,7 +167,7 @@ per new requirement, and a `bench_compact` row.
 
 ---
 
-# C. Salvage — shape only
+# C. Salvage
 
 **Out-of-place rebuild.** Read the damaged directory *without opening it
 normally*, scan every file for whatever validates, and write a fresh database
@@ -193,18 +193,134 @@ itself.
    generation is recoverable from the filename; only the checksum engine is
    genuinely unknown, and there are three of them to try.
 
-### Open questions for its own brainstorm
+### The comparator is not a problem
 
-- **Key order when the comparator name is unreadable.** The output database needs
-  a comparator; a damaged header may not say which. Default and warn, or refuse?
-- **Recency across recovered records.** D-14 resolves visibility by file
-  generation and within-file offset. With gaps and skipped spans, some of that
-  ordering evidence is missing. What does salvage do when it cannot tell which of
-  two records for one key is newer?
-- **What to do with records inside spans that never committed.** They are on
-  disk and readable. Recovering them would resurrect writes that a conforming
-  reader has always treated as absent.
-- **Reporting.** An operator needs to know what was lost, not only what was
-  saved.
+This looked like an open question and dissolves. Salvage writes a **new**
+database through the ordinary write path, so the output is ordered by whatever
+comparator the caller supplies, and recency (D-14) is resolved by generation and
+offset rather than by key order. The source's comparator therefore never affects
+the correctness of the output. Salvage takes `compar` / `compar_name` exactly as
+`zs_db_open` does, compares against any header that is readable, and warns on a
+mismatch. Where no header is readable there is nothing to check and nothing that
+needs checking.
 
-These are not implementation details; each changes what the tool produces.
+### Resynchronisation, and why the default is fully verified
+
+A span terminator carries `spanlen` (F-19, `zeroskip.c:1166`). That is what makes
+recovery after mid-file damage sound rather than a guess:
+
+> From the failed position, step forward in 8-byte increments (F-2). At each
+> offset attempt `zsi_term_decode`. On success, compute
+> `span_start = pos - spanlen`; if that lands at or after the last known good
+> boundary, checksum `[span_start, pos)` together with the terminator's own bytes
+> and compare against the terminator's stored checksum. A match is a **genuine,
+> verified span**, and the walk resumes normally from there.
+
+So the default recovers everything after the damage with full checksum
+verification, which is stronger than merely "taking what decodes". What cannot be
+recovered by verification is the damaged span's **own** records, because its
+terminator is precisely what would prove them.
+
+That reshapes the uncommitted-records question. Position is no longer the
+discriminator; verifiability is:
+
+- **Verified spans** — recovered by default, wherever they sit. This is the big
+  win: today one bad span discards every later span in that generation (F-24).
+- **Rolled-back spans** — never recovered, whatever the flags. F-21 and F-25 make
+  them deliberately aborted, and no conforming reader has ever shown them.
+- **Unverifiable spans** — a damaged span's own records, and a trailing tail with
+  no valid terminator. Recovered only under `ZS_SALVAGE_UNVERIFIED`, and every
+  record so recovered is reported. Note these records carry no checksum of their
+  own: F-19's terminator checksum is the only thing that ever covered them.
+
+### API
+
+```c
+enum zs_salvage_kind {
+    ZS_SALVAGE_FILE_UNREADABLE,   /* could not be opened or mapped */
+    ZS_SALVAGE_HEADER_INVALID,    /* generation taken from the filename */
+    ZS_SALVAGE_ENGINE_GUESSED,    /* which engine the spans validated under */
+    ZS_SALVAGE_GAP,               /* a generation range absent from the set */
+    ZS_SALVAGE_PTRS_IGNORED,      /* pointer section unusable; order rescanned */
+    ZS_SALVAGE_SPAN_LOST,         /* a span that could not be verified */
+    ZS_SALVAGE_SPAN_ROLLBACK,     /* deliberately aborted; not recovered */
+    ZS_SALVAGE_RESYNC,            /* a verified span found after damage */
+    ZS_SALVAGE_KEY_UNVERIFIED,    /* value came from an unverifiable span */
+    ZS_SALVAGE_KEY_MAYBE_STALE    /* a newer version may have been in lost bytes */
+};
+
+struct zs_salvage_event {
+    int          kind;
+    const char  *file;        /* data file name, or NULL */
+    uint32_t     generation;
+    size_t       offset;      /* byte offset within that file */
+    size_t       length;      /* bytes affected */
+    const char  *key;         /* per-key events only */
+    size_t       keylen;
+};
+
+typedef int zs_salvage_cb(void *rock, const struct zs_salvage_event *ev);
+
+struct zs_salvage_data {
+    uint32_t        flags;         /* ZS_SALVAGE_UNVERIFIED */
+    zs_compar      *compar;
+    const char     *compar_name;
+    zs_csum        *csum;
+    zs_salvage_cb  *report;
+    void           *rock;
+    void          (*error)(const char *msg, const char *fmt, ...);
+};
+
+int zs_db_salvage(const char *from, const char *to,
+                  struct zs_salvage_data *setup);
+```
+
+The library writes no report of its own and chooses no destination for one:
+policy stays with the caller. `zstool salvage` renders the events as lines in the
+T-0a format, so an operator can grep them and the interop runner can compare
+them as text.
+
+### Algorithm
+
+1. `readdir` the source. Parse names (D-1) for uuid and generation range.
+   **Neither D-5 resolution nor D-6's tiling check is applied** — a gap is
+   reported and stepped over, which is the whole point.
+2. Order files oldest-first: by `start` ascending, and for equal `start` the
+   narrower range first, since a wider one is a repack output derived from it.
+   Records are then applied oldest to newest, so the newest surviving write for
+   each key naturally wins and no separate recency pass is needed.
+3. Per file: map it; if the header validates take its engine, otherwise report
+   `HEADER_INVALID`, take the generation from the filename, and determine the
+   engine by trying 1, then 2 if a function was supplied, then 0 — reporting
+   `ENGINE_GUESSED`. Engine 0 only "validates" where the stored checksum really
+   is zero, so it is a genuine signal rather than a catch-all.
+4. In-order files: **ignore the pointer section entirely** and walk the records
+   region directly, reporting `PTRS_IGNORED` when the section was unusable. An
+   in-order file has no spans (F-23), so this is a flat record walk.
+5. Unordered files: walk spans, resynchronising as above.
+6. Write into the destination in batched transactions through the public write
+   path. Deletions are applied as deletions, so a recovered tombstone still
+   removes a key and a key whose newest surviving version is a deletion ends
+   absent — which is correct rather than a loss.
+
+### Stale-value detection
+
+Track the earliest damage point per file as `(generation, offset)`. After the
+scan, a key is reported `KEY_MAYBE_STALE` if the record that won for it is older
+than any damage point — because only then could something we lost have superseded
+it. A key whose winning record is newer than all damage is definitely current and
+is not reported, which keeps the report small enough to act on.
+
+### Output database
+
+A fresh UUID: it is a new database, and the source may still exist beside it.
+The mapping is reported. Salvage does not enable the pointer table cache on
+either side.
+
+### What it deliberately does not do
+
+- No in-place repair, ever (R-4). The source is opened read-only and never
+  written, which is what lets salvage guess and improvise at all.
+- No attempt to reconstruct a missing generation's contents. A gap is reported
+  and the surrounding data recovered.
+- No recovery of rolled-back spans under any flag.
