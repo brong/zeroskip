@@ -1000,6 +1000,41 @@ mutant "salvage: opens the source writable" catch \
   's/    outsetup\.flags = ZS_CREATE;/    outsetup.flags = ZS_CREATE;\n    { struct zs_open_data w_ = ZS_OPEN_DATA_INITIALIZER; struct zs_db *wd_ = NULL;\n      if (zs_db_open(from, \&w_, \&wd_) == ZS_OK) zs_db_close(\&wd_); }/'
 
 echo
+echo "cursor liveness (D-14j)"
+
+# D-14j-a, the bug the Cyrus integration surfaced.  Holding an INDEX into the
+# transaction's sorted pending array means a write during the traversal shifts
+# the element under it and the cursor re-yields a key it already returned --
+# silently, so the caller processes a record twice.
+mutant "cursor: txn arm resumes from the index" catch \
+  's/    if \(zsi_pend_search\(fc->txn, fc->tkey, fc->tkeylen, &pos\) == ZS_OK\n        && fc->tstarted\)\n        pos\+\+;/    (void)zsi_pend_search(fc->txn, fc->tkey, fc->tkeylen, \&pos);/'
+
+# D-14j-b the other way: always advancing past the key means a seek that lands
+# ON a key skips it, so a scan from a start key loses its first record.
+mutant "cursor: txn arm always skips the seek hit" catch \
+  's/        && fc->tstarted\)\n        pos\+\+;/        )\n        pos++;/'
+
+# A-1a.  The merge caches each arm's current record, so without noticing the
+# pending array changed, a write made during the traversal is never seen.
+mutant "cursor: ignores writes on its own txn" catch \
+  's/    if \(c->txn && zsi_txn_seq\(c->txn\) != c->txn_seq\) \{/    if (0) {/'
+
+# D-14j.  The same for a non-transactional foreach whose callback commits --
+# which is exactly what cyrusdb promises and what the integration hit.
+mutant "cursor: ignores its own handle's commits" catch \
+  's/        if \(c->snap != c->db->snap\) \{/        if (0) {/'
+
+# G-4, from the other side: a cursor inside an EXPLICIT transaction must keep a
+# fixed file set.  Making every cursor live breaks the transactional read.
+mutant "cursor: explicit txn goes live too" catch \
+  's/    if \(c->handle_live\) \{/    if (1) {/'
+
+# D-14j-b.  A refresh re-seeks by key, and a seek lands ON that key when it is
+# still present -- which has already been yielded.  Not skipping it re-emits it.
+mutant "cursor: re-yields the key it resumed from" catch \
+  's/        if \(c->last_key && !c->cur\[i\]\.exhausted/        if (0 \&\& c->last_key \&\& !c->cur[i].exhausted/'
+
+echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"
 
