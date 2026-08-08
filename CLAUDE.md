@@ -115,6 +115,11 @@ Each of these has cost someone an afternoon. They are load-bearing.
 - **`zsi_repack_run` is the single merge entry point.** Both `zsi_repack` and `zsi_compact` go through it so D-17 to D-23 are implemented once. A second call site for `zsi_repack_merge` is how two sets of retention rules would drift apart, and D-19's tombstone rule is the one nobody would notice diverging.
 - **The fileset scan copies `d_name` with an explicit length, not `snprintf`.** `zsi_name_parse` has already bounded the name at 63 characters, but the compiler cannot see that and `d_name` is a declared `char[NAME_MAX]`, so `-Wformat-truncation` fires — and Cyrus builds `-Werror`. The explicit copy states the bound where it is relied on instead of suppressing the warning.
 
+- **Salvage does not share the read path, and must not.** It exists to read what §5 and §7 refuse — a set that does not tile, a header that fails, a pointer section that will not load, spans after a bad one. Routing it through `zsi_snapshot_take` would make it refuse exactly the databases it is for.
+- **Resync checksums its candidate before believing it** (S-7). A terminator carries `spanlen`, so a candidate implies a span start, and that span can be verified. Skipping the check would make salvage a guess rather than a recovery, and everything it produced unverified while claiming otherwise.
+- **Salvage never recovers a rolled-back span** (S-9), under any flag. Those records were deliberately aborted and no conforming reader has ever shown them.
+- **A salvaged value may be an older one.** If a key's newest version was in lost bytes, salvage emits the newest that survives and reports the key as possibly stale (S-10). The report is the mitigation, so it must not be dropped as noise — and it needs no second pass, because files are scanned oldest first and positions ascend, so the first loss is discovered before any record beyond it is applied.
+
 ## Testing
 
 Tests use a custom harness with `ASSERT()`, `ASSERT_EQ()`, `ASSERT_EQU()`, `ASSERT_OK()`, `ASSERT_SIGN()`, `ASSERT_STR_EQ()`, `ASSERT_MEM_EQ()`, and `CB_`-prefixed variants for callbacks. Each test gets a fresh temp directory via `setup()`/`teardown()`; `basedir` exists, `dbdir` deliberately does not, so tests exercise `ZS_CREATE`.

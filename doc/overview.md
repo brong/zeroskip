@@ -119,6 +119,44 @@ to under 0.1 ms, and a workload committing one record at a time gets about ten
 times faster — the second effect being the larger one, and not the one it was
 built for. Below a few hundred records it is marginally slower than not having it.
 
+## Salvaging a damaged database
+
+The rules that make a database safe also make it strict. A missing file, a
+corrupt header, an unreadable index at the end of a file — any of these can stop
+it opening at all, even when almost everything in it is perfectly readable. That
+strictness is deliberate: a database that half-opens and quietly returns some of
+your data is worse than one that refuses.
+
+Salvage is the way out. It reads the directory *without* those rules, takes
+whatever it can prove is intact, and writes a **new** database somewhere else.
+The original is never touched — not written to, not repaired, not even locked —
+so there is nothing salvage can do to make matters worse.
+
+What it can prove is the interesting part. Each batch of records ends with a
+marker recording how long the batch was and a checksum over it. So on meeting
+damage, salvage can walk forward looking for the next marker, work out from it
+exactly where that batch must have begun, and check the batch against its own
+checksum. A match is proof, not a guess. That matters because today a single
+damaged batch hides *every* batch after it in the same file; those are exactly
+what this recovers, and everything it recovers this way is verified.
+
+Three things it will not do:
+
+- **It will not recover a batch that was rolled back.** Those records were
+  deliberately abandoned and have never been visible; producing them would
+  invent history.
+- **It will not recover records nothing can vouch for** — the damaged batch's own
+  records, and anything at the very end of a file with no marker after it —
+  unless you ask, and then it says which they were.
+- **It will not invent anything** to fill a gap.
+
+The one thing to understand before trusting the result: if a key's *newest*
+version was in the damaged part, salvage recovers the newest one that survives —
+an older value, not a missing one. It tells you exactly which keys that could
+apply to. That list is the point, not a footnote: it is the difference between
+"here is your data" and "here is your data, and these entries may have moved
+backwards in time".
+
 ## What it costs
 
 - **Space before merges.** Superseded and deleted records occupy space until a
@@ -131,6 +169,10 @@ built for. Below a few hundred records it is marginally slower than not having i
   continues throughout, but the I/O is real.
 - **Readers hold space open.** A file being read is not freed until the reader
   finishes, so a long-running reader keeps retired files on disk.
+- **A salvaged database may contain older values.** Salvage recovers what
+  survives, which for a key whose newest version was lost means an earlier one.
+  The list of affected keys comes with it, and acting on that list is part of
+  the job.
 - **The pointer table cache needs looking after.** It is optional and everything
   works without it, but if used, its directory has to be scoped to the database —
   a stale table surviving a restore is the one way it can mislead.
