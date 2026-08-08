@@ -1034,6 +1034,22 @@ mutant "cursor: explicit txn goes live too" catch \
 mutant "cursor: re-yields the key it resumed from" catch \
   's/        if \(c->last_key && !c->cur\[i\]\.exhausted/        if (0 \&\& c->last_key \&\& !c->cur[i].exhausted/'
 
+# D-14j-b, reported downstream.  A refresh before the first record has been
+# emitted has no last-yielded key to resume from, so it must fall back to the
+# key the cursor was OPENED at.  Falling back to "the first key" yields records
+# before the start key -- and under ZS_CURSOR_PREFIX lands outside the prefix,
+# ending the scan immediately and returning nothing at all.
+mutant "cursor: refresh forgets the start key" catch \
+  's/    const char \*from = c->last_key \? c->last_key : c->start_key;\n    size_t fromlen = c->last_key \? c->last_keylen : c->start_keylen;/    const char *from = c->last_key;\n    size_t fromlen = c->last_keylen;/'
+
+# Initialising the counter at open is a PERFORMANCE fix, not a correctness one:
+# with the fallback above in place a spurious refresh resumes correctly, it just
+# re-seeks every arm for nothing on the first step of every cursor opened in a
+# transaction that already holds a write.  Recorded so nobody writes a bogus
+# test chasing it.
+mutant "cursor: txn_seq not taken at open" subsumed \
+  's/    c->txn_seq = zsi_txn_seq\(txn\);/    \/* not taken *\//'
+
 echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"

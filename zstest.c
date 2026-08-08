@@ -13079,6 +13079,126 @@ static void test_txn_cursor_view_is_fixed(void)
     ASSERT_OK(zs_db_close(&live_db));
 }
 
+/* D-14j: a refresh must not lose the cursor's START position.
+ *
+ * Reported downstream as a bug involving deletions mixed into a traversal, and
+ * the deletion is incidental: ANY pending write in the transaction is enough.
+ * Two faults compounded -- the cursor did not record the transaction's change
+ * counter at open, so its very first step saw a false change; and a refresh
+ * before anything had been emitted re-seeked to the FIRST key, because there was
+ * no last-yielded key to resume from.
+ *
+ * The prefix case is the dangerous one: restarting at the first key lands
+ * outside the prefix, so the scan ends immediately and returns NOTHING.  A
+ * silently empty result, from a scan that should have matched. */
+static int live_note_cb(void *rock, const char *k, size_t kl,
+                        const char *v, size_t vl)
+{
+    (void)rock; (void)v; (void)vl;
+    live_note(k, kl);
+    return 0;
+}
+
+static void test_cursor_start_key_survives_refresh(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_txn *txn = NULL;
+
+    live_seed(&setup);
+    ASSERT_OK(zs_db_store(live_db, "c", 1, "3", 1, 0));
+    ASSERT_OK(zs_db_store(live_db, "e", 1, "5", 1, 0));
+    /* a b c d e */
+
+    /* Baseline: a start-key scan in a clean transaction. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &txn));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(txn, "d", 1, NULL, live_note_cb, NULL, 0));
+    ASSERT_STR_EQ(live_log, "|d|e");
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* The same scan with a write already pending on the transaction. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &txn));
+    ASSERT_OK(zs_txn_delete(txn, "a", 1, 0));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(txn, "d", 1, NULL, live_note_cb, NULL, 0));
+    ASSERT_STR_EQ(live_log, "|d|e");        /* NOT |b|c|d|e */
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* And a prefix scan, where losing the start key empties the result. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &txn));
+    ASSERT_OK(zs_txn_delete(txn, "a", 1, 0));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(txn, "e", 1, NULL, live_note_cb, NULL,
+                             ZS_CURSOR_PREFIX));
+    ASSERT_STR_EQ(live_log, "|e");          /* NOT empty */
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* And the case that isolates the fallback rather than the counter: a
+     * GENUINE change before the first record has been emitted.  There is no
+     * last-yielded key to resume from, so the re-seek must fall back to the
+     * key the cursor was opened at -- not to the first key in the database. */
+    {
+        struct zs_cursor *c = NULL;
+        const char *k, *v;
+        size_t kl, vl;
+
+        ASSERT_OK(zs_db_begin_cursor(live_db, "d", 1, &c, 0));
+        ASSERT_OK(zs_txn_store(c->txn, "z", 1, "9", 1, 0));   /* real change */
+        ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+        ASSERT_EQU(kl, 1u);
+        ASSERT_MEM_EQ(k, "d", 1);                             /* NOT "a" */
+        ASSERT_OK(zs_cursor_abort(&c));
+    }
+
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/* D-14j with deletions, which is how this was reported.  Deleting the key the
+ * cursor is ON, and the key it is about to reach, must both behave: the current
+ * one has already been yielded, and the next one must not be. */
+static void test_cursor_delete_during_traversal(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    char seen[128] = "";
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &live_db));
+    for (const char *p = "abcdef"; *p; p++)
+        ASSERT_OK(zs_db_store(live_db, p, 1, "v", 1, 0));
+
+    ASSERT_OK(zs_db_begin_cursor(live_db, NULL, 0, &c, 0));
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        strncat(seen, "|", sizeof(seen) - strlen(seen) - 1);
+        strncat(seen, k, kl);
+
+        /* Delete the key we are on... */
+        if (kl == 1 && k[0] == 'b') ASSERT_OK(zs_cursor_delete(c, 0));
+        /* ...and, elsewhere, the key we are about to reach. */
+        if (kl == 1 && k[0] == 'd') ASSERT_OK(zs_txn_delete(c->txn, "e", 1, 0));
+    }
+    ASSERT_OK(zs_cursor_commit(&c));
+
+    /* "e" was deleted before the walk reached it, so it is not yielded; "b" was
+     * deleted after being yielded, so it is. */
+    ASSERT_STR_EQ(seen, "|a|b|c|d|f");
+
+    /* And both deletions actually took effect. */
+    {
+        const char *val;
+        size_t vlen;
+        ASSERT_EQ(zs_db_fetch(live_db, "b", 1, NULL, NULL, &val, &vlen, 0),
+                  ZS_NOTFOUND);
+        ASSERT_EQ(zs_db_fetch(live_db, "e", 1, NULL, NULL, &val, &vlen, 0),
+                  ZS_NOTFOUND);
+        ASSERT_OK(zs_db_fetch(live_db, "f", 1, NULL, NULL, &val, &vlen, 0));
+    }
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -13354,6 +13474,10 @@ static struct test_entry tests[] = {
     { "test_txn_cursor_no_duplicate_on_write",
                                         test_txn_cursor_no_duplicate_on_write },
     { "test_txn_cursor_view_is_fixed",  test_txn_cursor_view_is_fixed },
+    { "test_cursor_start_key_survives_refresh",
+                                        test_cursor_start_key_survives_refresh },
+    { "test_cursor_delete_during_traversal",
+                                        test_cursor_delete_during_traversal },
 
     { NULL, NULL }
 };

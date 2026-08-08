@@ -4103,6 +4103,16 @@ struct zs_cursor {
     char             *last_key;
     size_t            last_keylen;
 
+    /* The key this cursor was opened at, kept for the whole of its life.
+     *
+     * A refresh re-seeks every arm, and before the first record has been
+     * emitted there is no last_key to resume from -- so without this it would
+     * restart from the beginning and yield records BEFORE the start key.  Under
+     * ZS_CURSOR_PREFIX that restart lands outside the prefix and ends the scan
+     * immediately, turning a refresh into a silently empty result. */
+    char             *start_key;
+    size_t            start_keylen;
+
     /* Whether this cursor may observe the HANDLE's later commits.
      *
      * True for the non-transactional forms, whose enclosing transaction is one
@@ -4169,6 +4179,7 @@ static void zsi_cursor_free(struct zs_cursor *c)
     if (!c) return;
     for (size_t i = 0; i < c->ncur; i++) zsi_fcur_fini(&c->cur[i]);
     zsi_snapshot_release(&c->snap);
+    free(c->start_key);
     free(c->last_key);
     free(c->cur);
     free(c->prefix);
@@ -4204,6 +4215,19 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
     c->snap = snap;
     c->snap->refcount++;
     c->flags = flags;
+
+    /* Take the transaction's change counter NOW.  Starting from zero makes the
+     * first step see a false change whenever the transaction already holds a
+     * pending write -- and a spurious refresh before anything is emitted is
+     * exactly the case that loses the start key. */
+    c->txn_seq = zsi_txn_seq(txn);
+
+    if (key && keylen) {
+        c->start_key = malloc(keylen);
+        if (!c->start_key) { zsi_cursor_free(c); return ZS_INTERNAL; }
+        memcpy(c->start_key, key, keylen);
+        c->start_keylen = keylen;
+    }
 
     size_t n = snap->nfiles + (txn ? 1 : 0);
     if (n) {
@@ -4316,17 +4340,24 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
  * skipping a key that was already there. */
 static int zsi_cursor_reseek(struct zs_cursor *c)
 {
+    /* Resume from the last key yielded; before anything has been, from the key
+     * the cursor was OPENED at.  Falling back to "the first key" instead would
+     * yield records before the start key, and would empty a prefix scan
+     * outright. */
+    const char *from = c->last_key ? c->last_key : c->start_key;
+    size_t fromlen = c->last_key ? c->last_keylen : c->start_keylen;
+
     for (size_t i = 0; i < c->ncur; i++) {
         int r;
 
-        if (c->last_key)
-            r = zsi_fcur_seek(&c->cur[i], c->last_key, c->last_keylen);
+        if (from)
+            r = zsi_fcur_seek(&c->cur[i], from, fromlen);
         else
             r = zsi_fcur_seek_first(&c->cur[i]);
         if (r != ZS_OK) return r;
 
-        /* A seek lands ON the key when it is still present; that one has been
-         * yielded already. */
+        /* A seek lands ON the key when it is still present.  Skip it only when
+         * it is one we have already yielded -- the START key has not been. */
         if (c->last_key && !c->cur[i].exhausted
             && c->db->compar(c->cur[i].cur.key, c->cur[i].cur.keylen,
                              c->last_key, c->last_keylen) == 0) {
