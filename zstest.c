@@ -10361,10 +10361,18 @@ static void test_idxcache_rejects_db_dir(void)
 
     setup.flags = ZS_CREATE;
 
-    /* Identical strings, caught before the database is created. */
+    /* Identical strings, caught BEFORE the database is created.  The "before" is
+     * the point of having two checks: a call rejected as a usage error must not
+     * leave a directory behind, and the resolved-path compare cannot run until
+     * the directory exists.  Asserting only the return code would leave the
+     * ordering untested. */
     setup.index_dir = dbdir;
     ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
     ASSERT_NULL(db);
+    {
+        struct stat sb;
+        ASSERT_EQ(stat(dbdir, &sb), -1);
+    }
 
     /* Create the database for real, then try to name it a second way.  A plain
      * string compare cannot catch this one. */
@@ -10812,7 +10820,6 @@ static void test_idxcache_rejection_rules(void)
             { "magic",        ZSI_IDX_OFF_MAGIC      },
             { "header csum",  ZSI_IDX_OFF_CSUM       },
             { "uuid",         ZSI_IDX_OFF_UUID       },
-            { "generation",   ZSI_IDX_OFF_START      },
             { "comparator",   ZSI_IDX_OFF_COMPAR     },
             { "engine",       ZSI_IDX_OFF_FLAGS      },
             { "valid_upto",   ZSI_IDX_OFF_VALID_UPTO },
@@ -10865,6 +10872,85 @@ static void test_idxcache_rejection_rules(void)
                                &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
         ASSERT_NULL(base);
         tab[tablen - 1] = (char)((unsigned char)tab[tablen - 1] ^ 0x01);
+    }
+
+    /* A generation that is not this file's.  Set to a different NONZERO value
+     * rather than flipped: flipping the low bit of generation 1 gives 0, which
+     * F-9 rejects during the header decode, so the generation rule itself would
+     * never run and the case would assert nothing. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        uint32_t was = zsi_get32(tab + ZSI_IDX_OFF_START);
+
+        zsi_put32(tab + ZSI_IDX_OFF_START, was + 7);
+        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        zsi_put32(tab + ZSI_IDX_OFF_START, was);
+        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    }
+
+    /* An offset outside [H, valid_upto), with the ARRAY checksum recomputed so
+     * the range rule is the only one that can object.  Without recomputing it,
+     * a corrupted offset is caught by the checksum and the range rule is never
+     * reached -- which is a case that reads as coverage and provides none. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        uint64_t was = zsi_get64(tab + ZSI_IDX_HEADER_LEN);
+        size_t arrlen = tablen - ZSI_IDX_HEADER_LEN - 4;
+
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN,
+                  zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO) + 8);
+        zsi_put32(tab + tablen - 4,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        /* And below the data file's header length. */
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN, 8);
+        zsi_put32(tab + tablen - 4,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN, was);
+        zsi_put32(tab + tablen - 4,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    }
+
+    /* A comparator name the FILE does not carry, with the handle's matching.
+     *
+     * Constructed by poking the file's own header field, because F-11 and the
+     * agreement check at open make the two names equal in every state the
+     * database can reach -- so without this the file-side rule is invisible
+     * behind the handle-side one. */
+    {
+        size_t *base = NULL, nbase = 0, vu = 0, to = 0;
+        uint32_t tc = 0;
+        char saved[ZSI_COMPAR_NAME_LEN];
+
+        memcpy(saved, f->hdr.compar_name, sizeof(saved));
+        memset(f->hdr.compar_name, 0, sizeof(f->hdr.compar_name));
+        memcpy(f->hdr.compar_name, "elsewise", 8);
+
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        memcpy(f->hdr.compar_name, saved, sizeof(saved));
     }
 
     /* Truncated and padded: the size must be exactly 96 + 8n + 4. */
@@ -10969,7 +11055,8 @@ static void test_idxcache_rejects_bad_term_binding(void)
     char *tab;
     size_t tablen;
     size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-    uint32_t tc = 0;
+    size_t first_term_off;
+    uint32_t tc = 0, first_term_csum;
 
     idxcache_mkdir(cachedir, sizeof(cachedir));
     cfg.dir = cachedir;
@@ -10979,7 +11066,18 @@ static void test_idxcache_rejects_bad_term_binding(void)
     setup.index_dir = cachedir;
     setup.index_threshold = 1;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-    for (int i = 0; i < 10; i++) {
+
+    /* One record first, so an EARLIER span's terminator is on record.  It is a
+     * perfectly valid terminator at a lower offset, which is the only way to
+     * reach the "ends exactly at valid_upto" rule: any other term_off either
+     * fails to decode or trips the range check first. */
+    ASSERT_OK(zs_db_store(db, "key00", 5, "value", 5, 0));
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    first_term_off  = f->last_term_off;
+    first_term_csum = f->last_term_csum;
+
+    for (int i = 1; i < 10; i++) {
         char key[32];
         snprintf(key, sizeof(key), "key%02d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
@@ -10991,6 +11089,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
 
     f = zsi_snapshot_active(db->snap);
     ASSERT_NOT_NULL(f);
+    ASSERT(first_term_off < f->last_term_off);
 
     /* The recorded checksum is genuinely the terminator's, and the recorded
      * offset genuinely ends at valid_upto -- so the baseline is meaningful. */
@@ -11018,7 +11117,28 @@ static void test_idxcache_rejects_bad_term_binding(void)
     zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
               zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
 
-    /* A term_off that does not end at valid_upto. */
+    /* A term_off naming an EARLIER span's terminator, with its real checksum.
+     * Everything about it is genuine except that it does not end at valid_upto,
+     * so only that rule can object -- which is exactly the stale table a
+     * publisher recording the wrong boundary would leave behind. */
+    {
+        uint64_t was_off = zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF);
+        uint32_t was_csum = zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM);
+
+        zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF, (uint64_t)first_term_off);
+        zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM, first_term_csum);
+        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                  zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name, false,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF, was_off);
+        zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM, was_csum);
+    }
+
+    /* A term_off that is not a terminator at all. */
     zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
               zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF) - 8);
     zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
@@ -11119,10 +11239,21 @@ static void test_idxcache_open_agrees(void)
 
     ASSERT_OK(zs_db_open(dbdir, &cached, &db));
     {
-        /* The open really did use a table rather than replaying from the top. */
+        /* The open really did use a table rather than replaying from the top.
+         *
+         * An empty DELTA is the sharp part: the table covers the whole file, so
+         * P-12's replay from valid_upto has nothing to find.  A build that
+         * seeded from the table and then replayed from the header anyway would
+         * produce an identical ordering -- the delta wins ties, so every answer
+         * is still right -- and would silently do the work the table exists to
+         * avoid.  Only the delta shows it. */
         struct zsi_file *act = zsi_snapshot_active(db->snap);
         ASSERT_NOT_NULL(act);
         ASSERT(act->cached_upto > ZSI_HEADER_LEN);
+        ASSERT_EQU(act->cached_upto, (unsigned long long)act->complete);
+        ASSERT_NOT_NULL(act->index);
+        ASSERT_EQU(act->index->ndelta, 0u);
+        ASSERT_EQU(act->index->nbase, 50u);
     }
     for (int i = 25; i < 75; i++) {
         snprintf(key, sizeof(key), "key%03d", i);
@@ -11267,6 +11398,37 @@ static void test_idxcache_only_unordered_files(void)
 
     ASSERT(tables <= 1);
 
+    /* And publishing is refused for an in-order file outright.  Called directly,
+     * because the two real call sites only ever reach unordered files -- so
+     * without this the rule is unreachable and untested, which is the same thing
+     * as absent the day someone adds a third caller.
+     *
+     * Threshold ZERO deliberately.  An in-order file has complete == 0, so any
+     * nonzero threshold refuses it for a reason that has nothing to do with its
+     * kind, and the assertion would hold whatever P-1 said. */
+    {
+        struct zsi_idxcfg cfg = { cachedir, 0 };
+        struct zsi_file *inorder = NULL;
+
+        for (size_t i = 0; i < db->snap->nfiles; i++)
+            if (!zsi_file_is_unordered(db->snap->files[i])) {
+                inorder = db->snap->files[i];
+                break;
+            }
+
+        ASSERT_NOT_NULL(inorder);
+        ASSERT_EQ(zsi_idx_publish(inorder, &cfg, db->compar, false), ZS_DONE);
+
+        /* And nothing appeared under its start generation. */
+        {
+            char name[ZSI_NAME_MAX], p[PATH_MAX];
+            struct stat sb;
+            zsi_name_format_index(name, inorder->hdr.uuid, inorder->hdr.start);
+            snprintf(p, sizeof(p), "%s/%s", cachedir, name);
+            ASSERT_EQ(stat(p, &sb), -1);
+        }
+    }
+
     /* And the data is intact. */
     for (int i = 0; i < 60; i++) {
         char key[32];
@@ -11313,10 +11475,13 @@ static void test_idxcache_sweeps_dead_generations(void)
     snprintf(dead, sizeof(dead), "%s/%s", cachedir, name);
     ASSERT_OK(idxcache_spew(dead, junk, sizeof(junk)));
 
-    /* And one for a different database sharing the directory. */
+    /* And one for a different database sharing the directory, at a generation
+     * that is NOT live here.  A live generation would be kept for the wrong
+     * reason -- the liveness test rather than the uuid test -- which leaves the
+     * uuid rule unexercised. */
     memcpy(alien, db->uuid, 16);
     alien[0] = (unsigned char)(alien[0] ^ 0xFF);
-    zsi_name_format_index(name, alien, gen);
+    zsi_name_format_index(name, alien, gen + 100);
     snprintf(other, sizeof(other), "%s/%s", cachedir, name);
     ASSERT_OK(idxcache_spew(other, junk, sizeof(junk)));
 
@@ -11338,11 +11503,13 @@ static void test_idxcache_sweeps_dead_generations(void)
  * exactly the failure T-12a exists to prevent for data files -- so the shipped
  * bytes have to be the ones under test.
  *
- * The corpus must not be mutated by validating it (R-3 is why the other corpus
- * tests open ZS_SHARED).  Two things keep that true here: after loading a table
- * cached_upto equals complete, so P-13's threshold cannot fire; and the threshold
- * is set absurdly high anyway, so a REJECTED table cannot cause a publish
- * either. */
+ * The case is COPIED to scratch before being opened, and the checked-in bytes
+ * are never the ones handed to a live handle.  That is not belt and braces: a
+ * cache directory is a directory this library UNLINKS from (P-16), so pointing
+ * one at the corpus makes the golden bytes destroyable by any bug in the sweep.
+ * Mutation testing demonstrated it -- the two `sweeps` mutants deleted the
+ * shipped table outright, which would have read as a corpus that needed
+ * regenerating rather than as the bug it was. */
 static void test_corpus_index_table(void)
 {
     char cases[32][64];
@@ -11352,7 +11519,8 @@ static void test_corpus_index_table(void)
     if (!ncases) SKIP("no corpus (run make corpus)");
 
     for (size_t i = 0; i < ncases; i++) {
-        char dir[PATH_MAX], txtpath[PATH_MAX], idxdir[PATH_MAX];
+        char src[PATH_MAX], dir[PATH_MAX], txtpath[PATH_MAX], idxdir[PATH_MAX];
+        char cmd[PATH_MAX * 2 + 32];
         struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
         struct zs_db *db = NULL;
         struct zsi_file *f;
@@ -11361,8 +11529,8 @@ static void test_corpus_index_table(void)
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
         uint32_t tc = 0;
 
-        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
-        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
+        snprintf(src, sizeof(src), CORPUS_DIR "/%s", cases[i]);
+        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", src);
 
         txt = slurp(txtpath, NULL);
         if (!txt) continue;
@@ -11371,6 +11539,16 @@ static void test_corpus_index_table(void)
         if (!line) { free(txt); continue; }
         if (sscanf(line + 10, "%63s", sub) != 1) { free(txt); continue; }
         free(txt);
+
+        snprintf(dir, sizeof(dir), "%s/corpuscase", basedir);
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s' && cp -R '%s' '%s'",
+                 dir, src, dir);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "\n    FAIL %s: could not copy the case\n",
+                    cases[i]);
+            current_test_failed = 1;
+            return;
+        }
 
         snprintf(idxdir, sizeof(idxdir), "%s/%s", dir, sub);
         cfg.dir = idxdir;

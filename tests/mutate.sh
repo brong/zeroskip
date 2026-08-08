@@ -766,6 +766,141 @@ mutant "canonical: ancestor==start not flagged" catch \
   's/    if \(anc_stored && r->ancestor == file_start\) return false;/    \/* F-17 check removed *\//'
 
 echo
+echo "pointer table cache (spec section 8)"
+
+# Every acceptance rule of P-11, one at a time.  A table that is accepted when it
+# should not be does not fail loudly: it produces WRONG RECORDS, silently, which
+# is why each rule needs its own mutant rather than one covering the group.
+mutant "idx: drops the file's comparator check" catch \
+  's/    if \(memcmp\(h\.compar_name, f->hdr\.compar_name, ZSI_COMPAR_NAME_LEN\) != 0\)\n        goto out;/    \/* P-11 file comparator check removed *\//'
+
+mutant "idx: drops our own comparator check" catch \
+  's/    if \(memcmp\(h\.compar_name, compar_name, ZSI_COMPAR_NAME_LEN\) != 0\) goto out;/    \/* P-11 handle comparator check removed *\//'
+
+mutant "idx: drops the engine agreement check" catch \
+  's/    if \(zsi_idxhdr_engine_id\(buf\) != f->csum_id\) goto out;/    \/* P-7 engine check removed *\//'
+
+mutant "idx: drops the uuid check" catch \
+  's/    if \(memcmp\(h\.uuid, f->hdr\.uuid, 16\) != 0\) goto out;/    \/* P-11 uuid check removed *\//'
+
+mutant "idx: drops the generation check" catch \
+  's/    if \(h\.start != f->hdr\.start\) goto out;/    \/* P-11 generation check removed *\//'
+
+mutant "idx: accepts a nocsum-built table" catch \
+  's/    if \(!nocsum && !\(h\.flags & ZSI_IDX_FLAG_CSUM_VERIFIED\)\) goto out;/    \/* P-11 verified-flag check removed *\//'
+
+# SUBSUMED, with the combined mutant below.  Every wrong size the suite can
+# construct shifts the trailing 4 bytes, so the offset-array checksum rejects it
+# first.  Isolating the size rule would need a table whose trailing bytes happen
+# to be the correct checksum of a differently-sized array, which means finding a
+# preimage.  The rule stays as the cheap structural check it is.
+mutant "idx: drops the exact-size check" subsumed \
+  's/    if \(want != len\) goto out;/    \/* P-11 exact-size check removed *\//'
+
+mutant "idx: drops the offset-array checksum" catch \
+  's/    if \(zsi_get32\(buf \+ len - 4\)\n        != f->csum\(buf \+ ZSI_IDX_HEADER_LEN, arrlen\)\)\n        goto out;/    \/* P-11 array checksum removed *\//'
+
+mutant "idx: drops the offset range check" catch \
+  's/        if \(v < ZSI_HEADER_LEN \|\| v >= h\.valid_upto\) goto out;/        \/* P-11 offset range check removed *\//'
+
+# SUBSUMED, with the combined mutant below.  P-10's binding pins valid_upto to
+# term_off + term_len, and term_off is itself bounds-checked through
+# zsi_file_at, so an out-of-range valid_upto cannot survive the binding.  The
+# explicit bounds stay because they run BEFORE any file access and say plainly
+# what the field means.
+mutant "idx: drops the valid_upto bounds" subsumed \
+  's/    if \(h\.valid_upto < ZSI_HEADER_LEN \|\| h\.valid_upto > f->size\) goto out;/    \/* P-11 valid_upto bounds removed *\//'
+
+# The combined mutants the subsumed pair require: with the sibling check gone
+# too, the defence is demonstrated even though neither layer is isolated.
+mutant "idx: drops BOTH size and array checksum" catch \
+  's/    if \(want != len\) goto out;/    \/* size *\//;
+   s/    if \(zsi_get32\(buf \+ len - 4\)\n        != f->csum\(buf \+ ZSI_IDX_HEADER_LEN, arrlen\)\)\n        goto out;/    \/* array checksum *\//'
+
+mutant "idx: drops BOTH valid_upto bounds and binding" catch \
+  's/    if \(h\.valid_upto < ZSI_HEADER_LEN \|\| h\.valid_upto > f->size\) goto out;/    \/* bounds *\//;
+   s/        if \(after != \(size_t\)h\.valid_upto\) goto out;/        \/* binding *\//;
+   s/        if \(h\.term_off < ZSI_HEADER_LEN \|\| h\.term_off >= h\.valid_upto\) goto out;/        \/* term_off range *\//'
+
+# P-10.  The binding is what catches a data file whose covered prefix is not the
+# one the table was built over, which is the whole defence against an out-of-band
+# restore under a surviving cache directory (P-17).
+mutant "idx: drops the terminator checksum binding" catch \
+  's/        if \(term\.csum != h\.term_csum\) goto out;/        \/* P-10 terminator checksum binding removed *\//'
+
+mutant "idx: drops the terminator offset binding" catch \
+  's/        if \(after != \(size_t\)h\.valid_upto\) goto out;/        \/* P-10 terminator offset binding removed *\//'
+
+# P-5/P-6.  The symmetric-layout mutant: swapping two fields in the OFFSET TABLE
+# changes both the encoder and the decoder at once, so every round-trip still
+# succeeds and only test_idxcache_header_byte_layout's literal can object.  This
+# is the same bug class that made test_header_byte_layout necessary.
+mutant "idx: header swaps valid_upto and term_off" catch \
+  's/#define ZSI_IDX_OFF_VALID_UPTO    64   \/\*  8 \*\/\n#define ZSI_IDX_OFF_TERM_OFF      72   \/\*  8 \*\//#define ZSI_IDX_OFF_VALID_UPTO    72   \/*  8 *\/\n#define ZSI_IDX_OFF_TERM_OFF      64   \/*  8 *\//'
+
+mutant "idx: magic same as a data file's" catch \
+  's/    0x89, 0x7A, 0x73, 0x69, 0x6E, 0x64, 0x65, 0x78,\n    0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00\n\};/    0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,\n    0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00\n};/'
+
+# P-7.  Using the handle's engine produces tables a conforming peer must reject:
+# the failure is silent, and the cache does nothing while appearing to work.
+mutant "idx: publishes under the handle's engine" catch \
+  's/    h\.flags = \(uint16_t\)\(f->csum_id & ZSI_CSUM_MASK\);/    h.flags = (uint16_t)ZSI_CSUM_XXHASH;/'
+
+# P-4.  Writing the published name directly exposes a half-written table to a
+# concurrent reader, which is G-6's rule and not something checksums excuse.
+mutant "idx: publishes in place, no rename" catch \
+  's/    fd = open\(tmp, O_WRONLY \| O_CREAT \| O_EXCL, 0600\);/    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);/'
+
+# P-13.  Without the threshold a table is rewritten whole on every commit, which
+# makes a bulk load quadratic.  The test asserts the absence of a table below the
+# threshold, so this is observable rather than merely slow.
+mutant "idx: publishes on every commit" catch \
+  's/    if \(f->complete - f->cached_upto < cfg->threshold\) return ZS_DONE;/    \/* P-13 threshold removed *\//'
+
+# P-14.  A synced table is still CORRECT, so only the sync count can object --
+# which is why test_idxcache_no_fsync_on_publish counts rather than times.
+mutant "idx: syncs before publishing" catch \
+  's/    if \(close\(fd\) < 0\) \{ fd = -1; goto out_unlink; \}/    if (ZS_FDATASYNC(fd) < 0 || close(fd) < 0) { fd = -1; goto out_unlink; }/'
+
+# P-16.  A sweep that ignores the uuid deletes another database's tables out of a
+# shared cache directory: not a correctness bug for us, entirely one for them.
+mutant "idx: sweeps other databases' tables" catch \
+  's/        if \(strncmp\(nm, want, 36\) != 0\) continue;/        \/* P-16 uuid check removed *\//'
+
+# P-16 again, the other way: sweeping a generation that is still live throws away
+# a table the very next open would have used.
+mutant "idx: sweeps live generations too" catch \
+  's/        if \(alive\) continue;/        \/* P-16 liveness check removed *\//'
+
+# P-1.  SUBSUMED, with the combined mutant below: an in-order file has no private
+# index -- it uses its pointer section -- so the !f->index line answers first and
+# nothing can reach the kind check with an in-order file.  The check stays because
+# P-1 is a normative rule and belongs stated at the boundary, not left implied by
+# an incidental property of another field, which is the same reasoning that keeps
+# zsi_type_valid a switch rather than a computed predicate.
+mutant "idx: publishes for in-order files too" subsumed \
+  's/    if \(!zsi_file_is_unordered\(f\)\) return ZS_DONE;          \/\* P-1 \*\//    \/* P-1 kind check removed *\//'
+
+mutant "idx: drops BOTH the kind and index checks" catch \
+  's/    if \(!f->hdr_valid \|\| !f->csum \|\| !f->index\) return ZS_DONE;/    if (!f->hdr_valid || !f->csum) return ZS_DONE;/;
+   s/    if \(!zsi_file_is_unordered\(f\)\) return ZS_DONE;          \/\* P-1 \*\//    \/* P-1 *\//'
+
+# P-12.  Seeding the index but replaying from the top of the file duplicates
+# every record the table already covers.
+mutant "idx: seeds but replays from the header" catch \
+  's/    r = zsi_index_build_from\(f, compar, nocsum, base, nbase, vu\);/    r = zsi_index_build_from(f, compar, nocsum, base, nbase, ZSI_HEADER_LEN);/'
+
+# P-10.  A publisher that records the wrong terminator writes tables every reader
+# then rejects -- silently, so the cache simply stops working.
+mutant "idx: publishes the wrong terminator offset" catch \
+  's/    h\.term_off   = \(uint64_t\)f->last_term_off;/    h.term_off   = (uint64_t)f->complete;/'
+
+# A-8/P-2.  Without this a read-only handle publishes into the database
+# directory, which is a write to the database and exactly what R-3 forbids.
+mutant "idx: allows the database dir as the cache" catch \
+  's/        if \(strcmp\(dir, setup->index_dir\) == 0\) \{\n            free\(db->dir\);\n            free\(db\);\n            return ZS_BADUSAGE;\n        \}/        \/* P-2 identical-path check removed *\//'
+
+echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"
 
