@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 216 |
-| With an enforcing test | 207 |
+| Requirements | 227 |
+| With an enforcing test | 218 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -168,6 +168,15 @@ a spec label is missing here.
 | `D-23` | Removing a data file — a converted unordered file, repack inputs, or | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
 | `D-23a` | Tiling alone is **not** a sufficient test, because D-6 measures | `crash/snapshot_gap_retry` |
 | `D-24` | `zs_db_should_repack` reports whether D-16 currently has work. | `repack_selection` |
+| `D-25` | **Sealing.** A writer MAY convert the **active** file on demand, holding | `seal_converts_the_active_file` |
+| `D-25a` | Sealing MUST NOT create a replacement active file. A conversion | `seal_creates_no_new_generation` |
+| `D-25b` | Sealing is a no-op, and NOT an error, when there is no active file, | `seal_noop_cases` |
+| `D-25c` | An unclean active file (D-9) MAY be sealed. The conversion reads to | `seal_unclean_active_file` |
+| `D-26` | **Compaction.** An implementation MAY merge the **entire** database into | `compact_to_one_file` |
+| `D-26a` | D-16's geometric selection does NOT apply to compaction. That rule | `compact_ignores_geometric_selection` |
+| `D-27` | Because a compaction output spans the whole generation interval, | `compact_drops_tombstones` |
+| `D-28` | Compaction is **best effort in action and strict in reporting**: it | `compact_reports_and_fails_on_bad_file` |
+| `D-29` | Compaction is unbounded: it rewrites the whole database in one | `zsbench` |
 
 ## Concurrency and durability (`C-n`)
 
@@ -177,7 +186,7 @@ a spec label is missing here.
 | `C-1a` | The write and repack locks never contend, because the two jobs | `conversion_avoids_the_repack_lock`, `lock_excludes_other_process`, `mp_repack_and_writer_concurrent` |
 | `C-1b` | Publishing a new file needs **no lock at all**: `rename` into the | `mp_repack_and_writer_concurrent` |
 | `C-1c` | The **remove** lock makes verifying completeness and unlinking one | `mp_removal_needs_the_lock` |
-| `C-1d` | Lock ordering. Acquisition is always write → remove or | `lock_basic` |
+| `C-1d` | **Lock ordering.** The locks form one total order: repack → write → remove. | `lock_basic`, `compact_lock_order` |
 | `C-1e` | The primitive and the byte offsets are normative, because | `lock_byte_offsets`, `lock_never_uses_flock` |
 | `C-1f` | `fcntl` locks are per-process, not per-thread: two threads of one | `lock_byte_offsets`, `lock_dies_with_process`, `lock_two_handles_one_process`, +1 more |
 | `C-1g` | `fcntl` locks are released by closing **any** descriptor for the file | `one_lock_descriptor` |
@@ -250,6 +259,8 @@ a spec label is missing here.
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
 | `A-8` | `index_dir` names the pointer table cache directory (§8). A null or | `idxcache_rejects_db_dir`, `idxcache_publish_failure_is_not_fatal` |
 | `A-9` | `index_threshold` is P-13's threshold in bytes. Zero selects an | `idxcache_threshold_defaults` |
+| `A-10` | `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's | `seal_noop_cases`, `seal_readonly` |
+| `A-11` | `zs_db_compact` performs D-26, returning `ZS_OK` only when the | `compact_to_one_file`, `compact_reports_and_fails_on_bad_file` |
 
 ## Conformance suite (`T-n`)
 

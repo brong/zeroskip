@@ -940,6 +940,45 @@ The per-file cursors are held in an array kept sorted by:
   the same highest. A set covering less is not a complete set of the same
   database.
 - **D-24** `zs_db_should_repack` reports whether D-16 currently has work.
+- **D-25 Sealing.** A writer MAY convert the **active** file on demand, holding
+  the write lock. D-12 skips the active file because another writer may be
+  appending to it; a caller holding the write lock has excluded exactly that, so
+  the exception does not apply. Sealing leaves every file in the database with a
+  pointer section, so no reader has to replay a span chain.
+- **D-25a** Sealing MUST NOT create a replacement active file. A conversion
+  output covers its input's range (D-5a), so afterwards the newest file is
+  in-order and the set simply has no active file — a state a reader already
+  handles — and the next write creates a new generation (D-9b). An
+  implementation that rolled over first and converted second would reach the
+  same layout while consuming a generation per seal, and generations are finite
+  (D-9c).
+- **D-25b** Sealing is a no-op, and NOT an error, when there is no active file,
+  when the active file holds no valid spans, or when its header does not
+  validate (D-10). The last MUST be reported.
+- **D-25c** An unclean active file (D-9) MAY be sealed. The conversion reads to
+  the complete point (F-24), so content past it does not survive into the
+  output — the same outcome R-4 already produces, reached sooner.
+- **D-26 Compaction.** An implementation MAY merge the **entire** database into
+  one file. The order is normative: seal (D-25), then convert every remaining
+  unordered file (D-12), then merge every in-order file as a single input set.
+- **D-26a** D-16's geometric selection does NOT apply to compaction. That rule
+  exists to keep a repack amortised, and compaction is explicitly the
+  unamortised case. Every other repack rule applies unchanged, D-17 through
+  D-23.
+- **D-27** Because a compaction output spans the whole generation interval,
+  D-19's containment test succeeds for every key, so every tombstone whose
+  lifespan it contains is dropped. This is the **only** merge that can reclaim
+  them: a partial repack MUST retain a tombstone, because a file outside its
+  input set may still hold the key (D-19a).
+- **D-28** Compaction is **best effort in action and strict in reporting**: it
+  merges everything mergeable and reports what it could not, and reports failure
+  only if the result is not a single file. A non-active file with an invalid
+  header is the case that blocks it — D-10a tolerates such a file, but it can be
+  neither converted nor merged.
+- **D-29** Compaction is unbounded: it rewrites the whole database in one
+  invocation while writers continue. That is open item 1's unboundedness made a
+  deliberate entry point rather than an emergent property of D-16's cascade, and
+  the mitigations sketched there apply to it equally.
 
 ## 6. Concurrency and durability
 
@@ -982,9 +1021,16 @@ The per-file cursors are held in an array kept sorted by:
   through.
 - **C-1c** The **remove** lock makes verifying completeness and unlinking one
   step (D-23).
-- **C-1d Lock ordering.** Acquisition is always write → remove or
-  repack → remove. Nothing acquires write or repack while holding remove, and
-  nothing holds both write and repack, so no cycle exists.
+- **C-1d Lock ordering.** The locks form one total order: **repack → write →
+  remove**. A holder MAY acquire any lock later in that order and MUST NOT
+  acquire one earlier, so no cycle exists.
+
+  Most operations use a sub-chain of it: a writer takes write → remove, a
+  repacker takes repack → remove, and the two never contend (C-1a). Only
+  compaction (D-26) holds both repack and write, which is why the order is
+  stated as a chain rather than as two disjoint pairs. A caller taking both
+  MUST release write before the merge, so an unbounded compaction does not
+  block writers for its whole duration.
 - **C-1h Locks across databases.** C-1d orders the locks within one database.
   The library cannot see across two, so a caller that holds locks on several
   while writing MUST impose its own consistent order.
@@ -1345,6 +1391,8 @@ void zs_cursor_fini(struct zs_cursor **curp);
         zs_cursor_replace((cur), NULL, 0, (flags))
 
 int  zs_db_repack(struct zs_db *);
+int  zs_db_seal(struct zs_db *);
+int  zs_db_compact(struct zs_db *);
 bool zs_db_should_repack(struct zs_db *);
 int  zs_db_check_consistency(struct zs_db *);
 int  zs_db_dump(struct zs_db *, int detail);
@@ -1414,6 +1462,11 @@ different calls, though not every flag is meaningful everywhere:
   else still gets bounded publishing. That default SHOULD be capped below
   `rollover_size` so a caller using small generations still publishes within
   one rather than never.
+- **A-10** `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's
+  no-op cases, and `ZS_READONLY` on a read-only handle (R-3).
+- **A-11** `zs_db_compact` performs D-26, returning `ZS_OK` only when the
+  database is a single file and `ZS_BADFORMAT` otherwise, having merged whatever
+  it could first (D-28).
 
 ## 10. Conformance suite
 
@@ -1727,6 +1780,11 @@ backend is a thin separate adapter, out of scope.
    If it ever needs bounding, two mitigations preserve the same steady state:
    merge pairwise, one step per invocation, or cap the cascade at a projected
    output size and resume next time.
+
+   Compaction (D-26) makes this unboundedness a **deliberate API entry point**
+   rather than an emergent property of D-16's cascade — a caller asks for the
+   whole database to be rewritten and gets exactly that. Both mitigations apply
+   to it unchanged, and neither is implemented.
 **Resolved.** *Whether a shared index is worth reintroducing.* Measurement said
 yes — roughly 1.5 ms per open at the 2 MB `rollover_size` ceiling, flat per
 record, which is the dominant cost for a process that opens a database per
