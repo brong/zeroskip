@@ -58,6 +58,8 @@ enum zs_flagspec {
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
     ZS_CURSOR_PREFIX = 1<<16,  /* foreach,cursor: treat the start key as a prefix
                                   and stop when a key leaves it */
+    ZS_SALVAGE_UNVERIFIED = 1<<17,  /* salvage: also recover records no checksum
+                                       ever covered (S-8) */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */
@@ -177,6 +179,63 @@ int  zs_db_dump(struct zs_db *db, int detail);
 int  zs_db_index_dump(struct zs_db *db);
 int  zs_db_sync(struct zs_db *db);
 const char *zs_strerror(int r);
+
+/* Salvage (spec section 9).
+ *
+ * Rebuilds whatever is readable out of a DAMAGED directory into a new database.
+ * It reads structures the ordinary path refuses -- a file set with a gap, a
+ * header that does not validate, a pointer section that will not load, spans
+ * after a bad one -- because those are exactly the databases worth salvaging.
+ *
+ * The source is never written to, never locked, and never unlinked from (S-1).
+ * That is what lets salvage guess and improvise without risking the only copy
+ * of the data it is trying to save, and it is why R-4's "there is no in-place
+ * repair" needs no exception.
+ *
+ * Everything recovered is checksum-verified by default.  ZS_SALVAGE_UNVERIFIED
+ * additionally recovers records no checksum ever covered, each one reported.
+ * Rolled-back spans are never recovered, with or without it (S-9).
+ */
+enum zs_salvage_kind {
+    ZS_SALVAGE_FILE_UNREADABLE,   /* could not be opened or mapped */
+    ZS_SALVAGE_HEADER_INVALID,    /* generation taken from the filename */
+    ZS_SALVAGE_ENGINE_GUESSED,    /* which engine the spans validated under */
+    ZS_SALVAGE_GAP,               /* a generation range absent from the set */
+    ZS_SALVAGE_PTRS_IGNORED,      /* pointer section unusable; order rescanned */
+    ZS_SALVAGE_SPAN_LOST,         /* a span that could not be verified */
+    ZS_SALVAGE_SPAN_ROLLBACK,     /* deliberately aborted; not recovered */
+    ZS_SALVAGE_RESYNC,            /* a verified span found after damage */
+    ZS_SALVAGE_KEY_UNVERIFIED,    /* value came from an unverifiable span */
+    ZS_SALVAGE_KEY_MAYBE_STALE    /* a newer version may have been in lost bytes */
+};
+
+struct zs_salvage_event {
+    int          kind;        /* enum zs_salvage_kind */
+    const char  *file;        /* data file name, or NULL */
+    uint32_t     generation;
+    size_t       offset;      /* byte offset within that file */
+    size_t       length;      /* bytes affected */
+    const char  *key;         /* per-key events only, else NULL */
+    size_t       keylen;
+};
+
+/* Returning non-zero stops the salvage, which is then reported to the caller. */
+typedef int zs_salvage_cb(void *rock, const struct zs_salvage_event *ev);
+
+struct zs_salvage_data {
+    uint32_t        flags;         /* ZS_SALVAGE_UNVERIFIED */
+    zs_compar      *compar;        /* NULL = byte order */
+    const char     *compar_name;
+    zs_csum        *csum;          /* for a source using engine 2 */
+    zs_salvage_cb  *report;        /* structured, per event (S-11) */
+    void           *rock;
+    void          (*error)(const char *msg, const char *fmt, ...);
+};
+
+#define ZS_SALVAGE_DATA_INITIALIZER { 0, NULL, NULL, NULL, NULL, NULL, NULL }
+
+int  zs_db_salvage(const char *from, const char *to,
+                   struct zs_salvage_data *setup);
 
 /* Not part of the stable API.
  *

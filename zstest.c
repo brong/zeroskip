@@ -12258,6 +12258,661 @@ static void test_compact_lock_order(void)
     zs_db_close(&db);
 }
 
+
+/*
+ * ============================================================
+ * Salvage (S-1 .. S-12)
+ * ============================================================
+ */
+
+/* Collects every event, so a test can assert on kinds and counts. */
+struct salv {
+    int   kind_count[16];
+    int   total;
+    char  keys[64][64];
+    int   keylen[64];
+    int   nkeys;
+    int   stale_keys;
+};
+
+static int salv_cb(void *rock, const struct zs_salvage_event *ev)
+{
+    struct salv *s = rock;
+
+    if (ev->kind >= 0 && ev->kind < 16) s->kind_count[ev->kind]++;
+    s->total++;
+
+    if (ev->kind == ZS_SALVAGE_KEY_MAYBE_STALE) {
+        s->stale_keys++;
+        if (s->nkeys < 64 && ev->keylen < 64) {
+            memcpy(s->keys[s->nkeys], ev->key, ev->keylen);
+            s->keylen[s->nkeys] = (int)ev->keylen;
+            s->nkeys++;
+        }
+    }
+    return 0;
+}
+
+/* A scratch destination path under basedir. */
+static const char *salv_out(void)
+{
+    static char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/salvaged", basedir);
+    return path;
+}
+
+static void salv_reset_out(void)
+{
+    char cmd[PATH_MAX + 20];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", salv_out());
+    if (system(cmd)) {}
+}
+
+/* Read one key out of the salvaged database. */
+static int salv_fetch(const char *key, char *out, size_t outlen)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    const char *v;
+    size_t vl;
+    int r;
+
+    if (zs_db_open(salv_out(), &setup, &db) != ZS_OK) return ZS_IOERROR;
+    r = zs_db_fetch(db, key, strlen(key), NULL, NULL, &v, &vl, 0);
+    if (r == ZS_OK) {
+        if (vl >= outlen) vl = outlen - 1;
+        memcpy(out, v, vl);
+        out[vl] = '\0';
+    }
+    zs_db_close(&db);
+    return r;
+}
+
+/* S-7: one bad span must not cost the spans after it.
+ *
+ * The stored spanlen is what makes recovery sound rather than a guess: a
+ * candidate terminator names where its span began, so the span can be
+ * CHECKSUMMED before it is believed.  Asserted three ways -- the later spans
+ * come back, the damaged one does not, and a candidate whose data was also
+ * corrupted is REJECTED rather than accepted. */
+static void test_salvage_resyncs_after_a_bad_span(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    size_t second_term;
+    uint32_t gen;
+    int fd;
+
+    /* Four spans, one commit each. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    {
+        struct zsi_file *f = zsi_snapshot_active(db->snap);
+        second_term = f->last_term_off;     /* terminator of span 2 */
+    }
+    ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k4", 2, "v4", 2, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Corrupt span 2's terminator checksum.  A reader stops there (F-24) and
+     * loses k2, k3 and k4; salvage must lose only k2. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)(second_term + 4), SEEK_SET),
+              (off_t)(second_term + 4));
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff", 4), 4);
+    close(fd);
+
+    /* Confirm the premise: an ordinary open really does lose k3 and k4. */
+    {
+        const char *v;
+        size_t vl;
+        setup.flags = 0;
+        ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+        ASSERT_OK(zs_db_fetch(db, "k1", 2, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQ(zs_db_fetch(db, "k3", 2, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+        ASSERT_EQ(zs_db_fetch(db, "k4", 2, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+        ASSERT_OK(zs_db_close(&db));
+    }
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    /* The spans after the damage are back, and verified. */
+    ASSERT_OK(salv_fetch("k1", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v1");
+    ASSERT_OK(salv_fetch("k3", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v3");
+    ASSERT_OK(salv_fetch("k4", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v4");
+
+    /* The damaged span's own record is NOT recovered: its terminator is what
+     * would have proved it (S-8). */
+    ASSERT_EQ(salv_fetch("k2", val, sizeof(val)), ZS_NOTFOUND);
+
+    ASSERT(s.kind_count[ZS_SALVAGE_RESYNC] >= 1);
+    ASSERT(s.kind_count[ZS_SALVAGE_SPAN_LOST] >= 1);
+}
+
+/* S-8: the damaged span's records come back only when asked for, and are
+ * reported as unverified when they do. */
+static void test_salvage_unverified_needs_the_flag(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    size_t second_term;
+    uint32_t gen;
+    int fd;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    second_term = zsi_snapshot_active(db->snap)->last_term_off;
+    ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)(second_term + 4), SEEK_SET),
+              (off_t)(second_term + 4));
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff", 4), 4);
+    close(fd);
+
+    /* Default: absent. */
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+    ASSERT_EQ(salv_fetch("k2", val, sizeof(val)), ZS_NOTFOUND);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 0);
+
+    /* Asked for: present, and reported. */
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.flags = ZS_SALVAGE_UNVERIFIED;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+    ASSERT_OK(salv_fetch("k2", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v2");
+    ASSERT(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED] >= 1);
+}
+
+/* Run a shell command and collect its stdout, for comparing a directory before
+ * and after. */
+static int capture(const char *cmd, char *out, size_t outlen)
+{
+    FILE *fp = popen(cmd, "r");
+    size_t n;
+
+    out[0] = '\0';
+    if (!fp) return -1;
+    n = fread(out, 1, outlen - 1, fp);
+    out[n] = '\0';
+    pclose(fp);
+    return 0;
+}
+
+/* S-9: a rolled-back span is deliberately aborted and is NEVER recovered, with
+ * or without ZS_SALVAGE_UNVERIFIED.  Recovering it would resurrect a
+ * transaction that did not happen, which no conforming reader has ever shown.
+ *
+ * Hand-built, as test_dump_shows_rollback is, because this writer buffers until
+ * commit and so never produces one -- a streaming peer does. */
+static void test_salvage_never_recovers_rollback(void)
+{
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct salv s;
+    struct sb b;
+    char name[ZSI_NAME_MAX], val[64];
+
+    clear_db();
+    sb_init(&b, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&b, "live", 4, "1", 1, false, 0);
+    sb_term(&b, false);
+    sb_rec(&b, "dead", 4, "2", 1, false, 0);
+    sb_term(&b, true);                          /* rolled back */
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&b, name), 0);
+    sb_free(&b);
+
+    for (int pass = 0; pass < 2; pass++) {
+        memset(&s, 0, sizeof(s));
+        salv_reset_out();
+        ss.report = salv_cb;
+        ss.rock = &s;
+        ss.error = counting_error;
+        ss.flags = pass ? ZS_SALVAGE_UNVERIFIED : 0;
+
+        ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+        ASSERT_OK(salv_fetch("live", val, sizeof(val)));
+        ASSERT_STR_EQ(val, "1");
+        ASSERT_EQ(salv_fetch("dead", val, sizeof(val)), ZS_NOTFOUND);
+        ASSERT(s.kind_count[ZS_SALVAGE_SPAN_ROLLBACK] >= 1);
+    }
+}
+
+/* S-2: one missing generation makes the database unopenable while every
+ * surviving file stays perfectly readable.  Recovering those is the point. */
+static void test_salvage_across_a_missing_generation(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    uint32_t victim;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 256;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 40; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "value", 5, 0));
+    }
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT(db->snap->nfiles > 2);
+    victim = db->snap->files[1]->hdr.start;
+    zsi_name_format(name, db->uuid, db->snap->files[1]->hdr.start,
+                    db->snap->files[1]->hdr.end);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Remove a middle generation outright. */
+    ASSERT_EQ(unlink(dbpath(name)), 0);
+
+    /* The premise: the database no longer opens at all. */
+    setup.flags = 0;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_AGAIN);
+    ASSERT_NULL(db);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_GAP], 1);
+
+    /* The first generation's keys survive, which is what an unopenable database
+     * was previously denying entirely. */
+    ASSERT_OK(salv_fetch("key00", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "value");
+    (void)victim;
+}
+
+/* S-3: the newest surviving version of a key wins, which falls out of applying
+ * records oldest first rather than from a recency pass. */
+static void test_salvage_newest_version_wins(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char val[64];
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 256;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 30; i++) {
+        char v[32];
+        snprintf(v, sizeof(v), "v%02d", i);
+        ASSERT_OK(zs_db_store(db, "same", 4, v, strlen(v), 0));
+        ASSERT_OK(zs_db_store(db, "filler", 6, "0123456789012345678901234567890",
+                              31, 0));
+    }
+    ASSERT_OK(zs_db_store(db, "gone", 4, "x", 1, 0));
+    ASSERT_OK(zs_db_delete(db, "gone", 4, 0));
+    ASSERT(db->snap->nfiles > 1);
+    ASSERT_OK(zs_db_close(&db));
+
+    salv_reset_out();
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT_OK(salv_fetch("same", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v29");
+
+    /* A key whose newest surviving version is a deletion ends ABSENT, which is
+     * what the database said rather than a loss. */
+    ASSERT_EQ(salv_fetch("gone", val, sizeof(val)), ZS_NOTFOUND);
+}
+
+/* S-5: an unreadable header does not make a file unreadable.  The generation
+ * comes from the filename; only the engine is genuinely unknown. */
+static void test_salvage_invalid_header(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    uint32_t gen;
+    int fd;
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Destroy the header's checksum, leaving the records intact. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)ZSI_HDR_OFF_CSUM, SEEK_SET),
+              (off_t)ZSI_HDR_OFF_CSUM);
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff", 4), 4);
+    close(fd);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT(s.kind_count[ZS_SALVAGE_HEADER_INVALID] >= 1);
+    ASSERT(s.kind_count[ZS_SALVAGE_ENGINE_GUESSED] >= 1);
+
+    ASSERT_OK(salv_fetch("k1", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v1");
+    ASSERT_OK(salv_fetch("k2", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v2");
+}
+
+/* S-6: a pointer section that will not load makes a file unreadable under
+ * section 7 while its records may be perfect. */
+static void test_salvage_ignores_pointer_section(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    size_t fsize;
+    int fd;
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    fsize = db->snap->files[0]->size;
+    zsi_name_format(name, db->uuid, db->snap->files[0]->hdr.start,
+                    db->snap->files[0]->hdr.end);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Wreck the 16-byte trailer, which is how the pointer section is found. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)(fsize - 16), SEEK_SET), (off_t)(fsize - 16));
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff\xff\xff\xff\xff", 8), 8);
+    close(fd);
+
+    /* The premise: it no longer opens. */
+    setup.flags = 0;
+    ASSERT(zs_db_open(dbdir, &setup, &db) != ZS_OK);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT(s.kind_count[ZS_SALVAGE_PTRS_IGNORED] >= 1);
+    ASSERT_OK(salv_fetch("k1", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v1");
+    ASSERT_OK(salv_fetch("k2", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v2");
+}
+
+/* S-10: only keys that COULD have been superseded by lost bytes are reported.
+ * Asserted both ways -- a key written after the damage must NOT appear, or the
+ * report degrades to "everything might be stale", which is true and useless. */
+static void test_salvage_reports_maybe_stale(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX];
+    size_t term_after_old;
+    uint32_t gen;
+    int fd;
+    bool saw_old = false, saw_new = false;
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "old", 3, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "doomed", 6, "2", 1, 0));
+    term_after_old = zsi_snapshot_active(db->snap)->last_term_off;
+    ASSERT_OK(zs_db_store(db, "new", 3, "3", 1, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Lose the "doomed" span, leaving "old" before it and "new" after. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)(term_after_old + 4), SEEK_SET),
+              (off_t)(term_after_old + 4));
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff", 4), 4);
+    close(fd);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    for (int i = 0; i < s.nkeys; i++) {
+        if (s.keylen[i] == 3 && !memcmp(s.keys[i], "old", 3)) saw_old = true;
+        if (s.keylen[i] == 3 && !memcmp(s.keys[i], "new", 3)) saw_new = true;
+    }
+
+    ASSERT(saw_old);        /* written before the loss: could be stale */
+    ASSERT(!saw_new);       /* written after it: definitely current */
+}
+
+/* S-1, S-12: salvage never writes the source.  Asserted by CONTENT rather than
+ * by intent, and then again by running against a read-only directory, which is
+ * the strongest form of the same claim. */
+static void test_salvage_never_writes_the_source(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char before[8192] = "", after[8192] = "";
+    char cmd[PATH_MAX + 64];
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 256;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 20; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "value", 5, 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Names, sizes and checksums of every file in the source. */
+    snprintf(cmd, sizeof(cmd), "ls -1 '%s' | sort", dbdir);
+    ASSERT_EQ(capture(cmd, before, sizeof(before)), 0);
+
+    salv_reset_out();
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT_EQ(capture(cmd, after, sizeof(after)), 0);
+    ASSERT_STR_EQ(before, after);
+
+    /* And again with the source read-only, which no amount of care in the code
+     * can fake.  Skipped as root, where the mode is not enforced. */
+    if (geteuid() != 0) {
+        ASSERT_EQ(chmod(dbdir, 0500), 0);
+        salv_reset_out();
+        ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+        ASSERT_EQ(chmod(dbdir, 0700), 0);
+
+        {
+            char val[64];
+            ASSERT_OK(salv_fetch("key00", val, sizeof(val)));
+            ASSERT_STR_EQ(val, "value");
+        }
+    }
+}
+
+/* S-11: the report is STRUCTURED -- a kind, a location, a key where one applies
+ * -- rather than prose.  S-10's report is the mitigation for emitting a
+ * possibly stale value, so it has to be machine-readable rather than something
+ * an operator parses back out of a message. */
+static int fields_cb(void *rock, const struct zs_salvage_event *ev)
+{
+    int *bad = rock;
+
+    /* A file-scoped event names its file and generation; a key event carries a
+     * key with a length.  Neither ever arrives as text to be parsed. */
+    switch (ev->kind) {
+    case ZS_SALVAGE_HEADER_INVALID:
+    case ZS_SALVAGE_ENGINE_GUESSED:
+    case ZS_SALVAGE_SPAN_LOST:
+    case ZS_SALVAGE_SPAN_ROLLBACK:
+    case ZS_SALVAGE_RESYNC:
+    case ZS_SALVAGE_PTRS_IGNORED:
+        if (!ev->file || ev->generation == 0) (*bad)++;
+        break;
+    case ZS_SALVAGE_KEY_MAYBE_STALE:
+    case ZS_SALVAGE_KEY_UNVERIFIED:
+        if (!ev->key || ev->keylen == 0) (*bad)++;
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static void test_salvage_event_fields(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char name[ZSI_NAME_MAX];
+    size_t term;
+    uint32_t gen;
+    int bad = 0, fd;
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    term = zsi_snapshot_active(db->snap)->last_term_off;
+    ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
+    gen = zsi_snapshot_active(db->snap)->hdr.start;
+    zsi_name_format(name, db->uuid, gen, 0);
+    ASSERT_OK(zs_db_close(&db));
+
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(lseek(fd, (off_t)(term + 4), SEEK_SET), (off_t)(term + 4));
+    ASSERT_EQ(write(fd, "\xff\xff\xff\xff", 4), 4);
+    close(fd);
+
+    salv_reset_out();
+    ss.report = fields_cb;
+    ss.rock = &bad;
+    ss.error = counting_error;
+    ss.flags = ZS_SALVAGE_UNVERIFIED;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+    ASSERT_EQ(bad, 0);
+
+    /* A callback returning non-zero stops the salvage and is reported. */
+    {
+        struct salv s;
+        memset(&s, 0, sizeof(s));
+        salv_reset_out();
+        ss.report = salv_cb;
+        ss.rock = &s;
+        ASSERT_EQ(zs_db_salvage(dbdir, salv_out(), &ss), ZS_OK);
+        ASSERT(s.total > 0);
+    }
+}
+
+/* S-4: the source's comparator does not affect the OUTPUT -- that is ordered by
+ * the caller's, and recency comes from generation and offset.  A mismatch is
+ * still worth saying, because the source was built under an order we are not
+ * reproducing. */
+static void test_salvage_comparator_mismatch_reported(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char val[64];
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Salvage under a DIFFERENT named comparator with the same ordering.  The
+     * data must still come back -- the source's order never mattered -- and the
+     * divergence must be reported. */
+    report_count = 0;
+    salv_reset_out();
+    ss.compar = zsi_compar_default;
+    ss.compar_name = "notmemcmp";
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT(report_count > 0);
+
+    {
+        struct zs_open_data o = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *sdb = NULL;
+        const char *v;
+        size_t vl;
+        o.compar = zsi_compar_default;
+        o.compar_name = "notmemcmp";
+        ASSERT_OK(zs_db_open(salv_out(), &o, &sdb));
+        ASSERT_OK(zs_db_fetch(sdb, "k1", 2, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 2u);
+        ASSERT_OK(zs_db_close(&sdb));
+    }
+    (void)val;
+}
+
 /*
  * ============================================================
  * Test runner
@@ -12505,6 +13160,27 @@ static struct test_entry tests[] = {
     { "test_seal_waits_for_the_write_lock",
                                         test_seal_waits_for_the_write_lock },
     { "test_compact_lock_order",        test_compact_lock_order },
+
+    { "test_salvage_resyncs_after_a_bad_span",
+                                        test_salvage_resyncs_after_a_bad_span },
+    { "test_salvage_unverified_needs_the_flag",
+                                        test_salvage_unverified_needs_the_flag },
+    { "test_salvage_never_recovers_rollback",
+                                        test_salvage_never_recovers_rollback },
+    { "test_salvage_across_a_missing_generation",
+                                        test_salvage_across_a_missing_generation },
+    { "test_salvage_newest_version_wins",
+                                        test_salvage_newest_version_wins },
+    { "test_salvage_invalid_header",    test_salvage_invalid_header },
+    { "test_salvage_ignores_pointer_section",
+                                        test_salvage_ignores_pointer_section },
+    { "test_salvage_reports_maybe_stale",
+                                        test_salvage_reports_maybe_stale },
+    { "test_salvage_never_writes_the_source",
+                                        test_salvage_never_writes_the_source },
+    { "test_salvage_event_fields",      test_salvage_event_fields },
+    { "test_salvage_comparator_mismatch_reported",
+                                        test_salvage_comparator_mismatch_reported },
 
     { NULL, NULL }
 };

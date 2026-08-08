@@ -6623,3 +6623,594 @@ const char *zs_strerror(int r)
 
     return "unknown error";
 }
+
+/********** SALVAGE *************/
+
+/* Spec section 9.  Rebuild what is readable out of a DAMAGED directory into a
+ * new database.
+ *
+ * This section deliberately does NOT share the read path, and must not.  Its
+ * whole purpose is to read structures sections 5 and 7 refuse: a file set with a
+ * gap, a header that does not validate, a pointer section that will not load,
+ * spans sitting after a bad one.  Routing it through zsi_snapshot_take would
+ * make it refuse exactly the databases it exists for.
+ *
+ * The source is never written to, never locked, and never unlinked from (S-1).
+ * That is what lets this guess and improvise without risking the only copy of
+ * the data it is trying to save, and it is why R-4 needs no repair exception. */
+
+/* How far a resynchronisation scan will look before giving up on a file.  Not a
+ * correctness bound -- the scan stops at end of file regardless -- but a guard
+ * against spending unbounded time on a file that is mostly noise. */
+#define ZSI_SALVAGE_SCAN_MAX (64u * 1024u * 1024u)
+
+struct zsi_salvage_key { size_t off, len; };
+
+struct zsi_salvage_ctx {
+    struct zs_salvage_data *setup;
+    struct zs_db           *out;        /* the destination, open for writing */
+    const char             *fname;      /* the file being processed, for events */
+    uint32_t                gen;
+
+    /* S-10: the earliest point at which anything was lost, as (generation,
+     * offset).  A key whose winning record is older than this MAY have been
+     * superseded by something in the lost bytes. */
+    bool                    any_loss;
+    uint32_t                loss_gen;
+    size_t                  loss_off;
+
+    unsigned long long      nkeys, nstale, nunverified, nlost;
+    int                     stopped;    /* the callback asked us to stop */
+
+    /* Keys applied at or after the first loss (S-10).
+     *
+     * Files are scanned oldest first and positions ascend within a file, so the
+     * first loss is DISCOVERED before any record beyond it is applied.  A key is
+     * therefore stale exactly when its last application preceded that loss --
+     * which makes "safe" a set that can be built as we go, with no second pass
+     * and no need to know the loss point in advance.
+     *
+     * Keys are packed into one blob so a growable array of offsets can index
+     * them without a separate allocation per key. */
+    char                   *safe;       size_t safelen, safealloc;
+    struct zsi_salvage_key *safekeys;   size_t nsafe, safekeysalloc;
+};
+
+static void zsi_salvage_emit(struct zsi_salvage_ctx *ctx, int kind,
+                             size_t off, size_t len,
+                             const char *key, size_t keylen)
+{
+    struct zs_salvage_event ev;
+
+    if (!ctx->setup->report || ctx->stopped) return;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = kind;
+    ev.file = ctx->fname;
+    ev.generation = ctx->gen;
+    ev.offset = off;
+    ev.length = len;
+    ev.key = key;
+    ev.keylen = keylen;
+
+    if (ctx->setup->report(ctx->setup->rock, &ev) != 0) ctx->stopped = 1;
+}
+
+/* Note that data was lost at this point (S-10), keeping the earliest. */
+static void zsi_salvage_loss(struct zsi_salvage_ctx *ctx, size_t off, size_t len)
+{
+    ctx->nlost++;
+
+    if (!ctx->any_loss || ctx->gen < ctx->loss_gen
+        || (ctx->gen == ctx->loss_gen && off < ctx->loss_off)) {
+        ctx->any_loss = true;
+        ctx->loss_gen = ctx->gen;
+        ctx->loss_off = off;
+    }
+
+    zsi_salvage_emit(ctx, ZS_SALVAGE_SPAN_LOST, off, len, NULL, 0);
+}
+
+/* S-5: determine a file's checksum engine when its header did not validate.
+ *
+ * Tries each engine and keeps the one under which the FIRST span validates.
+ * Engine 0 is tried last and matches only where a stored checksum really is
+ * zero, so it is a genuine signal rather than a catch-all that would accept
+ * anything -- which is the whole risk of guessing at all.
+ *
+ * A file with no valid span under any engine yields ZS_NOTFOUND; the caller
+ * still reports it, because "nothing recoverable here" is worth saying. */
+static int zsi_salvage_engine(struct zsi_file *f, zs_csum *external,
+                              zs_csum **out, unsigned *id_out)
+{
+    static const unsigned order[] = { ZSI_CSUM_XXHASH, ZSI_CSUM_EXTERNAL,
+                                      ZSI_CSUM_NONE };
+
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        zs_csum *cs = zsi_csum_for_id(order[i], external);
+        size_t p = ZSI_HEADER_LEN;
+        struct zsi_term term;
+
+        if (!cs) continue;                      /* engine 2 with no function */
+
+        /* Walk records to the first terminator and see whether it validates. */
+        for (;;) {
+            const char *b = zsi_file_at(f, p, 1);
+            struct zsi_rec r;
+
+            if (!b) break;
+            if (!zsi_type_valid((uint8_t)b[0])) break;
+
+            if ((uint8_t)b[0] & ZSI_SPANTERM) {
+                const char *spandata, *termbytes;
+                size_t datalen = p - ZSI_HEADER_LEN;
+
+                if (zsi_term_decode(b, f->size - p, &term) != ZS_OK) break;
+                if (!zsi_file_at(f, p, term.len)) break;
+                if (term.spanlen != (uint64_t)datalen) break;
+
+                spandata = zsi_file_at(f, ZSI_HEADER_LEN, datalen);
+                termbytes = zsi_file_at(f, p, term.len);
+                if (!termbytes || (datalen && !spandata)) break;
+
+                if (zsi_csum2(cs, order[i], spandata ? spandata : "", datalen,
+                              termbytes, term.len - 4) == term.csum) {
+                    *out = cs;
+                    *id_out = order[i];
+                    return ZS_OK;
+                }
+                break;
+            }
+
+            if (!((uint8_t)b[0] & ZSI_HASKEY)) break;
+            if (zsi_rec_decode(b, f->size - p, f->hdr.start, &r) != ZS_OK) break;
+            if (r.len == 0) break;
+            if (!zsi_add_sz(p, r.len, &p)) break;
+            if (p > f->size) break;
+        }
+    }
+
+    return ZS_NOTFOUND;
+}
+
+/* S-7: find the next VERIFIED span at or after `from`.
+ *
+ * This is the only place salvage guesses, and the guess is always confirmed
+ * before it is believed.  A terminator carries its span's length (F-19), so a
+ * candidate terminator implies exactly where its span began -- and that span can
+ * then be checksummed.  A match is proof, not a heuristic.
+ *
+ * Steps 8 bytes at a time because every record and terminator begins on an
+ * 8-multiple (F-2), so nothing valid is skipped.
+ *
+ * Returns ZS_OK with *span_start, *term_off and *term filled, or ZS_NOTFOUND. */
+static int zsi_salvage_resync(struct zsi_file *f, zs_csum *cs, unsigned csum_id,
+                              size_t from, size_t floor,
+                              size_t *span_start, size_t *term_off,
+                              struct zsi_term *term)
+{
+    size_t scanned = 0;
+
+    for (size_t p = (from + 7u) & ~(size_t)7; p < f->size; p += 8) {
+        const char *b, *spandata, *termbytes;
+        struct zsi_term t;
+        size_t start, after;
+
+        if (++scanned > ZSI_SALVAGE_SCAN_MAX / 8) break;
+
+        b = zsi_file_at(f, p, 1);
+        if (!b) break;
+
+        if (zsi_term_decode(b, f->size - p, &t) != ZS_OK) continue;
+        if (!zsi_file_at(f, p, t.len)) continue;
+
+        /* The span it claims must lie inside the region we are still willing to
+         * attribute to this file: at or after the last known good boundary, and
+         * ending exactly at this terminator. */
+        if (t.spanlen > (uint64_t)(p - floor)) continue;
+        start = p - (size_t)t.spanlen;
+        if (start < floor) continue;
+        if (!zsi_add_sz(p, t.len, &after)) continue;
+        if (after > f->size) continue;
+
+        spandata = zsi_file_at(f, start, (size_t)t.spanlen);
+        termbytes = zsi_file_at(f, p, t.len);
+        if (!termbytes) continue;
+        if (t.spanlen && !spandata) continue;
+
+        /* The proof. */
+        if (zsi_csum2(cs, csum_id, spandata ? spandata : "",
+                      (size_t)t.spanlen, termbytes, t.len - 4) != t.csum)
+            continue;
+
+        *span_start = start;
+        *term_off = p;
+        *term = t;
+        return ZS_OK;
+    }
+
+    return ZS_NOTFOUND;
+}
+
+/* Apply one recovered record to the destination.
+ *
+ * Records arrive oldest first (S-3), so the newest surviving version of a key
+ * wins simply by being applied last -- there is no recency pass, and none is
+ * possible anyway once some of the ordering evidence has been lost.
+ *
+ * A deletion is applied as a deletion, so a recovered tombstone still removes a
+ * key and a key whose newest surviving version is a deletion ends absent.  That
+ * is correct rather than a loss: it is what the database said. */
+static int zsi_salvage_apply(struct zsi_salvage_ctx *ctx,
+                             const struct zsi_rec *rec, bool verified)
+{
+    int r;
+
+    if (rec->type & ZSI_ISDELETE)
+        r = zs_db_store(ctx->out, rec->key, rec->keylen, NULL, 0, 0);
+    else
+        r = zs_db_store(ctx->out, rec->key, rec->keylen, rec->val, rec->vallen, 0);
+
+    if (r != ZS_OK) return r;
+
+    ctx->nkeys++;
+
+    /* S-10: once anything has been lost, every key applied from here on has a
+     * version no older than the loss, so it cannot be stale. */
+    if (ctx->any_loss) {
+        if (ctx->safelen + rec->keylen > ctx->safealloc) {
+            size_t want = ctx->safealloc ? ctx->safealloc * 2 : 4096;
+            char *p;
+            while (want < ctx->safelen + rec->keylen) want *= 2;
+            p = realloc(ctx->safe, want);
+            if (!p) return ZS_INTERNAL;
+            ctx->safe = p;
+            ctx->safealloc = want;
+        }
+        if (ctx->nsafe == ctx->safekeysalloc) {
+            size_t want = ctx->safekeysalloc ? ctx->safekeysalloc * 2 : 256;
+            struct zsi_salvage_key *p =
+                realloc(ctx->safekeys, want * sizeof(*p));
+            if (!p) return ZS_INTERNAL;
+            ctx->safekeys = p;
+            ctx->safekeysalloc = want;
+        }
+        memcpy(ctx->safe + ctx->safelen, rec->key, rec->keylen);
+        ctx->safekeys[ctx->nsafe].off = ctx->safelen;
+        ctx->safekeys[ctx->nsafe].len = rec->keylen;
+        ctx->nsafe++;
+        ctx->safelen += rec->keylen;
+    }
+
+    if (!verified) {
+        ctx->nunverified++;
+        zsi_salvage_emit(ctx, ZS_SALVAGE_KEY_UNVERIFIED, 0, 0,
+                         rec->key, rec->keylen);
+    }
+
+    return ZS_OK;
+}
+
+/* Walk a span's records, applying each. */
+static int zsi_salvage_span(struct zsi_salvage_ctx *ctx, struct zsi_file *f,
+                            size_t from, size_t to, bool verified)
+{
+    size_t q = from;
+
+    while (q < to && !ctx->stopped) {
+        const char *b = zsi_file_at(f, q, 1);
+        struct zsi_rec r;
+        int rc;
+
+        if (!b) break;
+        if (zsi_rec_decode(b, f->size - q, f->hdr.start, &r) != ZS_OK) break;
+        if (r.len == 0) break;
+
+        rc = zsi_salvage_apply(ctx, &r, verified);
+        if (rc != ZS_OK) return rc;
+
+        q += r.len;
+    }
+
+    return ZS_OK;
+}
+
+/* One unordered file: walk its spans, resynchronising past damage (S-7). */
+static int zsi_salvage_unordered(struct zsi_salvage_ctx *ctx,
+                                 struct zsi_file *f,
+                                 zs_csum *cs, unsigned csum_id)
+{
+    bool want_unverified =
+        (ctx->setup->flags & ZS_SALVAGE_UNVERIFIED) != 0;
+    size_t pos = ZSI_HEADER_LEN;
+    int r;
+
+    while (pos < f->size && !ctx->stopped) {
+        size_t span_start, term_off, after;
+        struct zsi_term term;
+
+        if (zsi_salvage_resync(f, cs, csum_id, pos, pos,
+                               &span_start, &term_off, &term) != ZS_OK) {
+            /* Nothing verifiable remains.  Whatever is left is a torn tail: it
+             * was very likely never acknowledged to anyone, so it is recovered
+             * only on request (S-8) and always reported. */
+            if (pos < f->size) {
+                zsi_salvage_loss(ctx, pos, f->size - pos);
+                if (want_unverified) {
+                    r = zsi_salvage_span(ctx, f, pos, f->size, false);
+                    if (r != ZS_OK) return r;
+                }
+            }
+            return ZS_OK;
+        }
+
+        /* Bytes between where we were and where the next verified span begins
+         * are a span whose terminator did not survive.  Its own records cannot
+         * be proved -- the terminator is what would prove them (S-8). */
+        if (span_start > pos) {
+            zsi_salvage_loss(ctx, pos, span_start - pos);
+            if (want_unverified) {
+                r = zsi_salvage_span(ctx, f, pos, span_start, false);
+                if (r != ZS_OK) return r;
+            }
+            zsi_salvage_emit(ctx, ZS_SALVAGE_RESYNC, span_start,
+                             term_off - span_start, NULL, 0);
+        }
+
+        /* S-9: a rolled-back span is deliberately aborted.  Never recovered,
+         * with or without the flag -- no conforming reader has ever shown its
+         * records, and producing them would resurrect a transaction that did
+         * not happen. */
+        if (zsi_term_is_rollback(&term)) {
+            zsi_salvage_emit(ctx, ZS_SALVAGE_SPAN_ROLLBACK, span_start,
+                             term_off - span_start, NULL, 0);
+        } else {
+            r = zsi_salvage_span(ctx, f, span_start, term_off, true);
+            if (r != ZS_OK) return r;
+        }
+
+        if (!zsi_add_sz(term_off, term.len, &after)) break;
+        pos = after;
+    }
+
+    return ZS_OK;
+}
+
+/* One in-order file: walk the records region directly.
+ *
+ * S-6: the pointer section is IGNORED entirely, whether or not it loads.  A
+ * pointer section that fails makes the file unreadable under section 7 while its
+ * records may be perfect, and re-deriving order costs nothing here because the
+ * destination sorts anyway.  An in-order file has no spans (F-23), so this is a
+ * flat record walk. */
+static int zsi_salvage_inorder(struct zsi_salvage_ctx *ctx, struct zsi_file *f)
+{
+    size_t pos = ZSI_HEADER_LEN;
+
+    zsi_salvage_emit(ctx, ZS_SALVAGE_PTRS_IGNORED, 0, 0, NULL, 0);
+
+    while (pos < f->size && !ctx->stopped) {
+        const char *b = zsi_file_at(f, pos, 1);
+        struct zsi_rec r;
+        int rc;
+
+        if (!b) break;
+
+        /* The records region ends where the pointer section begins, which a
+         * type byte that is not a data record marks just as well -- and does so
+         * without trusting a trailer we have already decided to ignore. */
+        if (!zsi_type_valid((uint8_t)b[0])) break;
+        if (!((uint8_t)b[0] & ZSI_HASKEY)) break;
+
+        if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &r) != ZS_OK) {
+            zsi_salvage_loss(ctx, pos, f->size - pos);
+            break;
+        }
+        if (r.len == 0) break;
+
+        rc = zsi_salvage_apply(ctx, &r, true);
+        if (rc != ZS_OK) return rc;
+
+        pos += r.len;
+    }
+
+    return ZS_OK;
+}
+
+/* Order for S-3: oldest first, by start ascending; for equal start the NARROWER
+ * range first, since a wider one is a repack output derived from it and is
+ * therefore newer. */
+static int zsi_salvage_order(const void *va, const void *vb)
+{
+    const struct zsi_entry *a = va, *b = vb;
+
+    if (a->start != b->start) return a->start < b->start ? -1 : 1;
+
+    {
+        uint32_t ae = a->end ? a->end : a->start;
+        uint32_t be = b->end ? b->end : b->start;
+        if (ae != be) return ae < be ? -1 : 1;
+    }
+
+    return 0;
+}
+
+/* S-10: report every surviving key whose recovered record predates the first
+ * loss, and no others.
+ *
+ * Deliberately conservative rather than exact: it reports what COULD have been
+ * superseded by the lost bytes, because determining what actually was would need
+ * the key set of those bytes, which is precisely what has been lost.  Reporting
+ * only keys older than the loss is what keeps it small enough to act on -- the
+ * alternative, "everything might be stale", is true and useless. */
+static int zsi_salvage_report_stale(struct zsi_salvage_ctx *ctx)
+{
+    struct zs_cursor *c = NULL;
+    zs_compar *cmp = ctx->out->compar;
+    const char *k, *v;
+    size_t kl, vl;
+    int r;
+
+    if (!ctx->any_loss || !ctx->setup->report) return ZS_OK;
+
+    /* Sort the safe keys so each output key costs one binary search rather than
+     * a scan; duplicates are harmless to a lower-bound search. */
+    if (ctx->nsafe > 1) {
+        /* Insertion into a sorted array via the merge sort already in this file
+         * would need a context, so a simple qsort over a temporary of resolved
+         * pointers is clearer here -- and this runs once, over recovered keys
+         * only, on a path that has already read the whole database. */
+        for (size_t i = 1; i < ctx->nsafe; i++) {
+            struct zsi_salvage_key key = ctx->safekeys[i];
+            size_t j = i;
+            while (j > 0
+                   && cmp(ctx->safe + ctx->safekeys[j - 1].off,
+                          ctx->safekeys[j - 1].len,
+                          ctx->safe + key.off, key.len) > 0) {
+                ctx->safekeys[j] = ctx->safekeys[j - 1];
+                j--;
+            }
+            ctx->safekeys[j] = key;
+        }
+    }
+
+    r = zs_db_begin_cursor(ctx->out, NULL, 0, &c, 0);
+    if (r != ZS_OK) return r;
+
+    while ((r = zs_cursor_next(c, &k, &kl, &v, &vl)) == ZS_OK && !ctx->stopped) {
+        size_t lo = 0, hi = ctx->nsafe;
+        bool safe = false;
+
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int d = cmp(ctx->safe + ctx->safekeys[mid].off,
+                        ctx->safekeys[mid].len, k, kl);
+            if (d == 0) { safe = true; break; }
+            if (d < 0) lo = mid + 1; else hi = mid;
+        }
+
+        if (!safe) {
+            ctx->nstale++;
+            ctx->fname = NULL;
+            ctx->gen = 0;
+            zsi_salvage_emit(ctx, ZS_SALVAGE_KEY_MAYBE_STALE, 0, 0, k, kl);
+        }
+    }
+
+    zs_cursor_fini(&c);
+    return (r == ZS_DONE || r == ZS_OK) ? ZS_OK : r;
+}
+
+int zs_db_salvage(const char *from, const char *to,
+                  struct zs_salvage_data *setup)
+{
+    struct zs_salvage_data defaults = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_open_data outsetup = ZS_OPEN_DATA_INITIALIZER;
+    struct zsi_salvage_ctx ctx;
+    struct zsi_fileset fs;
+    struct zs_db *out = NULL;
+    uint32_t expect_gen = 0;
+    int r;
+
+    if (!from || !to) return ZS_BADUSAGE;
+    if (!setup) setup = &defaults;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.setup = setup;
+
+    /* S-2: scan for names only.  zsi_fileset_scan parses D-1 names and does NOT
+     * resolve overlaps or check tiling -- that is zsi_fileset_resolve, which is
+     * deliberately not called here.  A gap is something to report and step over,
+     * not something to fail on. */
+    r = zsi_fileset_scan(from, NULL, &fs);
+    if (r == ZS_NOTFOUND) return ZS_NOTFOUND;
+    if (r != ZS_OK) return r;
+
+    if (fs.nall == 0) { zsi_fileset_fini(&fs); return ZS_NOTFOUND; }
+
+    qsort(fs.all, fs.nall, sizeof(*fs.all), zsi_salvage_order);
+
+    outsetup.flags = ZS_CREATE;
+    outsetup.compar = setup->compar;
+    outsetup.compar_name = setup->compar_name;
+    outsetup.csum = setup->csum;
+    outsetup.error = setup->error;
+    r = zs_db_open(to, &outsetup, &out);
+    if (r != ZS_OK) { zsi_fileset_fini(&fs); return r; }
+    ctx.out = out;
+
+    for (size_t i = 0; i < fs.nall && !ctx.stopped; i++) {
+        struct zsi_file *f = NULL;
+        zs_csum *cs;
+        unsigned csum_id;
+
+        ctx.fname = fs.all[i].name;
+        ctx.gen = fs.all[i].start;
+
+        /* S-2 again: a generation absent from the set is reported, and the walk
+         * simply carries on.  Nothing is reconstructed (S-12). */
+        if (expect_gen && fs.all[i].start > expect_gen)
+            zsi_salvage_emit(&ctx, ZS_SALVAGE_GAP, 0,
+                             fs.all[i].start - expect_gen, NULL, 0);
+        {
+            uint32_t end = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
+            if (end + 1 > expect_gen) expect_gen = end + 1;
+        }
+
+        if (zsi_file_open(from, fs.all[i].name, fs.all[i].start,
+                          setup->csum, &f) != ZS_OK) {
+            zsi_salvage_emit(&ctx, ZS_SALVAGE_FILE_UNREADABLE, 0, 0, NULL, 0);
+            continue;
+        }
+
+        if (f->hdr_valid) {
+            cs = f->csum;
+            csum_id = f->csum_id;
+
+            /* S-4: the source's comparator does not affect the output, which is
+             * ordered by the caller's -- but a mismatch means the source was
+             * built under an order we are not reproducing, and that is worth
+             * saying rather than discovering later. */
+            if (out->compar_name[0]
+                && memcmp(f->hdr.compar_name, out->compar_name,
+                          ZSI_COMPAR_NAME_LEN) != 0)
+                setup->error ? setup->error(
+                    "source comparator differs from the one salvage was given",
+                    "file=<%s>", f->fname) : (void)0;
+        } else {
+            /* S-5: the header did not validate.  The generation still comes
+             * from the filename; only the engine is genuinely unknown. */
+            zsi_salvage_emit(&ctx, ZS_SALVAGE_HEADER_INVALID, 0, 0, NULL, 0);
+
+            if (zsi_salvage_engine(f, setup->csum, &cs, &csum_id) != ZS_OK) {
+                zsi_salvage_emit(&ctx, ZS_SALVAGE_FILE_UNREADABLE, 0, 0,
+                                 NULL, 0);
+                zsi_file_close(&f);
+                continue;
+            }
+            zsi_salvage_emit(&ctx, ZS_SALVAGE_ENGINE_GUESSED, csum_id, 0,
+                             NULL, 0);
+        }
+
+        /* The KIND comes from the filename, not the header: a file whose header
+         * is unreadable still has its range in its name (D-1), and that is what
+         * says whether to expect spans or a records region. */
+        if (fs.all[i].end == 0)
+            r = zsi_salvage_unordered(&ctx, f, cs, csum_id);
+        else
+            r = zsi_salvage_inorder(&ctx, f);
+
+        zsi_file_close(&f);
+        if (r != ZS_OK) goto out;
+    }
+
+    if (r == ZS_OK) r = zsi_salvage_report_stale(&ctx);
+    if (r == ZS_OK && ctx.stopped) r = ZS_DONE;
+
+out:
+    free(ctx.safe);
+    free(ctx.safekeys);
+    zsi_fileset_fini(&fs);
+    zs_db_close(&out);
+    return r;
+}
