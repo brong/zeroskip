@@ -4086,6 +4086,12 @@ static void zsi_cursor_free(struct zs_cursor *c)
 /* D-14e step 1: seek every per-file cursor to the start point, so its current
  * record is the first with key >= the start key -- or mark it exhausted, which is
  * immediately the case for a source holding no records.  Then sort. */
+/* `flags` is uint32_t here and `int` in the public binding, which is where the
+ * three casts at the call sites come from.  The binding uses int because that is
+ * what C callers expect of a flags argument; internally the flag space is one
+ * 32-bit set of bits and unsigned is the honest type for it.  Every public flag
+ * value fits well inside 30 bits, so the conversion is value-preserving -- but it
+ * is written out rather than left implicit, because Cyrus builds -Wconversion. */
 static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
                            struct zsi_snapshot *snap,
                            const char *key, size_t keylen,
@@ -6424,7 +6430,8 @@ int zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
     if (!txn || !cb) return ZS_BADUSAGE;
 
     rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
-                         startlen ? start : NULL, startlen, flags, &c);
+                         startlen ? start : NULL, startlen,
+                         (uint32_t)flags, &c);
     if (rc != ZS_OK) return rc;
 
     while ((rc = zsi_cursor_next(c, &r)) == ZS_OK) {
@@ -6466,7 +6473,8 @@ int zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
     if (!txn || !curp) return ZS_BADUSAGE;
     *curp = NULL;
     return zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
-                           keylen ? key : NULL, keylen, flags, curp);
+                           keylen ? key : NULL, keylen,
+                           (uint32_t)flags, curp);
 }
 
 int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
@@ -6485,7 +6493,8 @@ int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
     if (rc != ZS_OK) return rc;
 
     rc = zsi_cursor_open(db, txn->readonly ? NULL : txn, txn->snap,
-                         keylen ? key : NULL, keylen, flags, curp);
+                         keylen ? key : NULL, keylen,
+                         (uint32_t)flags, curp);
     if (rc != ZS_OK) { zs_txn_abort(&txn); return rc; }
 
     (*curp)->txn = txn;
