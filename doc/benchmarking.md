@@ -26,6 +26,7 @@ numbers can be read side by side.
 | `snapshot open` | the per-open replay cost, without a pointer table |
 | `open (cached)` | the same open with one — what spec section 8 buys |
 | `publish threshold` | what P-13's threshold trades, in both directions |
+| `compaction` | what compacting costs and what it reclaims (D-26, D-27) |
 
 The `store, one txn each` figure is dominated by `fdatasync` and therefore measures
 the *filesystem*, not zeroskip. Compare it against `store, 1000 per txn` on the same
@@ -101,6 +102,43 @@ The cache directory must be scoped to the database instance (P-17): a table
 outlives an out-of-band restore of the database directory, and P-10's binding
 checks one span rather than the whole prefix. A per-boot temporary directory
 satisfies that; restoring a database from backup means discarding its tables.
+
+## Compaction (D-26, D-27)
+
+`zs_db_compact` merges the whole database into one file. The cost is
+straightforward — it rewrites everything — so the number worth having is what it
+**reclaims**, measured against a database that has already been sealed and
+repacked as far as D-16's rule goes. That is the baseline a caller already has,
+so the column shows what compaction adds rather than what repacking would have
+done anyway.
+
+20 000 records, 100-byte values, 64 KB rollover:
+
+| deleted | after repack | after compact | reclaimed | compact |
+|---|---|---|---|---|
+| 0% | 2 426 KB | 2 422 KB | 0.2% | 7.5 ms |
+| 25% | 2 563 KB | 1 817 KB | 29.1% | 8.2 ms |
+| 50% | 2 699 KB | 1 211 KB | 55.1% | 7.7 ms |
+| 75% | 2 836 KB | 606 KB | **78.7%** | 8.6 ms |
+
+Two things to read from it:
+
+- **Reclamation tracks the deletion rate almost exactly.** That is D-27 working:
+  only a merge whose output spans the whole generation interval can drop a
+  tombstone, because only then does D-19's containment test succeed for every
+  key. A partial repack must keep them, since a file outside its input set may
+  still hold the key (D-19a) — which is why the "after repack" column *grows*
+  with the deletion rate while the compacted one shrinks.
+- **With nothing deleted there is almost nothing to reclaim.** Compaction is not
+  a general-purpose optimisation; it is for databases that have deleted a lot,
+  or that want to be a single file.
+
+**Compaction is unbounded** (D-29). These timings are for a 2 MB database; the
+cost is linear in total size, and one call rewrites all of it while writers
+continue. That is spec open item 1's unboundedness made a deliberate API entry
+point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
+bounded half — at most `rollover_size` of work — and is what to reach for if the
+goal is only to stop readers replaying the active file.
 
 ## Reading the rollover rows
 

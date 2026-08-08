@@ -66,6 +66,29 @@ and the deleted value reappears.
 | Identical output everywhere | The same operations produce byte-identical files on any machine and in any implementation, which is what allows independent implementations to be checked against each other. |
 | Self-describing files | Every file states its own format version and how to read it, so files written by different versions sit side by side. |
 
+## Sealing and compaction
+
+Two things a caller can ask for explicitly.
+
+**Sealing** converts the newest file — the one records land in — into a sorted,
+indexed one. Afterwards nothing in the database needs reading end to end, so any
+process opening it starts work immediately. It is cheap and bounded, because the
+newest file is only ever a couple of megabytes, and there is no harm in doing it
+often: before a backup, or before handing the database to readers. It creates
+nothing new; the next write simply starts a fresh file.
+
+**Compaction** merges everything into a single file. This is the only operation
+that reclaims the space held by deleted records. A record marking a deletion has
+to be kept as long as any older file might still hold the key it deletes — so
+ordinary merging, which only ever combines some of the files, must keep them all.
+A merge that takes *every* file has nothing older to worry about, and can drop
+them. In a database where three quarters of the keys have been deleted, that is
+about three quarters of the space.
+
+The cost is that compaction rewrites the entire database in one go. Writing
+continues while it runs, but the I/O is proportional to everything stored, not to
+what changed. It is a maintenance operation, not something to do on a timer.
+
 ## The pointer table cache
 
 Finding a key in the **active file** means reading it end to end, because records
