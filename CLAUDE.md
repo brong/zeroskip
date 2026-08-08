@@ -138,6 +138,8 @@ The perl patterns are tied to exact source text and will rot when the code is re
 
 **Nothing may touch `zeroskip.c` while `mutate.sh` runs, and two runs must never overlap.** It keeps its own backup and `cp`s it back between mutants, so a concurrent edit is silently reverted and two concurrent runs corrupt each other's verdicts. Both happened while the pointer table cache was being written, and the second produced a whole run that had to be thrown away. It also runs for ten to fifteen minutes, which is long enough to be tempted.
 
+**Killing a `mutate.sh` run orphans stopped `zstest` children.** It sets `set +m`, so the fork-based tests' children are left in `T` state rather than reaped, and they survive for hours holding descriptors. They cost no CPU, so the symptom is not an obvious hang but an inexplicably slow machine much later. After interrupting a run: `pkill -9 -f '^\./zstest'`, and check `ps aux | grep zstest` before blaming anything else for being slow.
+
 **A test must not be able to damage `tests/corpus/`.** `test_corpus_index_table` originally pointed a live cache directory at the checked-in corpus, and since a cache directory is one the library *unlinks from* (P-16), the two `sweeps` mutants deleted the golden table outright — which then made five unrelated mutants read as caught. It copies the case to scratch first. A deleted corpus file reads like a corpus that needs regenerating, which is exactly the diff `make corpus` must never be used to resolve.
 
 ## Interoperability surface
