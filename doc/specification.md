@@ -1233,10 +1233,21 @@ unreadable one.
   loaded — reaches an implementation-defined threshold. Readers and writers
   apply the same rule: whoever builds the pointers publishes them.
 
-  The threshold is required rather than advisory. A table is rewritten whole,
-  so publishing on every commit costs O(records in the file) of I/O per commit
-  and makes a bulk load quadratic. The threshold bounds both the publisher's
-  write amplification and the next reader's catch-up replay to the same figure.
+  The threshold is required rather than advisory, and **both ends of it cost**.
+
+  Too high is the expensive end. A write transaction refreshes its snapshot at
+  begin (C-4), and that refresh replays from the last published `valid_upto` —
+  so a threshold that publishes rarely leaves that replay unbounded, and a
+  one-store-per-transaction load becomes quadratic in the active file. Too low
+  costs an O(records) merge and a whole-table rewrite per commit, which is real
+  but cheaper, because a table is never synced (P-14).
+
+  Measured on 16000 single-store transactions over a 2 MB active file: no cache
+  26.8 s, threshold 1 byte 6.5 s, 4 KB 2.7 s, 32 KB 2.8 s, 256 KB 6.5 s, 1 MB
+  18.6 s. An implementation SHOULD choose its default from a measurement like
+  that one, and the figure is an absolute byte count rather than a fraction of
+  `rollover_size`: the knee is set by how much data a replay walks, which has
+  nothing to do with how large a caller lets a generation grow.
 - **P-14** A table MUST NOT be `fsync`ed before publication. It is rebuildable,
   and a torn or zero-filled file after a crash is rejected by P-11. Syncing it
   would add a sync to the commit path, which C-7 defines as exactly two.
@@ -1399,8 +1410,10 @@ different calls, though not every flag is meaningful everywhere:
   that is missing or unwritable disables the cache for that handle rather than
   failing the open (P-15).
 - **A-9** `index_threshold` is P-13's threshold in bytes. Zero selects an
-  implementation-defined default derived from `rollover_size`, so a caller that
-  sets `index_dir` and nothing else still gets bounded publishing.
+  implementation-defined default, so a caller that sets `index_dir` and nothing
+  else still gets bounded publishing. That default SHOULD be capped below
+  `rollover_size` so a caller using small generations still publishes within
+  one rather than never.
 
 ## 10. Conformance suite
 
