@@ -89,6 +89,29 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * (D-12d). */
 #define ZSI_DEFAULT_ROLLOVER (2 * 1024 * 1024)
 
+/* How far past the last published pointer table the active file may grow before
+ * another is published (P-13).  Measured, not guessed -- zsbench's "publish
+ * threshold" table, 16000 single-store transactions over a 2MB active file:
+ *
+ *     no cache  26.8s      every commit's snapshot refresh replays the whole file
+ *     1          6.5s      the whole table rewritten on every commit
+ *     4096       2.7s   <- flat minimum
+ *     32768      2.8s   <-
+ *     262144     6.5s      refresh replay growing again
+ *     1048576   18.6s
+ *
+ * BOTH ends cost, and the expensive one is the high end.  A write transaction
+ * refreshes its snapshot at begin (C-4), and that refresh replays from the last
+ * published point -- so a threshold that publishes too rarely leaves the replay
+ * unbounded and a one-store-per-transaction load quadratic.  Publishing too
+ * often costs an O(records) merge and rewrite per commit, which is real but
+ * cheaper, because those writes are never synced (P-14).
+ *
+ * An absolute byte count rather than a fraction of rollover_size, because the
+ * knee is set by how much data a replay has to walk, which has nothing to do
+ * with how large the caller lets a generation grow. */
+#define ZSI_DEFAULT_INDEX_THRESHOLD (32 * 1024)
+
 /********** LIBRARY SUPPORT *************/
 
 static void *zsi_zmalloc(size_t bytes)
@@ -5878,12 +5901,24 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
         db->index_dir = strdup(setup->index_dir);
         if (!db->index_dir) { free(db->dir); free(db); return ZS_INTERNAL; }
 
-        /* A-9.  Zero means a default derived from rollover_size, so a caller
-         * that sets index_dir and nothing else still gets bounded publishing.
+        /* A-9.  Zero means the measured default, so a caller that sets index_dir
+         * and nothing else still gets bounded publishing.
+         *
+         * Capped at a quarter of rollover_size, so a caller using small
+         * generations still publishes several times within one rather than
+         * never -- the default is an absolute figure, and a rollover smaller
+         * than it would otherwise make the cache useless exactly where opens are
+         * most frequent.
+         *
          * Never zero in the end: a threshold of zero publishes on every commit,
-         * which P-13 exists to prevent. */
-        db->index_threshold = setup->index_threshold ? setup->index_threshold
-                                                     : db->rollover_size / 8;
+         * which P-13 exists to bound. */
+        if (setup->index_threshold) {
+            db->index_threshold = setup->index_threshold;
+        } else {
+            size_t quarter = db->rollover_size / 4;
+            db->index_threshold = quarter < ZSI_DEFAULT_INDEX_THRESHOLD
+                                ? quarter : (size_t)ZSI_DEFAULT_INDEX_THRESHOLD;
+        }
         if (db->index_threshold == 0) db->index_threshold = 1;
     }
 

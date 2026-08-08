@@ -72,6 +72,25 @@ static struct zs_db *open_at(const char *dir, uint32_t flags, size_t rollover)
     return db;
 }
 
+/* The same, with the pointer table cache enabled (spec section 8). */
+static struct zs_db *open_cached(const char *dir, uint32_t flags, size_t rollover,
+                                 const char *idxdir, size_t threshold)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = flags;
+    setup.rollover_size = rollover;
+    setup.error = quiet_error;
+    setup.index_dir = idxdir;
+    setup.index_threshold = threshold;
+    if (zs_db_open(dir, &setup, &db) != ZS_OK) {
+        fprintf(stderr, "zsbench: cannot open %s\n", dir);
+        exit(1);
+    }
+    return db;
+}
+
 static size_t dir_bytes(const char *dir)
 {
     /* Total size of the data files, for reporting write amplification. */
@@ -392,8 +411,183 @@ static void bench_snapshot_open(void)
         cleanup(dir);
     }
 
-    printf("    (linear us/record means the replay dominates; a shared index\n"
-           "     would trade this scan for a sort -- see open item 2)\n");
+    printf("    (linear us/record means the replay dominates; the pointer table\n"
+           "     cache removes both the scan and the sort -- see spec section 8)\n");
+    free(val);
+}
+
+/* ------------------------------------------------------------------------- */
+
+static void bench_cached_open(void)
+{
+    /* What spec section 8 buys: the same open, with a published pointer table
+     * to seed the index from.
+     *
+     * The comparison is deliberately open-against-open on the SAME database,
+     * because the cache changes nothing else -- same files, same records, same
+     * answers.  The cached column is measured after one warming open, since the
+     * point of a cache is what the SECOND process pays.
+     *
+     * A cold row is reported too.  The warm number flatters the cache: with the
+     * data file already in page cache the replay it avoids is cheap, while the
+     * whole reason the cache is worth having is a process that would otherwise
+     * fault the entire active file in. */
+    char dir[1200], idx[1200];
+    char *val = malloc(valsize);
+    memset(val, 'v', valsize);
+
+    printf("\n  open cost with and without a pointer table (spec section 8)\n");
+    printf("    %-12s %-12s %-12s %-12s %s\n",
+           "records", "active KB", "plain ms", "cached ms", "speedup");
+
+    for (int n = 250; n <= 16000; n *= 2) {
+        snprintf(dir, sizeof(dir), "%s/cachedopen", workdir);
+        snprintf(idx, sizeof(idx), "%s/cachedopen-idx", workdir);
+        cleanup(dir);
+        cleanup(idx);
+        if (mkdir(idx, 0700) && errno != EEXIST) { perror(idx); exit(1); }
+
+        /* Threshold 1: publish at every opportunity, so the table is current.
+         * The threshold's own cost is measured separately below. */
+        struct zs_db *db = open_cached(dir, ZS_CREATE, 512 * 1024 * 1024, idx, 1);
+        for (int i = 0; i < n; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "key%08d", i);
+            zs_db_store(db, k, strlen(k), val, valsize, 0);
+        }
+        zs_db_close(&db);
+
+        size_t bytes = dir_bytes(dir);
+
+        double plain = 1e18, cached = 1e18;
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            db = open_at(dir, 0, 512 * 1024 * 1024);
+            double dt = now() - t0;
+            zs_db_close(&db);
+            if (dt < plain) plain = dt;
+        }
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            db = open_cached(dir, 0, 512 * 1024 * 1024, idx, 1);
+            double dt = now() - t0;
+            zs_db_close(&db);
+            if (dt < cached) cached = dt;
+        }
+
+        printf("    %-12d %-12.1f %-12.3f %-12.3f %.1fx\n",
+               n, (double)bytes / 1024.0, plain * 1000.0, cached * 1000.0,
+               cached > 0 ? plain / cached : 0.0);
+
+        cleanup(dir);
+        cleanup(idx);
+    }
+
+    free(val);
+}
+
+/* ------------------------------------------------------------------------- */
+
+static void bench_index_threshold(void)
+{
+    /* What P-13's threshold trades.
+     *
+     * Low: a table is republished often, so every commit carries an O(records)
+     * merge and an O(records) write, and a bulk load goes quadratic.
+     * High: publishing is rare, so the next reader replays further.
+     *
+     * Both costs are reported against the same workload, which is what makes the
+     * default a measurement rather than a guess. */
+    char dir[1200], idx[1200];
+    char *val = malloc(valsize);
+    static const size_t thresholds[] = { 1, 512, 4096, 32768, 262144, 1048576 };
+    memset(val, 'v', valsize);
+
+    printf("\n  publish threshold: write cost vs open cost (P-13)\n");
+    printf("    %-14s %-14s %-14s %s\n",
+           "threshold", "store ms", "open ms", "table KB");
+
+    /* The baseline, with no cache at all.  It belongs in this table rather than
+     * beside it: a write transaction refreshes its snapshot at BEGIN (C-4), and
+     * that refresh replays the active file from the last published point.  With
+     * no table there is no published point, so every commit replays the whole
+     * file and a one-store-per-transaction load is quadratic.  The threshold is
+     * what bounds that replay, which is a bigger effect than the republication
+     * cost it also controls. */
+    {
+        snprintf(dir, sizeof(dir), "%s/thresh", workdir);
+        cleanup(dir);
+
+        double t0 = now();
+        struct zs_db *db = open_at(dir, ZS_CREATE, 512 * 1024 * 1024);
+        for (int i = 0; i < nrecs; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "key%08d", i);
+            zs_db_store(db, k, strlen(k), val, valsize, 0);
+        }
+        zs_db_close(&db);
+        double store = now() - t0;
+
+        double open_best = 1e18;
+        for (int r = 0; r < 5; r++) {
+            double s0 = now();
+            db = open_at(dir, 0, 512 * 1024 * 1024);
+            double dt = now() - s0;
+            zs_db_close(&db);
+            if (dt < open_best) open_best = dt;
+        }
+
+        printf("    %-14s %-14.1f %-14.3f %s\n",
+               "no cache", store * 1000.0, open_best * 1000.0, "-");
+        cleanup(dir);
+    }
+
+    for (size_t t = 0; t < sizeof(thresholds) / sizeof(thresholds[0]); t++) {
+        snprintf(dir, sizeof(dir), "%s/thresh", workdir);
+        snprintf(idx, sizeof(idx), "%s/thresh-idx", workdir);
+        cleanup(dir);
+        cleanup(idx);
+        if (mkdir(idx, 0700) && errno != EEXIST) { perror(idx); exit(1); }
+
+        double t0 = now();
+        struct zs_db *db = open_cached(dir, ZS_CREATE, 512 * 1024 * 1024,
+                                       idx, thresholds[t]);
+        for (int i = 0; i < nrecs; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "key%08d", i);
+            zs_db_store(db, k, strlen(k), val, valsize, 0);
+        }
+        zs_db_close(&db);
+        double store = now() - t0;
+
+        double open_best = 1e18;
+        for (int r = 0; r < 5; r++) {
+            double s0 = now();
+            db = open_cached(dir, 0, 512 * 1024 * 1024, idx, thresholds[t]);
+            double dt = now() - s0;
+            zs_db_close(&db);
+            if (dt < open_best) open_best = dt;
+        }
+
+        /* How large the surviving table is.  Total bytes written cannot be
+         * observed after the fact -- each publish replaces the last -- so this
+         * reports the steady-state size, and the store column carries the
+         * republication cost. */
+        char cmd[2600];
+        snprintf(cmd, sizeof(cmd),
+                 "cat '%s'/zeroskip.index-* 2>/dev/null | wc -c", idx);
+        FILE *fp = popen(cmd, "r");
+        long long tb = 0;
+        if (fp) { if (fscanf(fp, "%lld", &tb) != 1) tb = 0; pclose(fp); }
+
+        printf("    %-14zu %-14.1f %-14.3f %.1f\n",
+               thresholds[t], store * 1000.0, open_best * 1000.0,
+               (double)tb / 1024.0);
+
+        cleanup(dir);
+        cleanup(idx);
+    }
+
     free(val);
 }
 
@@ -485,6 +679,8 @@ int main(int argc, char **argv)
         bench_rollover_and_convert();
         bench_repack_cascade();
         bench_snapshot_open();
+        bench_cached_open();
+        bench_index_threshold();
     }
 
     cleanup(workdir);

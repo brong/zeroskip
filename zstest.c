@@ -10398,12 +10398,20 @@ static void test_idxcache_threshold_defaults(void)
 
     setup.flags = ZS_CREATE;
     setup.index_dir = cachedir;
-    setup.rollover_size = 8192;
 
+    /* The plain default: an absolute byte count, because the knee is set by how
+     * much data a replay walks and not by how large a generation may grow. */
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_NOT_NULL(db);
-    ASSERT_EQU(db->index_threshold, 8192u / 8u);
+    ASSERT_EQU(db->index_threshold, (unsigned long long)ZSI_DEFAULT_INDEX_THRESHOLD);
     ASSERT_STR_EQ(db->index_dir, cachedir);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Capped at a quarter of rollover_size, so small generations still publish
+     * several times within one instead of never. */
+    setup.rollover_size = 8192;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQU(db->index_threshold, 8192u / 4u);
     ASSERT_OK(zs_db_close(&db));
 
     /* An explicit value wins, and the cache stays off when index_dir is NULL. */
