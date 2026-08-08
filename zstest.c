@@ -12766,8 +12766,20 @@ static void test_salvage_never_writes_the_source(void)
     }
     ASSERT_OK(zs_db_close(&db));
 
-    /* Names, sizes and checksums of every file in the source. */
-    snprintf(cmd, sizeof(cmd), "ls -1 '%s' | sort", dbdir);
+    /* Remove the lock file first, so its ABSENCE is part of what is compared.
+     * Without this the source already has one and a salvage that opened the
+     * source as a writable database -- which creates it (D-3a) -- would change
+     * nothing observable.  R-3 already forbids a reader creating it; salvage
+     * must not either. */
+    {
+        char lockpath[PATH_MAX];
+        snprintf(lockpath, sizeof(lockpath), "%s/zeroskip.lock", dbdir);
+        ASSERT_EQ(unlink(lockpath), 0);
+    }
+
+    /* Every name in the source, with sizes. */
+    snprintf(cmd, sizeof(cmd), "ls -1l '%s' | awk '{print $5, $9}' | sort",
+             dbdir);
     ASSERT_EQ(capture(cmd, before, sizeof(before)), 0);
 
     salv_reset_out();

@@ -944,6 +944,62 @@ mutant "compact: takes the write lock outermost" catch \
   's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    \/\* Steps 1 and 2/    r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) return r;\n\n    \/* Steps 1 and 2/'
 
 echo
+echo "salvage (S-1..S-12)"
+
+# S-7, and the most important mutant here.  Believing a candidate terminator
+# without checksumming the span it implies turns salvage from a recovery into a
+# guess, and everything it produced would be unverified while claiming not to be.
+mutant "salvage: resync believes a candidate unchecked" catch \
+  's/        if \(zsi_csum2\(cs, csum_id, spandata \? spandata : "",\n                      \(size_t\)t\.spanlen, termbytes, t\.len - 4\) != t\.csum\)\n            continue;/        \/* S-7 proof removed *\//'
+
+# S-7 again.  SUBSUMED, and the group's demonstration is the checksum mutant
+# above rather than a combined one.
+#
+# Reaching this check needs a candidate whose implied span starts BEFORE the last
+# verified boundary and still checksums correctly -- overlapping spans, which a
+# conforming writer never produces and which no test hand-builds.  Everything the
+# suite does construct is rejected first by the checksum proof, or, where
+# p - spanlen underflows, by zsi_file_at's bounds check (F-30).
+#
+# It stays because it states the invariant the `floor` parameter exists for,
+# rather than leaving it as a consequence of an unsigned comparison two lines up.
+mutant "salvage: resync ignores the floor" subsumed \
+  's/        if \(start < floor\) continue;/        \/* floor removed *\//'
+
+# S-9.  Recovering a rolled-back span resurrects a transaction that never
+# happened and that no conforming reader has ever shown.
+mutant "salvage: recovers rolled-back spans" catch \
+  's/        if \(zsi_term_is_rollback\(&term\)\) \{/        if (0) {/'
+
+# S-8.  Unverifiable records carry no checksum of their own; producing them
+# without being asked makes the default output partly unproven.
+mutant "salvage: recovers unverified without the flag" catch \
+  's/    bool want_unverified =\n        \(ctx->setup->flags & ZS_SALVAGE_UNVERIFIED\) != 0;/    bool want_unverified = true;/'
+
+# S-2.  Applying the tiling check makes salvage refuse the database it exists
+# for -- one missing generation, every other file perfectly readable.
+mutant "salvage: applies the tiling check" catch \
+  's/    r = zsi_fileset_scan\(from, NULL, &fs\);/    r = zsi_fileset_scan(from, NULL, \&fs);\n    if (r == ZS_OK) { int rr_ = zsi_fileset_resolve(\&fs);\n        if (rr_ != ZS_OK) { zsi_fileset_fini(\&fs); return rr_; } }/'
+
+# S-3.  Newest first makes an OLDER value win, silently, with no error anywhere.
+mutant "salvage: processes newest first" catch \
+  's/    if \(a->start != b->start\) return a->start < b->start \? -1 : 1;/    if (a->start != b->start) return a->start < b->start ? 1 : -1;/'
+
+# S-10.  The report is the mitigation for emitting a possibly stale value, so
+# dropping it leaves the value emitted and the risk unnamed.
+mutant "salvage: never reports stale keys" catch \
+  's/    if \(!ctx->any_loss \|\| !ctx->setup->report\) return ZS_OK;/    return ZS_OK;\n    if (!ctx->any_loss || !ctx->setup->report) return ZS_OK;/'
+
+# S-10 the other way: reporting every key makes the report useless rather than
+# wrong, which is the failure mode that would survive a careless test.
+mutant "salvage: reports every key as stale" catch \
+  's/            if \(d == 0\) \{ safe = true; break; \}/            if (d == 0) { break; }/'
+
+# S-1.  Opening the source for writing is the one thing salvage must never do.
+mutant "salvage: opens the source writable" catch \
+  's/    outsetup\.flags = ZS_CREATE;/    outsetup.flags = ZS_CREATE;\n    { struct zs_open_data w_ = ZS_OPEN_DATA_INITIALIZER; struct zs_db *wd_ = NULL;\n      if (zs_db_open(from, \&w_, \&wd_) == ZS_OK) zs_db_close(\&wd_); }/'
+
+echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"
 
