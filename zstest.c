@@ -11915,6 +11915,210 @@ static void test_seal_unclean_active_file(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* D-26, A-11: everything becomes one in-order file spanning the whole range. */
+static void test_compact_to_one_file(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;          /* force several generations */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 80; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "0123456789", 10, 0));
+    }
+    ASSERT(db->snap->nfiles > 1);
+
+    ASSERT_OK(zs_db_compact(db));
+
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT_EQU(db->snap->files[0]->hdr.start, 1u);
+    ASSERT(!zs_db_should_repack(db));
+
+    for (int i = 0; i < 80; i++) {
+        char k[32];
+        const char *v = NULL;
+        size_t vl = 0;
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 10u);
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+
+    /* Idempotent: compacting a single file must not rewrite it. */
+    {
+        uint32_t end = db->snap->files[0]->hdr.end;
+        ASSERT_OK(zs_db_compact(db));
+        ASSERT_EQU(db->snap->nfiles, 1u);
+        ASSERT_EQU(db->snap->files[0]->hdr.end, end);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-26a: compaction merges files a repack deliberately leaves alone.  Built so
+ * zs_db_should_repack is FALSE first -- otherwise a repack would have done the
+ * same thing and the test would prove nothing about the selection. */
+static void test_compact_ignores_geometric_selection(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 80; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "0123456789", 10, 0));
+    }
+    ASSERT_OK(zs_db_seal(db));
+    while (zs_db_should_repack(db)) ASSERT_OK(zs_db_repack(db));
+
+    /* D-16 says there is nothing left to do, and more than one file remains. */
+    ASSERT(!zs_db_should_repack(db));
+    ASSERT(db->snap->nfiles > 1);
+
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-27: a compaction spanning 1..N drops tombstones, which a repack cannot.
+ *
+ * Asserted by SIZE as well as by behaviour: "the key is absent" holds either
+ * way, so only the file getting smaller shows the tombstone actually went.  Two
+ * thirds of the keys are deleted so the difference cannot be noise. */
+static void test_compact_drops_tombstones(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    size_t before = 0, after;
+    const char *v = NULL;
+    size_t vl = 0;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 60; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "0123456789", 10, 0));
+    }
+    for (int i = 0; i < 40; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_delete(db, k, strlen(k), 0));
+    }
+    ASSERT_OK(zs_db_seal(db));
+    for (size_t i = 0; i < db->snap->nfiles; i++)
+        before += db->snap->files[i]->size;
+
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    after = db->snap->files[0]->size;
+    ASSERT(after < before);
+
+    for (int i = 0; i < 40; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_EQ(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0),
+                  ZS_NOTFOUND);
+    }
+    for (int i = 40; i < 60; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 10u);
+    }
+
+    /* A key deleted and then rewritten survives with its NEW value -- the case
+     * dropping a tombstone carelessly would break. */
+    ASSERT_OK(zs_db_store(db, "key000", 6, "again", 5, 0));
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT_OK(zs_db_fetch(db, "key000", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 5u);
+    ASSERT_MEM_EQ(v, "again", 5);
+
+    /* And the other deleted keys are still gone after the second compaction. */
+    ASSERT_EQ(zs_db_fetch(db, "key001", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-28, A-11: best effort in action, strict in reporting. */
+static void test_compact_reports_and_fails_on_bad_file(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char name[ZSI_NAME_MAX];
+    size_t files_before;
+    int fd;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;
+    setup.error = counting_error;
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 80; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "key%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "0123456789", 10, 0));
+    }
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT(db->snap->nfiles > 2);
+
+    /* Pick a middle file, so the in-order prefix stops at it and files remain on
+     * both sides -- the arrangement where "merge what you can" is meaningful. */
+    zsi_name_format(name, db->uuid, db->snap->files[1]->hdr.start,
+                    db->snap->files[1]->hdr.end);
+    files_before = db->snap->nfiles;
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Destroy its header, which D-10a tolerates and nothing can merge. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    ASSERT_EQ(write(fd, "not a zeroskip header at all", 28), 28);
+    close(fd);
+
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    report_count = 0;
+
+    ASSERT_EQ(zs_db_compact(db), ZS_BADFORMAT);
+
+    /* It reported, and it still merged what it could. */
+    ASSERT(report_count > 0);
+    ASSERT(db->snap->nfiles > 1);
+    ASSERT(db->snap->nfiles < files_before);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-11, R-3: a read-only handle must not compact. */
+static void test_compact_readonly(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    setup.flags = ZS_SHARED;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(zs_db_compact(db), ZS_READONLY);
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -12152,6 +12356,13 @@ static struct test_entry tests[] = {
     { "test_seal_noop_cases",           test_seal_noop_cases },
     { "test_seal_readonly",             test_seal_readonly },
     { "test_seal_unclean_active_file",  test_seal_unclean_active_file },
+    { "test_compact_to_one_file",       test_compact_to_one_file },
+    { "test_compact_ignores_geometric_selection",
+                                        test_compact_ignores_geometric_selection },
+    { "test_compact_drops_tombstones",  test_compact_drops_tombstones },
+    { "test_compact_reports_and_fails_on_bad_file",
+                                        test_compact_reports_and_fails_on_bad_file },
+    { "test_compact_readonly",          test_compact_readonly },
 
     { NULL, NULL }
 };

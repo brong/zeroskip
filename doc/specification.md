@@ -960,21 +960,28 @@ The per-file cursors are held in an array kept sorted by:
   output — the same outcome R-4 already produces, reached sooner.
 - **D-26 Compaction.** An implementation MAY merge the **entire** database into
   one file. The order is normative: seal (D-25), then convert every remaining
-  unordered file (D-12), then merge every in-order file as a single input set.
+  unordered file (D-12), then merge in-order files until no two adjacent ones
+  remain.
 - **D-26a** D-16's geometric selection does NOT apply to compaction. That rule
   exists to keep a repack amortised, and compaction is explicitly the
   unamortised case. Every other repack rule applies unchanged, D-17 through
-  D-23.
+  D-23 — **including adjacency** (D-19).
+- **D-26b** Adjacency is why compaction merges every maximal **run** of adjacent
+  in-order files rather than the in-order prefix. A file that can be neither
+  converted nor merged (D-28) splits the set into runs, and each must be merged
+  separately. Taking only the prefix would merge nothing at all when such a file
+  is second in the set — which is precisely the damaged database where D-28's
+  "everything mergeable" has to mean something.
 - **D-27** Because a compaction output spans the whole generation interval,
   D-19's containment test succeeds for every key, so every tombstone whose
   lifespan it contains is dropped. This is the **only** merge that can reclaim
   them: a partial repack MUST retain a tombstone, because a file outside its
   input set may still hold the key (D-19a).
 - **D-28** Compaction is **best effort in action and strict in reporting**: it
-  merges everything mergeable and reports what it could not, and reports failure
-  only if the result is not a single file. A non-active file with an invalid
-  header is the case that blocks it — D-10a tolerates such a file, but it can be
-  neither converted nor merged.
+  merges everything mergeable (D-26b) and reports what it could not, and reports
+  failure only if the result is not a single file. A non-active file with an
+  invalid header is the case that blocks it — D-10a tolerates such a file, but
+  it can be neither converted nor merged.
 - **D-29** Compaction is unbounded: it rewrites the whole database in one
   invocation while writers continue. That is open item 1's unboundedness made a
   deliberate entry point rather than an emergent property of D-16's cascade, and

@@ -161,6 +161,12 @@ bool zs_db_should_repack(struct zs_db *db);
  * rollover_size, so cheap enough to call routinely.  A no-op, not an error,
  * when there is nothing to seal. */
 int  zs_db_seal(struct zs_db *db);
+
+/* Merge the entire database into a single file (D-26), reclaiming the tombstones
+ * a partial repack structurally cannot (D-27).  UNBOUNDED: it rewrites
+ * everything in one call while writers continue.  Returns ZS_BADFORMAT if the
+ * result is not a single file, having merged whatever it could first. */
+int  zs_db_compact(struct zs_db *db);
 int  zs_db_check_consistency(struct zs_db *db);
 int  zs_db_dump(struct zs_db *db, int detail);
 

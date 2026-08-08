@@ -3739,12 +3739,16 @@ static int zsi_lock_fcntl(int fd, enum zsi_lock which, int type, bool block)
  * test and corrupts a database the moment two threads write, which is invisible
  * to a single-threaded suite and is why T-14 must be run per implementation.
  *
- * C-1d lock ordering: acquisition is always write -> remove or repack -> remove.
- * Nothing takes write or repack while holding remove, and nothing holds both
- * write and repack, so no cycle exists.  Asserted here, which is sound now that
- * a handle belongs to one thread of control: `held` describes the one actor
- * using it, and a violation deadlocks in production while being trivially visible
- * in development. */
+ * C-1d lock ordering: the locks form ONE TOTAL ORDER, repack -> write -> remove.
+ * A holder may take a lock later in that order and must not take one earlier, so
+ * no cycle exists.  Most operations use a sub-chain: a writer takes
+ * write -> remove, a repacker repack -> remove, and the two never contend
+ * (C-1a).  Only compaction (D-26) holds both repack and write, which is why the
+ * order is a chain rather than two disjoint pairs.
+ *
+ * Asserted here, which is sound now that a handle belongs to one thread of
+ * control: `held` describes the one actor using it, and a violation deadlocks in
+ * production while being trivially visible in development. */
 static int zsi_lock_take(struct zsi_locks *lk, enum zsi_lock which, int flags)
 {
     bool block = !(flags & ZS_NONBLOCKING);
@@ -3752,10 +3756,10 @@ static int zsi_lock_take(struct zsi_locks *lk, enum zsi_lock which, int flags)
     assert(lk->fd >= 0);
     assert(!(lk->held & (1u << which)));        /* not already held */
 
+    /* C-1d, as a chain: taking a lock is legal only while holding locks strictly
+     * EARLIER in repack -> write -> remove. */
     if (which == ZSI_LOCK_WRITE || which == ZSI_LOCK_REPACK)
-        assert(!(lk->held & (1u << ZSI_LOCK_REMOVE)));   /* C-1d */
-    if (which == ZSI_LOCK_WRITE)
-        assert(!(lk->held & (1u << ZSI_LOCK_REPACK)));
+        assert(!(lk->held & (1u << ZSI_LOCK_REMOVE)));
     if (which == ZSI_LOCK_REPACK)
         assert(!(lk->held & (1u << ZSI_LOCK_WRITE)));
 
@@ -5455,6 +5459,45 @@ out:
  * A single invocation is therefore unbounded in duration, which the spec records
  * as an open item -- writing continues throughout regardless, because the repack
  * lock and the write lock never contend (C-1a). */
+/* Merge snap->files[first .. first+count) into one, retire the inputs, refresh.
+ *
+ * THE single merge entry point.  Both zsi_repack and zsi_compact reach the merge
+ * through here, so D-17 to D-23 are implemented once: a second call site for
+ * zsi_repack_merge is exactly how two sets of retention rules would drift apart,
+ * and D-19's tombstone rule is the one nobody would notice diverging.
+ *
+ * The caller holds the repack lock and has refreshed under it. */
+static int zsi_repack_run(struct zs_db *db, size_t first, size_t count)
+{
+    int r;
+
+    /* Remember the input names before the merge: the snapshot is replaced by the
+     * refresh below, and the names are what D-23 needs. */
+    char (*names)[ZSI_NAME_MAX] = malloc(count * sizeof(*names));
+    if (!names) return ZS_INTERNAL;
+    for (size_t i = 0; i < count; i++)
+        zsi_name_format(names[i], db->uuid,
+                        db->snap->files[first + i]->hdr.start,
+                        db->snap->files[first + i]->hdr.end);
+
+    r = zsi_repack_merge(db, db->snap, first, count);
+    if (r != ZS_OK) { free(names); return r; }
+
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) { free(names); return r; }
+
+    /* Retire the inputs (D-23).  Each is now superseded by the output, so each
+     * verification succeeds -- but a failure is not fatal: a leaked file costs
+     * disk space and a later pass removes it. */
+    for (size_t i = 0; i < count; i++) {
+        int rr = zsi_remove_file(db, names[i]);
+        (void)rr;
+    }
+
+    free(names);
+    return zsi_db_refresh(db);
+}
+
 static int zsi_repack(struct zs_db *db)
 {
     int r = zsi_check_writable(db);
@@ -5472,31 +5515,90 @@ static int zsi_repack(struct zs_db *db)
     count = zsi_repack_select(db->snap, &first);
     if (count < 2) { r = ZS_OK; goto out; }     /* nothing to do */
 
-    /* Remember the input names before the merge: the snapshot is replaced by the
-     * refresh below, and the names are what D-23 needs. */
-    char (*names)[ZSI_NAME_MAX] = malloc(count * sizeof(*names));
-    if (!names) { r = ZS_INTERNAL; goto out; }
-    for (size_t i = 0; i < count; i++)
-        zsi_name_format(names[i], db->uuid,
-                        db->snap->files[first + i]->hdr.start,
-                        db->snap->files[first + i]->hdr.end);
+    r = zsi_repack_run(db, first, count);
 
-    r = zsi_repack_merge(db, db->snap, first, count);
-    if (r != ZS_OK) { free(names); goto out; }
+out:
+    zsi_lock_release(&db->locks, ZSI_LOCK_REPACK);
+    return r;
+}
+
+/* D-26: the whole database into one file.
+ *
+ * Unbounded by design (D-29), holding the repack lock throughout while writers
+ * continue -- the same shape zs_db_repack already has, and spec open item 1's
+ * unboundedness now a deliberate API entry point rather than an emergent
+ * property of D-16's cascade.
+ *
+ * Lock order is REPACK then WRITE (C-1d), and zsi_seal releases the write lock
+ * before returning, so the merge runs holding repack alone and a long compaction
+ * does not block writers throughout.  C-1d had to be AMENDED for this: it
+ * previously said nothing holds both write and repack.  The order is still
+ * acyclic -- repack, write, remove is a chain -- and every other operation uses
+ * a sub-chain of it. */
+static int zsi_compact(struct zs_db *db)
+{
+    size_t first, count;
+    int r = zsi_check_writable(db);
+    if (r != ZS_OK) return r;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) return r;
+
+    /* Steps 1 and 2: seal the active generation, and convert any straggler.
+     * zsi_seal takes and releases the write lock itself, and converts pending
+     * files on its way out. */
+    r = zsi_seal(db);
+    if (r != ZS_OK) goto out;
 
     r = zsi_db_refresh(db);
-    if (r != ZS_OK) { free(names); goto out; }
+    if (r != ZS_OK) goto out;
 
-    /* Retire the inputs (D-23).  Each is now superseded by the output, so each
-     * verification succeeds -- but a failure is not fatal: a leaked file costs
-     * disk space and a later pass removes it. */
-    for (size_t i = 0; i < count; i++) {
-        int rr = zsi_remove_file(db, names[i]);
-        (void)rr;
+    /* Step 3: merge every maximal RUN of adjacent in-order files, largest job
+     * first, until none of two or more remains.
+     *
+     * Runs, not the in-order prefix (D-26a).  D-16's geometric selection does not
+     * apply -- it exists to keep a repack amortised and compaction is explicitly
+     * the unamortised case -- but adjacency still does (D-19), so a file nothing
+     * can convert splits the set into runs that must each be merged separately.
+     * Taking only the prefix would merge NOTHING when such a file sits second,
+     * which is exactly the damaged database where D-28's "everything mergeable"
+     * has to mean something.
+     *
+     * Terminates because each pass reduces nfiles by at least one, and
+     * zsi_repack_run refreshes, so the next scan sees the new set. */
+    for (;;) {
+        size_t i = 0;
+        bool found = false;
+
+        while (i < db->snap->nfiles) {
+            if (zsi_file_is_unordered(db->snap->files[i])) { i++; continue; }
+
+            first = i;
+            while (i < db->snap->nfiles
+                   && !zsi_file_is_unordered(db->snap->files[i])) i++;
+            count = i - first;
+
+            if (count >= 2) { found = true; break; }
+        }
+
+        if (!found) break;
+
+        r = zsi_repack_run(db, first, count);
+        if (r != ZS_OK) goto out;
     }
 
-    free(names);
-    r = zsi_db_refresh(db);
+    /* D-28: strict in reporting, having already done everything it could.  What
+     * blocks a single file is a non-active file with an invalid header -- D-10a
+     * tolerates it, and it can be neither converted nor merged, so it sits in
+     * the middle of the range and stops the in-order prefix there. */
+    if (db->snap->nfiles != 1) {
+        for (size_t i = 0; i < db->snap->nfiles; i++)
+            if (!db->snap->files[i]->hdr_valid)
+                db->error("file cannot be merged; compaction left it in place",
+                          "file=<%s>", db->snap->files[i]->fname);
+        r = ZS_BADFORMAT;
+    }
 
 out:
     zsi_lock_release(&db->locks, ZSI_LOCK_REPACK);
@@ -5513,6 +5615,12 @@ int zs_db_seal(struct zs_db *db)
 {
     if (!db) return ZS_BADUSAGE;
     return zsi_seal(db);
+}
+
+int zs_db_compact(struct zs_db *db)
+{
+    if (!db) return ZS_BADUSAGE;
+    return zsi_compact(db);
 }
 
 bool zs_db_should_repack(struct zs_db *db)

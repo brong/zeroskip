@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 227 |
-| With an enforcing test | 218 |
+| Requirements | 228 |
+| With an enforcing test | 219 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -174,6 +174,7 @@ a spec label is missing here.
 | `D-25c` | An unclean active file (D-9) MAY be sealed. The conversion reads to | `seal_unclean_active_file` |
 | `D-26` | **Compaction.** An implementation MAY merge the **entire** database into | `compact_to_one_file` |
 | `D-26a` | D-16's geometric selection does NOT apply to compaction. That rule | `compact_ignores_geometric_selection` |
+| `D-26b` | Adjacency is why compaction merges every maximal **run** of adjacent | `compact_reports_and_fails_on_bad_file` |
 | `D-27` | Because a compaction output spans the whole generation interval, | `compact_drops_tombstones` |
 | `D-28` | Compaction is **best effort in action and strict in reporting**: it | `compact_reports_and_fails_on_bad_file` |
 | `D-29` | Compaction is unbounded: it rewrites the whole database in one | `zsbench` |
