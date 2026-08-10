@@ -45,10 +45,23 @@ set +m          # no async job-control messages: a crashing mutant's
 cd "$(dirname "$0")/.." || exit 1
 
 FILTER="${1:-}"
-WORK="$(mktemp -d)"
-BAK="$WORK/zeroskip.c.orig"
-trap 'cp "$BAK" zeroskip.c 2>/dev/null; rm -rf "$WORK"' EXIT
 
+# Mutate a COPY, never the checkout.  Everything the two test binaries need to
+# build and run is snapshotted into a temp directory up front and mutated
+# there, so an edit made in the repo during a run cannot be silently reverted,
+# an interrupted run cannot leave a mutant in the tree, and two concurrent runs
+# cannot corrupt each other's verdicts -- each has its own copy.  (All three
+# happened while this mutated the checkout in place; one cost a whole run.)
+# The flip side: repo changes made after launch are not part of this run.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+cp zeroskip.c zeroskip.h zstest.c zstest-crash.c xxhash.h Makefile "$WORK/"
+mkdir -p "$WORK/tests"
+cp -R tests/corpus "$WORK/tests/corpus"
+cd "$WORK" || exit 1
+
+BAK="$WORK/zeroskip.c.orig"
 cp zeroskip.c "$BAK"
 caught=0 missed=0 equivalent=0 broken=0
 
@@ -1075,9 +1088,5 @@ mutant "cursor: txn_seq not taken at open" subsumed \
 echo
 printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
     "$caught" "$equivalent" "$missed" "$broken"
-
-cp "$BAK" zeroskip.c
-rm -f zstest
-make zstest >/dev/null 2>&1
 
 [ "$missed" -eq 0 ] && [ "$broken" -eq 0 ]
