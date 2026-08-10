@@ -247,6 +247,12 @@ Each part earns its place, following the reasoning behind the PNG signature:
   may still read a newer file even when it must not write to it. A reader MUST
   refuse to read above its read version and MUST refuse to write above its
   write version.
+- **F-7a** Version 2 is the first published version: a conforming writer
+  writes `version_read = version_write = 2`, and a reader MUST refuse
+  `version_read` below 2 as well as above its own. Version 1 was never
+  released, so this is a pre-release clean break — not a compatibility path
+  dropped for a format that shipped — made necessary by the per-record
+  checksum (F-32): a version-1 record has no trailing checksum field to read.
 - **F-8** Reserved fields MUST be written as zero and MUST be ignored on read.
   Compatibility decisions belong to the version fields, not to reserved bytes.
 - **F-9** Generations start at 1, so `end == 0` is never a legitimate
@@ -338,72 +344,82 @@ containing file, and is stored only when it differs from the containing file's
 
 ```
 KEYVALUE (0x01)
-  +0   1  type
-  +1   1  keylen
-  +2   2  vallen
-  +4   .  key NUL value NUL pad->8
-  len = roundup8(4 + keylen + 1 + vallen + 1)
+  +0      1  type
+  +1      1  keylen
+  +2      2  vallen
+  +4      .  key NUL value NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
+  len = roundup8(4 + keylen + 1 + vallen + 1 + 4)
 
 KEYVALUE_ANC (0x09)
-  +0   1  type
-  +1   1  keylen
-  +2   2  vallen
-  +4   4  ancestor generation
-  +8   .  key NUL value NUL pad->8
-  len = roundup8(8 + keylen + 1 + vallen + 1)
+  +0      1  type
+  +1      1  keylen
+  +2      2  vallen
+  +4      4  ancestor generation
+  +8      .  key NUL value NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
+  len = roundup8(8 + keylen + 1 + vallen + 1 + 4)
 
 DELETION (0x03)
-  +0   1  type
-  +1   1  keylen
-  +2   2  pad
-  +4   .  key NUL pad->8
-  len = roundup8(4 + keylen + 1)
+  +0      1  type
+  +1      1  keylen
+  +2      2  pad
+  +4      .  key NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
+  len = roundup8(4 + keylen + 1 + 4)
 
 DELETION_ANC (0x0B)
-  +0   1  type
-  +1   1  keylen
-  +2   2  pad
-  +4   4  ancestor generation
-  +8   .  key NUL pad->8
-  len = roundup8(8 + keylen + 1)
+  +0      1  type
+  +1      1  keylen
+  +2      2  pad
+  +4      4  ancestor generation
+  +8      .  key NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
+  len = roundup8(8 + keylen + 1 + 4)
 
 BIGKEYVALUE (0x05)
-  +0   1  type
-  +1   7  pad
-  +8   8  keylen
-  +16  8  vallen
-  +24  .  key NUL value NUL pad->8
+  +0      1  type
+  +1      7  pad
+  +8      8  keylen
+  +16     8  vallen
+  +24     .  key NUL value NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
 
 BIGKEYVALUE_ANC (0x0D)
-  +0   1  type
-  +1   3  pad
-  +4   4  ancestor generation
-  +8   8  keylen
-  +16  8  vallen
-  +24  .  key NUL value NUL pad->8
+  +0      1  type
+  +1      3  pad
+  +4      4  ancestor generation
+  +8      8  keylen
+  +16     8  vallen
+  +24     .  key NUL value NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
 
 BIGDELETION (0x07)
-  +0   1  type
-  +1   7  pad
-  +8   8  keylen
-  +16  .  key NUL pad->8
+  +0      1  type
+  +1      7  pad
+  +8      8  keylen
+  +16     .  key NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
 
 BIGDELETION_ANC (0x0F)
-  +0   1  type
-  +1   3  pad
-  +4   4  ancestor generation
-  +8   8  keylen
-  +16  .  key NUL pad->8
+  +0      1  type
+  +1      3  pad
+  +4      4  ancestor generation
+  +8      8  keylen
+  +16     .  key NUL pad->8
+  +len-4  4  csum      covers [0, len-4)
 ```
 
 - **F-15** Encoding is canonical: an implementation MUST use the short form
   whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
   whenever the span is `<= 0xFFFFFF` bytes; and MUST select between the
   ancestor-storing and ancestor-omitting forms exactly as F-17 requires; and MUST
-  choose the pointer width by F-26c. Output bytes are therefore determined by the
-  logical contents together with what the file already holds. The big form is
-  chosen by key or value length only, never by the ancestor, which is 4 bytes
-  whenever it is present.
+  choose the pointer width by F-26c; and the stored checksum (F-32) MUST be
+  correct under the containing file's engine — a checksum that does not match
+  is corruption, never an alternative encoding of the same record. Output
+  bytes are therefore determined by the logical contents together with what
+  the file already holds. The big form is chosen by key or value length only,
+  never by the ancestor, which is 4 bytes whenever it is present.
 
 ### 4.6 Ancestors
 
@@ -596,6 +612,26 @@ filesize-4    4   checksum of the pointer section
   16-byte trailer, verify the pointer-section checksum, use the pointers.
   Records are bounds-checked on access, and their checksum is verified only on
   demand (F-26f).
+- **F-32** Every data record ends in a 4-byte checksum: the last 4 bytes of
+  the padded record, computed by the containing file's engine (F-5a) over
+  `[0, len-4)` — type, lengths, ancestor, key, value, and padding. This is
+  the format's one checksum convention, stated once: **every checksum is the
+  last field of the thing it covers, and covers everything before it**
+  (header F-4, terminator F-19, trailer F-26b, records F-32).
+- **F-32a** A record's checksum MUST be verified when the record is
+  materialized for a caller — a lookup result or a cursor yield — unless the
+  handle was opened `ZS_NOCSUM` (F-5e). The failure is reported for that
+  record alone; other records remain readable.
+- **F-32b** A record's checksum MUST NOT be verified during span replay
+  (F-24) or pointer-section load. Replay completes a file at its first
+  invalid record, discarding everything after it — so verifying there turns
+  one flipped byte into the loss of every later record, a G-3 violation. A
+  record inside a valid span whose own checksum fails is in-place corruption,
+  detected at materialization.
+- **F-32c** A record copied byte-for-byte keeps a valid checksum only when
+  the output file's engine matches the input's. A writer copying records
+  into a file under a different engine MUST re-encode them (D-20b already
+  requires the source be verified first).
 
 ## 5. Database layout
 

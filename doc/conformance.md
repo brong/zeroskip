@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 242 |
-| With an enforcing test | 233 |
+| Requirements | 247 |
+| With an enforcing test | 238 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -57,6 +57,7 @@ a spec label is missing here.
 | `F-6` | A reader MUST validate all 16 bytes, not a prefix. | `magic` |
 | `F-6a` | The magic is **not valid UTF-8**: `0x89` lies in the continuation-byte | `magic`, `staging_names` |
 | `F-7` | Split read and write versions let an older library determine that it | `header_versions` |
+| `F-7a` | Version 2 is the first published version: a conforming writer | `header_versions` |
 | `F-8` | Reserved fields MUST be written as zero and MUST be ignored on read. | `header_reserved` |
 | `F-9` | Generations start at 1, so `end == 0` is never a legitimate | `filename_rejections`, `header_bounds_and_ranges`, `header_checksum` |
 | `F-10` | An unordered file holds **exactly one** generation: `start` is that | `header_roundtrip` |
@@ -98,6 +99,10 @@ a spec label is missing here.
 | `F-29` | Progress rule. Iteration computes the next offset from the current | `corpus_engine_from_file_not_config`, `malformed_never_hangs`, `span_progress` |
 | `F-30` | Every length, offset and pointer MUST be bounds-checked against the | **none** |
 | `F-31` | Opening an in-order file is O(1): validate the header, read the | `open_is_o1_in_records` |
+| `F-32` | Every data record ends in a 4-byte checksum: the last 4 bytes of | `record_byte_layout_v2`, `corpus` |
+| `F-32a` | A record's checksum MUST be verified when the record is | `read_verifies_record_csum`, `read_verifies_record_csum_unordered`, `record_csum_nocsum_reads` |
+| `F-32b` | A record's checksum MUST NOT be verified during span replay | `record_csum_replay_no_truncate` |
+| `F-32c` | A record copied byte-for-byte keeps a valid checksum only when | `convert_reencodes_engine_mismatch` |
 
 ## Database layout (`D-n`)
 
