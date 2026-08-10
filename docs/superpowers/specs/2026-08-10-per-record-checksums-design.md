@@ -82,12 +82,12 @@ offsets, not record bytes) and its version does not change.
 ## Repack/conversion interaction
 
 A record copied byte-for-byte keeps its checksum, and that is only valid when
-the output file's engine matches the input's. Both conversion and repack write
-their output under the handle's create engine (`zsi_write_inorder` and
-`zsi_repack_merge` both use `db->create_csum_id`), so both get the same rule:
-copy verbatim when the engines match, re-encode — which recomputes the
-checksum — when they differ. The merge already re-encodes when the ancestor
-form changes; this adds one more trigger.
+the output file's engine matches the input's (F-32c). Repack turned out to
+need nothing: `zsi_repack_merge` re-encodes every record it writes, so its
+checksums are always the output engine's. Conversion (`zsi_write_inorder`)
+is the verbatim copier, and it writes under the handle's create engine — so
+it re-encodes exactly when `src->csum_id != db->create_csum_id`, preserving
+the ancestor decision verbatim while canonicalising the form.
 
 ## Implementation surface
 

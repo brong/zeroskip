@@ -12129,6 +12129,33 @@ static void test_salvage_unverified_needs_the_flag(void)
     ASSERT(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED] >= 1);
 }
 
+static void test_convert_reencodes_engine_mismatch(void)
+{
+    /* F-32c: an engine-0 file sealed by an engine-1 handle.  The output
+     * file's header says engine 1, so a verbatim record copy would carry a
+     * ZERO checksum that fails under engine 1 for every record.  Conversion
+     * must re-encode.  (The reverse mismatch would pass silently -- engine 0
+     * verifies nothing -- which is why the test is this way round.) */
+    struct zs_db *db;
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_open_data setup2 = ZS_OPEN_DATA_INITIALIZER;
+    const char *v; size_t vl;
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_CSUM_NONE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+    zs_db_close(&db);
+
+    setup2.flags = ZS_CSUM_XXHASH;
+    ASSERT_OK(zs_db_open(dbdir, &setup2, &db));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
 static void test_check_reports_record_csum(void)
 {
     /* F-32a in check, both file kinds, both isolated so ONLY the per-record
@@ -13291,6 +13318,8 @@ static struct test_entry tests[] = {
 
     { "test_salvage_resyncs_after_a_bad_span",
                                         test_salvage_resyncs_after_a_bad_span },
+    { "test_convert_reencodes_engine_mismatch",
+                                    test_convert_reencodes_engine_mismatch },
     { "test_check_reports_record_csum", test_check_reports_record_csum },
     { "test_salvage_verifies_records_inorder",
                                     test_salvage_verifies_records_inorder },

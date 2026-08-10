@@ -5390,20 +5390,41 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         if (!ptrs) return ZS_INTERNAL;
     }
 
+    /* F-32c: a record's checksum is under its FILE's engine.  While the
+     * output engine matches the source's, a byte-for-byte copy carries a
+     * valid checksum with it; when the two differ -- an engine-0 file sealed
+     * by an engine-1 handle, say -- the copied checksum validates for
+     * nobody, so every record is re-encoded under the output engine instead.
+     * D-20b verified the source before this ran.  Re-encoding canonicalises
+     * the form (F-15) but copies the ancestor DECISION verbatim (F-17,
+     * D-17a): stored stays stored with its stored value, omitted stays
+     * omitted, nothing is renumbered. */
+    bool reencode = (src->csum_id != db->create_csum_id);
+
     /* Lay the records out contiguously, recording each one's offset in the
      * output.  A record is copied byte for byte from the source, which is what
      * makes ancestors verbatim rather than recomputed. */
     for (size_t i = 0; i < n; i++) {
         const char *b = zsi_file_at(src, offs[i], 1);
         struct zsi_rec rec;
+        size_t outlen;
 
         if (!b) { r = ZS_BADFORMAT; goto fail; }
         if (zsi_rec_decode(b, src->size - offs[i], src->hdr.start, &rec)
             != ZS_OK) { r = ZS_BADFORMAT; goto fail; }
 
-        if (recslen + rec.len > alloc) {
+        bool store_anc = (rec.type & ZSI_HASANCESTOR) != 0;
+
+        outlen = rec.len;
+        if (reencode) {
+            outlen = zsi_rec_encoded_len(rec.keylen, rec.vallen,
+                                         rec.val == NULL, store_anc);
+            if (!outlen) { r = ZS_BADFORMAT; goto fail; }
+        }
+
+        if (recslen + outlen > alloc) {
             size_t want = alloc ? alloc * 2 : 8192;
-            while (want < recslen + rec.len) want *= 2;
+            while (want < recslen + outlen) want *= 2;
             char *q = realloc(recs, want);
             if (!q) { r = ZS_INTERNAL; goto fail; }
             recs = q;
@@ -5411,8 +5432,12 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         }
 
         ptrs[i] = (uint64_t)(ZSI_HEADER_LEN + recslen);
-        memcpy(recs + recslen, b, rec.len);
-        recslen += rec.len;
+        if (reencode)
+            zsi_rec_encode(recs + recslen, cs, rec.key, rec.keylen,
+                           rec.val, rec.vallen, store_anc, rec.ancestor);
+        else
+            memcpy(recs + recslen, b, rec.len);
+        recslen += outlen;
     }
 
     memset(&h, 0, sizeof(h));
