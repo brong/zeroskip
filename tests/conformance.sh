@@ -53,11 +53,19 @@ if [ -n "$extra" ]; then
 fi
 
 # --- cited tests exist -------------------------------------------------------
-# Citations are backticked names in the "Enforced by" column.  Resolve each
+# Citations are backticked names in the "Enforced by" column -- the FOURTH
+# |-field of a requirement row, so backticked words in the requirement text
+# (`end == 0` and friends) are not mistaken for citations.  Resolve each
 # against the test sources; a citation naming a test that no longer exists is
 # worse than no citation, because it reads as coverage.
-cited=$(grep -oE '\| `[a-z0-9_/ ,+()]+`( — [^|]*)? \|$' "$MAP" \
-        | grep -oE '`[a-z0-9_/]+`' | tr -d '`' | sort -u)
+#
+# An earlier version matched only rows whose whole cell was one backtick pair,
+# which skipped every multi-citation row -- so a test removal left rows
+# pointing at nothing and the check still passed.
+cited=$(awk -F'|' '/^\| `/ { print $4 }' "$MAP" \
+        | sed 's/ — .*//' | tr -d '`' | tr ',' '\n' \
+        | sed 's/^ *//; s/ *$//' | grep -vE '^\+[0-9]+ more$' \
+        | grep -E '^(crash/)?[a-z0-9_.]+$' | sort -u)
 
 for c in $cited; do
     case "$c" in
