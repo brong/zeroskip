@@ -1018,7 +1018,7 @@ static void test_header_byte_layout(void)
         0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
         0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00,
         /* 16 vread, 17 vwrite, 18 flags (LE), 20 reserved */
-        0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
         /* 24 uuid */
         0x49, 0x41, 0xDA, 0x54, 0x94, 0x06, 0x4F, 0xAA,
         0xA4, 0x57, 0xC4, 0xB6, 0x5B, 0xEA, 0xE3, 0xEB,
@@ -1028,7 +1028,7 @@ static void test_header_byte_layout(void)
         0x6D, 0x65, 0x6D, 0x63, 0x6D, 0x70, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         /* 64 reserved, 68 checksum of [0, 68) */
-        0x00, 0x00, 0x00, 0x00, 0xA7, 0xA7, 0xCF, 0x9D
+        0x00, 0x00, 0x00, 0x00, 0x8F, 0x2D, 0xF0, 0xE0
     };
 
     static const zsi_uuid_t u = {
@@ -1041,9 +1041,12 @@ static void test_header_byte_layout(void)
     ASSERT_EQ(ZSI_HEADER_LEN, 72);
     ASSERT_EQ(ZSI_MAGIC_LEN, 16);
 
+    /* version 2, the format-flip minimum (F-32): version 1 was never
+     * released and zsi_header_decode now refuses it outright, so the golden
+     * buffer this test decodes back below must carry a version it accepts. */
     memset(&h, 0, sizeof(h));
-    h.version_read  = 1;
-    h.version_write = 1;
+    h.version_read  = 2;
+    h.version_write = 2;
     h.flags         = 1;
     memcpy(h.uuid, u, 16);
     h.start = 0x01020304;
@@ -1065,8 +1068,8 @@ static void test_header_byte_layout(void)
     /* Each field at its literal offset, so a failure names the field rather than
      * just an offset. */
     ASSERT_MEM_EQ(buf + 0, zsi_magic, 16);
-    ASSERT_EQ((unsigned char)buf[16], 1);
-    ASSERT_EQ((unsigned char)buf[17], 1);
+    ASSERT_EQ((unsigned char)buf[16], 2);
+    ASSERT_EQ((unsigned char)buf[17], 2);
     ASSERT_EQU(zsi_get16(buf + 18), 1u);
     ASSERT_EQU(zsi_get32(buf + 20), 0u);
     ASSERT_MEM_EQ(buf + 24, u, 16);
@@ -1074,7 +1077,7 @@ static void test_header_byte_layout(void)
     ASSERT_EQU(zsi_get32(buf + 44), 0x05060708u);
     ASSERT_MEM_EQ(buf + 48, "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
     ASSERT_EQU(zsi_get32(buf + 64), 0u);
-    ASSERT_EQU(zsi_get32(buf + 68), 0x9DCFA7A7u);
+    ASSERT_EQU(zsi_get32(buf + 68), 0xE0F02D8Fu);
 
     /* And it decodes back to what it came from. */
     ASSERT_OK(zsi_header_decode((const char *)golden, ZSI_HEADER_LEN,
@@ -1085,8 +1088,8 @@ static void test_header_byte_layout(void)
     /* A full 16-byte comparator name, which has no NUL padding at all: the copy
      * must be the field width, not the string length. */
     memset(&h, 0, sizeof(h));
-    h.version_read = 1;
-    h.version_write = 1;
+    h.version_read = 2;
+    h.version_write = 2;
     h.flags = 1;
     memcpy(h.uuid, u, 16);
     h.start = 1;
@@ -1106,6 +1109,14 @@ static void test_header_versions(void)
     /* A read version above ours is refused (F-7). */
     make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
     buf[ZSI_HDR_OFF_VREAD] = (char)(ZSI_VERSION_READ + 1);
+    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
+              ZS_BADFORMAT);
+
+    /* A read version below 2 is refused too: version 1 was never released,
+     * and its records carry no trailing checksum for F-32 to verify. */
+    make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
+    buf[ZSI_HDR_OFF_VREAD] = 1;
     zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
     ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
               ZS_BADFORMAT);
@@ -1298,63 +1309,75 @@ static void test_type_byte_validity(void)
 static void test_record_byte_layout(void)
 {
     char buf[64];
+    /* Engine 0 writes a ZERO checksum field (F-32), which is what keeps these
+     * literals simple: the trailing 4 bytes are zero, exactly where the old
+     * (pre-F-32) layout already had zero padding. test_record_byte_layout_v2
+     * is what pins a real, nonzero engine's checksum against a literal. */
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
 
     /* KEYVALUE (0x01): key "ab", value "xy", ancestor omitted.
-     *   +0 type, +1 keylen, +2 vallen(LE16), +4 key NUL value NUL, pad to 8
-     *   len = roundup8(4 + 2 + 1 + 2 + 1) = roundup8(10) = 16 */
+     *   +0 type, +1 keylen, +2 vallen(LE16), +4 key NUL value NUL,
+     *   pad, last 4 bytes checksum (F-32)
+     *   len = roundup8(4 + 2 + 1 + 2 + 1 + 4) = roundup8(14) = 16 */
     static const unsigned char kv[16] = {
         0x01, 0x02, 0x02, 0x00, 'a', 'b', 0x00, 'x',
         'y',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
     ASSERT_EQU(zsi_rec_encoded_len(2, 2, false, false), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, "ab", 2, "xy", 2, false, 0);
+    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, false, 0);
     ASSERT_MEM_EQ(buf, kv, 16);
 
     /* KEYVALUE_ANC (0x09): the same with ancestor 5 stored.
-     *   +4 ancestor, +8 key NUL value NUL
-     *   len = roundup8(8 + 6) = 16 -- the ancestor is free here, because the
-     *   padding absorbed it */
-    static const unsigned char kva[16] = {
+     *   +4 ancestor, +8 key NUL value NUL, then padding, then checksum
+     *   len = roundup8(8 + 2 + 1 + 2 + 1 + 4) = roundup8(18) = 24 -- the
+     *   checksum no longer fits in the ancestor form's leftover padding, so
+     *   this shape grows a whole roundup8 step over the pre-F-32 layout. */
+    static const unsigned char kva[24] = {
         0x09, 0x02, 0x02, 0x00, 0x05, 0x00, 0x00, 0x00,
-        'a',  'b',  0x00, 'x',  'y',  0x00, 0x00, 0x00
+        'a',  'b',  0x00, 'x',  'y',  0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false, true), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false, true), 24u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, "ab", 2, "xy", 2, true, 5);
-    ASSERT_MEM_EQ(buf, kva, 16);
+    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, true, 5);
+    ASSERT_MEM_EQ(buf, kva, 24);
 
     /* DELETION (0x03): key "ab", no value field at all.
-     *   +0 type, +1 keylen, +2 pad(2), +4 key NUL, pad to 8
-     *   len = roundup8(4 + 3) = 8 */
-    static const unsigned char del[8] = {
-        0x03, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00
+     *   +0 type, +1 keylen, +2 pad(2), +4 key NUL, then padding, then checksum
+     *   len = roundup8(4 + 2 + 1 + 4) = roundup8(11) = 16 */
+    static const unsigned char del[16] = {
+        0x03, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true, false), 8u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true, false), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, "ab", 2, NULL, 0, false, 0);
-    ASSERT_MEM_EQ(buf, del, 8);
+    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, false, 0);
+    ASSERT_MEM_EQ(buf, del, 16);
 
     /* DELETION_ANC (0x0B): +4 ancestor, +8 key NUL
-     *   len = roundup8(8 + 3) = 16 */
+     *   len = roundup8(8 + 2 + 1 + 4) = roundup8(15) = 16 -- unchanged from the
+     *   pre-F-32 layout, because the checksum fits the same leftover padding
+     *   that used to be zero anyway. */
     static const unsigned char dela[16] = {
         0x0B, 0x02, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
         'a',  'b',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
     ASSERT_EQU(zsi_rec_encoded_len(2, 0, true, true), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, "ab", 2, NULL, 0, true, 5);
+    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, true, 5);
     ASSERT_MEM_EQ(buf, dela, 16);
 
     /* An empty value is legal and distinct from an absent key (F-14, A-1).
-     *   len = roundup8(4 + 2 + 1 + 0 + 1) = 8 */
-    static const unsigned char kv_empty[8] = {
-        0x01, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00
+     *   len = roundup8(4 + 2 + 1 + 0 + 1 + 4) = roundup8(12) = 16 */
+    static const unsigned char kv_empty[16] = {
+        0x01, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false, false), 8u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false, false), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, "ab", 2, "", 0, false, 0);
-    ASSERT_MEM_EQ(buf, kv_empty, 8);
+    zsi_rec_encode(buf, cs, "ab", 2, "", 0, false, 0);
+    ASSERT_MEM_EQ(buf, kv_empty, 16);
 
     /* Note this is byte-distinct from DELETION above at exactly one place -- the
      * type byte -- and identical everywhere else.  Which is the whole reason an
@@ -1368,21 +1391,27 @@ static void test_record_byte_layout_big(void)
 {
     /* The big forms' fixed headers, asserted byte for byte.  The bodies are too
      * large for a literal, so the header and the total length are pinned here and
-     * the body placement is checked by decoding. */
+     * the body placement is checked by decoding.
+     *
+     * The +4 for F-32's trailing checksum lands inside padding these big forms
+     * already carried (same roundup8 step, or absorbed exactly), so none of
+     * the totals below change from the pre-F-32 layout -- verified by hand
+     * for each below, not assumed. */
     size_t keylen = 256;                 /* one past the short form's limit */
     char *key = malloc(keylen);
     ASSERT_NOT_NULL(key);
     for (size_t i = 0; i < keylen; i++) key[i] = (char)('A' + (i % 26));
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
 
     /* BIGKEYVALUE (0x05): +0 type, +1 pad(7), +8 keylen(LE64), +16 vallen(LE64),
-     *                     +24 key NUL value NUL
-     *   len = roundup8(24 + 256 + 1 + 2 + 1) = roundup8(284) = 288 */
+     *                     +24 key NUL value NUL, then checksum (F-32)
+     *   len = roundup8(24 + 256 + 1 + 2 + 1 + 4) = roundup8(288) = 288 */
     size_t want = 288;
     ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false, false), want);
     char *buf = malloc(want + 16);
     ASSERT_NOT_NULL(buf);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, key, keylen, "xy", 2, false, 0);
+    zsi_rec_encode(buf, cs, key, keylen, "xy", 2, false, 0);
 
     static const unsigned char bkv_hdr[24] = {
         0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1399,7 +1428,7 @@ static void test_record_byte_layout_big(void)
      * carries, so the header stays 24 bytes and the total is unchanged (F-12c). */
     ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false, true), want);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, key, keylen, "xy", 2, true, 5);
+    zsi_rec_encode(buf, cs, key, keylen, "xy", 2, true, 5);
     static const unsigned char bkva_hdr[24] = {
         0x0D, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,   /* +4 ancestor = 5 */
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1407,11 +1436,11 @@ static void test_record_byte_layout_big(void)
     };
     ASSERT_MEM_EQ(buf, bkva_hdr, 24);
 
-    /* BIGDELETION (0x07): +0 type, +1 pad(7), +8 keylen, +16 key NUL
-     *   len = roundup8(16 + 256 + 1) = roundup8(273) = 280 */
+    /* BIGDELETION (0x07): +0 type, +1 pad(7), +8 keylen, +16 key NUL, checksum
+     *   len = roundup8(16 + 256 + 1 + 4) = roundup8(277) = 280 */
     ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true, false), 280u);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, key, keylen, NULL, 0, false, 0);
+    zsi_rec_encode(buf, cs, key, keylen, NULL, 0, false, 0);
     static const unsigned char bdel_hdr[16] = {
         0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -1422,7 +1451,7 @@ static void test_record_byte_layout_big(void)
     /* BIGDELETION_ANC (0x0F): +1 pad(3), +4 ancestor, +8 keylen, +16 key NUL */
     ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true, true), 280u);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, key, keylen, NULL, 0, true, 5);
+    zsi_rec_encode(buf, cs, key, keylen, NULL, 0, true, 5);
     static const unsigned char bdela_hdr[16] = {
         0x0F, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -1431,6 +1460,39 @@ static void test_record_byte_layout_big(void)
 
     free(buf);
     free(key);
+}
+
+/* F-32: the checksum is the LAST 4 bytes of the padded record, covering
+ * [0, len-4).  Asserted against literals for the structure, and against a
+ * direct call to the engine function for the checksum itself -- never
+ * against zsi_rec_encode's own output for the same field, which is exactly
+ * the round-trip trap test_header_byte_layout's mutation history warns
+ * about (a symmetric encode/decode bug would pass that check too). */
+static void test_record_byte_layout_v2(void)
+{
+    char buf[64];
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
+
+    /* KEYVALUE "ab" -> "xy": fixed 4 + 2+1+2+1 + csum 4 = 14 -> len 16. */
+    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, false, 0);
+    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 2, false, false), 16u);
+    ASSERT_EQ(buf[0], 0x01);
+    ASSERT_EQ(buf[1], 2);                       /* keylen */
+    ASSERT_EQU(zsi_get16(buf + 2), 2u);         /* vallen */
+    ASSERT_MEM_EQ(buf + 4, "ab\0xy\0", 6);
+    ASSERT_EQ(buf[10], 0); ASSERT_EQ(buf[11], 0);   /* pad, covered */
+    ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));   /* trailing csum */
+
+    /* DELETION_ANC "ab", anc 5: fixed 8 + 2+1 + 4 = 15 -> len 16. */
+    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, true, 5);
+    ASSERT_EQ(buf[0], 0x0B);
+    ASSERT_EQU(zsi_get32(buf + 4), 5u);         /* ancestor stays at +4 */
+    ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));
+
+    /* Engine 0 writes a ZERO field. */
+    zs_csum *cs0 = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
+    zsi_rec_encode(buf, cs0, "ab", 2, "xy", 2, false, 0);
+    ASSERT_EQU(zsi_get32(buf + 12), 0u);
 }
 
 static void test_record_roundtrip(void)
@@ -1469,8 +1531,8 @@ static void test_record_roundtrip(void)
         char *buf = malloc(len);
         ASSERT_NOT_NULL(buf);
         memset(buf, 0xAA, len);
-        zsi_rec_encode(buf, key, kl, shapes[i].isdelete ? NULL : val, vl,
-                       shapes[i].anc, 7);
+        zsi_rec_encode(buf, zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL), key, kl,
+                       shapes[i].isdelete ? NULL : val, vl, shapes[i].anc, 7);
 
         ASSERT_EQ((unsigned char)buf[0], shapes[i].type);
 
@@ -1537,13 +1599,14 @@ static void test_record_canonical(void)
     ASSERT_EQ(zsi_rec_type_for(255, 0, true, true), ZSI_DELETION_ANC);
 
     /* Encoding at each boundary produces the type the table says. */
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
     memset(buf, 0, sizeof(buf));
-    zsi_rec_encode(buf, key, 255, "", 0, false, 0);
+    zsi_rec_encode(buf, cs, key, 255, "", 0, false, 0);
     ASSERT_EQ((unsigned char)buf[0], ZSI_KEYVALUE);
 
     char *big = malloc(zsi_rec_encoded_len(256, 0, false, false));
     ASSERT_NOT_NULL(big);
-    zsi_rec_encode(big, key, 256, "", 0, false, 0);
+    zsi_rec_encode(big, cs, key, 256, "", 0, false, 0);
     ASSERT_EQ((unsigned char)big[0], ZSI_BIGKEYVALUE);
     free(big);
 
@@ -1573,7 +1636,7 @@ static void test_record_canonical(void)
     size_t n = zsi_rec_encoded_len(300, 2, false, false);
     char *ok = malloc(n);
     ASSERT_NOT_NULL(ok);
-    zsi_rec_encode(ok, key, 300, "xy", 2, false, 0);
+    zsi_rec_encode(ok, cs, key, 300, "xy", 2, false, 0);
     ASSERT_OK(zsi_rec_decode(ok, n, 1, &r));
     ASSERT_EQU(r.keylen, 300u);
     ASSERT(zsi_rec_is_canonical(&r, 1));
@@ -1601,7 +1664,7 @@ static void test_record_canonical(void)
                                          shapes[i].del, shapes[i].anc);
         char *b = malloc(len);
         ASSERT_NOT_NULL(b);
-        zsi_rec_encode(b, key, shapes[i].kl,
+        zsi_rec_encode(b, cs, key, shapes[i].kl,
                        shapes[i].del ? NULL : val, shapes[i].vl,
                        shapes[i].anc, 7);
         ASSERT_OK(zsi_rec_decode(b, len, 1, &r));
@@ -1621,7 +1684,7 @@ static void test_record_canonical(void)
     size_t l2 = zsi_rec_encoded_len(2, 2, false, true);
     char *b2 = malloc(l2);
     ASSERT_NOT_NULL(b2);
-    zsi_rec_encode(b2, "ab", 2, "xy", 2, true, 5);
+    zsi_rec_encode(b2, cs, "ab", 2, "xy", 2, true, 5);
     ASSERT_OK(zsi_rec_decode(b2, l2, 5, &r));
     ASSERT_EQU(r.ancestor, 5u);
     ASSERT(!zsi_rec_is_canonical(&r, 5));   /* stored, but equals file start */
@@ -1640,11 +1703,14 @@ static void test_record_embedded_nul(void)
 
     const char key[] = { 'a', '\0', 'b' };
     const char val[] = { '\0', 'x', '\0' };
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
     size_t len = zsi_rec_encoded_len(3, 3, false, false);
-    ASSERT_EQU(len, 16u);               /* roundup8(4 + 3 + 1 + 3 + 1) = 16 */
+    /* roundup8(4 + 3 + 1 + 3 + 1 + 4) = roundup8(16) = 16 -- the checksum's
+     * +4 does not push this over another roundup8 step. */
+    ASSERT_EQU(len, 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, key, 3, val, 3, false, 0);
+    zsi_rec_encode(buf, cs, key, 3, val, 3, false, 0);
     ASSERT_OK(zsi_rec_decode(buf, len, 1, &r));
     ASSERT_EQU(r.keylen, 3u);
     ASSERT_MEM_EQ(r.key, key, 3);
@@ -1659,7 +1725,7 @@ static void test_record_embedded_nul(void)
     const char nuls[] = { '\0', '\0', '\0', '\0' };
     len = zsi_rec_encoded_len(4, 0, false, false);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, nuls, 4, "", 0, false, 0);
+    zsi_rec_encode(buf, cs, nuls, 4, "", 0, false, 0);
     ASSERT_OK(zsi_rec_decode(buf, len, 1, &r));
     ASSERT_EQU(r.keylen, 4u);
     ASSERT_MEM_EQ(r.key, nuls, 4);
@@ -1671,6 +1737,7 @@ static void test_record_bounds(void)
 {
     char buf[512];
     struct zsi_rec r;
+    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
     /* For each shape, decoding with len one byte short of the true length is
      * rejected rather than reading past the end. */
@@ -1688,7 +1755,7 @@ static void test_record_bounds(void)
         char *k = malloc(shapes[i].kl);
         ASSERT_NOT_NULL(k);
         memset(k, 'k', shapes[i].kl);
-        zsi_rec_encode(b, k, shapes[i].kl,
+        zsi_rec_encode(b, cs, k, shapes[i].kl,
                        shapes[i].del ? NULL : "xy", shapes[i].vl,
                        shapes[i].anc, 3);
 
@@ -1931,7 +1998,9 @@ static void sb_rec(struct sb *s, const char *key, size_t keylen,
     size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, store_anc);
     assert(n > 0);
     sb_reserve(s, n);
-    zsi_rec_encode(s->buf + s->len, key, keylen, val, vallen, store_anc, anc);
+    zs_csum *cs = zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM);
+    zsi_rec_encode(s->buf + s->len, cs, key, keylen, val, vallen, store_anc,
+                   anc);
     s->len += n;
 }
 
@@ -2018,7 +2087,8 @@ static void ib_rec(struct ib *b, const char *key, size_t keylen,
     }
     assert(b->n < 256);
     b->offs[b->n++] = b->len;
-    zsi_rec_encode(b->buf + b->len, key, keylen, val, vallen, anc, ancgen);
+    zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
+    zsi_rec_encode(b->buf + b->len, cs, key, keylen, val, vallen, anc, ancgen);
     b->len += n;
 }
 
@@ -3751,8 +3821,10 @@ static void test_inorder_ptrs64(void)
     char *buf = calloc(1, total);
     ASSERT_NOT_NULL(buf);
     make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
-    zsi_rec_encode(buf + ZSI_HEADER_LEN, "a", 1, "1", 1, false, 0);
-    zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, "b", 1, "2", 1, false, 0);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN, zsi_csum_xxhash, "a", 1, "1", 1,
+                   false, 0);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, zsi_csum_xxhash, "b", 1,
+                   "2", 1, false, 0);
 
     buf[records_end] = (char)ZSI_PTRS64;
     zsi_put64(buf + records_end + 8, 2);
@@ -9498,7 +9570,10 @@ static void test_mp_reader_sees_torn_span(void)
         size_t n = zsi_rec_encoded_len(7, 3, false, false);
         char *rec = malloc(n);
         ASSERT_NOT_NULL(rec);
-        zsi_rec_encode(rec, "partial", 7, "no!", 3, false, 0);
+        /* fresh_db() defaults to engine 0 (no ZS_CSUM_XXHASH flag), so match
+         * the file's actual engine here even though this span never gets a
+         * terminator and so is never read as valid data. */
+        zsi_rec_encode(rec, zsi_csum_none, "partial", 7, "no!", 3, false, 0);
         int fd = open(dbpath(name), O_WRONLY | O_APPEND);
         ASSERT(fd >= 0);
         ASSERT_EQ(write(fd, rec, n), (ssize_t)n);
@@ -12782,6 +12857,7 @@ static struct test_entry tests[] = {
     { "test_type_byte_validity",        test_type_byte_validity },
     { "test_record_byte_layout",        test_record_byte_layout },
     { "test_record_byte_layout_big",    test_record_byte_layout_big },
+    { "test_record_byte_layout_v2",     test_record_byte_layout_v2 },
     { "test_record_roundtrip",          test_record_roundtrip },
     { "test_record_canonical",          test_record_canonical },
     { "test_record_embedded_nul",       test_record_embedded_nul },

@@ -662,8 +662,8 @@ static const unsigned char zsi_magic[ZSI_MAGIC_LEN] = {
 #define ZSI_HDR_OFF_CSUM       68   /*  4, covers [0, 68) */
 
 /* The lowest library version able to read, and to write, a file we produce. */
-#define ZSI_VERSION_READ  1
-#define ZSI_VERSION_WRITE 1
+#define ZSI_VERSION_READ  2
+#define ZSI_VERSION_WRITE 2
 
 #define ZSI_COMPAR_NAME_LEN 16
 
@@ -736,6 +736,11 @@ static int zsi_header_decode(const char *buf, size_t len,
 
     uint8_t vread = (uint8_t)buf[ZSI_HDR_OFF_VREAD];
     if (vread > ZSI_VERSION_READ) return ZS_BADFORMAT;
+
+    /* Version 1 was never released (F-7): records below version 2 carry no
+     * checksum, and pretending to read them would serve unverifiable data.
+     * The clean break is spec'd, not an accident of this reader. */
+    if (vread < 2) return ZS_BADFORMAT;
 
     out->version_read  = vread;
     out->version_write = (uint8_t)buf[ZSI_HDR_OFF_VWRITE];
@@ -857,6 +862,8 @@ struct zsi_rec {
     const char *val;    size_t vallen;   /* val == NULL for a deletion */
     uint32_t    ancestor;                /* always resolved, never raw (F-17) */
     size_t      len;                     /* total on-disk bytes, multiple of 8 */
+    const char *base;   /* record start; csum covers [base, base+len-4) */
+    uint32_t    csum;    /* the stored trailing checksum (F-32) */
 };
 
 struct zsi_term {
@@ -876,7 +883,11 @@ static bool zsi_rec_is_delete(const struct zsi_rec *r)
  * The big form is chosen by key or value length only, never by the ancestor:
  * the ancestor is 4 bytes whenever it is present, and in the big forms it fits
  * inside padding the shape already carries, so HasAncestor costs nothing there
- * (F-12c).  In the short forms it adds 4 bytes. */
+ * (F-12c).  In the short forms it adds 4 bytes.
+ *
+ * The body also carries the record's own trailing 4-byte checksum (F-32),
+ * inside the roundup: it is the last 4 bytes of the padded record, not an
+ * addition on top of it. */
 static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
                                   bool store_ancestor)
 {
@@ -891,14 +902,15 @@ static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
         hdr = big ? ZSI_HDRLEN_BIGDELETION
                   : (store_ancestor ? ZSI_HDRLEN_DELETION_ANC
                                     : ZSI_HDRLEN_DELETION);
-        /* key NUL, no value at all */
-        if (!zsi_add_sz(keylen, 1, &body)) return 0;
+        /* key NUL, no value at all, F-32's trailing checksum */
+        if (!zsi_add_sz(keylen, 1 + 4, &body)) return 0;
     } else {
         hdr = big ? ZSI_HDRLEN_BIGKEYVALUE
                   : (store_ancestor ? ZSI_HDRLEN_KEYVALUE_ANC
                                     : ZSI_HDRLEN_KEYVALUE);
-        /* key NUL value NUL (F-13: stored lengths exclude the terminators) */
-        if (!zsi_add3_sz(keylen, vallen, 2, &body)) return 0;
+        /* key NUL value NUL (F-13: stored lengths exclude the terminators),
+         * F-32's trailing checksum */
+        if (!zsi_add3_sz(keylen, vallen, 2 + 4, &body)) return 0;
     }
 
     size_t total;
@@ -933,9 +945,12 @@ static uint8_t zsi_rec_type_for(size_t keylen, size_t vallen, bool isdelete,
  * Every pad byte is zeroed, not just the tail padding.  Canonical encoding means
  * byte-for-byte reproducibility across implementations (T-12a), and an
  * uninitialised pad byte breaks that while being invisible to every test that
- * reads back through the decoder. */
-static void zsi_rec_encode(char *buf, const char *key, size_t keylen,
-                           const char *val, size_t vallen,
+ * reads back through the decoder.
+ *
+ * csum is the CONTAINING FILE's engine function (A-6/F-5a), not the handle's --
+ * the writer path already holds the right one for span checksums. */
+static void zsi_rec_encode(char *buf, zs_csum *csum, const char *key,
+                           size_t keylen, const char *val, size_t vallen,
                            bool store_ancestor, uint32_t ancestor)
 {
     bool isdelete = (val == NULL);
@@ -1002,14 +1017,26 @@ static void zsi_rec_encode(char *buf, const char *key, size_t keylen,
         if (vallen) memcpy(buf + body + keylen + 1, val, vallen);
         buf[body + keylen + 1 + vallen] = '\0';
     }
+
+    /* F-32: the trailing checksum, over everything before it -- fixed
+     * fields, key, value, NULs, and the padding.  The engine is the
+     * CONTAINING FILE's (F-5a), which is why it is a parameter: the
+     * handle's engine is the same trap here as in A-6. */
+    zsi_put32(buf + total - 4, csum(buf, total - 4));
 }
 
 /* Decode the data record at buf[0..len), resolving its ancestor against the
  * containing file's start generation (F-17).
  *
- * Records carry no checksum of their own; the span terminator covers them
- * (F-19), so nothing is verified here.  What is checked is structure: the type
- * byte, every length bounded and overflow-free, and the total within len.
+ * Every record now carries its own trailing checksum (F-32), but it is
+ * deliberately NOT verified here.  The span terminator's checksum is what
+ * covers replay (F-19); verifying a record's own checksum during replay
+ * would put the check inside F-24's completion logic, where a single
+ * flipped byte would cost every record after it rather than just the one
+ * (F-32b).  What is checked here is structure: the type byte, every length
+ * bounded and overflow-free, and the total within len.  The checksum itself
+ * is read out into out->csum, alongside out->base, for the caller to verify
+ * on demand at materialization (F-32a).
  *
  * Returns ZS_BADFORMAT for anything that does not decode.  On success out->len is
  * the record's total on-disk size, which the caller uses to advance -- and which
@@ -1081,12 +1108,13 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
 
     /* Total size, every term overflow-checked (G-0b).  keylen + vallen + 2 is
      * exactly the expression that turns a bounds check into a bypass when it
-     * wraps. */
+     * wraps.  The +4 is F-32's trailing checksum, counted here exactly as
+     * zsi_rec_encoded_len counts it. */
     size_t body, total;
     if (isdelete) {
-        if (!zsi_add_sz(keylen, 1, &body)) return ZS_BADFORMAT;
+        if (!zsi_add_sz(keylen, 1 + 4, &body)) return ZS_BADFORMAT;
     } else {
-        if (!zsi_add3_sz(keylen, vallen, 2, &body)) return ZS_BADFORMAT;
+        if (!zsi_add3_sz(keylen, vallen, 2 + 4, &body)) return ZS_BADFORMAT;
     }
     if (!zsi_add_sz(hdr, body, &total)) return ZS_BADFORMAT;
     total = zsi_roundup8(total);
@@ -1098,6 +1126,8 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
     out->key      = buf + hdr;
     out->ancestor = ancestor;
     out->len      = total;
+    out->base     = buf;
+    out->csum     = zsi_get32(buf + total - 4);
 
     if (isdelete) {
         out->val    = NULL;
@@ -4893,8 +4923,8 @@ static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
                 alloc = want;
             }
 
-            zsi_rec_encode(span + spanlen, p->key, p->keylen, p->val, p->vallen,
-                           store_anc, anc);
+            zsi_rec_encode(span + spanlen, cs, p->key, p->keylen, p->val,
+                           p->vallen, store_anc, anc);
             if (offs) offs[noffs++] = base_off + spanlen;
             spanlen += n;
         }
@@ -5799,8 +5829,8 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
         }
 
         ptrs[nptrs++] = (uint64_t)(ZSI_HEADER_LEN + recslen);
-        zsi_rec_encode(recs + recslen, mk.v3.key, mk.v3.keylen, val, vallen,
-                       store_anc, anc);
+        zsi_rec_encode(recs + recslen, cs, mk.v3.key, mk.v3.keylen, val,
+                       vallen, store_anc, anc);
         recslen += n;
     }
 
