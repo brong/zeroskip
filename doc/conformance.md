@@ -51,7 +51,7 @@ a spec label is missing here.
 | `F-5` | Exactly three checksum engines exist: | `corpus`, `interop_constants_csum` |
 | `F-5a` | The engine id is recorded in each file header, so every file is | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `open_engine_selection` |
 | `F-5b` | Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the | `interop_constants_csum` |
-| `F-5c` | Engine 0 weakens G-2 and G-3, because F-22's property — that a | `header_checksum`, `span_engine_zero`, `terminator_detects_tear` |
+| `F-5c` | Engine 0 weakens G-2 and G-3, because F-22's property — that a | `header_checksum`, `span_engine_zero` |
 | `F-5d` | Engine 2 makes a file readable only by a caller supplying the same | `corpus` |
 | `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_records_checksum`, `span_terminator_without_data` |
 | `F-6` | A reader MUST validate all 16 bytes, not a prefix. | `magic` |
@@ -74,13 +74,13 @@ a spec label is missing here.
 | `F-16a` | The stored value is the **`start` of the range of the file holding | `write_ancestors` |
 | `F-16b` | There is **no guarantee the ancestor is numerically close**: a key | `repack_d18_table` |
 | `F-16c` | The ancestor is absolute precisely so it never needs | `repack_v1_ancestor_v3_value` |
-| `F-17` | The ancestor is **omitted exactly when it equals the containing | `check_noncanonical`, `inorder_roundtrip`, `record_canonical`, +3 more |
+| `F-17` | The ancestor is **omitted exactly when it equals the containing | `check_noncanonical`, `record_canonical`, `record_roundtrip`, +1 more |
 | `F-17a` | The two conditions "this is a later occurrence in the file" and | `write_ancestors` |
 | `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
 | `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
 | `F-22` | Because the checksum covers the span **and** the terminator, a | `crash/crash_nosync_mode`, `mp_reader_sees_torn_span`, `span_terminator_without_data`, +2 more |
-| `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_bad_length`, `span_basic` |
+| `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_basic`, `span_engine_zero` |
 | `F-24` | An unordered file is **complete** at its last valid span, whether | `check_noncanonical`, `check_unclean_reported`, `corpus_engine_from_file_not_config`, +3 more |
 | `F-24a` | An in-order file has no equivalent notion, because it is written | `inorder_kind_rules` |
 | `F-25` | Visibility is per span, not a watermark: a rolled-back span may sit | `dump_shows_rollback`, `span_rollback` |
@@ -91,8 +91,8 @@ a spec label is missing here.
 | `F-26d` | The narrow section is padded with zeroes to a multiple of 8 so the | `inorder_trailer_negatives`, `inorder_widths_and_padding` |
 | `F-26e` | The records checksum covers the region from the end of the header to | `check_records_checksum`, `inorder_records_checksum` |
 | `F-26f` | The records checksum is verified lazily — by | `check_records_checksum`, `inorder_records_checksum`, `open_is_o1_in_records` |
-| `F-26g` | `count` MAY be **zero**. An in-order file with no records is legal | `fcur_empty_sources`, `file_open_inorder`, `inorder_empty`, +3 more |
-| `F-26h` | An **unordered** file may equally hold no records: an active file | `fcur_empty_sources`, `file_open_unordered`, `index_empty`, +3 more |
+| `F-26g` | `count` MAY be **zero**. An in-order file with no records is legal | `fcur_empty_sources`, `inorder_empty`, `interop_constants_csum`, +2 more |
+| `F-26h` | An **unordered** file may equally hold no records: an active file | `fcur_empty_sources`, `open_create`, `span_empty_file`, +1 more |
 | `F-27` | Every pointer MUST be 8-aligned and lie between the header and the | `inorder_trailer_negatives` |
 | `F-28` | `zs_db_check_consistency` MUST verify that an in-order file's | `check_out_of_order_pointers` |
 | `F-29` | Progress rule. Iteration computes the next offset from the current | `corpus_engine_from_file_not_config`, `malformed_never_hangs`, `span_progress` |
@@ -104,7 +104,7 @@ a spec label is missing here.
 | Req | Requirement | Enforced by |
 |---|---|---|
 | `D-0` | The `<uuid>` in a filename is the **36-character lowercase hyphenated | `interop_constants_uuid` |
-| `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_lexical_order`, `filename_rejections`, `filenames` |
+| `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_rejections`, `filenames` |
 | `D-1a` | Data files carry **no extension**. An unordered file's name is | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
 | `D-2` | `zeroskip-*` matches data files only and `zeroskip.*` matches | `filename_rejections`, `fileset_ignores_foreign`, `staging_names` |
 | `D-3` | `zeroskip.lock` MUST be a distinct file that is never replaced. | `staging_names` |
@@ -113,14 +113,14 @@ a spec label is missing here.
 | `D-3c` | The lock file is empty and its contents are never read. Nothing about | `lock_basic` |
 | `D-4` | A file participates if its name matches `zeroskip-<uuid>-*` for this | `filename_rejections`, `fileset_ignores_foreign` |
 | `D-4a` | On first open the UUID is not yet known, so it is **discovered**: take | `fileset_uuid_discovery`, `open_create`, `open_uuid_mismatch` |
-| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_lexical_order`, `filename_prefix_property`, `filename_rejections`, +1 more |
-| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_lexical_order`, `filename_prefix_property`, `fileset_overlap_table` |
+| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_prefix_property`, `filename_rejections`, `snapshot_resolves_overlap` |
+| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_prefix_property`, `fileset_overlap_table` |
 | `D-5b` | The rule requires an unordered file's name to sort before the in-order | `fileset_first_vs_last` |
 | `D-5c` | A **partial** overlap, where neither range contains the other, cannot | `fileset_gaps`, `mp_racing_removers` |
 | `D-6` | Completeness. A set is complete if and only if the scan of D-5 consumes | `convert_steady_state`, `fileset_gaps`, `mp_repack_and_writer_concurrent`, +1 more |
 | `D-7` | `readdir` is not atomic, so a scan may miss an entry and produce a set | `fileset_gaps` |
 | `D-8` | Creating a file **is** publishing it, since the directory is the truth. | `open_create` |
-| `D-8a` | Creating a database. With `ZS_CREATE` and no existing directory, or a | `file_open_unordered`, `fileset_ignores_foreign`, `open_create`, +2 more |
+| `D-8a` | Creating a database. With `ZS_CREATE` and no existing directory, or a | `fileset_ignores_foreign`, `open_create`, `snapshot_basic`, +1 more |
 | `D-9` | An active file is **clean** if it has a valid header and zero or more | `check_unclean_reported`, `crash/crash_after_invalid_terminator`, `crash/snapshot_gap_retry`, +4 more |
 | `D-9a` | A writer moves to a new file when the active file is not clean, or | `write_rollover` |
 | `D-9b` | The next generation is one above the highest present in the directory. | `fileset_next_gen` |
@@ -139,18 +139,18 @@ a spec label is missing here.
 | `D-13b` | A **writer is a reader that also maintains the active file's index | `index_delta` |
 | `D-13c` | No shared state is mutated in place anywhere in the design: files are | `mp_reader_across_repack` |
 | `D-13d` | The cost is that each snapshot replays the unordered files it | `zsbench (snapshot open)` |
-| `D-14` | Within a file the newest version of a key wins — the highest offset | `index_newest_per_key`, `read_deletion_hides_older`, `read_newest_wins`, +1 more |
+| `D-14` | Within a file the newest version of a key wins — the highest offset | `fcur_no_duplicate_keys`, `read_d14f_duplicate_across_three_files`, `read_model` |
 | `D-14a` | Point lookups, cursors and range scans MUST all resolve visibility | `fcur_uniform` |
-| `D-14b` | Searching one file for a key: | `fcur_empty_sources`, `index_empty`, `inorder_empty`, +1 more |
+| `D-14b` | Searching one file for a key: | `fcur_empty_sources`, `inorder_empty`, `read_arrangements` |
 | `D-14c` | Ancestors are **not** consulted by any read. They exist solely for | `reads_never_consult_ancestors` |
 | `D-14d` | Point lookup Walk the sources in priority order; in each, search | `inorder_probe_ends_agrees`, `zsbench` |
 | `D-14e` | Iteration A cursor holds one **per-file cursor** per source, each | `fcur_deletions_visible`, `fcur_empty_sources`, `open_uuid_mismatch`, +2 more |
 | `D-14f` | Because the tie-break is part of the sort, cursors on the emitted key | `read_d14f_duplicate_across_three_files`, `read_prefix_across_files` |
 | `D-14g` | The write transaction's own records sort as though they had a | **none** |
-| `D-14h` | A per-file cursor never yields the same key twice: an in-order file | `fcur_no_duplicate_keys`, `index_delta_shadows_base`, `index_newest_per_key` |
-| `D-14j` | **Liveness.** What a cursor observes of writes made while it runs | `cursor_sees_own_handle_writes`, `txn_cursor_sees_own_writes` |
+| `D-14h` | A per-file cursor never yields the same key twice: an in-order file | `fcur_no_duplicate_keys`, `index_delta_shadows_base` |
+| `D-14j` | **Liveness.** What a cursor observes of writes made while it runs | `cursor_sees_own_handle_writes`, `txn_cursor_sees_own_writes`, `txn_cursor_view_is_fixed`, +1 more |
 | `D-14j-a` | A source's records MUST NOT be yielded twice because of a write | `txn_cursor_no_duplicate_on_write` |
-| `D-14j-b` | After observing a change, a cursor resumes at the first key | `cursor_sees_own_handle_writes` |
+| `D-14j-b` | After observing a change, a cursor resumes at the first key | `cursor_start_key_survives_refresh`, `txn_cursor_store_behind_not_yielded`, +1 more |
 | `D-14i` | Picking the next record is O(1) and re-sorting one cursor is O(k) | `read_cursor_invariant` |
 | `D-15` | The repacker **never touches the active file**, and never touches an | `repack_never_touches_unordered`, `repack_selection` |
 | `D-16` | The repacker works **only on in-order files**; converting unordered | `corpus`, `repack_cascade`, `repack_never_touches_unordered`, +1 more |
@@ -158,7 +158,7 @@ a spec label is missing here.
 | `D-16b` | A cascade writes one output for the whole selected set, not one per | `repack_selection`, `zsbench` |
 | `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_backlog_oldest_first` |
 | `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
-| `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `inorder_roundtrip`, +1 more |
+| `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
 | `D-17a` | Ancestors are copied verbatim; nothing is renumbered and no | `repack_v1_ancestor_v3_value` |
 | `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_v1_ancestor_v3_value` |
 | `D-18` | Per key: | `repack_d18_table`, `repack_v1_ancestor_v3_value` |
@@ -203,7 +203,7 @@ a spec label is missing here.
 | `C-4b` | Why a retry suffices. `readdir` may miss entries, and a file may be | `crash/snapshot_gap_retry` |
 | `C-4c` | Immutability of what was opened. In-order files are never modified. | `mp_writer_and_readers`, `snapshot_boundary` |
 | `C-4d` | Every index is private (D-13c), so a snapshot needs no synchronisation | `mp_writer_and_readers` |
-| `C-4f` | Concurrent visibility. A reader scanning the active file may meet a | `mp_reader_sees_torn_span`, `span_terminator_without_data`, `terminator_detects_tear` |
+| `C-4f` | Concurrent visibility. A reader scanning the active file may meet a | `mp_reader_sees_torn_span`, `span_terminator_without_data` |
 | `C-4g` | Lifetime. Once its descriptors are open a packer may (subject to | `mp_reader_across_repack`, `snapshot_refcount` |
 | `C-4h` | Termination. A retry happens only when the file set changed during | `snapshot_retries_and_bounds` |
 | `C-5` | The accepted cost of C-4g is that disk space is held until the last | `mp_reader_across_repack` |
@@ -240,7 +240,7 @@ a spec label is missing here.
 | `P-9` | The offsets are the record offsets of every distinct key committed | `idxcache_matches_full_build`, `idxcache_open_agrees`, `corpus_index_table` |
 | `P-10` | `term_off` is the offset of the terminator immediately below | `idxcache_rejects_bad_term_binding` |
 | `P-11` | A reader MUST use a table only if **all** of the following hold, and | `idxcache_rejection_rules` |
-| `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_replays_the_suffix`, `idxcache_open_agrees` |
+| `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_open_agrees`, `idxcache_valid_upto_is_span_boundary` |
 | `P-13` | After building or extending an index over an unordered file, a | `idxcache_threshold` |
 | `P-14` | A table MUST NOT be `fsync`ed before publication. It is rebuildable, | `crash/idxcache_no_fsync_on_publish` |
 | `P-15` | A failure to publish MUST NOT fail the operation that triggered it. | `idxcache_publish_failure_is_not_fatal` |
@@ -291,15 +291,15 @@ a spec label is missing here.
 | `T-0a` | Driver contract. Each implementation MUST provide a small executable | `dump_line_format`, `tool.sh` |
 | `T-1` | to T-11 are per-implementation tests , run | `corpus`, `dump_shows_rollback`, `open_with_uuid`, +1 more |
 | `T-2` | Magic and versions. All 16 magic bytes required (F-6); each | `magic_designed_corruptions`, `staging_names` |
-| `T-2a` | The trailer. Opening an in-order file depends entirely on it, so: the | `index_many`, `inorder_trailer_negatives` |
+| `T-2a` | The trailer. Opening an in-order file depends entirely on it, so: the | `inorder_trailer_negatives` |
 | `T-2b` | Type byte validity. All 256 byte values fed as a record type, asserting | `header_bounds_and_ranges`, `type_byte_validity` |
 | `T-2c` | Interoperability constants. The values two implementations must agree on | `filenames`, `overflow_guards`, `strerror` |
 | `T-3` | Malformed input. Every golden file truncated at *every byte offset*, | `corpus_engine_from_file_not_config`, `malformed_bitflips`, `malformed_truncation`, +1 more |
-| `T-4` | Behavioural. Ordering, prefix scans, cursor replace, | `header_bounds_and_ranges`, `read_model`, `terminator_long_span`, +1 more |
+| `T-4` | Behavioural. Ordering, prefix scans, cursor replace, | `header_bounds_and_ranges`, `read_model`, `span_long_terminator`, +1 more |
 | `T-5` | Model-based. Randomised operation sequences against an in-memory | `open_uuid_mismatch`, `read_model`, `read_prefix_across_files` |
 | `T-5a` | Read paths under every file arrangement. The same assertions driven | `inorder_probe_ends_agrees`, `open_uuid_mismatch`, `read_arrangements` |
 | `T-5b` | Cursor mechanics. The sorted-array invariant of D-14e asserted after | `open_uuid_mismatch`, `read_cursor_invariant`, `read_d14f_duplicate_across_three_files` |
-| `T-6` | File states and encoding. That `end == 0` and `end != 0` files are | `check_noncanonical`, `index_many`, `inorder_kind_rules`, +4 more |
+| `T-6` | File states and encoding. That `end == 0` and `end != 0` files are | `check_noncanonical`, `inorder_kind_rules`, `inorder_ptrs64`, +3 more |
 | `T-7` | Ancestors and repacking. For every arrangement of create, update and | `convert_readonly_does_nothing` |
 | `T-8` | Crash injection. A test build interposes `write`, `fdatasync`, `rename` | `crash/crash_after_invalid_terminator`, `crash/crash_leaves_unaligned_length`, `crash/sync_failure_every_point` |
 | `T-8a` | Sync failure. The case C-7a exists for, which no crash test reaches: | `crash/dirsync_justifies_c6` |
