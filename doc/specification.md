@@ -1224,6 +1224,18 @@ any point.
   implementation SHOULD bound the retry count and report `ZS_AGAIN` rather than
   spin indefinitely, so a pathological rate of structural change surfaces as an
   error instead of a livelock.
+- **C-4i Freshness.** Beginning a transaction — shared or exclusive — MUST
+  yield a snapshot that observes every transaction whose commit completed
+  before the begin, in any process. A handle that holds a database open for
+  hours reads as current as one opened for the call; snapshot isolation (G-4)
+  is a property of a transaction's lifetime, never of a handle's. A cached
+  snapshot MAY be reused only after an inspection that would have detected
+  any such commit. Inspecting the directory's **name set** and the active
+  file's **size** is sufficient and exact — not a heuristic — because every
+  commit either appends to the active file or publishes a file by `rename`
+  (C-3, D-21), and file timestamps, whose granularity is a filesystem
+  property, play no part. `ZS_CURSOR_LIVE`'s per-step check (D-14j) MAY use
+  the same inspection rather than rebuilding a snapshot each step.
 - **C-5** The accepted cost of C-4g is that disk space is held until the last
   reader holding an old snapshot exits.
 - **C-6 Directory durability.** After creating a **data file** (a new active
