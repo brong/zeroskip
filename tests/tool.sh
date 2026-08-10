@@ -11,6 +11,10 @@
 # language-neutral runner compares between implementations (T-12, T-13), so a
 # change to them breaks other implementations' test runs rather than just a
 # human's expectations.  Everything is asserted against literal expected output.
+#
+# The runner drives the tool with --hex; the default is raw, for humans.  Both
+# modes are pinned here -- the hex lines because a peer compares them, the raw
+# lines because nothing else would notice them regressing.
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -44,34 +48,35 @@ check "create makes a lock file" "zeroskip.lock" \
     "$(ls "$DB" | grep '^zeroskip\.')"
 
 # --- store / get -------------------------------------------------------------
-$TOOL "$DB" store 6b6579 76616c
-check "get returns the value in hex" "76616c" "$($TOOL "$DB" get 6b6579)"
-check "get of an absent key" "NOTFOUND" "$($TOOL "$DB" get 6e6f7065)"
+$TOOL "$DB" store 6b6579 76616c --hex
+check "get returns the value in hex" "76616c" "$($TOOL "$DB" get 6b6579 --hex)"
+check "get of an absent key" "NOTFOUND" "$($TOOL "$DB" get 6e6f7065 --hex)"
 
 # --- an empty value is distinct from an absent key (A-1) ---------------------
-$TOOL "$DB" store 656d70747970 ""
+$TOOL "$DB" store 656d70747970 "" --hex
 check "an empty value reads back empty, not NOTFOUND" "" \
-    "$($TOOL "$DB" get 656d70747970)"
+    "$($TOOL "$DB" get 656d70747970 --hex)"
 
 # --- delete ------------------------------------------------------------------
-$TOOL "$DB" delete 6b6579
-check "get after delete" "NOTFOUND" "$($TOOL "$DB" get 6b6579)"
+$TOOL "$DB" delete 6b6579 --hex
+check "get after delete" "NOTFOUND" "$($TOOL "$DB" get 6b6579 --hex)"
 
 # --- keys and values containing NUL and newline ------------------------------
-# 00 0a 00 as a key, 0a 00 0a as a value.  This is why the format is hex: raw
-# output could not express either, and T-12 compares scan output byte for byte.
-$TOOL "$DB" store 000a00 0a000a
+# 00 0a 00 as a key, 0a 00 0a as a value.  This is why the runner's mode is hex:
+# raw output could not express either, and T-12 compares scan output byte for
+# byte.
+$TOOL "$DB" store 000a00 0a000a --hex
 check "a key with NUL and newline round-trips" "0a000a" \
-    "$($TOOL "$DB" get 000a00)"
+    "$($TOOL "$DB" get 000a00 --hex)"
 
 # --- batch: several operations in ONE transaction ----------------------------
 # A tool that could only do one operation per invocation could never produce a
 # span with more than one record, so multi-record spans would be untestable.
 printf 'store 61 3031\nstore 62 3032\nstore 63 3033\ndelete 62\n' \
-    | $TOOL "$DB" batch
-check "batch stored a" "3031" "$($TOOL "$DB" get 61)"
-check "batch deleted b" "NOTFOUND" "$($TOOL "$DB" get 62)"
-check "batch stored c" "3033" "$($TOOL "$DB" get 63)"
+    | $TOOL "$DB" batch --hex
+check "batch stored a" "3031" "$($TOOL "$DB" get 61 --hex)"
+check "batch deleted b" "NOTFOUND" "$($TOOL "$DB" get 62 --hex)"
+check "batch stored c" "3033" "$($TOOL "$DB" get 63 --hex)"
 
 # Three records, not four: a transaction is a MAP, so `store 62` followed by
 # `delete 62` coalesces to one pending entry (a deletion).  That is what makes
@@ -87,10 +92,10 @@ check "scan output" \
 61 3031
 63 3033
 656d70747970 " \
-    "$($TOOL "$DB" scan)"
+    "$($TOOL "$DB" scan --hex)"
 
-check "scan --prefix" "61 3031" "$($TOOL "$DB" scan --prefix 61)"
-check "scan --prefix matching nothing" "" "$($TOOL "$DB" scan --prefix ff)"
+check "scan --prefix" "61 3031" "$($TOOL "$DB" scan --prefix 61 --hex)"
+check "scan --prefix matching nothing" "" "$($TOOL "$DB" scan --prefix ff --hex)"
 
 # --- check -------------------------------------------------------------------
 check "check on a clean database" "OK" "$($TOOL "$DB" check)"
@@ -105,27 +110,58 @@ check "dump reports the checksum engine" "1" \
 check "dump --detail shows records" "1" \
     "$($TOOL "$DB" dump --detail 1 | grep -c 'key=61')"
 
+# --- raw mode (the default): arguments are the bytes themselves --------------
+# For humans at a shell, not for the runner: raw cannot express a NUL or a
+# newline, which is what --hex is for.  Output pairs are key<TAB>value, since a
+# value may contain spaces.
+DBR="$WORK/dbraw"
+$TOOL "$DBR" create --uuid "$UUID"
+$TOOL "$DBR" store greeting "hello world"
+check "raw get prints the raw value" "hello world" "$($TOOL "$DBR" get greeting)"
+check "raw get of an absent key fails" "1" \
+    "$($TOOL "$DBR" get nope >/dev/null 2>&1; echo $?)"
+$TOOL "$DBR" store empty ""
+check "raw empty value reads back empty" "" "$($TOOL "$DBR" get empty)"
+printf 'store\tbatchkey\tbatch value\ndelete\tgreeting\n' | $TOOL "$DBR" batch
+check "raw batch lines are tab-separated" "batch value" \
+    "$($TOOL "$DBR" get batchkey)"
+check "raw batch deleted" "1" \
+    "$($TOOL "$DBR" get greeting >/dev/null 2>&1; echo $?)"
+check "raw scan output is key<TAB>value" \
+    "$(printf 'batchkey\tbatch value\nempty\t')" \
+    "$($TOOL "$DBR" scan)"
+check "raw scan --prefix" "$(printf 'batchkey\tbatch value')" \
+    "$($TOOL "$DBR" scan --prefix batch)"
+
+# --- create --nochecksum: engine 0 -------------------------------------------
+DBN="$WORK/dbn"
+$TOOL "$DBN" create --uuid "$UUID" --nochecksum
+$TOOL "$DBN" store k v
+check "nochecksum writes engine-0 files" "1" \
+    "$($TOOL "$DBN" dump | grep -c 'csum=0')"
+check "nochecksum data reads back" "v" "$($TOOL "$DBN" get k)"
+
 # --- convert -----------------------------------------------------------------
 # A second generation, then convert: the first becomes an in-order file.
 DB2="$WORK/db2"
 $TOOL "$DB2" create --uuid "$UUID"
-$TOOL "$DB2" store 61 3031
+$TOOL "$DB2" store 61 3031 --hex
 # Force a new generation by making the active file unclean, as a crash would.
 printf '\336\255\276\357\336\255\276\357' >> "$DB2/zeroskip-$UUID-00000001"
-$TOOL "$DB2" store 62 3032
+$TOOL "$DB2" store 62 3032 --hex
 check "an unclean active file forces a new generation" "2" \
     "$(ls "$DB2" | grep -c '^zeroskip-')"
 $TOOL "$DB2" convert
 check "convert produced an in-order file" "1" \
     "$($TOOL "$DB2" dump | grep -c 'kind=inorder')"
-check "convert kept the data" "3031" "$($TOOL "$DB2" get 61)"
+check "convert kept the data" "3031" "$($TOOL "$DB2" get 61 --hex)"
 check "check after convert" "OK" "$($TOOL "$DB2" check)"
 
 # --- repack ------------------------------------------------------------------
 DB3="$WORK/db3"
 $TOOL "$DB3" create --uuid "$UUID"
 for i in 1 2 3 4 5 6 7 8; do
-    $TOOL "$DB3" store "3$i" "763$i"
+    $TOOL "$DB3" store "3$i" "763$i" --hex
     printf '\336\255\276\357\336\255\276\357' \
         >> "$DB3/$(ls "$DB3" | grep '^zeroskip-' | sort | tail -1)"
 done
@@ -141,7 +177,7 @@ else
         "$before" "$after"
 fi
 check "check after repack" "OK" "$($TOOL "$DB3" check)"
-check "data survived the repack" "7631" "$($TOOL "$DB3" get 31)"
+check "data survived the repack" "7631" "$($TOOL "$DB3" get 31 --hex)"
 
 # --- hold-write --------------------------------------------------------------
 # The runner needs to know the lock is HELD before starting the process it expects
@@ -158,8 +194,8 @@ A="$WORK/repro-a"
 B="$WORK/repro-b"
 for d in "$A" "$B"; do
     $TOOL "$d" create --uuid "$UUID"
-    printf 'store 61 3031\nstore 62 3032\ndelete 61\n' | $TOOL "$d" batch
-    $TOOL "$d" store 63 3033
+    printf 'store 61 3031\nstore 62 3032\ndelete 61\n' | $TOOL "$d" batch --hex
+    $TOOL "$d" store 63 3033 --hex
 done
 if diff -r "$A" "$B" >/dev/null 2>&1; then
     pass=$((pass + 1))
@@ -171,7 +207,7 @@ fi
 
 # --- errors ------------------------------------------------------------------
 check "malformed hex is rejected" "2" \
-    "$($TOOL "$DB" get 6b65790 >/dev/null 2>&1; echo $?)"
+    "$($TOOL "$DB" get 6b65790 --hex >/dev/null 2>&1; echo $?)"
 check "opening a missing database fails" "1" \
     "$($TOOL "$WORK/nope" get 61 >/dev/null 2>&1; echo $?)"
 check "an unknown command prints usage" "2" \

@@ -159,6 +159,6 @@ Changing any of these breaks other implementations, so they need a spec change f
 - `fcntl` record locking on `zeroskip.lock` bytes 0/1/2
 - the pointer table's 16 magic bytes, its 96-byte header layout, the offset array
   and its trailing checksum, and the `zeroskip.index-<uuid>-<GEN8hex>` name
-- `zstool`'s output line format, which the interop runner compares as text
+- `zstool --hex`'s line format, which the interop runner compares as text (the raw default is for humans, and is not interop surface)
 
 Locks are ordered *within* one database. A caller holding locks on several databases while writing must impose its own consistent order (C-1h).

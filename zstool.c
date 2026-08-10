@@ -9,10 +9,12 @@
  * of subcommands over a database directory, with a defined line format, so one
  * language-neutral runner can drive every implementation.
  *
- * Keys and values are HEX on the way in and out.  Not for elegance: keys may
- * contain NUL bytes and newlines (F-13), and T-12 requires two implementations'
- * `scan` output match byte for byte -- which raw output cannot express.  Hex is
- * the only encoding where "the same bytes" and "the same text" coincide.
+ * Keys and values are the argument's own bytes by default, for a human at a
+ * shell.  Under --hex they are hex on the way in and out, which is the mode the
+ * runner and the corpus use.  Not for elegance: keys may contain NUL bytes and
+ * newlines (F-13), and T-12 requires two implementations' `scan` output match
+ * byte for byte -- which raw output cannot express.  Hex is the only encoding
+ * where "the same bytes" and "the same text" coincide.
  *
  * Without this contract each language reimplements the conformance suite and they
  * drift apart, which is the failure mode the whole exercise exists to prevent.
@@ -27,6 +29,9 @@
 #include "zeroskip.h"
 
 #define NOTFOUND_MARKER "NOTFOUND"
+
+/* --hex: keys and values are hex in and out (the runner's mode). */
+static int hexmode = 0;
 
 static void oops(const char *what, int r)
 {
@@ -74,6 +79,27 @@ static void puthex(const char *p, size_t n)
     for (size_t i = 0; i < n; i++) printf("%02x", (unsigned char)p[i]);
 }
 
+/* Decode a key or value argument: hex under --hex, the argument's own bytes
+ * otherwise.  Always malloc'd, so callers free either way.  Raw covers what a
+ * command line can carry; a NUL or a newline needs --hex. */
+static char *inbytes(const char *in, size_t *lenp)
+{
+    if (hexmode) return unhex(in, lenp);
+
+    size_t n = strlen(in);
+    char *out = malloc(n ? n : 1);
+    if (!out) return NULL;
+    memcpy(out, in, n);
+    *lenp = n;
+    return out;
+}
+
+static void putbytes(const char *p, size_t n)
+{
+    if (hexmode) puthex(p, n);
+    else fwrite(p, 1, n, stdout);
+}
+
 static const char *salvage_kind_name(int kind)
 {
     switch (kind) {
@@ -115,13 +141,15 @@ static int salvage_report(void *rock, const struct zs_salvage_event *ev)
     return 0;
 }
 
+/* Hex pairs are space-separated (the runner's line format); raw pairs are
+ * tab-separated, because a value may contain spaces. */
 static int scan_cb(void *rock, const char *key, size_t keylen,
                    const char *val, size_t vallen)
 {
     (void)rock;
-    puthex(key, keylen);
-    putchar(' ');
-    puthex(val, vallen);
+    putbytes(key, keylen);
+    putchar(hexmode ? ' ' : '\t');
+    putbytes(val, vallen);
     putchar('\n');
     return 0;
 }
@@ -131,13 +159,13 @@ static int usage(void)
     fprintf(stderr,
         "usage: zstool <dir> <command> [args]\n"
         "\n"
-        "  create [--uuid U] [--engine 0|1]\n"
-        "                         create a database\n"
-        "  store KEYHEX VALHEX    one transaction, one store\n"
-        "  delete KEYHEX          one transaction, one delete\n"
+        "  create [--uuid U] [--nochecksum]\n"
+        "                         create a database (--nochecksum: engine 0)\n"
+        "  store KEY VAL          one transaction, one store\n"
+        "  delete KEY             one transaction, one delete\n"
         "  batch                  a script on stdin, all in ONE transaction\n"
-        "  get KEYHEX             print the value in hex, or " NOTFOUND_MARKER "\n"
-        "  scan [--prefix PHEX]   every visible pair, in comparator order\n"
+        "  get KEY                print the value, or fail if absent\n"
+        "  scan [--prefix P]      every visible pair, in comparator order\n"
         "  dump [--detail N]      print structure\n"
         "  check                  run the consistency checks\n"
         "  convert                force conversion of non-active unordered files\n"
@@ -150,15 +178,16 @@ static int usage(void)
         "  hold-write --for MS    take the write lock and hold it\n"
         "  index-dump             print the pointer table state (spec section 8)\n"
         "\n"
+        "  --hex                  keys and values are hex in and out, and get\n"
+        "                         prints " NOTFOUND_MARKER " for an absent key.  The\n"
+        "                         interop runner's mode: embedded NULs and\n"
+        "                         newlines survive a comparison as text (T-12)\n"
         "  --index-dir PATH       enable the pointer table cache for this run;\n"
         "                         MUST NOT be the database directory (P-2)\n"
         "\n"
-        "Keys and values are hex, so embedded NULs and newlines survive the\n"
-        "comparison an interop runner makes.\n"
-        "\n"
-        "batch script lines:\n"
-        "  store KEYHEX VALHEX\n"
-        "  delete KEYHEX\n");
+        "batch script lines, tab-separated (space-separated under --hex):\n"
+        "  store KEY VAL\n"
+        "  delete KEY\n");
     return 2;
 }
 
@@ -168,7 +197,7 @@ int main(int argc, char **argv)
     struct zs_db *db = NULL;
     const char *dir, *cmd;
     const char *uuid = NULL, *prefix = NULL, *index_dir = NULL;
-    int detail = 0, engine = -1;
+    int detail = 0, nochecksum = 0;
     long hold_ms = 0;
     int r;
 
@@ -206,7 +235,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prefix") && i + 1 < argc) prefix = argv[++i];
         else if (!strcmp(argv[i], "--detail") && i + 1 < argc) detail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--for") && i + 1 < argc)    hold_ms = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--engine") && i + 1 < argc)  engine = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--nochecksum"))             nochecksum = 1;
+        else if (!strcmp(argv[i], "--hex"))                    hexmode = 1;
         else if (!strcmp(argv[i], "--index-dir") && i + 1 < argc) index_dir = argv[++i];
     }
 
@@ -225,12 +255,12 @@ int main(int argc, char **argv)
      * uniform open keeps the tool's behaviour predictable for a runner. */
     if (!strcmp(cmd, "create")) {
         setup.flags = ZS_CREATE;
-        /* Which engine files this database's creator writes (A-6).  Engine 2 is
-         * deliberately unreachable from here: a file written under it is readable
-         * only by a caller supplying the same function, so it cannot appear in a
-         * shared corpus (F-5d). */
-        if (engine == 0) setup.flags |= ZS_CSUM_NONE;
-        else if (engine == 1) setup.flags |= ZS_CSUM_XXHASH;
+        /* Which engine files this database's creator writes (A-6): engine 1
+         * unless --nochecksum asks for engine 0.  Engine 2 is deliberately
+         * unreachable from here: a file written under it is readable only by a
+         * caller supplying the same function, so it cannot appear in a shared
+         * corpus (F-5d). */
+        setup.flags |= nochecksum ? ZS_CSUM_NONE : ZS_CSUM_XXHASH;
         r = uuid ? zs_db_open_with_uuid(dir, &setup, uuid, &db)
                  : zs_db_open(dir, &setup, &db);
         if (r != ZS_OK) oops("create", r);
@@ -244,8 +274,8 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "store")) {
         if (argc < 5) return usage();
         size_t kl, vl;
-        char *k = unhex(argv[3], &kl);
-        char *v = unhex(argv[4], &vl);
+        char *k = inbytes(argv[3], &kl);
+        char *v = inbytes(argv[4], &vl);
         if (!k || !v) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
         r = zs_db_store(db, k, kl, v, vl, 0);
         if (r != ZS_OK) oops("store", r);
@@ -254,7 +284,7 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "delete")) {
         if (argc < 4) return usage();
         size_t kl;
-        char *k = unhex(argv[3], &kl);
+        char *k = inbytes(argv[3], &kl);
         if (!k) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
         r = zs_db_delete(db, k, kl, 0);
         if (r != ZS_OK && r != ZS_NOTFOUND) oops("delete", r);
@@ -270,29 +300,33 @@ int main(int argc, char **argv)
         r = zs_db_begin_txn(db, 0, &txn);
         if (r != ZS_OK) oops("begin", r);
 
+        /* Hex batch lines are space-separated (the runner's format); raw ones
+         * are tab-separated, because a raw value may contain spaces. */
+        char sep = hexmode ? ' ' : '\t';
+
         while (fgets(line, sizeof(line), stdin)) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = '\0';
             if (!line[0] || line[0] == '#') continue;
 
-            char *sp = strchr(line, ' ');
+            char *sp = strchr(line, sep);
             if (!sp) { fprintf(stderr, "zstool: bad batch line\n"); return 2; }
             *sp++ = '\0';
 
             if (!strcmp(line, "store")) {
-                char *sp2 = strchr(sp, ' ');
+                char *sp2 = strchr(sp, sep);
                 if (!sp2) { fprintf(stderr, "zstool: bad store line\n"); return 2; }
                 *sp2++ = '\0';
                 size_t kl, vl;
-                char *k = unhex(sp, &kl);
-                char *v = unhex(sp2, &vl);
+                char *k = inbytes(sp, &kl);
+                char *v = inbytes(sp2, &vl);
                 if (!k || !v) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
                 r = zs_txn_store(txn, k, kl, v, vl, 0);
                 if (r != ZS_OK) oops("store", r);
                 free(k); free(v);
             } else if (!strcmp(line, "delete")) {
                 size_t kl;
-                char *k = unhex(sp, &kl);
+                char *k = inbytes(sp, &kl);
                 if (!k) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
                 r = zs_txn_store(txn, k, kl, NULL, 0, 0);
                 if (r != ZS_OK) oops("delete", r);
@@ -309,13 +343,16 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "get")) {
         if (argc < 4) return usage();
         size_t kl;
-        char *k = unhex(argv[3], &kl);
+        char *k = inbytes(argv[3], &kl);
         if (!k) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
         const char *v;
         size_t vl;
         r = zs_db_fetch(db, k, kl, NULL, NULL, &v, &vl, 0);
-        if (r == ZS_OK) { puthex(v, vl); putchar('\n'); }
-        else if (r == ZS_NOTFOUND) printf("%s\n", NOTFOUND_MARKER);
+        /* The runner needs absence as a defined stdout marker (T-0a); a raw
+         * value could BE the marker's bytes, so raw mode reports absence the
+         * way every other failure is reported: stderr and a nonzero exit. */
+        if (r == ZS_OK) { putbytes(v, vl); putchar('\n'); }
+        else if (r == ZS_NOTFOUND && hexmode) printf("%s\n", NOTFOUND_MARKER);
         else oops("get", r);
         free(k);
 
@@ -323,7 +360,7 @@ int main(int argc, char **argv)
         size_t pl = 0;
         char *p = NULL;
         if (prefix) {
-            p = unhex(prefix, &pl);
+            p = inbytes(prefix, &pl);
             if (!p) { fprintf(stderr, "zstool: bad hex\n"); return 2; }
         }
         r = zs_db_foreach(db, p, pl, NULL, scan_cb, NULL,
