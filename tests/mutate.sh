@@ -951,6 +951,19 @@ mutant "compact: merges the prefix, not runs" catch \
 mutant "compact: reports success regardless" catch \
   's/        r = ZS_BADFORMAT;\n    \}\n\nout:\n    zsi_lock_release\(&db->locks, ZSI_LOCK_REPACK\);/        r = ZS_OK;\n    }\n\nout:\n    zsi_lock_release(\&db->locks, ZSI_LOCK_REPACK);/'
 
+# D-20b.  A repack input's record bodies are covered only by the records-region
+# checksum, which nothing on the read path checks.  Skipping the verification
+# launders a corrupt body: the output is written under a FRESH checksum computed
+# over the corrupt copy, and D-23 then removes the input -- the only evidence.
+mutant "repack: inputs not verified before merge" catch \
+  's/        r = zsi_ptrs_verify_records\(snap->files\[first \+ i\]\);/        r = ZS_OK;/'
+
+# D-20b again, the natural wrong version on the conversion path: verifying with
+# the HANDLE's nocsum setting.  F-5e scopes ZS_NOCSUM to reads, and conversion
+# writes -- a NOCSUM handle that seals a corrupt span certifies it as good.
+mutant "convert: verification honours ZS_NOCSUM" catch \
+  's/        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, false, NULL, NULL\);/        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, db->nocsum, NULL, NULL);/'
+
 # C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
 # in-process assertion catches it from the other side.
 mutant "compact: takes the write lock outermost" catch \

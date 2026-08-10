@@ -5421,6 +5421,27 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
 
     if (!f->index) return ZS_INTERNAL;
 
+    /* D-20b: verify the span chain over everything about to be copied, with
+     * checksums ON regardless of db->nocsum -- that flag is scoped to reads
+     * (F-5e), and this is a write: the output gets a fresh records checksum
+     * computed over the copy, so converting an unverified span would launder
+     * corruption into a file that validates.  Replayed on a SCRATCH copy,
+     * because the walk records its progress into the struct it is given
+     * (complete, the last terminator) and this walk's answer must not replace
+     * the one the handle's readers are using; nothing in the copy is owned or
+     * released.  A verified walk stopping short of f->complete means a span
+     * this handle admitted fails its checksum. */
+    {
+        struct zsi_file scratch = *f;
+        r = zsi_unordered_replay(&scratch, ZSI_HEADER_LEN, false, NULL, NULL);
+        if (r != ZS_OK) return r;
+        if (scratch.complete < f->complete) {
+            db->error("unordered file fails a span checksum; not converted",
+                      "file=<%s>", f->fname);
+            return ZS_BADCHECKSUM;
+        }
+    }
+
     /* The index already holds exactly the live records, newest per key, in key
      * order (D-13a) -- which is precisely what the output needs (D-20: inputs are
      * iterated in key order, from the same private index any reader builds; there
@@ -5672,6 +5693,22 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
 
     zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
     if (!cs) return ZS_BADUSAGE;
+
+    /* D-20b: verify every input's records-region checksum before copying a
+     * byte of it.  NOT gated on db->nocsum -- that flag is scoped to reads
+     * (F-5e), and this is a write: the output gets a fresh checksum computed
+     * over whatever is copied, and D-23 then removes the inputs, so copying
+     * an unverified body would launder corruption into a file that validates
+     * while destroying the only evidence.  Failing here costs nothing: the
+     * inputs stay, the database still reads, salvage still works. */
+    for (size_t i = 0; i < count; i++) {
+        r = zsi_ptrs_verify_records(snap->files[first + i]);
+        if (r != ZS_OK) {
+            db->error("repack input fails its records checksum; not merged",
+                      "file=<%s>", snap->files[first + i]->fname);
+            return r;
+        }
+    }
 
     fc = zsi_zmalloc(count * sizeof(*fc));
     if (!fc) return ZS_INTERNAL;

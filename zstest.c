@@ -7478,6 +7478,134 @@ static void test_repack_empty_output(void)
     zs_db_close(&db);
 }
 
+static void test_repack_verifies_inputs(void)
+{
+    /* D-20b: repack verifies each input's records-region checksum before
+     * copying a byte.  Without this, a record body corrupted in place is
+     * LAUNDERED: the merge computes a fresh checksum over the corrupt copy,
+     * D-23 removes the input, and check_consistency reports clean forever
+     * after -- the only evidence F-26e could have caught is gone. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    char got[64];
+
+    clear_db();
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_finish(&b);
+    /* Damage a value byte, leaving every length and pointer intact -- the
+     * corruption reads fine and only the records checksum knows. */
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","other"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+
+    /* Reads do not verify record bodies, so the damage is invisible here --
+     * which is the point: the merge is the last line of defence. */
+    db_get(db, "a", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");
+
+    ASSERT_EQ(zsi_repack_merge(db, db->snap, 0, 2), ZS_BADCHECKSUM);
+
+    /* Both inputs are left in place, and nothing was written. */
+    ASSERT_OK(zsi_db_refresh(db));
+    ASSERT_NOT_NULL(file_with_range(db, 1, 1));
+    ASSERT_NOT_NULL(file_with_range(db, 2, 2));
+    ASSERT_NULL(file_with_range(db, 1, 2));
+    zs_db_close(&db);
+}
+
+static void test_repack_verifies_inputs_nocsum(void)
+{
+    /* D-20b under ZS_NOCSUM: the flag is scoped to READS (F-5e).  A repack
+     * writes a fresh checksum over whatever it copies, so it verifies its
+     * inputs no matter how the handle was opened -- a NOCSUM handle that
+     * repacked without checking would certify corrupt bytes as good. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+
+    clear_db();
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_finish(&b);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","other"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOCSUM);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zsi_repack_merge(db, db->snap, 0, 2), ZS_BADCHECKSUM);
+
+    ASSERT_OK(zsi_db_refresh(db));
+    ASSERT_NOT_NULL(file_with_range(db, 1, 1));
+    ASSERT_NOT_NULL(file_with_range(db, 2, 2));
+    ASSERT_NULL(file_with_range(db, 1, 2));
+    zs_db_close(&db);
+}
+
+static void test_seal_verifies_spans_nocsum(void)
+{
+    /* D-20b on the conversion path.  A ZS_NOCSUM handle admits a span whose
+     * checksum fails (F-5e -- that is the flag working as designed), but
+     * converting it would copy the unverified bytes into an in-order file
+     * under a fresh records checksum.  So conversion re-verifies the span
+     * chain with checksums ON, whatever the handle skipped at read time. */
+    struct zs_db *db;
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    char got[64];
+
+    clear_db();
+
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "k", 1, "value", 5, false, 0);
+    sb_term(&s, false);
+    /* Damage one value byte AFTER the terminator checksum was computed. */
+    {
+        size_t voff = 0;
+        for (size_t i = ZSI_HEADER_LEN; i + 5 <= s.len; i++)
+            if (memcmp(s.buf + i, "value", 5) == 0) { voff = i; break; }
+        ASSERT(voff != 0);
+        s.buf[voff] = 'V';
+    }
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    /* A NOCSUM handle reads the corrupt span happily -- F-5e's bargain. */
+    db = open_db(ZS_NOCSUM);
+    ASSERT_NOT_NULL(db);
+    db_get(db, "k", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");
+
+    /* But sealing must not certify it. */
+    ASSERT_EQ(zs_db_seal(db), ZS_BADCHECKSUM);
+
+    /* The file is still unordered, still present, still readable. */
+    ASSERT_OK(zsi_db_refresh(db));
+    ASSERT_NOT_NULL(file_with_range(db, 1, 0));
+    db_get(db, "k", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");
+    zs_db_close(&db);
+}
+
 static void test_repack_cascade(void)
 {
     /* D-16's cascade reaching the geometric size relation after many rollovers,
@@ -12765,6 +12893,9 @@ static struct test_entry tests[] = {
     { "test_repack_d18_table",          test_repack_d18_table },
     { "test_repack_d19a_resurrection",  test_repack_d19a_resurrection },
     { "test_repack_empty_output",       test_repack_empty_output },
+    { "test_repack_verifies_inputs",    test_repack_verifies_inputs },
+    { "test_repack_verifies_inputs_nocsum", test_repack_verifies_inputs_nocsum },
+    { "test_seal_verifies_spans_nocsum", test_seal_verifies_spans_nocsum },
     { "test_repack_cascade",            test_repack_cascade },
     { "test_repack_never_touches_unordered",
                                         test_repack_never_touches_unordered },
