@@ -1032,7 +1032,29 @@ mutant "cursor: explicit txn goes live too" catch \
 # D-14j-b.  A refresh re-seeks by key, and a seek lands ON that key when it is
 # still present -- which has already been yielded.  Not skipping it re-emits it.
 mutant "cursor: re-yields the key it resumed from" catch \
-  's/        if \(c->last_key && !c->cur\[i\]\.exhausted/        if (0 \&\& c->last_key \&\& !c->cur[i].exhausted/'
+  's/    if \(c->last_key && !fc->exhausted/    if (0 \&\& c->last_key \&\& !fc->exhausted/'
+
+# D-14j-b, reported downstream (Cyrus aaa-db foreach_changes).  On a pending
+# write, re-positioning the transaction arm from ITS OWN state -- the last key
+# consumed from that arm -- instead of from the cursor's last yielded key.  The
+# arm's position lags the merge (an arm exhausted at open has consumed nothing),
+# so a key stored BEHIND the cursor resurfaces and is yielded out of order,
+# shifting the rest of the traversal by one.
+mutant "cursor: txn arm resumes from its own position" catch \
+  's/(zsi_cursor_reseek_txn\(struct zs_cursor \*c\)\n\{\n.*?)int r = zsi_cursor_reseek_arm\(c, &c->cur\[i\]\);/$1int r = zsi_fcur_load(\&c->cur[i]);/s'
+
+# The txn-only re-seek is a PERFORMANCE split, not a behavioural one: the full
+# re-seek repositions every arm to the same place, it just searches every file
+# again for a change that touched none of them.  Recorded so nobody writes a
+# bogus test chasing it.
+mutant "cursor: pending change re-seeks every arm" equivalent \
+  's/    if \(txn_moved\)   return zsi_cursor_reseek_txn\(c\);/    if (txn_moved)   return zsi_cursor_reseek(c);/'
+
+# D-14e: the merge takes from element 0, so an arm repositioned without the
+# re-sort sits wherever it was and its record surfaces at the wrong point in
+# the order.
+mutant "cursor: txn re-seek skips the sort" catch \
+  's/(zsi_cursor_reseek_txn\(struct zs_cursor \*c\)\n\{\n.*?)    zsi_cur_sort\(c\);/$1    \/* no sort *\//s'
 
 # D-14j-b, reported downstream.  A refresh before the first record has been
 # emitted has no last-yielded key to resume from, so it must fall back to the

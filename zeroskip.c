@@ -4335,10 +4335,18 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
     return ZS_OK;
 }
 
-/* Re-seek every arm to just after the last key yielded, against whatever the
- * sources hold now.  D-14j-b: resume strictly after, never re-yielding and never
- * skipping a key that was already there. */
-static int zsi_cursor_reseek(struct zs_cursor *c)
+/* Re-seek one arm to just after the last key yielded, against whatever its
+ * source holds now.  D-14j-b: resume strictly after, never re-yielding and never
+ * skipping a key that was already there.
+ *
+ * The resume point is the CURSOR's, never the arm's.  An arm has its own notion
+ * of position -- the last key consumed from it -- and that position LAGS the
+ * merge: an arm that was exhausted at open has consumed nothing at all.
+ * Re-positioning an arm from its own state therefore resurfaces any key written
+ * into the gap between the two, and the merge hands it out BEHIND the last key
+ * yielded (found downstream: a store made mid-walk at a key already passed was
+ * yielded out of order, shifting the rest of the traversal by one). */
+static int zsi_cursor_reseek_arm(struct zs_cursor *c, struct zsi_fcur *fc)
 {
     /* Resume from the last key yielded; before anything has been, from the key
      * the cursor was OPENED at.  Falling back to "the first key" instead would
@@ -4346,24 +4354,50 @@ static int zsi_cursor_reseek(struct zs_cursor *c)
      * outright. */
     const char *from = c->last_key ? c->last_key : c->start_key;
     size_t fromlen = c->last_key ? c->last_keylen : c->start_keylen;
+    int r;
 
+    if (from)
+        r = zsi_fcur_seek(fc, from, fromlen);
+    else
+        r = zsi_fcur_seek_first(fc);
+    if (r != ZS_OK) return r;
+
+    /* A seek lands ON the key when it is still present.  Skip it only when
+     * it is one we have already yielded -- the START key has not been. */
+    if (c->last_key && !fc->exhausted
+        && c->db->compar(fc->cur.key, fc->cur.keylen,
+                         c->last_key, c->last_keylen) == 0)
+        return zsi_fcur_next(fc);
+
+    return ZS_OK;
+}
+
+static int zsi_cursor_reseek(struct zs_cursor *c)
+{
     for (size_t i = 0; i < c->ncur; i++) {
-        int r;
-
-        if (from)
-            r = zsi_fcur_seek(&c->cur[i], from, fromlen);
-        else
-            r = zsi_fcur_seek_first(&c->cur[i]);
+        int r = zsi_cursor_reseek_arm(c, &c->cur[i]);
         if (r != ZS_OK) return r;
+    }
 
-        /* A seek lands ON the key when it is still present.  Skip it only when
-         * it is one we have already yielded -- the START key has not been. */
-        if (c->last_key && !c->cur[i].exhausted
-            && c->db->compar(c->cur[i].cur.key, c->cur[i].cur.keylen,
-                             c->last_key, c->last_keylen) == 0) {
-            r = zsi_fcur_next(&c->cur[i]);
-            if (r != ZS_OK) return r;
-        }
+    zsi_cur_sort(c);
+    return ZS_OK;
+}
+
+/* A pending write moved only the transaction's own records, so only that arm
+ * needs re-seeking; the files cannot have moved.  An in-order file is never
+ * modified, a non-active unordered file is never appended to again, and the
+ * active file only ever grows by a COMMIT -- which replaces the handle's
+ * snapshot and is the other refresh case entirely.
+ *
+ * That distinction is the difference between one binary search of the pending
+ * array and a search through every file per record written mid-walk, which on a
+ * large traversal is the whole cost of the liveness mechanism. */
+static int zsi_cursor_reseek_txn(struct zs_cursor *c)
+{
+    for (size_t i = 0; i < c->ncur; i++) {
+        if (c->cur[i].kind != ZSI_SRC_TXN) continue;
+        int r = zsi_cursor_reseek_arm(c, &c->cur[i]);
+        if (r != ZS_OK) return r;
     }
 
     zsi_cur_sort(c);
@@ -4375,14 +4409,14 @@ static int zsi_cursor_reseek(struct zs_cursor *c)
  * only case that costs, and it is opt-in. */
 static int zsi_cursor_refresh(struct zs_cursor *c)
 {
-    bool stale = false;
+    bool files_moved = false, txn_moved = false;
 
     /* The transaction's own pending records, whether the transaction is ours or
      * the caller's: A-1a makes a write on it visible to a traversal already in
      * progress on it. */
     if (c->txn && zsi_txn_seq(c->txn) != c->txn_seq) {
         c->txn_seq = zsi_txn_seq(c->txn);
-        stale = true;
+        txn_moved = true;
     }
 
     /* The file set, but only for a cursor from a DATABASE HANDLE.  Inside an
@@ -4430,11 +4464,16 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
                     fc->gen = ZSI_GEN_TXN;
                 }
             }
-            stale = true;
+            files_moved = true;
         }
     }
 
-    return stale ? zsi_cursor_reseek(c) : ZS_OK;
+    /* A snapshot change subsumes a pending-write change: the full re-seek
+     * repositions every arm, transaction included. */
+    if (files_moved) return zsi_cursor_reseek(c);
+    if (txn_moved)   return zsi_cursor_reseek_txn(c);
+
+    return ZS_OK;
 }
 
 static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)

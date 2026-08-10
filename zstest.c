@@ -13133,17 +13133,36 @@ static void test_cursor_start_key_survives_refresh(void)
     ASSERT_STR_EQ(live_log, "|e");          /* NOT empty */
     ASSERT_OK(zs_txn_abort(&txn));
 
-    /* And the case that isolates the fallback rather than the counter: a
+    /* And the cases that isolate the fallback rather than the counter: a
      * GENUINE change before the first record has been emitted.  There is no
      * last-yielded key to resume from, so the re-seek must fall back to the
-     * key the cursor was opened at -- not to the first key in the database. */
+     * key the cursor was opened at -- not to the first key in the database.
+     *
+     * Both kinds of change, because they re-seek different arms: a pending
+     * write repositions only the transaction arm, and a snapshot change
+     * repositions every arm -- so only the second exercises the fallback for
+     * the FILE arms. */
     {
         struct zs_cursor *c = NULL;
         const char *k, *v;
         size_t kl, vl;
 
         ASSERT_OK(zs_db_begin_cursor(live_db, "d", 1, &c, 0));
-        ASSERT_OK(zs_txn_store(c->txn, "z", 1, "9", 1, 0));   /* real change */
+        ASSERT_OK(zs_txn_store(c->txn, "z", 1, "9", 1, 0));   /* pending write */
+        ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+        ASSERT_EQU(kl, 1u);
+        ASSERT_MEM_EQ(k, "d", 1);                             /* NOT "a" */
+        ASSERT_OK(zs_cursor_abort(&c));
+    }
+    {
+        struct zs_cursor *c = NULL;
+        const char *k, *v;
+        size_t kl, vl;
+
+        /* ZS_SHARED, so the cursor holds no write lock and the same handle can
+         * commit underneath it -- the handle-live snapshot swap (D-14j). */
+        ASSERT_OK(zs_db_begin_cursor(live_db, "d", 1, &c, ZS_SHARED));
+        ASSERT_OK(zs_db_store(live_db, "z", 1, "9", 1, 0));   /* snapshot change */
         ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
         ASSERT_EQU(kl, 1u);
         ASSERT_MEM_EQ(k, "d", 1);                             /* NOT "a" */
@@ -13196,6 +13215,69 @@ static void test_cursor_delete_during_traversal(void)
                   ZS_NOTFOUND);
         ASSERT_OK(zs_db_fetch(live_db, "f", 1, NULL, NULL, &val, &vlen, 0));
     }
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
+/* D-14j-b: a key stored BEHIND the cursor during a traversal must not be
+ * yielded.  It is before the resume point, so yielding it hands the caller a
+ * key out of order and shifts everything after it by one.
+ *
+ * Reported from the Cyrus integration (aaa-db foreach_changes: "affect" stored
+ * while the cursor sat on "cubist" came out between "cubist" and "eulogy").
+ * The trap is resolving the transaction arm from ITS OWN position after a
+ * pending write: the arm's position is the last key consumed FROM THAT ARM,
+ * which lags the merge's progress -- for an arm that was exhausted at open it
+ * is "the beginning".  A reload from there resurfaces every pending key behind
+ * the merge.  The resume point is the CURSOR's last yielded key, and only a
+ * re-seek from it is correct.
+ *
+ * Two arrangements: the arm exhausted at open (empty pending -- the Cyrus
+ * shape), and the arm having already yielded a key of its own, which lags the
+ * merge by less but still lags. */
+static int live_store_behind_cb(void *rock, const char *k, size_t kl,
+                                const char *v, size_t vl)
+{
+    (void)rock; (void)v; (void)vl;
+    live_note(k, kl);
+    if (kl == 1 && k[0] == 'b')
+        CB_ASSERT(zs_txn_store(live_txn, "aa", 2, "!", 1, 0) == ZS_OK);
+    return 0;
+}
+
+static void test_txn_cursor_store_behind_not_yielded(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    const char *v;
+    size_t vl;
+
+    live_seed(&setup);         /* a b d, committed */
+
+    /* Arm exhausted at open: nothing pending when the walk starts. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &live_txn));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, live_store_behind_cb,
+                             NULL, 0));
+    ASSERT_STR_EQ(live_log, "|a|b|d");          /* NOT |a|b|aa|d */
+
+    /* The write itself took: it is in the transaction's view... */
+    ASSERT_OK(zs_txn_fetch(live_txn, "aa", 2, NULL, NULL, &v, &vl, 0));
+    /* ...and a FRESH traversal of the same transaction yields it in place. */
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, live_note_cb, NULL, 0));
+    ASSERT_STR_EQ(live_log, "|a|aa|b|d");
+    ASSERT_OK(zs_txn_abort(&live_txn));
+
+    /* Arm already mid-array: "0" is pending before the walk starts and is
+     * yielded first, so the arm's own position is "0" when the write lands --
+     * behind the merge's "b", and "aa" sits in the gap between them. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &live_txn));
+    ASSERT_OK(zs_txn_store(live_txn, "0", 1, "0", 1, 0));
+    live_log[0] = '\0';
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, live_store_behind_cb,
+                             NULL, 0));
+    ASSERT_STR_EQ(live_log, "|0|a|b|d");        /* NOT |0|a|b|aa|d */
+    ASSERT_OK(zs_txn_abort(&live_txn));
+
     ASSERT_OK(zs_db_close(&live_db));
 }
 
@@ -13478,6 +13560,8 @@ static struct test_entry tests[] = {
                                         test_cursor_start_key_survives_refresh },
     { "test_cursor_delete_during_traversal",
                                         test_cursor_delete_during_traversal },
+    { "test_txn_cursor_store_behind_not_yielded",
+                                        test_txn_cursor_store_behind_not_yielded },
 
     { NULL, NULL }
 };
