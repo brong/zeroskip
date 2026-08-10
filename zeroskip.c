@@ -1140,6 +1140,29 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
     return ZS_OK;
 }
 
+/* Verify a record's trailing checksum (F-32a).
+ *
+ * The engine is the caller's to supply, because a record does not know its
+ * file -- and it is always the CONTAINING file's engine (F-5a).  Engine 0
+ * computes zero over anything and stores zero, so it passes with no special
+ * case.
+ *
+ * Callers are the MATERIALIZATION points only: the lookup return, the cursor
+ * yield, check_consistency, salvage.  Wiring this into decode or replay is
+ * the data-loss bug F-32b names: replay completes a file at its first invalid
+ * record (F-24), so a verifying replay converts one flipped byte into the
+ * silent loss of every record after it.
+ *
+ * Only records DECODED FROM A FILE qualify.  The transaction arm synthesizes
+ * records over its pending buffers with base == NULL and no checksum, and the
+ * merge gates on the arm's file pointer before calling here. */
+static int zsi_rec_verify(zs_csum *csum, const struct zsi_rec *r)
+{
+    if (r->len < 4) return ZS_BADFORMAT;
+    if (csum(r->base, r->len - 4) != r->csum) return ZS_BADCHECKSUM;
+    return ZS_OK;
+}
+
 /* Bytes a terminator will occupy: 8 while the span fits in three bytes, 24
  * beyond that (F-15). */
 static size_t zsi_term_encoded_len(uint64_t spanlen)
@@ -4078,6 +4101,12 @@ static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
 
         int r = zsi_fcur_find(&fc, key, keylen, out);
         zsi_fcur_fini(&fc);
+        /* F-32a: verify the record being materialized -- tombstones included,
+         * since a corrupt tombstone is about to decide this key is absent. */
+        if (r == ZS_OK && !db->nocsum) {
+            int vr = zsi_rec_verify(snap->files[i]->csum, out);
+            if (vr != ZS_OK) return vr;
+        }
         if (r == ZS_OK) return zsi_rec_is_delete(out) ? ZS_NOTFOUND : ZS_OK;
         if (r != ZS_NOTFOUND) return r;
     }
@@ -4317,6 +4346,18 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
     if (!c->ncur || c->cur[0].exhausted) return ZS_DONE;
 
     struct zsi_rec rec = c->cur[0].cur;
+
+    /* F-32a: verify at the yield, on the record actually being consumed --
+     * element 0 is the newest version, the one whose bytes the caller (or the
+     * tombstone filter below) will act on.  The stale duplicates step 3 skips
+     * are never verified: a corrupt SHADOWED version must not fail a read
+     * whose answer does not depend on it.  The file gate also excludes the
+     * transaction arm, whose records are synthesized over pending buffers
+     * with no base and no checksum. */
+    if (c->cur[0].file && !c->db->nocsum) {
+        int vr = zsi_rec_verify(c->cur[0].file->csum, &rec);
+        if (vr != ZS_OK) return vr;
+    }
 
     /* Step 6, bound: for a prefix scan, stop when the emitted key leaves the
      * prefix.  Checked before emitting, so the first out-of-prefix key ends the

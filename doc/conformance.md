@@ -100,7 +100,7 @@ a spec label is missing here.
 | `F-30` | Every length, offset and pointer MUST be bounds-checked against the | **none** |
 | `F-31` | Opening an in-order file is O(1): validate the header, read the | `open_is_o1_in_records` |
 | `F-32` | Every data record ends in a 4-byte checksum: the last 4 bytes of | `record_byte_layout_v2`, `corpus` |
-| `F-32a` | A record's checksum MUST be verified when the record is | `read_verifies_record_csum`, `read_verifies_record_csum_unordered`, `record_csum_nocsum_reads` |
+| `F-32a` | A record's checksum MUST be verified when the record is | `read_verifies_record_csum`, `read_verifies_record_csum_unordered`, `record_csum_engine0` |
 | `F-32b` | A record's checksum MUST NOT be verified during span replay | `record_csum_replay_no_truncate` |
 | `F-32c` | A record copied byte-for-byte keeps a valid checksum only when | `convert_reencodes_engine_mismatch` |
 

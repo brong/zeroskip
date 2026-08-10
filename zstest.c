@@ -7581,10 +7581,12 @@ static void test_repack_verifies_inputs(void)
     db = open_db(0);
     ASSERT_NOT_NULL(db);
 
-    /* Reads do not verify record bodies, so the damage is invisible here --
-     * which is the point: the merge is the last line of defence. */
+    /* Since F-32a the READ sees the damage too -- the record's own checksum
+     * fails at materialization.  D-20b's merge gate remains load-bearing for
+     * what reads never reach: a NOCSUM handle, and shadowed or unread bytes
+     * that a merge copies anyway. */
     db_get(db, "a", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "Value");
+    ASSERT_STR_EQ(got, "-");
 
     ASSERT_EQ(zsi_repack_merge(db, db->snap, 0, 2), ZS_BADCHECKSUM);
 
@@ -7675,6 +7677,138 @@ static void test_seal_verifies_spans_nocsum(void)
     ASSERT_NOT_NULL(file_with_range(db, 1, 0));
     db_get(db, "k", 1, got, sizeof(got));
     ASSERT_STR_EQ(got, "Value");
+    zs_db_close(&db);
+}
+
+static void test_read_verifies_record_csum(void)
+{
+    /* F-32a: a value byte flipped in place in an in-order file fails THAT key
+     * at materialization; sibling keys still read; a ZS_NOCSUM handle still
+     * reads the corrupt value (F-5e).
+     *
+     * The corruption lands BETWEEN ib_rec and ib_finish, so the trailer's
+     * records-region checksum is computed over the corrupt bytes and
+     * validates -- the record's own checksum is the ONLY witness.  Corrupting
+     * after ib_finish would leave both stale and prove nothing about which
+     * one fired. */
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    char got[64];
+    const char *v; size_t vl;
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_BADCHECKSUM);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "other", 5);
+    zs_db_close(&db);
+
+    db = open_db(ZS_NOCSUM);
+    ASSERT_NOT_NULL(db);
+    db_get(db, "a", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");
+    zs_db_close(&db);
+}
+
+static void test_read_verifies_record_csum_unordered(void)
+{
+    /* F-32a in an unordered file: corrupt ONE record inside a span BEFORE the
+     * terminator is written, so the span checksum covers the corrupt bytes
+     * and the span validates -- pure record-level corruption, invisible to
+     * replay, caught only at materialization. */
+    struct zs_db *db;
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    const char *v; size_t vl;
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "value", 5, false, 0);
+    sb_rec(&s, "b", 1, "other", 5, false, 0);
+    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
+    sb_term(&s, false);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_BADCHECKSUM);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "other", 5);
+    zs_db_close(&db);
+}
+
+static void test_record_csum_replay_no_truncate(void)
+{
+    /* F-32b, the G-3 half: a record checksum failure must NOT make replay
+     * complete the file early.  "b" was stored AFTER the corrupt "a" in the
+     * SAME span; a replay that verified record checksums would discard it
+     * (F-24), which is precisely the tempting wrong version the mutant
+     * "record: verified during replay" preserves.  A scan must also survive:
+     * the corrupt record fails its own yield and only its own yield. */
+    struct zs_db *db;
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    const char *v; size_t vl;
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "value", 5, false, 0);
+    sb_rec(&s, "b", 1, "other", 5, false, 0);
+    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    sb_term(&s, false);
+    zsi_name_format(name, test_uuid, 1, 0);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "other", 5);
+
+    /* A cursor walk hits the corrupt record first and reports it, rather
+     * than skipping it silently or truncating the traversal semantics. */
+    {
+        struct zs_cursor *c = NULL;
+        struct zsi_rec r;
+        ASSERT_OK(zsi_cursor_open(db, NULL, db->snap, NULL, 0, 0, &c));
+        ASSERT_EQ(zsi_cursor_next(c, &r), ZS_BADCHECKSUM);
+        zsi_cursor_free(c);
+    }
+    zs_db_close(&db);
+}
+
+static void test_record_csum_engine0(void)
+{
+    /* Engine 0: the checksum field is written as zero and the engine computes
+     * zero for every input, so verification passes with no special case --
+     * F-5c's bargain, unchanged by F-32. */
+    struct zs_db *db;
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    const char *v; size_t vl;
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_CSUM_NONE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
     zs_db_close(&db);
 }
 
@@ -7931,7 +8065,13 @@ static void test_check_noncanonical(void)
         buf[ZSI_HEADER_LEN + 25] = '\0';
         buf[ZSI_HEADER_LEN + 26] = 'v';
         buf[ZSI_HEADER_LEN + 27] = '\0';
-        reclen = 32;                                /* roundup8(24 + 1 + 1 + 1 + 1) */
+        reclen = 32;                        /* roundup8(24 + 1+1+1+1 + 4) */
+        /* F-32: the trailing checksum, honest even though the FORM is
+         * non-canonical -- the divergence under test is the shape, and a
+         * stale checksum would make the fetch below fail for the wrong
+         * reason. */
+        zsi_put32(buf + ZSI_HEADER_LEN + reclen - 4,
+                  zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen - 4));
 
         uint64_t ptr = ZSI_HEADER_LEN;
         char *sec = NULL;
@@ -12975,6 +13115,12 @@ static struct test_entry tests[] = {
     { "test_repack_verifies_inputs",    test_repack_verifies_inputs },
     { "test_repack_verifies_inputs_nocsum", test_repack_verifies_inputs_nocsum },
     { "test_seal_verifies_spans_nocsum", test_seal_verifies_spans_nocsum },
+    { "test_read_verifies_record_csum",  test_read_verifies_record_csum },
+    { "test_read_verifies_record_csum_unordered",
+                                    test_read_verifies_record_csum_unordered },
+    { "test_record_csum_replay_no_truncate",
+                                    test_record_csum_replay_no_truncate },
+    { "test_record_csum_engine0",       test_record_csum_engine0 },
     { "test_repack_cascade",            test_repack_cascade },
     { "test_repack_never_touches_unordered",
                                         test_repack_never_touches_unordered },
