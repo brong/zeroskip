@@ -982,6 +982,29 @@ mutant "repack: inputs not verified before merge" catch \
 mutant "convert: verification honours ZS_NOCSUM" catch \
   's/        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, false, NULL, NULL\);/        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, db->nocsum, NULL, NULL);/'
 
+# F-32a.  Skipping verification at the yield is the headline gap the whole
+# format change exists to close: corrupt bytes served without a word.
+mutant "record: not verified at yield" catch \
+  's/    if \(c->cur\[0\]\.file && !c->db->nocsum\) \{\n        int vr = zsi_rec_verify\(c->cur\[0\]\.file->csum, &rec\);\n        if \(vr != ZS_OK\) return vr;\n    \}/    \/* F-32a removed *\//'
+
+# F-32.  Covering [0, len) instead of [0, len-4) includes the checksum field in
+# its own coverage -- the off-by-pad class, wrong for every record.
+mutant "record: csum covers its own field" catch \
+  's/    if \(csum\(r->base, r->len - 4\) != r->csum\) return ZS_BADCHECKSUM;/    if (csum(r->base, r->len) != r->csum) return ZS_BADCHECKSUM;/'
+
+# F-32b.  Verifying during replay is the tempting wrong version: replay
+# completes a file at its first invalid record (F-24), so this turns one
+# flipped value byte into the silent loss of every record after it -- caught by
+# the no-truncate test, which is the G-3 half of the requirement.
+mutant "record: verified during replay" catch \
+  's/            struct zsi_rec r;\n            if \(zsi_rec_decode\(b, avail, f->hdr\.start, &r\) != ZS_OK\) break;/            struct zsi_rec r;\n            if (zsi_rec_decode(b, avail, f->hdr.start, \&r) != ZS_OK) break;\n            if (zsi_rec_verify(f->csum, \&r) != ZS_OK) break;/'
+
+# F-32.  The write-side gap: a checksum never computed reads as engine 0's
+# everywhere, so every engine-1 read fails -- unmissable, which is the point:
+# it proves the read tests depend on the WRITTEN value, not on a round-trip.
+mutant "record: checksum never written" catch \
+  's/    zsi_put32\(buf \+ total - 4, csum\(buf, total - 4\)\);/    zsi_put32(buf + total - 4, 0);/'
+
 # C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
 # in-process assertion catches it from the other side.
 mutant "compact: takes the write lock outermost" catch \
