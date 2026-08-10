@@ -20,7 +20,10 @@ no locks.
 
 Each batch of changes ends with a marker giving its size and a checksum over it.
 A batch counts only once that marker is present and correct, so a half-written
-batch is indistinguishable from one that never happened.
+batch is indistinguishable from one that never happened. Each record also
+carries its own checksum, verified whenever a value is handed to a caller —
+a bit that flips on disk after the write is caught at the read that would
+have served it.
 
 ## How data moves through it
 

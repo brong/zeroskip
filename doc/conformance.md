@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 247 |
-| With an enforcing test | 238 |
+| Requirements | 248 |
+| With an enforcing test | 239 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -265,6 +265,7 @@ a spec label is missing here.
 | `S-6` | For an in-order file the pointer section MUST be ignored and the | `salvage_ignores_pointer_section` |
 | `S-7` | **Resynchronisation.** On reaching a span that does not validate, | `salvage_resyncs_after_a_bad_span` |
 | `S-8` | The span that failed cannot be verified — its terminator is what would | `salvage_unverified_needs_the_flag` |
+| `S-8a` | An in-order file has no commitment question: it was written whole | `salvage_verifies_records_inorder` |
 | `S-9` | A **rolled-back** span MUST NOT be recovered under any option. | `salvage_never_recovers_rollback` |
 | `S-10` | Salvage MUST report, per key, where the record it recovered may be | `salvage_reports_maybe_stale` |
 | `S-11` | Reporting MUST be structured — a kind, a location, and a key where | `salvage_event_fields` |

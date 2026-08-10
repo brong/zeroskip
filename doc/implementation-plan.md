@@ -1,5 +1,10 @@
 # zeroskip C Implementation Plan
 
+> **HISTORICAL:** this plan predates format version 2 (F-32 per-record
+> checksums, 2026-08-10). Where it disagrees with `doc/specification.md` —
+> version constants, record layouts, `zsi_rec_encode`'s signature, "records
+> carry no checksum" — the spec is right and this is the v1 snapshot.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A clean-room C implementation of the zeroskip append-only ordered

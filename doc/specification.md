@@ -384,6 +384,7 @@ BIGKEYVALUE (0x05)
   +16     8  vallen
   +24     .  key NUL value NUL pad->8
   +len-4  4  csum      covers [0, len-4)
+  len = roundup8(24 + keylen + 1 + vallen + 1 + 4)
 
 BIGKEYVALUE_ANC (0x0D)
   +0      1  type
@@ -393,6 +394,7 @@ BIGKEYVALUE_ANC (0x0D)
   +16     8  vallen
   +24     .  key NUL value NUL pad->8
   +len-4  4  csum      covers [0, len-4)
+  len = roundup8(24 + keylen + 1 + vallen + 1 + 4)
 
 BIGDELETION (0x07)
   +0      1  type
@@ -400,6 +402,7 @@ BIGDELETION (0x07)
   +8      8  keylen
   +16     .  key NUL pad->8
   +len-4  4  csum      covers [0, len-4)
+  len = roundup8(16 + keylen + 1 + 4)
 
 BIGDELETION_ANC (0x0F)
   +0      1  type
@@ -408,6 +411,7 @@ BIGDELETION_ANC (0x0F)
   +8      8  keylen
   +16     .  key NUL pad->8
   +len-4  4  csum      covers [0, len-4)
+  len = roundup8(16 + keylen + 1 + 4)
 ```
 
 - **F-15** Encoding is canonical: an implementation MUST use the short form
@@ -621,7 +625,11 @@ filesize-4    4   checksum of the pointer section
 - **F-32a** A record's checksum MUST be verified when the record is
   materialized for a caller — a lookup result or a cursor yield — unless the
   handle was opened `ZS_NOCSUM` (F-5e). The failure is reported for that
-  record alone; other records remain readable.
+  record alone; other records remain readable. A cursor verifies the record
+  it takes from the head of the merge even when a bound (such as a prefix)
+  then ends the scan instead of yielding it: converting a corrupt record into
+  a silent early end of traversal would hide exactly what this exists to
+  surface.
 - **F-32b** A record's checksum MUST NOT be verified during span replay
   (F-24) or pointer-section load. Replay completes a file at its first
   invalid record, discarding everything after it — so verifying there turns
@@ -1494,8 +1502,17 @@ silently resurrects a transaction that never committed, is worse than none.
 - **S-8** The span that failed cannot be verified — its terminator is what would
   prove it — and neither can a trailing region with no valid terminator. Their
   records MUST NOT be recovered unless explicitly requested, and every record so
-  recovered MUST be reported. Such records carry no checksum of their own:
-  F-19's terminator checksum is the only thing that ever covered them.
+  recovered MUST be reported. A record's own checksum (F-32) does not change
+  this: it proves the record's **bytes**, while the terminator is what proves
+  the transaction was **committed** — a torn tail with pristine record
+  checksums was still never acknowledged to anyone, so salvage MUST NOT treat
+  byte-proof as commitment-proof in a span walk.
+- **S-8a** An in-order file has no commitment question: it was written whole
+  and published by a single `rename` (D-21), so every record in it belongs to
+  committed history. Salvage of an in-order file therefore verifies **per
+  record** against F-32, and reports as unverified exactly the records that
+  cannot be proved: every record of an engine-0 file, and any record whose
+  checksum fails.
 - **S-9** A **rolled-back** span MUST NOT be recovered under any option. F-21
   and F-25 make it deliberately aborted, and no conforming reader has ever shown
   its records; recovering them would resurrect a transaction that did not

@@ -58,8 +58,11 @@ enum zs_flagspec {
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
     ZS_CURSOR_PREFIX = 1<<16,  /* foreach,cursor: treat the start key as a prefix
                                   and stop when a key leaves it */
-    ZS_SALVAGE_UNVERIFIED = 1<<17,  /* salvage: also recover records no checksum
-                                       ever covered (S-8) */
+    ZS_SALVAGE_UNVERIFIED = 1<<17,  /* salvage: also recover records whose
+                                       COMMIT cannot be proved -- a span with
+                                       no valid terminator (S-8).  The record's
+                                       own checksum (F-32) proves bytes, not
+                                       commitment, so it does not lift this. */
     ZS_CURSOR_LIVE   = 1<<18,  /* foreach,cursor: also observe writes committed by
                                   OTHER processes (D-14j).  Costs a re-scan per
                                   record; a cursor already sees writes made
@@ -196,8 +199,10 @@ const char *zs_strerror(int r);
  * of the data it is trying to save, and it is why R-4's "there is no in-place
  * repair" needs no exception.
  *
- * Everything recovered is checksum-verified by default.  ZS_SALVAGE_UNVERIFIED
- * additionally recovers records no checksum ever covered, each one reported.
+ * Everything recovered is checksum-verified by default -- spans by their
+ * terminator, in-order records each by their own checksum (F-32, S-8a).
+ * ZS_SALVAGE_UNVERIFIED additionally recovers records whose commit cannot be
+ * proved -- a span with no valid terminator -- each one reported (S-8).
  * Rolled-back spans are never recovered, with or without it (S-9).
  */
 enum zs_salvage_kind {

@@ -1005,6 +1005,11 @@ mutant "record: verified during replay" catch \
 mutant "record: checksum never written" catch \
   's/    zsi_put32\(buf \+ total - 4, csum\(buf, total - 4\)\);/    zsi_put32(buf + total - 4, 0);/'
 
+# F-32c.  Copying verbatim across an engine boundary carries a checksum that
+# validates for nobody -- the A-6 trap at one remove, silent until read.
+mutant "convert: copies verbatim across engines" catch \
+  's/    bool reencode = \(src->csum_id != db->create_csum_id\);/    bool reencode = false;/'
+
 # C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
 # in-process assertion catches it from the other side.
 mutant "compact: takes the write lock outermost" catch \
