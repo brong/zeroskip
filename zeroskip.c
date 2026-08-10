@@ -38,6 +38,8 @@
 #include "zeroskip.h"
 
 #define XXH_INLINE_ALL
+#define XXH_NO_INLINE_HINTS 1   /* callers without the SSE2 target attribute
+                                   cannot inline always_inline SSE2 helpers */
 #include "xxhash.h"
 
 /* Syscall interposition for crash and sync-failure injection (T-8, T-8a).
