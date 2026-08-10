@@ -6340,16 +6340,176 @@ static void test_write_txn_isolation(void)
     ASSERT_OK(zs_txn_commit(&txn));
     ASSERT_NULL(txn);
 
-    /* Still not: `other` holds its own snapshot, taken before the commit.  A
-     * FRESH open sees it (G-4: a read transaction sees a fixed snapshot). */
-    ASSERT_EQ(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0),
-              ZS_NOTFOUND);
-    zs_db_close(&other);
-
-    other = open_db(0);
+    /* C-4i: `other` sees the commit on its NEXT read -- freshness belongs to
+     * the begin, not the open.  This line used to assert the opposite, and
+     * the opposite is the bug Cyrus found: one process created a mailbox and
+     * another, holding the database open since before that commit, answered
+     * that it did not exist. */
     ASSERT_OK(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "y", 1);
     zs_db_close(&other);
+    zs_db_close(&db);
+}
+
+static int reap(pid_t pid);     /* defined with the multi-process tests */
+
+static void test_mp_read_sees_other_process_commit(void)
+{
+    /* C-4i, in the exact shape Cyrus reported: a long-lived READONLY handle
+     * in one process, a commit in another, then a read on the old handle.
+     * SETACL said "Mailbox does not exist" because this used to return
+     * ZS_NOTFOUND. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL, *rdb = NULL;
+    const char *v; size_t vl;
+    pid_t pid;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "base", 4, "b", 1, 0));
+    zs_db_close(&db);
+
+    /* The long-lived handle, opened readonly BEFORE the other process's
+     * commit, and warmed so it holds a snapshot. */
+    {
+        struct zs_open_data rs = ZS_OPEN_DATA_INITIALIZER;
+        rs.flags = ZS_SHARED;
+        ASSERT_OK(zs_db_open(dbdir, &rs, &rdb));
+        ASSERT_OK(zs_db_fetch(rdb, "base", 4, NULL, NULL, &v, &vl, 0));
+    }
+
+    pid = fork();
+    ASSERT(pid >= 0);
+    if (pid == 0) {
+        struct zs_open_data ws = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *wdb = NULL;
+        if (zs_db_open(dbdir, &ws, &wdb) != ZS_OK) _exit(1);
+        if (zs_db_store(wdb, "mailbox", 7, "m", 1, 0) != ZS_OK) _exit(2);
+        zs_db_close(&wdb);
+        _exit(0);
+    }
+    ASSERT_EQ(reap(pid), 0);
+
+    /* The commit completed before this read began, so it MUST be seen --
+     * non-transactionally, and from a new read transaction. */
+    ASSERT_OK(zs_db_fetch(rdb, "mailbox", 7, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "m", 1);
+    {
+        struct zs_txn *txn = NULL;
+        ASSERT_OK(zs_db_begin_txn(rdb, 1, &txn));
+        ASSERT_OK(zs_txn_fetch(txn, "mailbox", 7, NULL, NULL, &v, &vl, 0));
+        ASSERT_OK(zs_txn_abort(&txn));
+    }
+    zs_db_close(&rdb);
+}
+
+static void test_read_freshens_after_rollover(void)
+{
+    /* C-4i's name-set half, isolated: the stale handle's snapshot holds NO
+     * unordered file (the database was sealed), so the probe's active-size
+     * check has nothing to stat and the changed NAME SET is the only thing
+     * that can announce the commit -- which arrives in a brand-new
+     * generation whose creation changes no existing file. */
+    struct zs_db *a, *b;
+    const char *v; size_t vl;
+
+    clear_db();
+    b = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(b);
+    ASSERT_OK(zs_db_store(b, "old", 3, "o", 1, 0));
+    ASSERT_OK(zs_db_seal(b));
+
+    a = open_db(0);
+    ASSERT_NOT_NULL(a);
+    ASSERT_OK(zs_db_fetch(a, "old", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_NULL(zsi_snapshot_active(a->snap));      /* the premise */
+
+    ASSERT_OK(zs_db_store(b, "new", 3, "n", 1, 0)); /* creates a generation */
+
+    ASSERT_OK(zs_db_fetch(a, "new", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "n", 1);
+    zs_db_close(&a);
+    zs_db_close(&b);
+}
+
+static void test_cursor_live_sees_other_handle_commit(void)
+{
+    /* ZS_CURSOR_LIVE (D-14j): a live cursor observes commits from OTHER
+     * handles mid-traversal, resuming strictly after its last key (D-14j-b).
+     * Without the flag the same traversal keeps its snapshot -- both halves
+     * asserted, since the boundary is the flag's whole meaning. */
+    struct zs_db *db, *other;
+    struct zs_cursor *c = NULL;
+    const char *k, *v; size_t kl, vl;
+
+    clear_db();
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+
+    other = open_db(0);
+    ASSERT_NOT_NULL(other);
+
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_CURSOR_LIVE));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "a", 1);
+
+    ASSERT_OK(zs_db_store(other, "b", 1, "2", 1, 0));
+
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "b", 1);                   /* the flag, working */
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "c", 1);
+    zs_cursor_fini(&c);
+
+    /* Without the flag, the traversal's view stays put. */
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "a", 1);
+    ASSERT_OK(zs_db_store(other, "aa", 2, "x", 1, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "b", 1);                   /* not aa: snapshot held */
+    zs_cursor_fini(&c);
+
+    zs_db_close(&other);
+    zs_db_close(&db);
+}
+
+static void test_probe_no_change_reuses_snapshot(void)
+{
+    /* C-4i's other edge: freshness must not mean rebuilding.  With nothing
+     * committed in between, consecutive reads keep the SAME snapshot object
+     * -- the probe is a few syscalls, not a snapshot take.  A commit through
+     * another handle then swaps it. */
+    struct zs_db *db, *other;
+    struct zsi_snapshot *s1;
+    const char *v; size_t vl;
+
+    clear_db();
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+
+    /* The FIRST read on a handle refreshes once regardless: the probe has no
+     * baseline until a freshen has run, and "no baseline" must read as stale
+     * -- guessing fresh there would be the bug this whole test guards. */
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+
+    s1 = db->snap;
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT(db->snap == s1);                         /* reused, not rebuilt */
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT(db->snap == s1);
+
+    other = open_db(0);
+    ASSERT_NOT_NULL(other);
+    ASSERT_OK(zs_db_store(other, "k2", 2, "w", 1, 0));
+    zs_db_close(&other);
+
+    ASSERT_OK(zs_db_fetch(db, "k2", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT(db->snap != s1);                         /* the probe fired */
     zs_db_close(&db);
 }
 
@@ -9172,21 +9332,27 @@ static void test_mp_writer_and_readers(void)
         readers[i] = fork();
         ASSERT(readers[i] >= 0);
         if (readers[i] == 0) {
-            /* Hold one snapshot and re-scan it repeatedly.  It must never change. */
+            /* G-4 holds per TRANSACTION: a scan inside one explicit read
+             * transaction must never change, however much the writer commits.
+             * It used to be asserted of the HANDLE, which C-4i deliberately
+             * broke: handle-level reads are now fresh at every begin. */
             struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
             struct zs_db *rdb = NULL;
+            struct zs_txn *rtxn = NULL;
             setup.flags = ZS_SHARED;
             setup.error = counting_error;
             if (zs_db_open(dbdir, &setup, &rdb) != ZS_OK) _exit(1);
 
+            if (zs_db_begin_txn(rdb, 1, &rtxn) != ZS_OK) _exit(1);
+
             char first[4096] = "";
-            if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, first, 0)
+            if (zs_txn_foreach(rtxn, NULL, 0, NULL, api_collect_cb, first, 0)
                 != ZS_OK) _exit(2);
 
             for (int n = 0; n < 200; n++) {
                 char again[4096] = "";
-                if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb, again, 0)
-                    != ZS_OK) _exit(3);
+                if (zs_txn_foreach(rtxn, NULL, 0, NULL, api_collect_cb,
+                                   again, 0) != ZS_OK) _exit(3);
                 if (strcmp(first, again) != 0) _exit(4);   /* snapshot moved */
                 usleep(200);
             }
@@ -9197,6 +9363,26 @@ static void test_mp_writer_and_readers(void)
                 char want[32];
                 snprintf(want, sizeof(want), "base%d=v", j);
                 if (!strstr(first, want)) _exit(5);
+            }
+
+            if (zs_txn_abort(&rtxn) != ZS_OK) _exit(6);
+
+            /* And C-4i's other half: HANDLE-level reads on this old handle see
+             * whatever the writer has committed by now -- at least one scan
+             * must observe more than the base keys once the writer has run.
+             * The parent holds reaping until its 40 commits are done, so by
+             * the time anyone checks this exit code the writer HAS run; loop
+             * briefly to let this reader catch it. */
+            {
+                bool grew = false;
+                for (int n = 0; n < 2000 && !grew; n++) {
+                    char now[4096] = "";
+                    if (zs_db_foreach(rdb, NULL, 0, NULL, api_collect_cb,
+                                      now, 0) != ZS_OK) _exit(7);
+                    if (strstr(now, "new39=w")) grew = true;
+                    else usleep(1000);
+                }
+                if (!grew) _exit(8);            /* stale forever: the bug */
             }
 
             zs_db_close(&rdb);
@@ -13198,6 +13384,13 @@ static struct test_entry tests[] = {
 
     { "test_write_basic",               test_write_basic },
     { "test_write_txn_isolation",       test_write_txn_isolation },
+    { "test_mp_read_sees_other_process_commit",
+                                    test_mp_read_sees_other_process_commit },
+    { "test_read_freshens_after_rollover", test_read_freshens_after_rollover },
+    { "test_probe_no_change_reuses_snapshot",
+                                    test_probe_no_change_reuses_snapshot },
+    { "test_cursor_live_sees_other_handle_commit",
+                                    test_cursor_live_sees_other_handle_commit },
     { "test_write_abort",               test_write_abort },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },

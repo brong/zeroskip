@@ -1010,6 +1010,26 @@ mutant "record: checksum never written" catch \
 mutant "convert: copies verbatim across engines" catch \
   's/    bool reencode = \(src->csum_id != db->create_csum_id\);/    bool reencode = false;/'
 
+# C-4i.  The original Cyrus bug, preserved: a shared begin that reuses the
+# handle's snapshot reads the world as of the handle's last write, forever.
+mutant "begin: shared reuses the handle snapshot" catch \
+  's/        r = zsi_db_freshen\(db\);\n        if \(r != ZS_OK\) \{ free\(txn\); return r; \}/        r = ZS_OK;/'
+
+# C-4i.  The probe is exact only because it checks BOTH halves.  Appends grow
+# the active file without changing any name...
+mutant "freshen: ignores the active file size" catch \
+  's/        if \(act\) \{\n            struct stat sb;/        if (act \&\& 0) {\n            struct stat sb;/'
+
+# ...and a rollover, conversion or repack changes the name set without growing
+# any file the stale snapshot knows about.
+mutant "freshen: ignores the name set" catch \
+  's/    stale = !db->probe_names\n         \|\| db->probe_names_len != len\n         \|\| memcmp\(db->probe_names, names, len\) != 0;/    stale = !db->probe_names;/'
+
+# D-14j/C-4i.  A live cursor that stops looking is just a cursor: the flag's
+# entire meaning is observing other processes mid-traversal.
+mutant "cursor: LIVE step stops looking" catch \
+  's/            int r = zsi_db_freshen\(c->db\);\n            if \(r != ZS_OK\) return r;/            int r = ZS_OK;\n            if (r != ZS_OK) return r;/'
+
 # C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
 # in-process assertion catches it from the other side.
 mutant "compact: takes the write lock outermost" catch \

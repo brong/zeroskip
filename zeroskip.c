@@ -3942,6 +3942,13 @@ struct zs_db {
     struct zsi_snapshot *snap;      /* current snapshot for zs_db_* calls */
     struct zs_txn       *write_txn;
 
+    /* C-4i freshness baseline: the raw sorted name set of the last probe's
+     * directory scan, NUL-joined.  Taken BEFORE the snapshot it vouches for,
+     * so a file appearing between the two scans makes the NEXT probe fire a
+     * spurious refresh rather than ever missing one -- the safe direction. */
+    char        *probe_names;
+    size_t       probe_names_len;
+
     /* Backing for pointers returned by the non-transactional calls, whose
      * implicit transaction has ended by the time the caller sees them (A-4). */
     char        *retbuf;
@@ -4042,6 +4049,90 @@ static int zsi_db_refresh(struct zs_db *db)
     }
 
     return ZS_OK;
+}
+
+static int zsi_entry_name_order(const void *va, const void *vb)
+{
+    const struct zsi_entry *a = va, *b = vb;
+    return strcmp(a->name, b->name);
+}
+
+/* C-4i: refresh the handle's snapshot, unless a probe proves nothing has
+ * committed since it was taken.
+ *
+ * If the active file is the same and hasn't changed size, it's always safe --
+ * what remains is noticing a NEW active file, and the name set is what does
+ * that.  The probe is therefore EXACT, not a heuristic: every commit either
+ * appends to the active file -- its size grows past the snapshot's -- or
+ * publishes a file by rename (rollover, conversion, repack), which changes
+ * the directory's name set.  Timestamps play no part, so filesystem
+ * timestamp granularity cannot fake freshness.
+ *
+ * The baseline name set is the probe's own scan, captured BEFORE the refresh
+ * it triggers.  A file that appears between this scan and the refresh's own
+ * is in the snapshot but missing from the baseline, so the NEXT probe fires a
+ * refresh for nothing -- a spurious refresh, never a missed commit.  That is
+ * the safe direction, and it converges the probe after.
+ *
+ * This is what makes a read on an hours-old handle as current as one on a
+ * handle opened for the call, at a few syscalls rather than the snapshot
+ * rebuild zsi_db_refresh pays: readers take no lock (C-2), so nothing
+ * announces another process's commit -- the only way to see it is to look. */
+static int zsi_db_freshen(struct zs_db *db)
+{
+    struct zsi_fileset fs;
+    char *names = NULL;
+    size_t len = 0;
+    bool stale;
+    int r;
+
+    r = zsi_fileset_scan(db->dir, db->have_uuid ? &db->uuid : NULL, &fs);
+    if (r != ZS_OK) return r;
+
+    /* The raw name set, sorted and NUL-joined into one comparable blob.
+     * Raw rather than resolved: after a repack, a superseded input lingers
+     * beside its output until D-23 removes it, and a resolved-set baseline
+     * would read that removal window as "changed" on every probe. */
+    qsort(fs.all, fs.nall, sizeof(*fs.all), zsi_entry_name_order);
+    for (size_t i = 0; i < fs.nall; i++) len += strlen(fs.all[i].name) + 1;
+
+    names = malloc(len ? len : 1);
+    if (!names) { zsi_fileset_fini(&fs); return ZS_INTERNAL; }
+    {
+        size_t off = 0;
+        for (size_t i = 0; i < fs.nall; i++) {
+            size_t n = strlen(fs.all[i].name) + 1;
+            memcpy(names + off, fs.all[i].name, n);
+            off += n;
+        }
+    }
+    zsi_fileset_fini(&fs);
+
+    stale = !db->probe_names
+         || db->probe_names_len != len
+         || memcmp(db->probe_names, names, len) != 0;
+
+    /* Names unchanged: the set is the same, so the only possible commit is an
+     * append to the snapshot's active file.  No active file means the newest
+     * file is in-order and any commit would have had to CREATE one -- which
+     * the name set would have caught -- so there is nothing left to check. */
+    if (!stale) {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        if (act) {
+            struct stat sb;
+            /* fname is already the full path, as zsi_file_open stored it. */
+            if (stat(act->fname, &sb) != 0) stale = true;
+            else if ((size_t)sb.st_size != act->size) stale = true;
+        }
+    }
+
+    if (!stale) { free(names); return ZS_OK; }
+
+    free(db->probe_names);
+    db->probe_names = names;
+    db->probe_names_len = len;
+
+    return zsi_db_refresh(db);
 }
 
 /********** READ PATH *************/
@@ -4497,10 +4588,12 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
      * (G-4), which is what a transactional read promises. */
     if (c->handle_live) {
         if (c->flags & ZS_CURSOR_LIVE) {
-            /* The expensive case, and the reason it is a flag: readers take no
-             * lock (C-2), so another process's commit cannot announce itself and
-             * the only way to see it is to look. */
-            int r = zsi_db_refresh(c->db);
+            /* Still the case that costs, and still a flag -- but C-4i's probe
+             * makes each step a few syscalls, not the full snapshot rebuild
+             * this used to pay: readers take no lock (C-2), so another
+             * process's commit cannot announce itself and the only way to see
+             * it is to look. */
+            int r = zsi_db_freshen(c->db);
             if (r != ZS_OK) return r;
         }
 
@@ -5074,6 +5167,15 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
             free(txn);
             return r;
         }
+    } else {
+        /* C-4i: freshness is a property of BEGIN, not of open.  Without this
+         * a long-lived handle reads the world as of its own last write --
+         * found downstream, where one process created a mailbox and another,
+         * holding the database open since before that commit, answered that
+         * it did not exist.  Snapshot isolation (G-4) starts here and holds
+         * for the transaction's lifetime, never the handle's. */
+        r = zsi_db_freshen(db);
+        if (r != ZS_OK) { free(txn); return r; }
     }
 
     txn->snap = db->snap;
@@ -6725,6 +6827,7 @@ int zs_db_close(struct zs_db **dbp)
 
     zsi_snapshot_release(&db->snap);
     zsi_lock_close(&db->locks);
+    free(db->probe_names);
     free(db->retbuf);
     free(db->index_dir);
     free(db->dir);
