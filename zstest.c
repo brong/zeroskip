@@ -12129,6 +12129,89 @@ static void test_salvage_unverified_needs_the_flag(void)
     ASSERT(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED] >= 1);
 }
 
+static void test_check_reports_record_csum(void)
+{
+    /* F-32a in check, both file kinds, both isolated so ONLY the per-record
+     * checksum can fire: the in-order corruption lands before ib_finish so
+     * the region checksum covers the corrupt bytes and validates; the
+     * unordered corruption lands before sb_term so the span validates.  T-6
+     * style -- reported, while the healthy key still reads. */
+    struct zs_db *db;
+    struct ib b;
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    const char *v; size_t vl;
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    sb_init(&s, 2, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "c", 1, "third", 5, false, 0);
+    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'T';
+    sb_term(&s, false);
+    zsi_name_format(name, test_uuid, 2, 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    zs_db_close(&db);
+
+    /* F-5e: a NOCSUM handle's check skips the verification, like every other
+     * read-side check it skips. */
+    db = open_db(ZS_NOCSUM);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
+static void test_salvage_verifies_records_inorder(void)
+{
+    /* F-32 sharpens S-6's honesty: an in-order file's records were committed
+     * by construction (published whole by rename, D-21), so byte-proof is
+     * the only open question and the record checksum answers it per record.
+     * The corrupt record is still recovered -- salvage never discards what
+     * it can read -- but it alone is reported KEY_UNVERIFIED. */
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct salv s;
+    struct ib b;
+    char name[ZSI_NAME_MAX], val[64];
+
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    /* Both keys recovered; only the corrupt one reported. */
+    ASSERT_OK(salv_fetch("a", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "Value");
+    ASSERT_OK(salv_fetch("b", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "other");
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 1);
+}
+
 /* Run a shell command and collect its stdout, for comparing a directory before
  * and after. */
 static int capture(const char *cmd, char *out, size_t outlen)
@@ -13208,6 +13291,9 @@ static struct test_entry tests[] = {
 
     { "test_salvage_resyncs_after_a_bad_span",
                                         test_salvage_resyncs_after_a_bad_span },
+    { "test_check_reports_record_csum", test_check_reports_record_csum },
+    { "test_salvage_verifies_records_inorder",
+                                    test_salvage_verifies_records_inorder },
     { "test_salvage_unverified_needs_the_flag",
                                         test_salvage_unverified_needs_the_flag },
     { "test_salvage_never_recovers_rollback",

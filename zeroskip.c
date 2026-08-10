@@ -6168,6 +6168,13 @@ static int zsi_check_inorder(struct zs_db *db, struct zsi_file *f)
             r = ZS_BADFORMAT;
         }
 
+        /* F-32a: the record's own checksum.  The region check below sees the
+         * same bytes but cannot name the record; this names it. */
+        if (!db->nocsum && zsi_rec_verify(f->csum, &cur) != ZS_OK) {
+            zsi_report(db, "record checksum mismatch", f->fname, i);
+            r = ZS_BADCHECKSUM;
+        }
+
         prev = cur;
     }
 
@@ -6194,6 +6201,17 @@ static int zsi_check_rec_cb(void *rock, const struct zsi_rec *rec, size_t off)
     if (!zsi_rec_is_canonical(rec, c->f->hdr.start)) {
         zsi_report(c->db, "non-canonical record encoding", c->f->fname, off);
         c->result = ZS_BADFORMAT;
+    }
+
+    /* F-32a.  This callback only runs inside a span the replay just
+     * validated, and the span checksum covers the record checksum field --
+     * so a mismatch here cannot be in-place corruption (that would have
+     * failed the span first).  It means the record was WRITTEN wrong: a
+     * peer's encoder bug, reported-not-rejected exactly like a
+     * non-canonical encoding (T-6). */
+    if (!c->db->nocsum && zsi_rec_verify(c->f->csum, rec) != ZS_OK) {
+        zsi_report(c->db, "record checksum mismatch", c->f->fname, off);
+        c->result = ZS_BADCHECKSUM;
     }
 
     return 0;
@@ -7363,7 +7381,15 @@ static int zsi_salvage_apply(struct zsi_salvage_ctx *ctx,
     return ZS_OK;
 }
 
-/* Walk a span's records, applying each. */
+/* Walk a span's records, applying each.
+ *
+ * A record's own checksum (F-32) is deliberately NOT consulted here.  It
+ * proves the record's BYTES; "verified" in this walk means the span's
+ * terminator proved the records were COMMITTED (S-8), and a torn tail with
+ * pristine record checksums was still never acknowledged to anyone.  The
+ * two proofs answer different questions, and only in-order salvage -- where
+ * publication by rename already implies commitment (D-21) -- may substitute
+ * one for the other. */
 static int zsi_salvage_span(struct zsi_salvage_ctx *ctx, struct zsi_file *f,
                             size_t from, size_t to, bool verified)
 {
@@ -7455,7 +7481,8 @@ static int zsi_salvage_unordered(struct zsi_salvage_ctx *ctx,
  * records may be perfect, and re-deriving order costs nothing here because the
  * destination sorts anyway.  An in-order file has no spans (F-23), so this is a
  * flat record walk. */
-static int zsi_salvage_inorder(struct zsi_salvage_ctx *ctx, struct zsi_file *f)
+static int zsi_salvage_inorder(struct zsi_salvage_ctx *ctx, struct zsi_file *f,
+                               zs_csum *cs, unsigned csum_id)
 {
     size_t pos = ZSI_HEADER_LEN;
 
@@ -7480,7 +7507,15 @@ static int zsi_salvage_inorder(struct zsi_salvage_ctx *ctx, struct zsi_file *f)
         }
         if (r.len == 0) break;
 
-        rc = zsi_salvage_apply(ctx, &r, true);
+        /* F-32 gives every record its own proof, so "verified" is a
+         * per-record fact here rather than a blanket claim -- an in-order
+         * file has no spans, and the trailer that could vouch for the region
+         * is exactly what salvage refuses to trust (S-6).  Under engine 0
+         * nothing can be proved and every key reports unverified, which is
+         * the honest version of what this path used to assert. */
+        rc = zsi_salvage_apply(ctx, &r,
+                               csum_id != 0
+                               && zsi_rec_verify(cs, &r) == ZS_OK);
         if (rc != ZS_OK) return rc;
 
         pos += r.len;
@@ -7670,7 +7705,7 @@ int zs_db_salvage(const char *from, const char *to,
         if (fs.all[i].end == 0)
             r = zsi_salvage_unordered(&ctx, f, cs, csum_id);
         else
-            r = zsi_salvage_inorder(&ctx, f);
+            r = zsi_salvage_inorder(&ctx, f, cs, csum_id);
 
         zsi_file_close(&f);
         if (r != ZS_OK) goto out;
