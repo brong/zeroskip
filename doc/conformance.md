@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 241 |
-| With an enforcing test | 232 |
+| Requirements | 242 |
+| With an enforcing test | 233 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -166,6 +166,7 @@ a spec label is missing here.
 | `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_resurrection` |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
 | `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
+| `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs`, `repack_verifies_inputs_nocsum`, `seal_verifies_spans_nocsum` |
 | `D-21` | The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to | `repack_selection` |
 | `D-22` | The output may legitimately contain **zero records**, in the form | `inorder_empty`, `repack_empty_output` |
 | `D-23` | Removing a data file — a converted unordered file, repack inputs, or | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |

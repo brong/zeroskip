@@ -192,7 +192,9 @@ whether a pointer section must be present.
 - **F-5d** Engine 2 makes a file readable only by a caller supplying the same
   function, so the conformance corpus covers engines 0 and 1 only.
 - **F-5e** `ZS_NOCSUM` is distinct from engine 0: it skips verification of
-  checksums that are nonetheless written.
+  checksums that are nonetheless written. It is a **read-path** flag only: an
+  operation that writes a new file from existing records MUST still verify its
+  inputs (D-20b).
 
 ### 4.2 Magic
 
@@ -979,6 +981,17 @@ The per-file cursors are held in an array kept sorted by:
   hosts readily have the same pid — and two processes writing one staging file
   would produce an interleaved output that is then renamed into place as though
   complete. `O_EXCL` costs nothing and removes the case.
+- **D-20b** Before writing the output, the writer MUST verify the checksums
+  covering every input record it will copy: the records-region checksum
+  (F-26e) of each in-order input, and the span checksums (F-22) of an
+  unordered input's chain. This applies to conversion, sealing, repack and
+  compaction alike, and it applies **regardless of `ZS_NOCSUM`** (F-5e), which
+  affects only reads. The output is written under fresh checksums, so copying
+  unverified input would launder corruption into a file that validates
+  perfectly — and D-23 then removes the failing input, the only evidence a
+  later check could have caught. A verification failure MUST abort the
+  operation with every input left in place: the database stays readable, and
+  salvage (section 9) stays possible.
 - **D-21** The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to
   `zeroskip-<uuid>-<start>-<end>` covering the entire range of every input,
   only once complete.
