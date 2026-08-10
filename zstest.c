@@ -9570,10 +9570,13 @@ static void test_mp_reader_sees_torn_span(void)
         size_t n = zsi_rec_encoded_len(7, 3, false, false);
         char *rec = malloc(n);
         ASSERT_NOT_NULL(rec);
-        /* fresh_db() defaults to engine 0 (no ZS_CSUM_XXHASH flag), so match
-         * the file's actual engine here even though this span never gets a
-         * terminator and so is never read as valid data. */
-        zsi_rec_encode(rec, zsi_csum_none, "partial", 7, "no!", 3, false, 0);
+        /* fresh_db() defaults to ENGINE 1 (zsi_csum_id_for_flags maps no
+         * flag to XXHASH), so the record's checksum must be engine 1's --
+         * the same engine the terminator below this uses.  This span is
+         * never read as valid data, but salvage walks it, and a wrong-engine
+         * checksum here would read as record corruption rather than the
+         * missing terminator this test is about. */
+        zsi_rec_encode(rec, zsi_csum_xxhash, "partial", 7, "no!", 3, false, 0);
         int fd = open(dbpath(name), O_WRONLY | O_APPEND);
         ASSERT(fd >= 0);
         ASSERT_EQ(write(fd, rec, n), (ssize_t)n);

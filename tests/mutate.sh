@@ -726,7 +726,7 @@ mutant "ancestor promotes to big form" catch \
   's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);/bool big = store_ancestor || keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);/g'
 
 mutant "lengths include the NUL terminators" catch \
-  's/        if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0, \&body)) return 0;/'
+  's/        if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0 + 4, \&body)) return 0;/'
 
 mutant "vallen stored at +3 not +2" catch \
   's/            zsi_put16\(buf \+ 2, \(uint16_t\)vallen\);/            zsi_put16(buf + 3, (uint16_t)vallen);/'
@@ -767,7 +767,7 @@ mutant "decode: total not bounded by len" catch \
   's/    if \(total > len\) return ZS_BADFORMAT;/    \/* bound removed *\//'
 
 mutant "decode: unchecked keylen+vallen" catch \
-  's/        if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return ZS_BADFORMAT;/        body = keylen + vallen + 2;/'
+  's/        if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return ZS_BADFORMAT;/        body = keylen + vallen + 2 + 4;/'
 
 mutant "decode: data record accepts COMMIT" catch \
   's/    if \(!\(type & ZSI_HASKEY\)\) return ZS_BADFORMAT;   \/\* not a data record \*\//    \/* family check removed *\//'
