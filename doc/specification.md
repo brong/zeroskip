@@ -75,6 +75,36 @@ tolerate compaction happening out of band.
 | clean | an unordered file whose complete point *is* its physical end — nothing follows the last valid span |
 | ancestor | the absolute generation at which the shadow cast by a record hits the previous record for that key |
 | shadowed | a record superseded by a later record for the same key, anywhere |
+| tombstone | a deletion record — data that hides every older version of its key (D-14), not mere absence |
+| file set | the data files present in the directory, derived from their names alone (D-2) |
+| resolved set | the file set after overlap resolution (D-5): the files a reader actually consults |
+| tiling | the property that the resolved set covers generation 1 through the newest contiguously, each generation exactly once (D-6) |
+| staging name | the dot-prefixed name a new file is built under, invisible to the fileset scan, until rename publishes it (C-3) |
+| publish | make a completed structure visible in one atomic `rename` from its staging name; nothing is ever visible half-written |
+| replay | walking an unordered file's span chain from the header (or a known span boundary) forward, verifying each terminator, to find its records and its complete point (F-20–F-24) |
+| snapshot | the fixed set of files, with their indexes, that one read observes — taken lock-free by the C-4 protocol, private to its holder |
+| handle | one process's open database object; not thread-safe, and never two writers in one process (G-5) |
+| rollover | a writer moving to a new active file once the current one exceeds `rollover_size` (D-9a) |
+| conversion | rewriting one non-active unordered file as an in-order file covering the same generation (D-12) |
+| repack | merging adjacent in-order files into one file covering their combined range (D-16–D-23) |
+| seal | converting the active file in place, so every file in the database is in-order (D-25) |
+| compaction | repacking every maximal run of adjacent in-order files, aiming for a single file (D-26) |
+| salvage | rebuilding whatever is readable from a damaged directory into a new database, never writing the source (§9) |
+| resync | salvage scanning forward after damage for the next span it can verify (S-7) |
+| private index | the in-memory ordered index a snapshot builds over an unordered file's committed records (D-13); private to the process that built it |
+| pointer section | the sorted array of record offsets, plus trailer, that an in-order file carries (F-26) |
+| pointer table | an optional cached private index for an unordered file, persisted outside the database (§8) |
+| pending array | a write transaction's uncommitted records, held sorted in memory until commit (A-1a); the highest-priority read source (D-14) |
+| source | anything a read draws records from: the pending array, then each data file newest to oldest (D-14) |
+| merge | the traversal over all of a cursor's sources that implements D-14e's six steps |
+| arm | one per-source cursor inside a merge; the sorted array of arms is what D-14e's steps operate on |
+| exhausted | an arm with no record at or after its position; exhausted arms sort last (D-14e step 1) |
+| yield | hand one record to the caller; a cursor's unit of progress (D-14j) |
+| stale duplicate | the emitted key surfacing again at an older arm's head, consumed without being yielded (D-14e step 3, D-14f) |
+| liveness | which writes made during a traversal a cursor observes; depends on how it was opened (D-14j) |
+| handle-live | a cursor from the non-transactional forms, which observes commits made through its own handle as it goes (D-14j) |
+| resume point | the key a refreshed cursor resumes strictly after: the last key it yielded, or before anything has been yielded, the key it was opened at (D-14j-b) |
+| refresh | a cursor noticing a change it is allowed to observe and re-seeking its arms to the resume point (D-14j) |
 
 The two file kinds are exhaustive and distinguishable from the header alone:
 **`end == 0` means unordered with no pointers; `end != 0` means in-order with
