@@ -12,8 +12,18 @@
 # claims to guard against, and reports whether the suite noticed.  Every mutant
 # should be reported as "caught"; anything else needs explaining.
 #
-#     ./tests/mutate.sh              run every mutant
+#     ./tests/mutate.sh              run every mutant (a full rebuild and two
+#                                    test binaries PER MUTANT -- the better part
+#                                    of an hour, and growing with the suite)
 #     ./tests/mutate.sh compar       run mutants whose name matches a substring
+#     ./tests/mutate.sh --rot-only   apply every pattern with no build and no
+#                                    run, reporting only PATTERN ROTTED: seconds,
+#                                    not an hour, and the right check after
+#                                    refactoring source the patterns anchor on
+#
+# The full run is NOT part of the standard loop -- at a rebuild per mutant it is
+# priced for releases and suite audits, not for every change.  Day to day: run
+# the mutants you are adding by name, and --rot-only after touching zeroskip.c.
 #
 # Two categories of expected non-catch, both of which the report labels rather
 # than hides:
@@ -44,6 +54,8 @@ set +m          # no async job-control messages: a crashing mutant's
                 # unrelated mutant's result and appear to belong to it
 cd "$(dirname "$0")/.." || exit 1
 
+ROTONLY=0
+if [ "${1:-}" = "--rot-only" ]; then ROTONLY=1; shift; fi
 FILTER="${1:-}"
 
 # Mutate a COPY, never the checkout.  Everything the two test binaries need to
@@ -63,7 +75,7 @@ cd "$WORK" || exit 1
 
 BAK="$WORK/zeroskip.c.orig"
 cp zeroskip.c "$BAK"
-caught=0 missed=0 equivalent=0 broken=0
+caught=0 missed=0 equivalent=0 broken=0 intact=0
 
 # mutant <name> <expectation: catch|equivalent> <perl expression>
 mutant() {
@@ -76,6 +88,12 @@ mutant() {
     if diff -q zeroskip.c "$BAK" >/dev/null 2>&1; then
         printf '  %-46s PATTERN ROTTED\n' "$name"
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
+    fi
+
+    # --rot-only stops here: the pattern matched, which is all it asks.  It
+    # says nothing about whether the mutant would be caught.
+    if [ "$ROTONLY" -eq 1 ]; then
+        intact=$((intact + 1)); cp "$BAK" zeroskip.c; return
     fi
 
     rm -f zstest zstest-crash
@@ -1099,7 +1117,12 @@ mutant "cursor: txn_seq not taken at open" subsumed \
   's/    c->txn_seq = zsi_txn_seq\(txn\);/    \/* not taken *\//'
 
 echo
-printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
-    "$caught" "$equivalent" "$missed" "$broken"
+if [ "$ROTONLY" -eq 1 ]; then
+    printf '%d patterns intact, %d ROTTED (no mutant was built or run)\n' \
+        "$intact" "$broken"
+else
+    printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \
+        "$caught" "$equivalent" "$missed" "$broken"
+fi
 
 [ "$missed" -eq 0 ] && [ "$broken" -eq 0 ]
