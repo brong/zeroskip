@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 249 |
-| With an enforcing test | 240 |
+| Requirements | 254 |
+| With an enforcing test | 245 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -181,6 +181,8 @@ a spec label is missing here.
 | `D-25a` | Sealing MUST NOT create a replacement active file. A conversion | `seal_creates_no_new_generation` |
 | `D-25b` | Sealing is a no-op, and NOT an error, when there is no active file, | `seal_noop_cases` |
 | `D-25c` | An unclean active file (D-9) MAY be sealed. The conversion reads to | `seal_unclean_active_file` |
+| `D-25d` | A writer SHOULD seal at the end of any commit that leaves the | `commit_seals_oversized_active`, `commit_below_rollover_stays_unordered` |
+| `D-25e` | A writer sealing under D-25d SHOULD NOT publish a pointer table | `seal_at_commit_skips_table_publish` |
 | `D-26` | **Compaction.** An implementation MAY merge the **entire** database into | `compact_to_one_file` |
 | `D-26a` | D-16's geometric selection does NOT apply to compaction. That rule | `compact_ignores_geometric_selection` |
 | `D-26b` | Adjacency is why compaction merges every maximal **run** of adjacent | `compact_reports_and_fails_on_bad_file` |
@@ -237,7 +239,9 @@ a spec label is missing here.
 | Req | Requirement | Enforced by |
 |---|---|---|
 | `P-1` | A pointer table covers exactly one **unordered** file, identified by | `idxcache_only_unordered_files` |
-| `P-2` | Tables live in a **cache directory** named by the caller. It MUST NOT | `idxcache_rejects_db_dir` |
+| `P-2` | Tables live in a **cache root** named by the caller, or — when the | `idxcache_rejects_db_dir` |
+| `P-2a` | Under a configured root, the tables for a database live in the | `idxcache_threshold_defaults`, `corpus_index_table` |
+| `P-2b` | With A-8a's flag, the cache directory is `zeroskip.cache` inside | `index_local_publishes`, `index_local_readonly_creates_nothing`, `index_local_sweeps_foreign_uuid` |
 | `P-3` | A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using | `idxcache_published_name` |
 | `P-4` | A table is published by writing a complete file under a staging name | `idxcache_publishes_by_rename` |
 | `P-5` | A table is a 96-byte header, then `nptrs` 8-byte little-endian record | `idxcache_header_byte_layout` |
@@ -286,7 +290,8 @@ a spec label is missing here.
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
 | `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
-| `A-8` | `index_dir` names the pointer table cache directory (§8). A null or | `idxcache_rejects_db_dir`, `idxcache_publish_failure_is_not_fatal` |
+| `A-8` | `index_dir` names the pointer table cache **root** (§8); tables live | `idxcache_rejects_db_dir`, `idxcache_publish_failure_is_not_fatal` |
+| `A-8a` | `ZS_INDEX_LOCAL` selects P-2b's in-database cache directory, | `index_local_and_dir_is_badusage`, `index_local_publishes` |
 | `A-9` | `index_threshold` is P-13's threshold in bytes. Zero selects an | `idxcache_threshold_defaults` |
 | `A-10` | `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's | `seal_noop_cases`, `seal_readonly` |
 | `A-11` | `zs_db_compact` performs D-26, returning `ZS_OK` only when the | `compact_to_one_file`, `compact_reports_and_fails_on_bad_file` |
