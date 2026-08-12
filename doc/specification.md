@@ -798,8 +798,10 @@ without opening a single file.
   the active one**, so a snapshot normally replays only that file and nothing
   else (D-13d). A non-active unordered file exists only transiently — between a
   rollover and the next writer's conversion, or after a crash left an unclean
-  file behind (D-10). Several can accumulate only across several crashes, and
-  each is converted in turn.
+  file behind (D-10). With D-25d in play the rollover case is rarer still — a
+  commit normally seals the file it overgrew — so a non-active unordered file
+  is chiefly a crash artefact. Several can accumulate only across several
+  crashes, and each is converted in turn.
 - **D-12b** A writer MUST convert **oldest first**. That keeps the generation
   range split into a prefix of in-order files followed by a suffix of unordered
   ones, the last of which is the active file. Converting out of order would leave
@@ -812,6 +814,10 @@ without opening a single file.
 - **D-12d** Each conversion is bounded by `rollover_size` — sort the keys, write
   the records in order, append the pointer section and trailer — so a writer's
   extra cost is bounded and predictable rather than proportional to the database.
+  The bound assumes files grown by transactions smaller than `rollover_size`;
+  a single larger transaction produces a proportionally larger unordered
+  file, which is why D-25d converts it in the commit that created it rather
+  than leaving it for a later writer.
 
 ### 5.4 Indexing unordered files
 
@@ -1080,6 +1086,23 @@ The per-file cursors are held in an array kept sorted by:
 - **D-25c** An unclean active file (D-9) MAY be sealed. The conversion reads to
   the complete point (F-24), so content past it does not survive into the
   output — the same outcome R-4 already produces, reached sooner.
+- **D-25d** A writer SHOULD seal at the end of any commit that leaves the
+  active file at or above `rollover_size`, while still holding the write
+  lock, and after D-12's pending conversions so D-12b's oldest-first order is
+  preserved. This is the one case D-12d's bound cannot cover: a single
+  transaction larger than `rollover_size` grows the active file past the
+  threshold in one append, and deferring the conversion hands its full,
+  unbounded cost to the next writer's commit — a writer that did nothing to
+  incur it. Sealing at commit end assigns the cost to the transaction that
+  caused it, and a bulk load ends with an in-order file rather than an
+  oversized unordered one. A failure to seal MUST NOT fail the commit: the
+  records are already durable, and D-9a's rollover recovers the layout at the
+  next commit. A writer that relies on D-9a alone remains conforming.
+- **D-25e** A writer sealing under D-25d SHOULD NOT publish a pointer table
+  for that file in the same commit (P-13). A table covers only unordered
+  files (P-1), so it would be created already stale and removed at the next
+  sweep (P-16). A table published by a concurrent reader that took its
+  snapshot before the seal is harmless for the same reason.
 - **D-26 Compaction.** An implementation MAY merge the **entire** database into
   one file. The order is normative: seal (D-25), then convert every remaining
   unordered file (D-12), then merge in-order files until no two adjacent ones
