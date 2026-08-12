@@ -6563,6 +6563,45 @@ static void test_write_abort(void)
     zs_db_close(&db);
 }
 
+/* D-13b: a writer folds the records it appended into the active file's index
+ * rather than rebuilding the snapshot -- observable as the SNAPSHOT OBJECT a
+ * write transaction's begin installed surviving that transaction's commit.
+ * (Identity must be captured AFTER begin: a write begin performs its own full
+ * refresh under the lock, so the handle's snapshot always changes there.)
+ *
+ * The handle and the committing transaction are the snapshot's two expected
+ * holders at the fold; miscounting "sole holder" as one made the fold dead
+ * code from the first commit, so every commit paid a SECOND full rebuild on
+ * top of begin's -- and the writer-side P-13 publish, which lives in the same
+ * branch, never ran at all. */
+static void test_commit_folds_index_incrementally(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "seed", 4, "x", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    struct zsi_snapshot *during = db->snap;
+    struct zsi_index *idx_during = zsi_snapshot_active(db->snap)->index;
+    ASSERT_OK(zs_txn_store(txn, "next", 4, "y", 1, 0));
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    ASSERT(db->snap == during);
+    ASSERT(zsi_snapshot_active(db->snap)->index == idx_during);
+
+    /* And the folded record is really in the index. */
+    const char *v = NULL;
+    size_t vl = 0;
+    ASSERT_OK(zs_db_fetch(db, "next", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "y", 1);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 static void test_write_rollover(void)
 {
     /* D-9a: a writer moves to a new file when the active file exceeds
@@ -13392,6 +13431,8 @@ static struct test_entry tests[] = {
     { "test_cursor_live_sees_other_handle_commit",
                                     test_cursor_live_sees_other_handle_commit },
     { "test_write_abort",               test_write_abort },
+    { "test_commit_folds_index_incrementally",
+                                        test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
     { "test_write_ancestors",           test_write_ancestors },

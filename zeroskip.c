@@ -5241,13 +5241,21 @@ static int zsi_txn_commit(struct zs_txn *txn)
      * in rather than rescanning a file it is writing -- which matters because a
      * rescan is O(active file) per commit, making a bulk load quadratic.
      *
-     * Only when this handle is the sole holder of the snapshot.  A cursor opened
-     * from the same handle shares the object, and replacing its mapping or
-     * mutating its index underneath would be exactly the in-place mutation of
-     * something a reader is reading that G-6 forbids.  With a sharer present the
-     * fallback is a full refresh, which builds a NEW snapshot and leaves the old
-     * one untouched. */
-    if (act && offs && db->snap->refcount == 1
+     * Only when nothing else holds the snapshot.  A cursor opened from the
+     * same handle shares the object, and replacing its mapping or mutating its
+     * index underneath would be exactly the in-place mutation of something a
+     * reader is reading that G-6 forbids.  With a sharer present the fallback
+     * is a full refresh, which builds a NEW snapshot and leaves the old one
+     * untouched.
+     *
+     * TWO references are this commit's own: db->snap itself, and txn->snap,
+     * re-pointed at the same object above.  Counting "sole holder" as one made
+     * this branch dead code from the first commit -- every commit fell back to
+     * a full refresh, and with no cache directory to seed it that refresh
+     * replays the whole active file, making a bulk load exactly the quadratic
+     * thing this branch exists to prevent.  Found by a mutant that targeted
+     * the branch and could not be caught. */
+    if (act && offs && db->snap->refcount == 2
         && act->hdr.start == gen && act->index) {
         r = zsi_file_remap(act);
         if (r == ZS_OK) {

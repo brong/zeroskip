@@ -541,6 +541,14 @@ mutant "next: advances only delta on a tie" catch \
 mutant "next: advances only base on a tie" catch \
   's/            c->di\+\+;\n            c->bi\+\+;\n        \} else if \(cmp < 0\) \{/            c->bi++;\n        } else if (cmp < 0) {/'
 
+# D-13b at the commit site.  db->snap and txn->snap are the commit's own two
+# references; counting "sole holder" as one made the incremental fold dead code
+# from the first commit -- every commit fell back to a full refresh, quadratic
+# over the active file when no cache directory seeds it.  This mutant IS that
+# bug, preserved.
+mutant "commit: incremental fold never taken" catch \
+  's/    if \(act && offs && db->snap->refcount == 2/    if (act \&\& offs \&\& db->snap->refcount == 1/'
+
 # The insert path (D-13b), and the bound that makes it amortised O(1).
 mutant "insert: no replace of an existing key" catch \
   's/    if \(zsi_index_eq\(ix->delta, ix->ndelta, i, &ks, key, keylen\)\) \{\n        ix->delta\[i\] = off;\n        return ZS_OK;\n    \}/    \/* replace removed *\//'
