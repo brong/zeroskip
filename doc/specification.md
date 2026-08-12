@@ -1328,6 +1328,13 @@ any point.
   If a crash loses it, the active file is simply no longer clean, so the next
   writer moves to a new file (D-9) and reaches the same state. Nothing is being
   promised to a caller, so there is nothing to make durable.
+- **C-8a** The unsynced `ROLLBACK` is still **ordered** ahead of any later
+  commit, without costing a sync of its own: F-21 needs the `ROLLBACK` on disk
+  before the next `COMMIT` terminator, and the next commit's first gate — the
+  fdatasync before its own terminator (C-7) — flushes everything before it,
+  the `ROLLBACK` included. A writer that streams records as they are stored
+  therefore aborts for free, and a crash that loses the tail leaves a torn
+  span F-22 already discards.
 
 ## 7. Open and recovery
 
