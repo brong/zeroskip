@@ -2431,6 +2431,98 @@ static void zsi_index_cur_next(struct zsi_index *ix, zs_compar *compar,
     else        c->bi++;
 }
 
+/* Reverse twins (D-14k).  A reverse position is a COUNT: the candidate on
+ * each side is [pos-1], and 0 means that side is spent -- nothing underflows.
+ * The tie rules are the forward ones verbatim: equal keys prefer the delta
+ * (newer), and stepping past a tie consumes BOTH sides, or the base's stale
+ * copy would surface on the following step and break D-14h one level down. */
+static void zsi_index_cur_seek_last(struct zsi_index *ix,
+                                    struct zsi_index_cur *c)
+{
+    c->bi = ix->nbase;
+    c->di = ix->ndelta;
+}
+
+/* Position on the largest key <= (inclusive) or < (exclusive) the given key.
+ * A lower bound counts the elements strictly below the key, which IS the
+ * exclusive reverse position; inclusive adds the exact match when present. */
+static void zsi_index_cur_seek_rev(struct zsi_index *ix, zs_compar *compar,
+                                   const char *key, size_t keylen,
+                                   bool inclusive, struct zsi_index_cur *c)
+{
+    struct zsi_ksort ks = { ix->file, compar };
+
+    c->bi = zsi_index_lb(ix->base, ix->nbase, &ks, key, keylen);
+    if (inclusive && zsi_index_eq(ix->base, ix->nbase, c->bi, &ks, key, keylen))
+        c->bi++;
+    c->di = zsi_index_lb(ix->delta, ix->ndelta, &ks, key, keylen);
+    if (inclusive && zsi_index_eq(ix->delta, ix->ndelta, c->di, &ks, key, keylen))
+        c->di++;
+}
+
+static int zsi_index_cur_get_rev(struct zsi_index *ix, zs_compar *compar,
+                                 struct zsi_index_cur *c,
+                                 struct zsi_rec *out, size_t *off)
+{
+    bool have_b = c->bi > 0;
+    bool have_d = c->di > 0;
+    size_t chosen;
+
+    if (!have_b && !have_d) return ZS_DONE;
+
+    if (have_b && have_d) {
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[c->bi - 1], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[c->di - 1], &kd, &ld);
+        /* The LARGER key is next; equal keys prefer the delta, the newer. */
+        chosen = (compar(kd, ld, kb, lb) >= 0) ? ix->delta[c->di - 1]
+                                              : ix->base[c->bi - 1];
+    } else {
+        chosen = have_d ? ix->delta[c->di - 1] : ix->base[c->bi - 1];
+    }
+
+    const char *b = zsi_file_at(ix->file, chosen, 1);
+    if (!b) return ZS_DONE;
+    if (zsi_rec_decode(b, ix->file->size - chosen, ix->file->hdr.start, out)
+        != ZS_OK)
+        return ZS_DONE;
+
+    if (off) *off = chosen;
+    return ZS_OK;
+}
+
+static void zsi_index_cur_prev(struct zsi_index *ix, zs_compar *compar,
+                               struct zsi_index_cur *c)
+{
+    bool have_b = c->bi > 0;
+    bool have_d = c->di > 0;
+
+    if (!have_b && !have_d) return;
+
+    if (have_b && have_d) {
+        const char *kb, *kd;
+        size_t lb, ld;
+        zsi_index_key_at(ix->file, ix->base[c->bi - 1], &kb, &lb);
+        zsi_index_key_at(ix->file, ix->delta[c->di - 1], &kd, &ld);
+        int cmp = compar(kd, ld, kb, lb);
+
+        if (cmp == 0) {
+            /* Step past BOTH -- the D-14h reason zsi_index_cur_next gives. */
+            c->di--;
+            c->bi--;
+        } else if (cmp > 0) {
+            c->di--;
+        } else {
+            c->bi--;
+        }
+        return;
+    }
+
+    if (have_d) c->di--;
+    else        c->bi--;
+}
+
 /* Fold a newly committed record into the index (D-13b).
  *
  * A writer is a reader that also maintains the active file's index
@@ -3106,6 +3198,12 @@ struct zsi_fcur {
     zs_compar        *compar;
     uint32_t          gen;       /* file->hdr.start, or ZSI_GEN_TXN */
     bool              exhausted;
+
+    /* D-14k: travel toward smaller keys.  Fixed when the owning cursor is
+     * opened.  Reverse positions are COUNTS -- the in-order candidate is
+     * pi-1, the index cursor's are bi-1/di-1, and 0 is exhausted -- so no
+     * unsigned position ever underflows. */
+    bool              reverse;
     struct zsi_rec    cur;       /* valid iff !exhausted */
 
     /* kind-specific position */
@@ -3120,10 +3218,14 @@ struct zsi_fcur {
      * the cursor re-yields a key it has already returned.  A key survives that,
      * costs one binary search per step over the transaction's own pending set,
      * and makes a write ahead of the cursor visible, which is what A-1a and
-     * cyrusdb both want. */
+     * cyrusdb both want.  In reverse, NULL means "after the last" instead, and
+     * texclusive records whether a seek bound was < rather than <= -- it only
+     * matters until the first record is consumed (tstarted), after which the
+     * position is always strictly below tkey. */
     char                *tkey;   /* owned; NULL means "before the first" */
     size_t               tkeylen;
     bool                 tstarted;
+    bool                 texclusive;
 };
 
 /* Filled in by the WRITE PATH section, which owns struct zs_txn.  Declared here
@@ -3132,6 +3234,8 @@ struct zsi_fcur {
  * avoid. */
 static int zsi_txn_cur_load(struct zsi_fcur *fc);
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
+static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
+                                 size_t keylen, bool inclusive);
 
 /* struct zs_txn belongs to WRITE PATH, below, so the cursor reaches it through
  * these rather than through its fields -- the same arrangement the two above
@@ -3145,14 +3249,22 @@ static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap);
 static int zsi_fcur_load(struct zsi_fcur *fc)
 {
     switch (fc->kind) {
-    case ZSI_SRC_INORDER:
-        if (fc->pi >= fc->file->nptrs) { fc->exhausted = true; return ZS_OK; }
-        if (zsi_ptrs_rec(fc->file, fc->pi, &fc->cur) != ZS_OK) {
+    case ZSI_SRC_INORDER: {
+        uint64_t at = fc->pi;
+        if (fc->reverse) {
+            if (fc->pi == 0) { fc->exhausted = true; return ZS_OK; }
+            at = fc->pi - 1;
+        } else if (fc->pi >= fc->file->nptrs) {
+            fc->exhausted = true;
+            return ZS_OK;
+        }
+        if (zsi_ptrs_rec(fc->file, at, &fc->cur) != ZS_OK) {
             fc->exhausted = true;
             return ZS_BADFORMAT;
         }
         fc->exhausted = false;
         return ZS_OK;
+    }
 
     case ZSI_SRC_UNORDERED: {
         /* No index means the caller skipped building one, which is a wiring
@@ -3161,7 +3273,10 @@ static int zsi_fcur_load(struct zsi_fcur *fc)
          * and a cursor over a source with nothing in it is a defined answer. */
         if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
 
-        int r = zsi_index_cur_get(fc->file->index, fc->compar, &fc->ic,
+        int r = fc->reverse
+              ? zsi_index_cur_get_rev(fc->file->index, fc->compar, &fc->ic,
+                                      &fc->cur, NULL)
+              : zsi_index_cur_get(fc->file->index, fc->compar, &fc->ic,
                                   &fc->cur, NULL);
         fc->exhausted = (r != ZS_OK);
         return ZS_OK;
@@ -3221,15 +3336,77 @@ static int zsi_fcur_seek_first(struct zsi_fcur *fc)
     return zsi_fcur_load(fc);
 }
 
+/* D-14k step 1: position on the largest key <= (inclusive) or < (exclusive)
+ * the given key, or exhaust when nothing lies below the bound. */
+static int zsi_fcur_seek_rev(struct zsi_fcur *fc, const char *key,
+                             size_t keylen, bool inclusive)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER: {
+        uint64_t idx;
+        bool exact;
+        int r = zsi_ptrs_search(fc->file, fc->compar, key, keylen, &idx, &exact);
+        if (r != ZS_OK) { fc->exhausted = true; return r; }
+        /* idx counts the pointers strictly below the key -- the exclusive
+         * reverse position; inclusive keeps an exact match. */
+        fc->pi = idx + ((inclusive && exact) ? 1 : 0);
+        break;
+    }
+
+    case ZSI_SRC_UNORDERED:
+        if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
+        zsi_index_cur_seek_rev(fc->file->index, fc->compar, key, keylen,
+                               inclusive, &fc->ic);
+        break;
+
+    case ZSI_SRC_TXN:
+        zsi_txn_cur_seek_rev(fc, key, keylen, inclusive);
+        break;
+    }
+
+    return zsi_fcur_load(fc);
+}
+
+/* D-14k's empty start: the last key each source holds. */
+static int zsi_fcur_seek_last(struct zsi_fcur *fc)
+{
+    switch (fc->kind) {
+    case ZSI_SRC_INORDER:
+        fc->pi = fc->file->nptrs;
+        break;
+    case ZSI_SRC_UNORDERED:
+        if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
+        zsi_index_cur_seek_last(fc->file->index, &fc->ic);
+        break;
+    case ZSI_SRC_TXN:
+        free(fc->tkey);
+        fc->tkey = NULL;
+        fc->tkeylen = 0;
+        fc->tstarted = false;
+        fc->texclusive = false;
+        break;
+    }
+
+    return zsi_fcur_load(fc);
+}
+
+/* Advance one step IN THE CURSOR'S DIRECTION -- the merge above never knows
+ * which way an arm travels (D-14k). */
 static int zsi_fcur_next(struct zsi_fcur *fc)
 {
     if (fc->exhausted) return ZS_OK;
 
     switch (fc->kind) {
-    case ZSI_SRC_INORDER:   fc->pi++; break;
+    case ZSI_SRC_INORDER:
+        if (fc->reverse) fc->pi--;
+        else             fc->pi++;
+        break;
     case ZSI_SRC_UNORDERED:
         if (!fc->file->index) { fc->exhausted = true; return ZS_OK; }
-        zsi_index_cur_next(fc->file->index, fc->compar, &fc->ic);
+        if (fc->reverse)
+            zsi_index_cur_prev(fc->file->index, fc->compar, &fc->ic);
+        else
+            zsi_index_cur_next(fc->file->index, fc->compar, &fc->ic);
         break;
     case ZSI_SRC_TXN: {
         /* Remember the key just yielded, so the next load finds its successor
@@ -4280,6 +4457,17 @@ struct zs_cursor {
     char             *start_key;
     size_t            start_keylen;
 
+    /* D-14k.  Direction is fixed at open.  For a reverse prefix scan the
+     * start position is the last key carrying the prefix, found by an
+     * exclusive seek at the prefix's byte-successor -- computed ONCE, here,
+     * so a refresh re-derives the same bound the open used rather than
+     * trusting a stale arm position.  rev_succ NULL with rev_succ_none set
+     * means the prefix was all 0xFF: no successor, seek from the end. */
+    bool              reverse;
+    char             *rev_succ;
+    size_t            rev_succlen;
+    bool              rev_succ_none;
+
     /* Whether this cursor may observe the HANDLE's later commits.
      *
      * True for the non-transactional forms, whose enclosing transaction is one
@@ -4301,7 +4489,10 @@ static int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
     if (b->exhausted) return -1;
 
     int r = c->db->compar(a->cur.key, a->cur.keylen, b->cur.key, b->cur.keylen);
-    if (r) return r;
+    /* D-14k: reverse flips the KEY order only.  The generation tie-break is
+     * direction-blind -- equal keys must stay newest-first however the walk
+     * travels, or step 3 would suppress the wrong duplicate. */
+    if (r) return c->reverse ? -r : r;
 
     if (a->gen == b->gen) return 0;
     return a->gen > b->gen ? -1 : 1;        /* higher generation first */
@@ -4324,10 +4515,11 @@ static void zsi_cur_sort(struct zs_cursor *c)
 
 /* D-14e step 5: advance element 0, then move it down to its new position.
  *
- * Its key only ever increases, so this is a single insertion into an
- * already-sorted array, and it stops as soon as it is no longer greater than its
- * neighbour.  O(k) worst case, and usually O(1) because the advanced cursor stays
- * at or near the front (D-14i). */
+ * Its key only ever moves in the direction of travel, so this is a single
+ * insertion into an already-sorted array, and it stops as soon as it is no
+ * longer greater than its neighbour under the cursor's order.  O(k) worst
+ * case, and usually O(1) because the advanced cursor stays at or near the
+ * front (D-14i). */
 static void zsi_cur_resort_head(struct zs_cursor *c)
 {
     if (c->ncur < 2) return;
@@ -4348,6 +4540,7 @@ static void zsi_cursor_free(struct zs_cursor *c)
     zsi_snapshot_release(&c->snap);
     free(c->start_key);
     free(c->last_key);
+    free(c->rev_succ);
     free(c->cur);
     free(c->prefix);
     free(c->skiproot_key);
@@ -4363,16 +4556,43 @@ static void zsi_cursor_free(struct zs_cursor *c)
  * 32-bit set of bits and unsigned is the honest type for it.  Every public flag
  * value fits well inside 30 bits, so the conversion is value-preserving -- but it
  * is written out rather than left implicit, because Cyrus builds -Wconversion. */
+/* D-14k step 1, one arm.  Forward: lower bound of the start key, or the
+ * beginning.  Reverse: the largest key <= the start key; under
+ * ZS_CURSOR_PREFIX the start key IS the prefix and the scan begins at the
+ * LAST key carrying it -- an exclusive seek at the prefix's byte-successor,
+ * computed once at open.  Shared by open and by the pre-first-emit reseek,
+ * so a refresh cannot diverge from the open (the zsi_cursor_reseek_arm
+ * lesson, again). */
+static int zsi_cursor_seek_arm_start(struct zs_cursor *c, struct zsi_fcur *fc)
+{
+    if (!c->reverse)
+        return c->start_key ? zsi_fcur_seek(fc, c->start_key, c->start_keylen)
+                            : zsi_fcur_seek_first(fc);
+
+    if ((c->flags & ZS_CURSOR_PREFIX) && c->prefixlen) {
+        if (c->rev_succ_none) return zsi_fcur_seek_last(fc);
+        return zsi_fcur_seek_rev(fc, c->rev_succ, c->rev_succlen, false);
+    }
+
+    return c->start_key ? zsi_fcur_seek_rev(fc, c->start_key,
+                                            c->start_keylen, true)
+                        : zsi_fcur_seek_last(fc);
+}
+
 static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
                            struct zsi_snapshot *snap,
                            const char *key, size_t keylen,
                            uint32_t flags, struct zs_cursor **out)
 {
+    /* A-13: reverse composed with LIVE is rejected, not half-supported. */
+    if ((flags & ZS_REVERSE) && (flags & ZS_CURSOR_LIVE)) return ZS_BADUSAGE;
+
     struct zs_cursor *c = zsi_zmalloc(sizeof(*c));
     if (!c) return ZS_INTERNAL;
 
     c->db = db;
     c->txn = txn;
+    c->reverse = (flags & ZS_REVERSE) != 0;
 
     /* The cursor takes its OWN reference rather than borrowing the
      * transaction's.  It used to borrow, which was fine while a cursor's
@@ -4430,9 +4650,29 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
         c->prefixlen = keylen;
     }
 
+    /* D-14k: the byte-successor of the prefix -- increment the last
+     * non-0xFF byte and discard everything after it.  All 0xFF has no
+     * successor and means "from the end".  Seeking at the prefix ITSELF
+     * would be the bug here: the largest key <= the prefix is below every
+     * key carrying it (F-11a orders the bare prefix first), so the scan
+     * would end before it began unless the bare prefix happened to exist. */
+    if (c->reverse && (flags & ZS_CURSOR_PREFIX) && c->prefixlen) {
+        size_t n = c->prefixlen;
+        while (n && (unsigned char)c->prefix[n - 1] == 0xFF) n--;
+        if (!n) {
+            c->rev_succ_none = true;
+        } else {
+            c->rev_succ = malloc(n);
+            if (!c->rev_succ) { zsi_cursor_free(c); return ZS_INTERNAL; }
+            memcpy(c->rev_succ, c->prefix, n);
+            c->rev_succ[n - 1] = (char)((unsigned char)c->rev_succ[n - 1] + 1);
+            c->rev_succlen = n;
+        }
+    }
+
     for (size_t i = 0; i < c->ncur; i++) {
-        int r = key ? zsi_fcur_seek(&c->cur[i], key, keylen)
-                    : zsi_fcur_seek_first(&c->cur[i]);
+        c->cur[i].reverse = c->reverse;
+        int r = zsi_cursor_seek_arm_start(c, &c->cur[i]);
         if (r != ZS_OK) { zsi_cursor_free(c); return r; }
     }
 
@@ -4527,23 +4767,24 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
  * yielded out of order, shifting the rest of the traversal by one). */
 static int zsi_cursor_reseek_arm(struct zs_cursor *c, struct zsi_fcur *fc)
 {
-    /* Resume from the last key yielded; before anything has been, from the key
-     * the cursor was OPENED at.  Falling back to "the first key" instead would
-     * yield records before the start key, and would empty a prefix scan
-     * outright. */
-    const char *from = c->last_key ? c->last_key : c->start_key;
-    size_t fromlen = c->last_key ? c->last_keylen : c->start_keylen;
     int r;
 
-    if (from)
-        r = zsi_fcur_seek(fc, from, fromlen);
+    /* Before anything has been yielded, the resume point is the OPEN
+     * position -- re-derived by the same helper the open used, which for a
+     * reverse prefix scan means the byte-successor bound rather than any
+     * stale arm state. */
+    if (!c->last_key) return zsi_cursor_seek_arm_start(c, fc);
+
+    /* Resume from the last key yielded.  A seek lands ON the key when it is
+     * still present, and it has been yielded, so step once past it -- in the
+     * direction of travel (D-14j-b, D-14k). */
+    if (c->reverse)
+        r = zsi_fcur_seek_rev(fc, c->last_key, c->last_keylen, true);
     else
-        r = zsi_fcur_seek_first(fc);
+        r = zsi_fcur_seek(fc, c->last_key, c->last_keylen);
     if (r != ZS_OK) return r;
 
-    /* A seek lands ON the key when it is still present.  Skip it only when
-     * it is one we have already yielded -- the START key has not been. */
-    if (c->last_key && !fc->exhausted
+    if (!fc->exhausted
         && c->db->compar(fc->cur.key, fc->cur.keylen,
                          c->last_key, c->last_keylen) == 0)
         return zsi_fcur_next(fc);
@@ -4644,6 +4885,9 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
                     fc->compar = c->db->compar;
                     fc->gen = ZSI_GEN_TXN;
                 }
+                /* Rebuilt arms travel the way the cursor does (D-14k). */
+                for (size_t i = 0; i < c->ncur; i++)
+                    c->cur[i].reverse = c->reverse;
             }
             files_moved = true;
         }
@@ -4855,6 +5099,36 @@ static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap)
     txn->snap->refcount++;
 }
 
+/* The reverse mirror of zsi_txn_cur_index, D-14j-a intact: the position is a
+ * key, resolved against the array as it stands NOW, so a store below the
+ * position mid-walk is seen and one at or above it is already passed.
+ * Returns false when the arm is exhausted. */
+static bool zsi_txn_cur_index_rev(struct zsi_fcur *fc, size_t *ti)
+{
+    struct zs_txn *txn = fc->txn;
+    size_t pos;
+
+    if (!txn->npend) return false;
+
+    if (!fc->tkey) {                            /* "after the last": the top */
+        *ti = txn->npend - 1;
+        return true;
+    }
+
+    bool exact = (zsi_pend_search(txn, fc->tkey, fc->tkeylen, &pos) == ZS_OK);
+
+    /* An inclusive seek that landed on a present key answers with it; after a
+     * yield (tstarted), or under an exclusive bound, the answer is strictly
+     * below -- pos counts the keys strictly below tkey either way. */
+    if (exact && !fc->tstarted && !fc->texclusive) {
+        *ti = pos;
+        return true;
+    }
+    if (pos == 0) return false;
+    *ti = pos - 1;
+    return true;
+}
+
 static int zsi_txn_cur_load(struct zsi_fcur *fc)
 {
     struct zs_txn *txn = fc->txn;
@@ -4862,7 +5136,14 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
 
     if (!txn) { fc->exhausted = true; return ZS_OK; }
 
-    ti = zsi_txn_cur_index(fc);
+    if (fc->reverse) {
+        if (!zsi_txn_cur_index_rev(fc, &ti)) {
+            fc->exhausted = true;
+            return ZS_OK;
+        }
+    } else {
+        ti = zsi_txn_cur_index(fc);
+    }
     if (ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
 
     struct zsi_pending *p = &txn->pend[ti];
@@ -4899,6 +5180,16 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
     /* A seek lands ON the key if present, so the first load must NOT skip it:
      * tstarted false makes zsi_txn_cur_index return the search position rather
      * than one past it. */
+}
+
+/* Reverse seek: largest pending key <= (inclusive) or < the given key.  An
+ * empty key means "after the last" here, since a reverse walk begins at the
+ * top (D-14k). */
+static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
+                                 size_t keylen, bool inclusive)
+{
+    zsi_txn_cur_seek(fc, key, keylen);
+    fc->texclusive = !inclusive;
 }
 
 /* Defined in CONVERSION.  D-12 requires a writer convert any non-active unordered
@@ -7033,13 +7324,24 @@ int zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
     if (!txn || !key) return ZS_BADUSAGE;
     if (keylen < 1) return ZS_BADUSAGE;
 
+    if ((flags & ZS_FETCHNEXT) && (flags & ZS_FETCHPREV))
+        return ZS_BADUSAGE;                                 /* A-12 */
+
     /* ZS_FETCHNEXT: return the record AFTER the given key.  A cursor seeked to
      * the key with ZS_SKIPROOT is exactly that, so it shares the merge rather than
-     * reimplementing "next". */
-    if (flags & ZS_FETCHNEXT) {
+     * reimplementing "next".
+     *
+     * ZS_FETCHPREV: the largest key <= (or, with ZS_SKIPROOT, <) the given
+     * key.  A REVERSE cursor seeked at the key is exactly that (D-14l), so it
+     * shares the merge too -- the fetch family stays two shapes, not three,
+     * and predecessor lookup cannot disagree with reverse iteration (G-7). */
+    if (flags & (ZS_FETCHNEXT | ZS_FETCHPREV)) {
         struct zs_cursor *c = NULL;
+        uint32_t cflags = (flags & ZS_FETCHNEXT)
+                        ? ZS_SKIPROOT
+                        : ZS_REVERSE | ((uint32_t)flags & ZS_SKIPROOT);
         rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
-                             key, keylen, ZS_SKIPROOT, &c);
+                             key, keylen, cflags, &c);
         if (rc != ZS_OK) return rc;
         rc = zsi_cursor_next(c, &r);
         if (rc == ZS_OK) {
@@ -7149,6 +7451,11 @@ int zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
     int rc;
 
     if (!txn || !cb) return ZS_BADUSAGE;
+
+    /* A-13: no reverse foreach.  Nothing needs it -- a consumer walking
+     * backwards drives a cursor -- and a rejected flag is cheaper than an
+     * untested promise. */
+    if (flags & ZS_REVERSE) return ZS_BADUSAGE;
 
     rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
                          startlen ? start : NULL, startlen,

@@ -413,7 +413,7 @@ mutant "seek: in-order lands one early" catch \
   's/        fc->pi = idx;/        fc->pi = idx ? idx - 1 : 0;/'
 
 mutant "load: exhaustion not detected in-order" catch \
-  's/        if \(fc->pi >= fc->file->nptrs\) \{ fc->exhausted = true; return ZS_OK; \}/        if (fc->pi > fc->file->nptrs) { fc->exhausted = true; return ZS_OK; }/'
+  's/        \} else if \(fc->pi >= fc->file->nptrs\) \{/        } else if (fc->pi > fc->file->nptrs) {/'
 
 mutant "load: unordered never exhausts" catch \
   's/        fc->exhausted = \(r != ZS_OK\);/        fc->exhausted = false; (void)r;/'
@@ -423,7 +423,7 @@ mutant "load: unordered never exhausts" catch \
 # 2^64 next() calls on an exhausted in-order cursor would wrap pi back into range
 # -- which is why this is subsumed rather than equivalent, and why the guard stays.
 mutant "next: advances an exhausted cursor" subsumed \
-  's/    if \(fc->exhausted\) return ZS_OK;\n\n    switch \(fc->kind\) \{\n    case ZSI_SRC_INORDER:   fc->pi\+\+; break;/    switch (fc->kind) {\n    case ZSI_SRC_INORDER:   fc->pi++; break;/'
+  's/    if \(fc->exhausted\) return ZS_OK;\n\n    switch \(fc->kind\) \{\n    case ZSI_SRC_INORDER:\n        if \(fc->reverse\) fc->pi--;/    switch (fc->kind) {\n    case ZSI_SRC_INORDER:\n        if (fc->reverse) fc->pi--;/'
 
 # find must report an exact hit only, or a point lookup silently returns a
 # neighbouring key -- which the read path would then treat as the answer.
@@ -1173,7 +1173,7 @@ mutant "cursor: explicit txn goes live too" catch \
 # D-14j-b.  A refresh re-seeks by key, and a seek lands ON that key when it is
 # still present -- which has already been yielded.  Not skipping it re-emits it.
 mutant "cursor: re-yields the key it resumed from" catch \
-  's/    if \(c->last_key && !fc->exhausted/    if (0 \&\& c->last_key \&\& !fc->exhausted/'
+  's/    if \(!fc->exhausted\n        && c->db->compar\(fc->cur.key, fc->cur.keylen,\n                         c->last_key, c->last_keylen\) == 0\)\n        return zsi_fcur_next\(fc\);/    \/* landed-on-key skip removed *\//'
 
 # D-14j-b, reported downstream (Cyrus aaa-db foreach_changes).  On a pending
 # write, re-positioning the transaction arm from ITS OWN state -- the last key
@@ -1203,7 +1203,55 @@ mutant "cursor: txn re-seek skips the sort" catch \
 # before the start key -- and under ZS_CURSOR_PREFIX lands outside the prefix,
 # ending the scan immediately and returning nothing at all.
 mutant "cursor: refresh forgets the start key" catch \
-  's/    const char \*from = c->last_key \? c->last_key : c->start_key;\n    size_t fromlen = c->last_key \? c->last_keylen : c->start_keylen;/    const char *from = c->last_key;\n    size_t fromlen = c->last_keylen;/'
+  's/    if \(!c->last_key\) return zsi_cursor_seek_arm_start\(c, fc\);/    if (!c->last_key) return zsi_fcur_seek_first(fc);/'
+
+echo
+echo "reverse iteration (D-14k, D-14l, A-12, A-13)"
+
+# D-14k: reverse flips the KEY order only.  Flipping the generation tie-break
+# too puts the OLDEST version of every duplicated key at element 0, so the
+# merge yields values that were overwritten.
+mutant "cursor: reverse flips the generation tie-break" catch \
+  's/    if \(a->gen == b->gen\) return 0;\n    return a->gen > b->gen \? -1 : 1;        \/\* higher generation first \*\//    if (a->gen == b->gen) return 0;\n    if (c->reverse) return a->gen > b->gen ? 1 : -1;\n    return a->gen > b->gen ? -1 : 1;/'
+
+# D-14k: an inclusive reverse seek that never lands ON the key returns the
+# predecessor of a present key -- FETCHPREV of an existing key is wrong.
+# Base and delta take separate branches, hence two mutants.
+mutant "index: reverse inclusive seek dropped (base)" catch \
+  's/    if \(inclusive && zsi_index_eq\(ix->base, ix->nbase, c->bi, &ks, key, keylen\)\)\n        c->bi\+\+;/    \/* inclusive dropped *\//'
+
+mutant "index: reverse inclusive seek dropped (delta)" catch \
+  's/    if \(inclusive && zsi_index_eq\(ix->delta, ix->ndelta, c->di, &ks, key, keylen\)\)\n        c->di\+\+;/    \/* inclusive dropped *\//'
+
+# D-14h one level down, in reverse: a key present in both base and delta must
+# consume BOTH on the step past it, or the base's stale copy surfaces and the
+# arm yields the same key twice -- the second time with the OLD value.
+mutant "index: reverse tie leaves the base entry" catch \
+  's/        if \(cmp == 0\) \{\n            \/\* Step past BOTH -- the D-14h reason zsi_index_cur_next gives\. \*\/\n            c->di--;\n            c->bi--;/        if (cmp == 0) {\n            c->di--;/'
+
+# D-14j-b reversed: after a yield the txn arm must resume strictly BELOW the
+# key it yielded; answering the exact hit again re-yields it forever.
+mutant "cursor: reverse txn arm resumes inclusively" catch \
+  's/    if \(exact && !fc->tstarted && !fc->texclusive\) \{/    if (exact \&\& !fc->texclusive) {/'
+
+# D-14k: seeking at the prefix ITSELF instead of its byte-successor starts the
+# scan below every key carrying the prefix, reporting a populated range empty.
+mutant "cursor: reverse prefix seeks the prefix, not its successor" catch \
+  's/        if \(c->rev_succ_none\) return zsi_fcur_seek_last\(fc\);\n        return zsi_fcur_seek_rev\(fc, c->rev_succ, c->rev_succlen, false\);/        return zsi_fcur_seek_rev(fc, c->prefix, c->prefixlen, true);/'
+
+# A-13: LIVE composed with reverse accepted silently.
+mutant "cursor: reverse accepts ZS_CURSOR_LIVE" catch \
+  's/    if \(\(flags & ZS_REVERSE\) && \(flags & ZS_CURSOR_LIVE\)\) return ZS_BADUSAGE;/    \/* not rejected *\//'
+
+# A-13: reverse foreach accepted silently -- it would even work, which is
+# exactly why the reject needs a test: an untested promise is worse than none.
+mutant "foreach: reverse accepted" catch \
+  's/    if \(flags & ZS_REVERSE\) return ZS_BADUSAGE;/    \/* not rejected *\//'
+
+# A-12: SKIPROOT not forwarded -- the strictly-less variant silently becomes
+# the inclusive one.
+mutant "fetch: FETCHPREV ignores SKIPROOT" catch \
+  's/                        : ZS_REVERSE \| \(\(uint32_t\)flags & ZS_SKIPROOT\);/                        : ZS_REVERSE;/'
 
 # Initialising the counter at open is a PERFORMANCE fix, not a correctness one:
 # with the fallback above in place a spurious refresh resumes correctly, it just

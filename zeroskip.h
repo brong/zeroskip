@@ -56,6 +56,9 @@ enum zs_flagspec {
     ZS_IFEXIST       = 1<<12,  /* store:   only if present, else ZS_NOTFOUND */
     ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record AFTER the given key */
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
+    ZS_FETCHPREV     = 1<<15,  /* fetch:   return the record with the largest key
+                                  <= the given key; with ZS_SKIPROOT, strictly <
+                                  (A-12).  Exclusive with ZS_FETCHNEXT. */
     ZS_CURSOR_PREFIX = 1<<16,  /* foreach,cursor: treat the start key as a prefix
                                   and stop when a key leaves it */
     ZS_SALVAGE_UNVERIFIED = 1<<17,  /* salvage: also recover records whose
@@ -72,6 +75,12 @@ enum zs_flagspec {
                                   writable handle creates the directory; a
                                   read-only handle uses it if present.  Mutually
                                   exclusive with index_dir (A-8a). */
+    ZS_REVERSE       = 1<<20,  /* cursor: iterate toward smaller keys (D-14k,
+                                  A-13).  An empty start key begins at the last
+                                  key; a non-empty one at the largest key <= it.
+                                  ZS_CURSOR_PREFIX composes: the scan begins at
+                                  the last key carrying the prefix.  Not valid
+                                  on foreach or with ZS_CURSOR_LIVE. */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */

@@ -174,6 +174,9 @@ backwards in time".
   merge removes them, so a database is larger than its live contents — sometimes
   substantially.
 - **A read may touch several files**, newest to oldest, until the key is found.
+  Cursors run either direction — reverse iteration and largest-key-at-or-below
+  lookup are the same machinery walked backwards — so an ordered consumer such
+  as a btree layer gets both ends of every range.
   Keeping the file count low is what merging is for.
 - **One writer at a time.** Concurrent writers serialise. Reads are unaffected.
 - **Merges can be long.** Rewriting a large database moves a lot of data. Writing

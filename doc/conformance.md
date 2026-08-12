@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 254 |
-| With an enforcing test | 245 |
+| Requirements | 259 |
+| With an enforcing test | 250 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -181,6 +181,8 @@ a spec label is missing here.
 | `D-25a` | Sealing MUST NOT create a replacement active file. A conversion | `seal_creates_no_new_generation` |
 | `D-25b` | Sealing is a no-op, and NOT an error, when there is no active file, | `seal_noop_cases` |
 | `D-25c` | An unclean active file (D-9) MAY be sealed. The conversion reads to | `seal_unclean_active_file` |
+| `D-14k` | **Reverse iteration.** A cursor MAY traverse in descending key order. | `cursor_reverse_walks_everything`, `cursor_reverse_prefix`, `cursor_reverse_own_writes` |
+| `D-14l` | **Predecessor lookup.** The record with the largest key ≤ K (or | `cursor_reverse_tombstones`, `fetchprev_basic` |
 | `D-25d` | A writer SHOULD seal at the end of any commit that leaves the | `commit_seals_oversized_active`, `commit_below_rollover_stays_unordered` |
 | `D-25e` | A writer sealing under D-25d SHOULD NOT publish a pointer table | `seal_at_commit_skips_table_publish` |
 | `D-26` | **Compaction.** An implementation MAY merge the **entire** database into | `compact_to_one_file` |
@@ -284,6 +286,7 @@ a spec label is missing here.
 | `A-1` | `store` with `val == NULL` writes a deletion; with a non-NULL | `record_byte_layout`, `span_basic`, `tool.sh`, +1 more |
 | `A-1a` | A write inside a transaction is visible to subsequent reads on that | `tool.sh`, `write_txn_isolation` |
 | `A-1b` | The `*_delete` forms are **macros** over `store` and | `api_cursor_replace`, `api_three_forms`, `write_basic` |
+| `A-1c` | A transaction supports **any number of cursors open at once**, and | `txn_many_cursors`, `txn_insert_select_self` |
 | `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
 | `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime` |
@@ -295,6 +298,8 @@ a spec label is missing here.
 | `A-9` | `index_threshold` is P-13's threshold in bytes. Zero selects an | `idxcache_threshold_defaults` |
 | `A-10` | `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's | `seal_noop_cases`, `seal_readonly` |
 | `A-11` | `zs_db_compact` performs D-26, returning `ZS_OK` only when the | `compact_to_one_file`, `compact_reports_and_fails_on_bad_file` |
+| `A-12` | `ZS_FETCHPREV` on `zs_db_fetch` and `zs_txn_fetch` returns the | `fetchprev_basic`, `fetchprev_sees_txn_writes`, `reverse_rejected_compositions` |
+| `A-13` | `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor` | `cursor_reverse_seek_and_skiproot`, `reverse_a4_lifetime`, `reverse_rejected_compositions` |
 
 ## Conformance suite (`T-n`)
 

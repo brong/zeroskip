@@ -13616,6 +13616,541 @@ static void test_txn_cursor_store_behind_not_yielded(void)
 
 /*
  * ============================================================
+ * Reverse iteration (D-14k, D-14l, A-12, A-13, A-1c)
+ * ============================================================
+ */
+
+/* Walk a cursor to the end, joining yielded keys with '|'. */
+static void collect_cursor_keys(struct zs_cursor *c, char *out, size_t outlen)
+{
+    const char *k, *v;
+    size_t kl, vl;
+    size_t used = 0;
+
+    out[0] = '\0';
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        if (used + kl + 2 >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, k, kl);
+        used += kl;
+        out[used] = '\0';
+    }
+}
+
+/* D-14k: a reverse walk over a database spread across every source kind --
+ * in-order files, the unordered active file, and the transaction's pending
+ * array -- yields exactly the forward walk, reversed, newest version of each
+ * key exactly once. */
+static void test_cursor_reverse_walks_everything(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    char got[4096], want[4096];
+    char val[120];
+
+    memset(val, 'v', sizeof(val));
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 512;          /* several generations */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 30; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
+        /* One key rewritten in every generation, so reverse duplicate
+         * suppression has stale versions to suppress in older files. */
+        ASSERT_OK(zs_db_store(db, "dup", 3, k, strlen(k), 0));
+    }
+
+    /* Pending writes: below, between, above -- and an overwrite. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "aa", 2, "p", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "k015", 4, "NEW", 3, 0));
+    ASSERT_OK(zs_txn_store(txn, "zz", 2, "p", 1, 0));
+
+    /* Expected: aa, dup, k000..k029, zz -- reversed. */
+    {
+        size_t used = 0;
+        used += (size_t)snprintf(want + used, sizeof(want) - used, "zz");
+        for (int i = 29; i >= 0; i--)
+            used += (size_t)snprintf(want + used, sizeof(want) - used,
+                                     "|k%03d", i);
+        used += (size_t)snprintf(want + used, sizeof(want) - used, "|dup|aa");
+    }
+
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, ZS_REVERSE));
+    /* The overwritten key yields the PENDING value: newest source wins in
+     * reverse exactly as forward (D-14, G-7). */
+    {
+        const char *k, *v;
+        size_t kl, vl;
+        char sofar[4096];
+        size_t used = 0;
+        sofar[0] = '\0';
+        while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+            if (kl == 4 && memcmp(k, "k015", 4) == 0) {
+                ASSERT_EQU(vl, 3u);
+                ASSERT_MEM_EQ(v, "NEW", 3);
+            }
+            if (used) sofar[used++] = '|';
+            memcpy(sofar + used, k, kl);
+            used += kl;
+            sofar[used] = '\0';
+        }
+        snprintf(got, sizeof(got), "%s", sofar);
+    }
+    zs_cursor_fini(&c);
+
+    ASSERT_STR_EQ(got, want);
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-14k/A-13: seek semantics -- largest <= start, SKIPROOT strictly <. */
+static void test_cursor_reverse_seek_and_skiproot(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_cursor *c = NULL;
+    char got[256];
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "d", 1, "4", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    /* Present key: lands on it. */
+    ASSERT_OK(zs_db_begin_cursor(db, "d", 1, &c, ZS_REVERSE));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "d|b");
+
+    /* Absent key: largest below it. */
+    ASSERT_OK(zs_db_begin_cursor(db, "e", 1, &c, ZS_REVERSE));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "d|b");
+
+    /* SKIPROOT: strictly below an exact match. */
+    ASSERT_OK(zs_db_begin_cursor(db, "d", 1, &c, ZS_REVERSE | ZS_SKIPROOT));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "b");
+
+    /* Below everything: exhausted at once. */
+    ASSERT_OK(zs_db_begin_cursor(db, "a", 1, &c, ZS_REVERSE));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "");
+
+    /* Empty start: from the last key. */
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_REVERSE));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "f|d|b");
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-14l/G-7: a tombstone at the largest candidate consumes the key and the
+ * walk moves to the next smaller live one. */
+static void test_cursor_reverse_tombstones(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    char got[256];
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+    ASSERT_OK(zs_db_store(db, "e", 1, "5", 1, 0));
+
+    /* The newest version of "e" is a pending deletion. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_delete(txn, "e", 1, 0));
+
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, ZS_REVERSE));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "c|a");
+
+    /* And the fetch form agrees, because it IS this walk (D-14l). */
+    {
+        const char *k = NULL, *v = NULL;
+        size_t kl = 0, vl = 0;
+        ASSERT_OK(zs_txn_fetch(txn, "e", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+        ASSERT_EQU(kl, 1u);
+        ASSERT_MEM_EQ(k, "c", 1);
+    }
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-14k: reverse prefix scans.  The byte-successor bound must be exclusive
+ * and exact -- a real key equal to the successor must not surface, trailing
+ * 0xFF bytes must truncate, and an all-0xFF prefix means "from the end". */
+static void test_cursor_reverse_prefix(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_cursor *c = NULL;
+    char got[256];
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a1", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b1", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b2", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b3", 2, "x", 1, 0));
+    /* "c" is exactly the byte-successor of prefix "b": the seek must be
+     * exclusive of it, or the scan starts on it, fails the prefix test, and
+     * reports a populated range empty. */
+    ASSERT_OK(zs_db_store(db, "c", 1, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "c1", 2, "x", 1, 0));
+
+    ASSERT_OK(zs_db_begin_cursor(db, "b", 1, &c,
+                                 ZS_REVERSE | ZS_CURSOR_PREFIX));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "b3|b2|b1");
+
+    /* An empty range is DONE at once, not an error. */
+    ASSERT_OK(zs_db_begin_cursor(db, "bb", 2, &c,
+                                 ZS_REVERSE | ZS_CURSOR_PREFIX));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "");
+
+    /* A prefix ending 0xFF: the successor truncates ("a\xFF" -> "b"). */
+    ASSERT_OK(zs_db_store(db, "a\xFF", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "a\xFF\x01", 3, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "a\xFFz", 3, "x", 1, 0));
+    ASSERT_OK(zs_db_begin_cursor(db, "a\xFF", 2, &c,
+                                 ZS_REVERSE | ZS_CURSOR_PREFIX));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "a\xFFz|a\xFF\x01|a\xFF");
+
+    /* An all-0xFF prefix has no successor: from the end, and correct, since
+     * every key above it carries it. */
+    ASSERT_OK(zs_db_store(db, "\xFF\xFF", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "\xFF\xFF\x41", 3, "x", 1, 0));
+    ASSERT_OK(zs_db_begin_cursor(db, "\xFF\xFF", 2, &c,
+                                 ZS_REVERSE | ZS_CURSOR_PREFIX));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "\xFF\xFF\x41|\xFF\xFF");
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-14j reversed: a store BELOW the position -- ahead, in the direction of
+ * travel -- is yielded when reached; one above is already passed and is not.
+ * And write-through at the current position works (A-13). */
+static void test_cursor_reverse_own_writes(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "d", 1, "4", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, ZS_REVERSE));
+
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "f", 1);
+
+    /* Ahead (below): seen later.  Behind (above): never. */
+    ASSERT_OK(zs_txn_store(txn, "c", 1, "3", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "z", 1, "26", 2, 0));
+
+    /* Write-through at the current position. */
+    ASSERT_OK(zs_cursor_replace(c, "SIX", 3, 0));
+
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "d", 1);
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "c", 1);
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "b", 1);
+    ASSERT_EQ(zs_cursor_next(c, &k, &kl, &v, &vl), ZS_DONE);
+
+    zs_cursor_fini(&c);
+
+    /* The replace took. */
+    ASSERT_OK(zs_txn_fetch(txn, "f", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 3u);
+    ASSERT_MEM_EQ(v, "SIX", 3);
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-13/A-12: the rejected compositions are usage errors, not half-support. */
+static void test_reverse_rejected_compositions(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_cursor *c = NULL;
+    const char *v;
+    size_t vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+
+    ASSERT_EQ(zs_db_begin_cursor(db, NULL, 0, &c,
+                                 ZS_REVERSE | ZS_CURSOR_LIVE), ZS_BADUSAGE);
+    ASSERT_NULL(c);
+
+    ASSERT_EQ(zs_db_foreach(db, NULL, 0, NULL, api_keys_cb, NULL,
+                            ZS_REVERSE), ZS_BADUSAGE);
+
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl,
+                          ZS_FETCHNEXT | ZS_FETCHPREV), ZS_BADUSAGE);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-12: predecessor fetch, both forms, all the bounds. */
+static void test_fetchprev_basic(void)
+{
+    struct zs_db *db = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "d", 1, "4", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    /* Exact hit. */
+    ASSERT_OK(zs_db_fetch(db, "d", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "d", 1);
+    ASSERT_MEM_EQ(v, "4", 1);
+
+    /* Exact hit on the newest store, which sits in the index's DELTA rather
+     * than its base -- the two sides take separate inclusive branches. */
+    ASSERT_OK(zs_db_fetch(db, "f", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "f", 1);
+
+    /* Gap: the largest below. */
+    ASSERT_OK(zs_db_fetch(db, "e", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "d", 1);
+
+    /* Above everything. */
+    ASSERT_OK(zs_db_fetch(db, "z", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "f", 1);
+
+    /* Strictly less. */
+    ASSERT_OK(zs_db_fetch(db, "d", 1, &k, &kl, &v, &vl,
+                          ZS_FETCHPREV | ZS_SKIPROOT));
+    ASSERT_MEM_EQ(k, "b", 1);
+
+    /* Below everything. */
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, &k, &kl, &v, &vl, ZS_FETCHPREV),
+              ZS_NOTFOUND);
+
+    /* And FETCHNEXT/FETCHPREV are inverses across a gap. */
+    ASSERT_OK(zs_db_fetch(db, "c", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "d", 1);
+    ASSERT_OK(zs_db_fetch(db, "c", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "b", 1);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-12: the transactional form sees pending writes -- a pending store can BE
+ * the answer, and a pending delete pushes the answer lower (A-1a, D-14l). */
+static void test_fetchprev_sees_txn_writes(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "d", 1, "4", 1, 0));
+
+    ASSERT_OK(zs_txn_fetch(txn, "e", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "d", 1);           /* the pending store IS the answer */
+
+    ASSERT_OK(zs_txn_delete(txn, "f", 1, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "z", 1, &k, &kl, &v, &vl, ZS_FETCHPREV));
+    ASSERT_MEM_EQ(k, "d", 1);           /* the tombstone pushed it lower */
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-1c: several cursors on one transaction at once, directions mixed,
+ * interleaved -- the sqlite shape, one query over several trees. */
+static void test_txn_many_cursors(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *cf = NULL, *cr = NULL, *cp = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    for (int t = 1; t <= 3; t++)
+        for (int i = 1; i <= 3; i++) {
+            char key[8];
+            snprintf(key, sizeof(key), "t%d|%d", t, i);
+            ASSERT_OK(zs_db_store(db, key, strlen(key), key, strlen(key), 0));
+        }
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    /* A pending write in one tree, visible to that tree's cursors only. */
+    ASSERT_OK(zs_txn_store(txn, "t2|4", 4, "t2|4", 4, 0));
+
+    ASSERT_OK(zs_txn_begin_cursor(txn, "t1|", 3, &cf, ZS_CURSOR_PREFIX));
+    ASSERT_OK(zs_txn_begin_cursor(txn, "t2|", 3, &cr,
+                                  ZS_REVERSE | ZS_CURSOR_PREFIX));
+    ASSERT_OK(zs_txn_begin_cursor(txn, "t3|", 3, &cp, ZS_CURSOR_PREFIX));
+
+    /* Interleave: each cursor holds its own position. */
+    ASSERT_OK(zs_cursor_next(cf, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t1|1", 4);
+    ASSERT_OK(zs_cursor_next(cr, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t2|4", 4);        /* the pending store, first in reverse */
+    ASSERT_OK(zs_cursor_next(cp, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t3|1", 4);
+    ASSERT_OK(zs_cursor_next(cr, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t2|3", 4);
+    ASSERT_OK(zs_cursor_next(cf, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t1|2", 4);
+    ASSERT_OK(zs_cursor_next(cr, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t2|2", 4);
+    ASSERT_OK(zs_cursor_next(cr, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t2|1", 4);
+    ASSERT_EQ(zs_cursor_next(cr, &k, &kl, &v, &vl), ZS_DONE);
+    ASSERT_OK(zs_cursor_next(cf, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "t1|3", 4);
+    ASSERT_EQ(zs_cursor_next(cf, &k, &kl, &v, &vl), ZS_DONE);
+
+    zs_cursor_fini(&cf);
+    zs_cursor_fini(&cr);
+    zs_cursor_fini(&cp);
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-1c/A-4: writes through the transaction while cursors are open never
+ * invalidate pointers already returned.  The INSERT INTO t SELECT FROM t
+ * shape: copy each row of one tree into another, mid-walk, then check every
+ * saved pointer still reads back. */
+static void test_txn_insert_select_self(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    const char *saved_k[8], *saved_v[8];
+    size_t saved_kl[8], saved_vl[8];
+    char expect_k[8][16], expect_v[8][16];
+    size_t n = 0;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    for (int i = 1; i <= 4; i++) {
+        char key[16], val[16];
+        snprintf(key, sizeof(key), "t|%d", i);
+        snprintf(val, sizeof(val), "row%d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, strlen(val), 0));
+    }
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_begin_cursor(txn, "t|", 2, &c, ZS_CURSOR_PREFIX));
+
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        char copy[16];
+        ASSERT(n < 8);
+        /* Save the returned pointers AND an owned copy of what they said. */
+        saved_k[n] = k; saved_kl[n] = kl;
+        saved_v[n] = v; saved_vl[n] = vl;
+        memcpy(expect_k[n], k, kl); expect_k[n][kl] = '\0';
+        memcpy(expect_v[n], v, vl); expect_v[n][vl] = '\0';
+        n++;
+
+        /* The copy lands in another tree, through the same transaction,
+         * while this cursor (and its yielded pointers) are live. */
+        snprintf(copy, sizeof(copy), "u|%.*s", (int)(kl - 2), k + 2);
+        ASSERT_OK(zs_txn_store(txn, copy, strlen(copy), v, vl, 0));
+    }
+    ASSERT_EQU(n, 4u);
+
+    /* Every pointer handed out along the way still reads back (A-4). */
+    for (size_t i = 0; i < n; i++) {
+        ASSERT_MEM_EQ(saved_k[i], expect_k[i], saved_kl[i]);
+        ASSERT_MEM_EQ(saved_v[i], expect_v[i], saved_vl[i]);
+    }
+
+    /* And the copies exist. */
+    ASSERT_OK(zs_txn_fetch(txn, "u|3", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 4u);
+    ASSERT_MEM_EQ(v, "row3", 4);
+
+    zs_cursor_fini(&c);
+    ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-13: reverse inherits A-4 unchanged -- pointers a reverse cursor returned
+ * survive later writes through the same transaction. */
+static void test_reverse_a4_lifetime(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "m", 1, "13", 2, 0));
+    ASSERT_OK(zs_db_store(db, "n", 1, "14", 2, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, ZS_REVERSE));
+
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "n", 1);
+
+    ASSERT_OK(zs_txn_store(txn, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "z", 1, "26", 2, 0));
+
+    /* The yielded pointers still read back after the stores. */
+    ASSERT_MEM_EQ(k, "n", 1);
+    ASSERT_MEM_EQ(v, "14", 2);
+
+    zs_cursor_fini(&c);
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/*
+ * ============================================================
  * Test runner
  * ============================================================
  */
@@ -13914,6 +14449,21 @@ static struct test_entry tests[] = {
                                         test_cursor_start_key_survives_refresh },
     { "test_cursor_delete_during_traversal",
                                         test_cursor_delete_during_traversal },
+    { "test_cursor_reverse_walks_everything",
+                                        test_cursor_reverse_walks_everything },
+    { "test_cursor_reverse_seek_and_skiproot",
+                                        test_cursor_reverse_seek_and_skiproot },
+    { "test_cursor_reverse_tombstones", test_cursor_reverse_tombstones },
+    { "test_cursor_reverse_prefix",     test_cursor_reverse_prefix },
+    { "test_cursor_reverse_own_writes", test_cursor_reverse_own_writes },
+    { "test_reverse_rejected_compositions",
+                                        test_reverse_rejected_compositions },
+    { "test_fetchprev_basic",           test_fetchprev_basic },
+    { "test_fetchprev_sees_txn_writes", test_fetchprev_sees_txn_writes },
+    { "test_txn_many_cursors",          test_txn_many_cursors },
+    { "test_txn_insert_select_self",    test_txn_insert_select_self },
+    { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },
+
     { "test_txn_cursor_store_behind_not_yielded",
                                         test_txn_cursor_store_behind_not_yielded },
 
