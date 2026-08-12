@@ -4970,11 +4970,16 @@ struct zs_txn {
      * would not be (D-14j). */
     unsigned long        pend_seq;
 
-    /* Backing for pointers returned by this transaction's reads, so A-4's
-     * lifetime promise holds for records that came from the pending array rather
-     * than from a mapping. */
-    char                *retbuf;
-    size_t               retalloc;
+    /* Value buffers REPLACED by a later store to the same key, kept until the
+     * transaction ends.  A-4 promises that pointers a read returned stay valid
+     * for the transaction's lifetime, and a fetch of a pending record returns
+     * the buffer itself -- so replacing in place and freeing dangles every
+     * earlier fetch of that key.  Found downstream (sqlite-on-zeroskip), whose
+     * undo log held exactly such a pointer across the overwrite.  The cost is
+     * bounded by what the caller overwrote, in a transaction that must fit in
+     * memory anyway. */
+    char               **retired;
+    size_t               nretired, aretired;
 };
 
 static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
@@ -5034,7 +5039,19 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
     }
 
     if (found) {
-        free(txn->pend[pos].val);
+        /* RETIRE the old buffer, never free it: a fetch of this key handed it
+         * out under A-4's transaction-lifetime promise.  Capacity is ensured
+         * before the swap, so a failure changes nothing. */
+        if (txn->pend[pos].val) {
+            if (txn->nretired == txn->aretired) {
+                size_t want = txn->aretired ? txn->aretired * 2 : 8;
+                char **p = realloc(txn->retired, want * sizeof(*p));
+                if (!p) { free(vcopy); return ZS_INTERNAL; }
+                txn->retired = p;
+                txn->aretired = want;
+            }
+            txn->retired[txn->nretired++] = txn->pend[pos].val;
+        }
         txn->pend[pos].val = vcopy;
         txn->pend[pos].vallen = val ? vallen : 0;
         return ZS_OK;
@@ -5436,7 +5453,8 @@ static void zsi_txn_free(struct zs_txn *txn)
 
     zsi_pend_clear(txn);
     free(txn->pend);
-    free(txn->retbuf);
+    for (size_t i = 0; i < txn->nretired; i++) free(txn->retired[i]);
+    free(txn->retired);
     zsi_snapshot_release(&txn->snap);
     free(txn);
 }

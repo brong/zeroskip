@@ -14121,6 +14121,53 @@ static void test_txn_insert_select_self(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* A-4: a pointer returned for the transaction's OWN pending record survives a
+ * later store to the same key.  The replace used to free the old value buffer
+ * in place, leaving every earlier fetch of that key dangling -- found
+ * downstream by sqlite-on-zeroskip, whose undo log held exactly such a
+ * pointer across the overwrite and had to copy defensively.
+ *
+ * The second store of a same-sized value is the clobber: the allocator hands
+ * the just-freed chunk straight back, so under the bug the saved pointer
+ * reads the NEW bytes -- deterministic enough for a plain build, and a hard
+ * use-after-free under ASan either way. */
+static void test_txn_fetch_survives_overwrite(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v1 = NULL, *v2 = NULL, *v3 = NULL;
+    size_t vl1 = 0, vl2 = 0, vl3 = 0;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "first", 5, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v1, &vl1, 0));
+    ASSERT_EQU(vl1, 5u);
+
+    /* Overwrite, then feed the allocator a same-sized value that would land
+     * in the freed chunk. */
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "SECOND", 6, 0));
+    ASSERT_OK(zs_txn_store(txn, "x", 1, "CLOB!", 5, 0));
+
+    ASSERT_MEM_EQ(v1, "first", 5);      /* A-4: still the value it returned */
+
+    /* A deletion retires the buffer the same way. */
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v2, &vl2, 0));
+    ASSERT_EQU(vl2, 6u);
+    ASSERT_OK(zs_txn_delete(txn, "k", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "y", 1, "CLOB2!", 6, 0));
+    ASSERT_MEM_EQ(v2, "SECOND", 6);
+
+    /* And the transaction's CURRENT view moved on regardless. */
+    ASSERT_EQ(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v3, &vl3, 0),
+              ZS_NOTFOUND);
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-13: reverse inherits A-4 unchanged -- pointers a reverse cursor returned
  * survive later writes through the same transaction. */
 static void test_reverse_a4_lifetime(void)
@@ -14467,6 +14514,8 @@ static struct test_entry tests[] = {
     { "test_fetchprev_sees_txn_writes", test_fetchprev_sees_txn_writes },
     { "test_txn_many_cursors",          test_txn_many_cursors },
     { "test_txn_insert_select_self",    test_txn_insert_select_self },
+    { "test_txn_fetch_survives_overwrite",
+                                        test_txn_fetch_survives_overwrite },
     { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },
 
     { "test_txn_cursor_store_behind_not_yielded",

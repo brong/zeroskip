@@ -1205,6 +1205,13 @@ mutant "cursor: txn re-seek skips the sort" catch \
 mutant "cursor: refresh forgets the start key" catch \
   's/    if \(!c->last_key\) return zsi_cursor_seek_arm_start\(c, fc\);/    if (!c->last_key) return zsi_fcur_seek_first(fc);/'
 
+# A-4.  Freeing a replaced pending value in place dangles every earlier fetch
+# of that key -- found downstream by sqlite-on-zeroskip, whose undo log held
+# exactly such a pointer across the overwrite.  This mutant IS that bug,
+# preserved.
+mutant "txn: replaced pending value freed, not retired" catch \
+  's/            txn->retired\[txn->nretired\+\+\] = txn->pend\[pos\].val;/            free(txn->pend[pos].val);/'
+
 echo
 echo "reverse iteration (D-14k, D-14l, A-12, A-13)"
 
