@@ -112,10 +112,18 @@ table carries enough about the file it describes to prove it belongs to it —
 anything doubtful is ignored and the file is read the old way, so a damaged or
 stale table costs time and never correctness.
 
-It is **off unless asked for**, and the scratch directory must be one the caller
-controls: a table planted by someone else would produce wrong answers rather than
-obvious failure. It must also be discarded whenever the database directory is
-restored from a backup, since a table can outlive the file it describes.
+It is **off unless asked for**, and lives in one of two places the caller
+chooses. A nominated scratch root gives each database its own subdirectory
+there, so one database's housekeeping never wades through another's tables.
+Or, by flag, the tables live in a `zeroskip.cache` directory inside the
+database itself — same trust boundary as the data, deleted with it, carried
+along by a backup — though a read-only handle will never create that
+directory, only use one already present. Either way the location must be one
+the caller controls: a table planted by someone else would produce wrong
+answers rather than obvious failure. A scratch-root cache must be discarded
+whenever the database directory is restored from a backup, since a table
+there can outlive the file it describes; the in-database cache is restored
+with its files and validates against them.
 
 In exchange, opening a database with a large active file goes from around 1.5 ms
 to under 0.1 ms, and a workload committing one record at a time gets about ten
@@ -177,8 +185,9 @@ backwards in time".
   The list of affected keys comes with it, and acting on that list is part of
   the job.
 - **The pointer table cache needs looking after.** It is optional and everything
-  works without it, but if used, its directory has to be scoped to the database —
-  a stale table surviving a restore is the one way it can mislead.
+  works without it. A scratch-root cache has to be scoped to the database
+  instance — a stale table surviving a restore is the one way it can mislead;
+  the in-database option removes that hazard by travelling with the files.
 
 ## Where it fits
 
