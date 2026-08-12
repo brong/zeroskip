@@ -886,6 +886,9 @@ static void test_idxcache_no_fsync_on_publish(void)
     with = sync_calls;
     CHECK(zs_db_store(db, "d", 1, "4", 1, 0) == ZS_OK, "store d");
     with = sync_calls - with;
+    /* Tables live in the per-uuid directory the open resolved (P-2a). */
+    CHECK(db->index_dir != NULL, "cache resolved");
+    snprintf(cachedir, sizeof(cachedir), "%s", db->index_dir);
     zs_db_close(&db);
 
     CHECK(without == 2, "C-7 gates: expected 2 syncs per commit, got %ld",
