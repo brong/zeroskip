@@ -1839,6 +1839,13 @@ run by a shared language-neutral runner over every implementation.
   implementation's source. Every implementation validates against the same
   bytes, and any implementation may generate the corpus — a corpus that only one
   can produce proves nothing.
+- **T-0b Corpus workloads avoid writer-choice-dependent bytes.** A buffered
+  writer coalesces a transaction to one record per key; a streaming writer
+  records its history, later records shadowing earlier by offset (D-17b).
+  Both are conforming, so a corpus operation sequence MUST NOT store or
+  delete the same key twice within one transaction — the resulting bytes
+  would depend on which conforming writer generated them, and T-0's "any
+  implementation may generate" would silently stop being true.
 - **T-0a Driver contract.** Each implementation MUST provide a small executable
   exposing a fixed set of subcommands over a database directory, so one runner
   can drive all of them:
