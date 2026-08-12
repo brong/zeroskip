@@ -1854,7 +1854,7 @@ run by a shared language-neutral runner over every implementation.
   |---|---|
   | `create --uuid U` | create a database with a given UUID, so output is reproducible |
   | `store K V` / `delete K` | one transaction, one operation |
-  | `batch < script` | a sequence of operations in one transaction, so multi-record spans are testable |
+  | `batch < script` | a sequence of operations in one transaction, so multi-record spans are testable; a trailing `abort` line aborts it instead of committing, so a natively written `ROLLBACK` span (C-8) is testable too |
   | `get K` | print the value, or a defined not-found marker |
   | `scan [--prefix P]` | print every visible pair in comparator order |
   | `dump` | print structure — files, generations, spans, record types, offsets |
