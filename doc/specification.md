@@ -1961,11 +1961,14 @@ writer killed mid-span while a reader scans, asserting the reader stops at the
 last valid terminator (C-4f) — the case that shows the terminator checksum, not a
 lock, is what makes reading a live file safe.
 
-**T-10a Steady state.** That the number of unordered files returns to one after
-each rollover, by driving many rollovers through a writer and asserting after each
-that exactly one unordered file remains and the rest are in-order (D-12a). Then a
-backlog: several crashes each leaving an unclean active file, asserting successive
-writers convert them oldest first and the count drains to one.
+**T-10a Steady state.** That the number of unordered files returns to **at
+most** one after each commit — exactly one while the active file remains below
+`rollover_size`, zero immediately after a commit that crossed it and sealed
+(D-25d) — by driving many rollovers through a writer and asserting after each
+commit that no more than one unordered file remains, that any unordered file
+is the newest, and that the rest are in-order (D-12a). Then a backlog: several
+crashes each leaving an unclean active file, asserting successive writers
+convert them oldest first and the count drains.
 
 **T-12 Write-here-read-there.** For every ordered pair of implementations *(A,
 B)*: *A* creates a database and performs a workload; *B* opens it and its `scan`
