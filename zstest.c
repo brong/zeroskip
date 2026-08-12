@@ -10985,7 +10985,7 @@ static void test_idxcache_rejection_rules(void)
  * directory. */
 static void test_idxcache_rejects_bad_term_binding(void)
 {
-    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    char cachedir[PATH_MAX], resolved[PATH_MAX], tabpath[PATH_MAX];
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zsi_idxcfg cfg;
     struct zs_db *db = NULL;
@@ -10997,13 +10997,21 @@ static void test_idxcache_rejects_bad_term_binding(void)
     uint32_t tc = 0, first_term_csum;
 
     idxcache_mkdir(cachedir, sizeof(cachedir));
-    cfg.dir = cachedir;
-    cfg.threshold = 1;
 
     setup.flags = ZS_CREATE;
     setup.index_dir = cachedir;
     setup.index_threshold = 1;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* The loader takes the RESOLVED per-database directory (P-2a).  Pointing
+     * it at the root turned every load below into ZS_NOTFOUND for the wrong
+     * reason and the whole test vacuous -- found by the full mutation run,
+     * where the offset-binding mutant escaped it.  The positive baseline
+     * load below is the guard against that ever happening silently again. */
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+    cfg.dir = resolved;
+    cfg.threshold = 1;
+    cfg.local = false;
 
     /* One record first, so an EARLIER span's terminator is on record.  It is a
      * perfectly valid terminator at a lower offset, which is the only way to
@@ -11043,6 +11051,15 @@ static void test_idxcache_rejects_bad_term_binding(void)
         ASSERT_EQU(rec_off + term.len, rec_vu);
         ASSERT_EQU(term.csum, zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM));
     }
+
+    /* The PRISTINE table loads.  Without this baseline, a load that fails for
+     * an unrelated reason -- a wrong directory, say -- makes every rejection
+     * below pass without testing anything. */
+    ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name, false,
+                           &base, &nbase, &vu, &to, &tc));
+    ASSERT_EQU(nbase, 10u);
+    free(base);
+    base = NULL;
 
     /* A term_csum that is not the terminator's. */
     zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
@@ -14121,6 +14138,69 @@ static void test_txn_insert_select_self(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* D-14k at the arm: the reverse index cursor over a REAL base+delta split.
+ * A key committed in an earlier session lands in the base at open; a store
+ * through the open handle folds into the delta (D-13b) -- so the same key
+ * sits in both arrays with the delta newer, which is the shape the reverse
+ * tie and inclusive-seek rules exist for.  Driven on the internals, because
+ * the API-level tests' write-transaction begins rebuild the snapshot and
+ * quietly empty the delta, which is how two mutants here escaped the suite. */
+static void test_index_cur_reverse_base_delta(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *act;
+    struct zsi_index_cur ic;
+    struct zsi_rec r;
+    size_t off;
+
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "aa", 2, "x", 1, 0));
+    ASSERT_OK(zs_db_store(db, "dup", 3, "1", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "dup", 3, "2", 1, 0));
+
+    act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    ASSERT_NOT_NULL(act->index);
+    /* The tie is real: dup's old record in the base, its new one in the
+     * delta.  If a snapshot rebuild ever collapses this, the test must say
+     * so rather than pass on an empty delta. */
+    ASSERT(act->index->nbase >= 2);
+    ASSERT_EQU(act->index->ndelta, 1u);
+
+    /* From the end: dup's NEWEST record first (delta wins the tie)... */
+    zsi_index_cur_seek_last(act->index, &ic);
+    ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
+    ASSERT_MEM_EQ(r.key, "dup", 3);
+    ASSERT_MEM_EQ(r.val, "2", 1);
+
+    /* ...and stepping past it consumes BOTH sides, so the base's stale copy
+     * never surfaces: the next record is aa, not dup again. */
+    zsi_index_cur_prev(act->index, db->compar, &ic);
+    ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
+    ASSERT_MEM_EQ(r.key, "aa", 2);
+    zsi_index_cur_prev(act->index, db->compar, &ic);
+    ASSERT_EQ(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off),
+              ZS_DONE);
+
+    /* An inclusive reverse seek lands ON the key, and on the DELTA's record. */
+    zsi_index_cur_seek_rev(act->index, db->compar, "dup", 3, true, &ic);
+    ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
+    ASSERT_MEM_EQ(r.key, "dup", 3);
+    ASSERT_MEM_EQ(r.val, "2", 1);
+
+    /* An exclusive one lands strictly below it. */
+    zsi_index_cur_seek_rev(act->index, db->compar, "dup", 3, false, &ic);
+    ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
+    ASSERT_MEM_EQ(r.key, "aa", 2);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-4: a pointer returned for the transaction's OWN pending record survives a
  * later store to the same key.  The replace used to free the old value buffer
  * in place, leaving every earlier fetch of that key dangling -- found
@@ -14514,6 +14594,8 @@ static struct test_entry tests[] = {
     { "test_fetchprev_sees_txn_writes", test_fetchprev_sees_txn_writes },
     { "test_txn_many_cursors",          test_txn_many_cursors },
     { "test_txn_insert_select_self",    test_txn_insert_select_self },
+    { "test_index_cur_reverse_base_delta",
+                                        test_index_cur_reverse_base_delta },
     { "test_txn_fetch_survives_overwrite",
                                         test_txn_fetch_survives_overwrite },
     { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },
