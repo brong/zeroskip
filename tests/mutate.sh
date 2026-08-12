@@ -962,6 +962,25 @@ mutant "seal: converts without the write lock" catch \
 mutant "seal: writes from a read-only handle" catch \
   's/static int zsi_seal\(struct zs_db \*db\)\n\{\n    struct zsi_file \*act;\n    int r = zsi_check_writable\(db\);\n    if \(r != ZS_OK\) return r;/static int zsi_seal(struct zs_db *db)\n{\n    struct zsi_file *act;\n    int r = ZS_OK;/'
 
+# D-25d.  Without the commit-tail seal, a one-transaction bulk load leaves an
+# oversized unordered file that every open must replay and whose conversion the
+# NEXT writer pays for.
+mutant "commit: oversized active never sealed" catch \
+  's/            int sr = zsi_convert_one\(db, oversized\);/            int sr = ZS_OK;/'
+
+# D-25d's gate inverted: every small commit pays a conversion, and the one
+# commit that should seal does not.
+mutant "commit: seal threshold inverted" catch \
+  's/            && oversized->size >= db->rollover_size/            \&\& oversized->size < db->rollover_size/'
+
+# D-25e.  A table published for a file the same commit seals is born stale --
+# but the seal's own refresh sweeps it (P-16) before the commit returns, so the
+# mutant's only effect is a whole table written and immediately unlinked: real
+# wasted I/O, no observable state.  Listed so nobody writes a bogus test
+# chasing it; the skip stays because a bulk-load table is megabytes.
+mutant "commit: publishes a table for the file it seals" equivalent \
+  's/        if \(r == ZS_OK && db->index_dir && !sealing\) \{/        if (r == ZS_OK \&\& db->index_dir) {/'
+
 # D-26.  Skipping the seal leaves the active generation out of the result, so the
 # database never reaches one file.
 mutant "compact: skips the seal" catch \

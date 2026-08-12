@@ -4891,6 +4891,7 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
  * means this one forward declaration, since conversion needs the write path's file
  * writer in turn. */
 static int zsi_convert_pending(struct zs_db *db);
+static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 
 /* Append bytes to a file descriptor, retrying a short write. */
 static int zsi_write_all(int fd, const char *buf, size_t len)
@@ -5277,8 +5278,13 @@ static int zsi_txn_commit(struct zs_txn *txn)
          * uses, and a failure never fails the commit: the records are already
          * durable, and a cache is not something a caller can act on.  Reported
          * once per handle so a broken cache directory is visible without
-         * becoming noise on every commit. */
-        if (r == ZS_OK && db->index_dir) {
+         * becoming noise on every commit.
+         *
+         * D-25e: no table for a file this commit is about to seal.  A table
+         * covers only unordered files (P-1), so it would be born stale and
+         * swept at the next opportunity (P-16). */
+        bool sealing = act->size >= db->rollover_size;
+        if (r == ZS_OK && db->index_dir && !sealing) {
             struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold };
             int pr = zsi_idx_publish(act, &cfg, db->compar, db->nocsum);
 
@@ -5303,6 +5309,24 @@ static int zsi_txn_commit(struct zs_txn *txn)
     if (r == ZS_OK) {
         int cr = zsi_convert_pending(db);
         (void)cr;
+    }
+
+    /* D-25d: a commit that grew the active file past rollover_size seals it
+     * now, while the write lock is still held, so the conversion cost lands on
+     * the transaction that incurred it rather than on the next writer -- the
+     * one case D-12d's bound cannot cover, since a span is never split across
+     * files and a bulk load writes its whole transaction as one span.  After
+     * zsi_convert_pending, so D-12b's oldest-first order holds.  Never fatal:
+     * the records are durable, and an unsealed oversized file is exactly what
+     * D-9a's rollover already recovers at the next commit. */
+    if (r == ZS_OK) {
+        struct zsi_file *oversized = zsi_snapshot_active(db->snap);
+        if (oversized && oversized->hdr_valid
+            && oversized->size >= db->rollover_size
+            && oversized->complete > ZSI_HEADER_LEN) {
+            int sr = zsi_convert_one(db, oversized);
+            if (sr == ZS_OK) (void)zsi_db_refresh(db);
+        }
     }
 
 out:

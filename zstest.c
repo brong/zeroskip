@@ -6624,10 +6624,12 @@ static void test_write_rollover(void)
         ASSERT_OK(zs_db_store(db, k, strlen(k), val, sizeof(val), 0));
     }
 
-    /* Several generations now exist, and D-12a's steady state holds: EXACTLY ONE
+    /* Several generations now exist, and the steady state holds: AT MOST ONE
      * unordered file, the active one, with everything older converted.  The
-     * writer converts before it finishes (D-12), so this is true after any commit
-     * rather than only after an explicit maintenance pass.
+     * writer converts before it finishes (D-12), and a commit that grows the
+     * active file past rollover_size seals it too (D-25d), so this is true
+     * after any commit rather than only after an explicit maintenance pass --
+     * and it is zero, not one, when the last commit was the one that crossed.
      *
      * The active file has no pointer section, because a writer never appends one
      * to an unordered file (D-11). */
@@ -6642,8 +6644,9 @@ static void test_write_rollover(void)
                    || db->snap->files[i]->hdr.end != 0);
         }
     }
-    ASSERT_EQU(nunordered, 1u);
-    ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
+    ASSERT(nunordered <= 1);
+    if (nunordered)
+        ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
 
     /* Every record still reads back, across the file boundaries. */
     for (int i = 0; i < 40; i++) {
@@ -7038,8 +7041,10 @@ static void count_kinds(struct zs_db *db, size_t *unordered, size_t *inorder)
 
 static void test_convert_basic(void)
 {
-    /* A rollover leaves generation 1 unordered; the writer converts it to 1-1
-     * before finishing (D-12), and the data reads back identically. */
+    /* Generation 1 is grown past rollover_size and converted to 1-1 before
+     * the writer finishes -- by the same commit's seal (D-25d), or by rollover
+     * plus the next writer's conversion (D-9a, D-12); either way the data
+     * reads back identically and the input is retired. */
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     char got[512];
@@ -7099,10 +7104,13 @@ static void test_convert_basic(void)
 
 static void test_convert_steady_state(void)
 {
-    /* T-10a: drive many rollovers, asserting after EACH that exactly one
-     * unordered file remains and the rest are in-order (D-12a). */
+    /* T-10a: drive many rollovers, asserting after EACH commit that at most
+     * one unordered file remains -- exactly one while the active file is
+     * below rollover_size, zero right after the commit that crossed it and
+     * sealed (D-25d) -- and the rest are in-order (D-12a). */
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
+    size_t sealed = 0;
 
     clear_db();
     setup.flags = ZS_CREATE;
@@ -7119,16 +7127,24 @@ static void test_convert_steady_state(void)
 
         size_t un, in;
         count_kinds(db, &un, &in);
-        if (un != 1) {
+        if (un > 1) {
             fprintf(stderr, "\n    FAIL after %d writes: %zu unordered files\n",
                     i, un);
             current_test_failed = 1;
             zs_db_close(&db);
             return;
         }
-        /* and the unordered one is the newest */
-        ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
+        /* and any unordered file is the newest */
+        if (un)
+            ASSERT(zsi_file_is_unordered(db->snap->files[db->snap->nfiles - 1]));
+        else
+            sealed++;
     }
+
+    /* The workload crosses rollover_size many times, so the sealed state must
+     * actually have been observed -- otherwise the "at most one" above never
+     * tested anything D-25d changed. */
+    ASSERT(sealed > 0);
 
     /* Every record readable, across all those files. */
     for (int i = 0; i < 30; i++) {
@@ -11721,6 +11737,111 @@ static void test_seal_creates_no_new_generation(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* D-25d: a commit that grows the active file past rollover_size seals it in
+ * the same commit, so a one-transaction bulk load -- cvt_cyrusdb's shape, a
+ * single span the rollover check cannot split -- ends with an in-order file
+ * rather than an oversized unordered one whose conversion the next writer
+ * would have to pay for. */
+static void test_commit_seals_oversized_active(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    char pad[512];
+
+    memset(pad, 'x', sizeof(pad));
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 4096;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (int i = 0; i < 32; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "key%04d", i);
+        ASSERT_OK(zs_txn_store(txn, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* Sealed in place: the only file is in-order 1-1, there is no active
+     * file, and no generation was consumed (D-25a via D-25d). */
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT_EQU(db->snap->files[0]->hdr.start, 1u);
+    ASSERT_EQU(db->snap->files[0]->hdr.end, 1u);
+
+    const char *v = NULL;
+    size_t vl = 0;
+    ASSERT_OK(zs_db_fetch(db, "key0007", 7, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(pad));
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-25d's gate: a commit below rollover_size must NOT seal, or every commit
+ * would pay a conversion and the active file could never grow. */
+static void test_commit_below_rollover_stays_unordered(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 65536;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-25e: the sealing commit publishes no pointer table for the file it
+ * seals.  A table covers only unordered files (P-1), so it would be born
+ * stale and merely wait for a sweep. */
+static void test_seal_at_commit_skips_table_publish(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    char cachedir[PATH_MAX];
+    char pad[512];
+
+    memset(pad, 'x', sizeof(pad));
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE;
+    setup.rollover_size = 4096;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (int i = 0; i < 32; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "key%04d", i);
+        ASSERT_OK(zs_txn_store(txn, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* The commit sealed, and left no table behind. */
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    {
+        DIR *d = opendir(cachedir);
+        struct dirent *de;
+        int ntables = 0;
+
+        ASSERT_NOT_NULL(d);
+        while ((de = readdir(d)) != NULL)
+            if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                         strlen(ZSI_IDX_NAME_PREFIX))) ntables++;
+        closedir(d);
+        ASSERT_EQ(ntables, 0);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* D-25b, A-10: the no-op cases, each ZS_OK and each leaving the set alone. */
 static void test_seal_noop_cases(void)
 {
@@ -13536,6 +13657,12 @@ static struct test_entry tests[] = {
                                         test_seal_converts_the_active_file },
     { "test_seal_creates_no_new_generation",
                                         test_seal_creates_no_new_generation },
+    { "test_commit_seals_oversized_active",
+                                        test_commit_seals_oversized_active },
+    { "test_commit_below_rollover_stays_unordered",
+                                        test_commit_below_rollover_stays_unordered },
+    { "test_seal_at_commit_skips_table_publish",
+                                        test_seal_at_commit_skips_table_publish },
     { "test_seal_noop_cases",           test_seal_noop_cases },
     { "test_seal_readonly",             test_seal_readonly },
     { "test_seal_unclean_active_file",  test_seal_unclean_active_file },
