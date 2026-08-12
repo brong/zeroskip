@@ -651,6 +651,7 @@ filesize-4    4   checksum of the pointer section
 | `zeroskip-<uuid>-<start>-<end>` | immutable | in-order file |
 | `zeroskip.tmp.<pid>.<n>` | transient | staging for a repack or conversion output |
 | `zeroskip.lock` | never replaced or unlinked | holds `fcntl` locks |
+| `zeroskip.cache/` | directory | opt-in pointer table cache (§8, P-2b) |
 
 - **D-0** The `<uuid>` in a filename is the **36-character lowercase hyphenated
   RFC 4122 form** of the header's 16-byte UUID, for example
@@ -1311,11 +1312,13 @@ Opening is recovery; there is no separate pass.
   rolled-back spans contribute nothing.
 - **R-3** A reader MUST NOT write **to the database**. Opening a damaged
   database read-only is side-effect-free: no conversion, no repack, no new
-  active file, no removal. There is no shared cache inside the database for it
-  to update (D-13c). Publishing a pointer table into a separately configured
-  cache directory (§8) is not a write to the database, and a read-only handle
-  MAY do it — which is why P-2 forbids that directory from being the database
-  directory.
+  active file, no removal. There is no shared index inside the database for it
+  to update (D-13c); `zeroskip.cache` (P-2b), when present, is outside the
+  file set — nothing in it parses as a data file (D-2, P-3). Publishing a
+  pointer table (§8) is therefore not a write to the database, and a
+  read-only handle MAY publish into an existing cache directory — but MUST
+  NOT create `zeroskip.cache`, because creating a directory inside the
+  database is a visible side effect.
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
@@ -1346,13 +1349,38 @@ unreadable one.
 - **P-1** A pointer table covers exactly one **unordered** file, identified by
   the database uuid and that file's generation. An in-order file has a pointer
   section (§4.9) and MUST NOT have a table.
-- **P-2** Tables live in a **cache directory** named by the caller. It MUST NOT
-  be the database directory, and an implementation MUST reject that
-  configuration. Writing to a cache directory is therefore not a write to the
-  database, and R-3 is not weakened: a read-only handle MAY publish a table.
-  An implementation MUST NOT choose a cache directory on the caller's behalf —
-  a planted table yields wrong records, and a world-writable default such as
-  `/tmp` would make planting one trivial.
+- **P-2** Tables live in a **cache root** named by the caller, or — when the
+  caller opts in (A-8a) — in the reserved directory `zeroskip.cache` inside
+  the database directory. A configured root MUST NOT be the database
+  directory itself, and an implementation MUST reject that configuration.
+  Beyond those two locations an implementation MUST NOT choose one on the
+  caller's behalf — a planted table yields wrong records, and a
+  world-writable default such as `/tmp` would make planting one trivial. The
+  in-database directory is not such a default: it inherits the database
+  directory's ownership and permissions, so anyone able to plant a table
+  there could already rewrite the data files.
+- **P-2a** Under a configured root, the tables for a database live in the
+  subdirectory named by the database's uuid in D-0's form —
+  `<root>/<uuid>/` — and the staging names of P-4 live there too. An
+  implementation creates that subdirectory as needed; any handle MAY,
+  including a read-only one, because it is outside the database and R-3 is
+  untouched. The root itself is never created (A-8). Scoping by database
+  keeps P-16's sweep proportional to one database's tables rather than to
+  every database sharing the root, and makes "not ours to remove"
+  structural rather than a filename filter.
+- **P-2b** With A-8a's flag, the cache directory is `zeroskip.cache` inside
+  the database directory, holding tables directly — it serves exactly one
+  database, so P-2a's uuid level would be redundant. Only a writable handle
+  creates it; a read-only handle uses it if present and is otherwise simply
+  without a cache, because creating a directory inside the database is a
+  visible side effect R-3 forbids. The cache then shares the database's
+  lifetime: deleting the database directory deletes its tables, which a
+  shared root cannot offer — P-16's sweep runs only for databases that get
+  opened, so a deleted database's tables under a shared root are nobody's to
+  remove. In this directory, and only here, a table whose uuid is not the
+  database's is garbage by construction, and a process MAY remove it — a
+  relaxation of P-16's uuid rule that is safe precisely because the
+  directory belongs to one database.
 - **P-3** A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using
   D-0's uuid form and D-1's generation form. The `zeroskip.` prefix puts it in
   the metadata namespace (D-2), so it can never be parsed as a data file.
@@ -1463,11 +1491,12 @@ unreadable one.
   would add a sync to the commit path, which C-7 defines as exactly two.
 - **P-15** A failure to publish MUST NOT fail the operation that triggered it.
   The data is already durable, and a cache is not something a caller can act on.
-- **P-16** A process MAY unlink tables in the cache directory whose uuid matches
-  its own database and whose generation is not present as an unordered file in
-  its snapshot. Tables carrying another uuid are not its to remove. Unlinking is
-  safe against a concurrent reader: a descriptor already open survives it, and a
-  reader that misses a table replays instead.
+- **P-16** A process MAY unlink tables in its per-database cache directory
+  (P-2a, P-2b) whose uuid matches its own database and whose generation is not
+  present as an unordered file in its snapshot. Tables carrying another uuid
+  are not its to remove — except inside `zeroskip.cache`, where P-2b relaxes
+  this. Unlinking is safe against a concurrent reader: a descriptor already
+  open survives it, and a reader that misses a table replays instead.
 - **P-17** P-10's binding detects a data file whose covered prefix has changed.
   Within the format that cannot happen — files are append-only and generations
   are never reissued (D-9b) — so the check exists for out-of-band events, of
@@ -1475,7 +1504,10 @@ unreadable one.
   directory is the realistic one. It examines one span, so it cannot detect
   divergence confined to an earlier one. A cache directory MUST therefore be
   scoped to the lifetime of the database instance, and a caller that restores a
-  database directory out of band MUST discard its tables.
+  database directory out of band MUST discard its tables. An in-database cache
+  directory (P-2b) travels with its database: a consistent copy restores tables
+  P-11 accepts, and the hazard here arises only when a cache outlives or
+  predates the data files beside it.
 
 Checksumming the whole covered prefix would close P-17 completely, and is
 deliberately not required: the cache's largest benefit on a cold page cache is
@@ -1706,12 +1738,18 @@ different calls, though not every flag is meaningful everywhere:
 - **A-7** `zs_compar` returns negative, zero or positive like `memcmp`, but MUST
   implement F-11a's total order rather than delegating to `memcmp` alone, which
   says nothing about keys of differing length.
-- **A-8** `index_dir` names the pointer table cache directory (§8). A null or
-  absent value disables the cache, which is the default: an implementation MUST
-  NOT choose a directory itself (P-2). Naming the database directory is a usage
-  error (`ZS_BADUSAGE`). The library does not create the directory; a directory
-  that is missing or unwritable disables the cache for that handle rather than
-  failing the open (P-15).
+- **A-8** `index_dir` names the pointer table cache **root** (§8); tables live
+  under `<index_dir>/<uuid>/` (P-2a). A null or absent value disables the
+  cache unless A-8a's flag is set, and disabled is the default: an
+  implementation MUST NOT choose a location itself (P-2). Naming the database
+  directory is a usage error (`ZS_BADUSAGE`). The library creates the
+  per-database subdirectory but never the root; a root that is missing or
+  unwritable disables the cache for that handle rather than failing the open
+  (P-15).
+- **A-8a** `ZS_INDEX_LOCAL` selects P-2b's in-database cache directory,
+  `zeroskip.cache`. Setting it together with a non-null `index_dir` is a
+  usage error (`ZS_BADUSAGE`): the two name different locations for the same
+  tables.
 - **A-9** `index_threshold` is P-13's threshold in bytes. Zero selects an
   implementation-defined default, so a caller that sets `index_dir` and nothing
   else still gets bounded publishing. That default SHOULD be capped below
