@@ -86,6 +86,19 @@ check "batch stored c" "3033" "$($TOOL "$DB" get 63 --hex)"
 check "the batch made one span of four records" "1" \
     "$($TOOL "$DB" dump | grep -c 'records=4')"
 
+# --- batch abort: a natively written ROLLBACK span (T-0a, C-8) ---------------
+# The records were streamed before the abort, so the span exists on disk and
+# the ROLLBACK terminator is what voids it (F-21): the keys must be absent,
+# the file must stay consistent, and a later commit must land cleanly after it.
+printf 'store 6464 3031\nstore 6465 3032\nabort\n' | $TOOL "$DB" batch --hex
+check "aborted store is absent" "NOTFOUND" "$($TOOL "$DB" get 6464 --hex)"
+check "abort left a rollback span" "1" \
+    "$($TOOL "$DB" dump | grep -c 'ROLLBACK')"
+$TOOL "$DB" store 6466 3033 --hex
+check "a commit after the abort lands" "3033" "$($TOOL "$DB" get 6466 --hex)"
+check "check passes over the rollback" "OK" "$($TOOL "$DB" check | tail -1)"
+$TOOL "$DB" delete 6466 --hex
+
 # --- scan: every visible pair, in comparator order ---------------------------
 # Shorter keys sort first (F-11a), so 000a00 precedes 61.
 check "scan output" \

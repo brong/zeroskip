@@ -187,7 +187,9 @@ static int usage(void)
         "\n"
         "batch script lines, tab-separated (space-separated under --hex):\n"
         "  store KEY VAL\n"
-        "  delete KEY\n");
+        "  delete KEY\n"
+        "  abort                  end the batch WITHOUT committing: the\n"
+        "                         streamed records become a ROLLBACK span\n");
     return 2;
 }
 
@@ -308,6 +310,17 @@ int main(int argc, char **argv)
             char *nl = strchr(line, '\n');
             if (nl) *nl = '\0';
             if (!line[0] || line[0] == '#') continue;
+
+            /* T-0a: an abort line ends the batch WITHOUT committing.  The
+             * streaming writer has already appended the records, so this
+             * writes a ROLLBACK span (C-8) -- the reason the operation
+             * exists, since no committing workload can produce one. */
+            if (!strcmp(line, "abort")) {
+                r = zs_txn_abort(&txn);
+                if (r != ZS_OK) oops("abort", r);
+                zs_db_close(&db);
+                return 0;
+            }
 
             char *sp = strchr(line, sep);
             if (!sp) { fprintf(stderr, "zstool: bad batch line\n"); return 2; }
