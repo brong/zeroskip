@@ -959,6 +959,35 @@ The per-file cursors are held in an array kept sorted by:
   advanced cursor stays at or near the front, so the insertion terminates
   immediately. The sources are fixed for the cursor's lifetime, so no file can
   appear or vanish mid-scan (C-4).
+- **D-14k Reverse iteration.** A cursor MAY traverse in descending key order.
+  The sources, the per-source structures, and the visibility rule are exactly
+  D-14's — the array of per-file cursors is instead kept sorted by **current
+  key descending, then generation descending** — so steps 2 through 6 of
+  D-14e apply verbatim, with "advance" meaning one step toward smaller keys
+  and step 1's seek positioning each source on the **largest key ≤ the start
+  key** (or the last key it holds, for an empty start). Equal keys remain
+  contiguous from the front of the array with the newest source first, so
+  duplicate suppression and tombstone filtering are shared with the forward
+  path rather than mirrored (G-7, D-14f). D-14j applies with the direction of
+  travel reversed: a resume is at the first key strictly BELOW the last one
+  yielded (D-14j-b), and positions are still keys, never indexes (D-14j-a).
+  Direction is fixed at open; an implementation need not support turning.
+
+  With a prefix bound (`ZS_CURSOR_PREFIX`), the scan begins at the last key
+  carrying the prefix and stops when a key leaves it. The last such key is
+  found by an exclusive seek at the prefix's byte-successor — the prefix with
+  its last non-`0xFF` byte incremented and everything after it discarded; a
+  prefix of all `0xFF` bytes has no successor, meaning "from the end". That
+  derivation bounds the prefix range only under the default comparator
+  (F-11a): a caller supplying its own comparator MUST NOT combine
+  `ZS_CURSOR_PREFIX` with reverse iteration unless byte-successor is an upper
+  bound for the prefix's keys under that order too.
+- **D-14l Predecessor lookup.** The record with the largest key ≤ K (or
+  strictly < K) MUST be resolved as reverse iteration's first emission from a
+  seek at K — by D-14k over the same sources, not by a second search rule. A
+  tombstone at the largest candidate therefore consumes that key and the
+  answer moves to the next smaller live one, exactly as a forward scan past a
+  tombstone does (G-7).
 
 ### 5.6 Repacking
 
@@ -1695,6 +1724,8 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
 | `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
+| `ZS_FETCHPREV` | fetch | return the record with the largest key ≤ the given key; with `ZS_SKIPROOT`, strictly < (A-12) |
+| `ZS_REVERSE` | cursor | iterate toward smaller keys (D-14k); not valid on `foreach` or with `ZS_CURSOR_LIVE` (A-13) |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
 | `ZS_CURSOR_PREFIX` | foreach, cursor | treat the start key as a prefix and stop when a key leaves it |
 | `ZS_CURSOR_LIVE` | foreach, cursor | also observe writes by other processes (D-14j); costs a re-scan per record |
@@ -1723,6 +1754,14 @@ different calls, though not every flag is meaningful everywhere:
   **Including a traversal already in progress**: a record written from inside a
   `zs_txn_foreach` callback, at a key the traversal has not yet reached, MUST be
   visible to the rest of that traversal (D-14j).
+- **A-1c** A transaction supports **any number of cursors open at once**, and
+  writes through the transaction while they are open. Each cursor observes
+  the write by D-14j; every key or value pointer any of them has returned
+  remains valid by A-4 — a store never invalidates another read's result.
+  Cursors are not thread-safe and this promises nothing across threads (G-5's
+  caveats apply); it promises composition within one caller, which is what a
+  layered consumer — one query touching several key ranges inside one write
+  transaction — depends on.
 - **A-2** There is no `yield` call and no yield flags: readers hold no lock, so
   there is nothing to yield.
 - **A-3** There is no MVCC flag. Snapshot isolation is the only read mode,
@@ -1760,6 +1799,22 @@ different calls, though not every flag is meaningful everywhere:
 - **A-11** `zs_db_compact` performs D-26, returning `ZS_OK` only when the
   database is a single file and `ZS_BADFORMAT` otherwise, having merged whatever
   it could first (D-28).
+- **A-12** `ZS_FETCHPREV` on `zs_db_fetch` and `zs_txn_fetch` returns the
+  record with the largest key ≤ the given key, resolved by D-14l; composed
+  with `ZS_SKIPROOT` the bound is strict (< the given key). The transactional
+  form sees the transaction's own pending writes, like every other read
+  (A-1a). `ZS_FETCHNEXT` and `ZS_FETCHPREV` together are a usage error
+  (`ZS_BADUSAGE`). A-4's lifetime applies to the result unchanged.
+- **A-13** `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor`
+  opens a D-14k cursor: a null or empty start key positions at the last key
+  in the database; a non-empty one at the largest key ≤ it, with
+  `ZS_SKIPROOT` skipping an exact match; `ZS_CURSOR_PREFIX` composes as
+  D-14k describes. `zs_cursor_next` steps toward smaller keys;
+  `zs_cursor_replace` and `zs_cursor_delete` work at the current position
+  unchanged, and A-4 applies to everything yielded. `ZS_REVERSE` with
+  `ZS_CURSOR_LIVE`, or on either `foreach` form, is a usage error
+  (`ZS_BADUSAGE`): neither is needed by any known consumer, and a rejected
+  flag is cheaper than an untested promise.
 
 ## 11. Conformance suite
 
