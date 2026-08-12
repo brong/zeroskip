@@ -83,6 +83,22 @@ store path; `zsi_lookup`'s txn source decodes at `off` via D2. The txn arm's
 `zsi_txn_cur_load` does the same. Values yielded to callers point into D2
 mappings or at pend key copies — both transaction-lifetime stable.
 
+**D8. The terminator checksum is computed by re-reading the streamed span
+through the mapping.** C-4f's checksum covers the span's BYTES plus the
+terminator, and the engine API (`zs_csum`, one-shot — and engine 2 is
+caller-supplied, so no incremental variant is possible) needs them
+contiguous: at commit AND at abort, flush, take `zsi_txn_at(txn, span_base,
+wsize - span_base)` (one mapping covers the whole span by construction), and
+hand that to `zsi_term_encode`. O(span) read at terminator time, O(1)
+memory; the buffered writer paid the same pass over RAM. A ROLLBACK's
+checksum matters as much as a COMMIT's — an invalid rollback span completes
+the file early (F-24) and costs everything after it.
+
+**D9. `zsi_txn_write_span` already has `rollback_only` plumbing** (the
+streaming writer was always intended); the terminator-encode path and its
+A-6 file-engine discipline are reused, the span-buffer accumulation is what
+dies.
+
 ---
 
 ### Task 1: Spec — the streaming writer
