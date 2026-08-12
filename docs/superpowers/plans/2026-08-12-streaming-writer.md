@@ -179,6 +179,22 @@ A-4 note), `CLAUDE.md` ("never produces a ROLLBACK span" bullet flips).
   Full mutate is an overnight job — schedule, don't block.
 - [ ] Commit.
 
+## Parked: offset-only pending keys
+
+The pending array still owns one KEY copy per distinct key (values never):
+memory is O(sum of keylens + 32 bytes per key).  It could drop to offsets
+only -- the committed index already works that way, reading keys in place
+via `zsi_index_key_at` -- but the sorted array is binary-searched on every
+store, and the most-probed keys are the recently-inserted neighbours whose
+records still sit in the unflushed chunk.  Offset-only therefore means
+either flushing per store (killing the write batching) or teaching
+`zsi_txn_at` to serve reads from the chunk, with the caveat that
+chunk-backed pointers are transient and must never escape under A-4.
+The 32-byte entry per key and the D-14j-a cursor position copy remain
+either way, so the win is only the key bytes.  Build it if a real workload
+shows transaction key-sets too big for RAM; not before (Brong, 2026-08-12:
+"just note it for now").
+
 ## Self-Review Notes
 
 - The one-write-path property is the point: no buffered/streamed seam.
