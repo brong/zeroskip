@@ -6364,6 +6364,11 @@ static void test_mp_read_sees_other_process_commit(void)
     const char *v; size_t vl;
     pid_t pid;
 
+    /* Not optional: leaks(1) tracking a forked child hangs, which is the
+     * whole reason make leaks sets the variable -- this test lacking the
+     * guard hung two full verification runs at exactly this line. */
+    SKIP_IF_NO_FORK();
+
     clear_db();
     setup.flags = ZS_CREATE;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
