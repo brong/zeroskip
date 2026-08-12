@@ -78,12 +78,13 @@ check "batch stored a" "3031" "$($TOOL "$DB" get 61 --hex)"
 check "batch deleted b" "NOTFOUND" "$($TOOL "$DB" get 62 --hex)"
 check "batch stored c" "3033" "$($TOOL "$DB" get 63 --hex)"
 
-# Three records, not four: a transaction is a MAP, so `store 62` followed by
-# `delete 62` coalesces to one pending entry (a deletion).  That is what makes
-# read-your-own-writes consistent (A-1a), and it means the span reflects the
-# transaction's final state rather than its history.
-check "the batch made one span of three records" "1" \
-    "$($TOOL "$DB" dump | grep -c 'records=3')"
+# FOUR records, not three: the writer STREAMS (C-8), so `store 62` followed by
+# `delete 62` appends both -- the span reflects the transaction's history, and
+# the later record shadows the earlier by offset order (D-17b).  Reads still
+# see a MAP: the pending index repoints to the newest record per key, which is
+# what keeps read-your-own-writes consistent (A-1a).
+check "the batch made one span of four records" "1" \
+    "$($TOOL "$DB" dump | grep -c 'records=4')"
 
 # --- scan: every visible pair, in comparator order ---------------------------
 # Shorter keys sort first (F-11a), so 000a00 precedes 61.

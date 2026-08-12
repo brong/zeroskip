@@ -14201,6 +14201,106 @@ static void test_index_cur_reverse_base_delta(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* C-8/F-21, the writer side: records were STREAMED before the abort, so the
+ * ROLLBACK terminator is the only thing keeping a later commit's span from
+ * enclosing them.  Both ways of getting it wrong are fatal: no terminator
+ * corrupts or resurrects, a COMMIT terminator resurrects outright. */
+static void test_stream_abort_writes_rollback(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "dead1", 5, "x", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "dead2", 5, "y", 1, 0));
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0),
+              ZS_NOTFOUND);
+
+    /* A later commit into the same file: its span begins after the rolled-
+     * back one and must not disturb or be disturbed by it. */
+    ASSERT_OK(zs_db_store(db, "live", 4, "z", 1, 0));
+    ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQ(zs_db_fetch(db, "dead2", 5, NULL, NULL, &v, &vl, 0),
+              ZS_NOTFOUND);
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And through a fresh replay (F-25 skipping the ROLLBACK span). */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "z", 1);
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0),
+              ZS_NOTFOUND);
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* The point of streaming (C-8): transaction memory is O(keys), and the
+ * mapping list that backs A-4 grows LOGARITHMICALLY -- so this asserts the
+ * map count against the bound, exercises the chunk-flush boundary and the
+ * bigger-than-the-chunk direct write, and holds a pointer from before
+ * megabytes of later writes to prove growth never invalidates it. */
+static void test_stream_bounded_memory(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v1 = NULL, *v = NULL;
+    size_t vl1 = 0, vl = 0;
+    char big[8192];
+    char *huge;
+
+    memset(big, 'v', sizeof(big));
+    huge = malloc(200 * 1024);
+    ASSERT_NOT_NULL(huge);
+    memset(huge, 'H', 200 * 1024);
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    ASSERT_OK(zs_txn_store(txn, "early", 5, "EARLY", 5, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "early", 5, NULL, NULL, &v1, &vl1, 0));
+    ASSERT_EQU(vl1, 5u);
+
+    for (int i = 0; i < 600; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%04d", i);
+        ASSERT_OK(zs_txn_store(txn, k, strlen(k), big, sizeof(big), 0));
+    }
+    /* Bigger than the chunk buffer: the direct-write path. */
+    ASSERT_OK(zs_txn_store(txn, "huge", 4, huge, 200 * 1024, 0));
+
+    /* Read back from the middle, which maps the grown file. */
+    ASSERT_OK(zs_txn_fetch(txn, "k0300", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(big));
+
+    /* ~5MB streamed: the mapping list is logarithmic, not linear. */
+    ASSERT(txn->nmaps <= 16);
+
+    /* And the pointer from before all of it still reads back (A-4): the
+     * mapping it points into was never unmapped by the growth. */
+    ASSERT_MEM_EQ(v1, "EARLY", 5);
+
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    ASSERT_OK(zs_db_fetch(db, "k0599", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(big));
+    ASSERT_OK(zs_db_fetch(db, "huge", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 200u * 1024u);
+    ASSERT_MEM_EQ(v, huge, 200 * 1024);
+
+    free(huge);
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-4: a pointer returned for the transaction's OWN pending record survives a
  * later store to the same key.  The replace used to free the old value buffer
  * in place, leaving every earlier fetch of that key dangling -- found
@@ -14596,6 +14696,9 @@ static struct test_entry tests[] = {
     { "test_txn_insert_select_self",    test_txn_insert_select_self },
     { "test_index_cur_reverse_base_delta",
                                         test_index_cur_reverse_base_delta },
+    { "test_stream_abort_writes_rollback",
+                                        test_stream_abort_writes_rollback },
+    { "test_stream_bounded_memory",     test_stream_bounded_memory },
     { "test_txn_fetch_survives_overwrite",
                                         test_txn_fetch_survives_overwrite },
     { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },

@@ -114,6 +114,11 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * with how large the caller lets a generation grow. */
 #define ZSI_DEFAULT_INDEX_THRESHOLD (32 * 1024)
 
+/* The streaming writer's append buffer (C-8): stores batch into it, so a
+ * store is a memcpy rather than a syscall, and it flushes whenever a read
+ * needs bytes it still holds and at every terminator. */
+#define ZSI_TXN_CHUNK (64 * 1024)
+
 /********** LIBRARY SUPPORT *************/
 
 static void *zsi_zmalloc(size_t bytes)
@@ -4942,13 +4947,36 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 
 /********** WRITE PATH *************/
 
-/* A transaction's own uncommitted records: owned copies, sorted by key.
+/* Defined further down this section; the streaming store needs them first. */
+static int zsi_write_all(int fd, const char *buf, size_t len);
+static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
+static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
+                                 uint32_t active_start,
+                                 const char *key, size_t keylen);
+
+/* A transaction's own uncommitted records: a sorted KEY -> OFFSET index over
+ * records already streamed into the active file (C-8's shape).  The key is an
+ * owned copy -- the sorted index and D-14j-a's key-based cursor positions need
+ * it -- but the VALUE lives in the file: transaction memory is O(keys), never
+ * O(bytes written), so a terabyte transaction does not eat a terabyte of RAM.
  *
  * They are the highest-priority source in D-14's table, visible to subsequent
- * reads on the same transaction and to nothing else until commit (A-1a). */
+ * reads on the same transaction and to nothing else until commit (A-1a).
+ * A same-key overwrite appends a new record and repoints `off`; the old
+ * record becomes a shadowed version in the span, exactly like a shadowed
+ * version across spans, and vanishes at the file's next conversion. */
 struct zsi_pending {
     char   *key;  size_t keylen;
-    char   *val;  size_t vallen;      /* val == NULL is a deletion (A-1) */
+    size_t  off;                      /* record offset in the active file */
+    size_t  len;                      /* its encoded length */
+};
+
+/* One read-only mapping of the active file.  A transaction accumulates these
+ * and unmaps NOTHING until it ends: that is what keeps every pointer any of
+ * its reads returned valid for its whole lifetime (A-4) with no copies. */
+struct zsi_txnmap {
+    char  *base;
+    size_t len;
 };
 
 struct zs_txn {
@@ -4970,16 +4998,30 @@ struct zs_txn {
      * would not be (D-14j). */
     unsigned long        pend_seq;
 
-    /* Value buffers REPLACED by a later store to the same key, kept until the
-     * transaction ends.  A-4 promises that pointers a read returned stay valid
-     * for the transaction's lifetime, and a fetch of a pending record returns
-     * the buffer itself -- so replacing in place and freeing dangles every
-     * earlier fetch of that key.  Found downstream (sqlite-on-zeroskip), whose
-     * undo log held exactly such a pointer across the overwrite.  The cost is
-     * bounded by what the caller overwrote, in a transaction that must fit in
-     * memory anyway. */
-    char               **retired;
-    size_t               nretired, aretired;
+    /* Streaming state (C-8).  The active file is chosen at the FIRST store --
+     * the write lock is held from begin, so D-9's rules apply identically,
+     * only the moment moves -- and records are appended as they are stored,
+     * through a small chunk buffer that is flushed whenever a read needs
+     * bytes it still holds.
+     *
+     * wsize is the file's logical size including the unflushed chunk;
+     * flushed is what has reached the fd.  A read maps the file on demand,
+     * each new mapping at least DOUBLING the last (and mapping ahead of EOF,
+     * which MAP_SHARED fills in as the file grows), so a transaction holds
+     * O(log bytes) mappings and unmaps none of them until it ends (A-4). */
+    int                  wfd;         /* -1 until the first store */
+    bool                 broken;      /* a stream failure poisoned the span:
+                                         commit MUST refuse (see zsi_pend_set) */
+    uint32_t             wgen;        /* generation being appended to */
+    zs_csum             *wcs;         /* the FILE's engine (A-6, F-5a) */
+    unsigned             wcsum_id;
+    size_t               span_base;   /* where this transaction's span begins */
+    size_t               wsize;
+    size_t               flushed;
+    char                *chunk;
+    size_t               chunklen, chunkcap;
+    struct zsi_txnmap   *maps;
+    size_t               nmaps, amaps;
 };
 
 static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
@@ -5006,15 +5048,161 @@ static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
 
 static void zsi_pend_clear(struct zs_txn *txn)
 {
-    for (size_t i = 0; i < txn->npend; i++) {
+    for (size_t i = 0; i < txn->npend; i++)
         free(txn->pend[i].key);
-        free(txn->pend[i].val);
-    }
     txn->npend = 0;
 }
 
+/* Flush the chunk buffer to the fd.  Called before any read that needs bytes
+ * the buffer still holds, and at every terminator. */
+static int zsi_txn_flush(struct zs_txn *txn)
+{
+    if (!txn->chunklen) return ZS_OK;
+    int r = zsi_write_all(txn->wfd, txn->chunk, txn->chunklen);
+    if (r != ZS_OK) return r;
+    txn->flushed += txn->chunklen;
+    txn->chunklen = 0;
+    return ZS_OK;
+}
+
+/* Append bytes to the transaction's stream, batching small records so a
+ * store is not a syscall. */
+static int zsi_txn_stream(struct zs_txn *txn, const char *buf, size_t len)
+{
+    if (txn->chunklen + len > txn->chunkcap) {
+        int r = zsi_txn_flush(txn);
+        if (r != ZS_OK) return r;
+        if (len >= txn->chunkcap) {
+            r = zsi_write_all(txn->wfd, buf, len);
+            if (r != ZS_OK) return r;
+            txn->flushed += len;
+            txn->wsize += len;
+            return ZS_OK;
+        }
+    }
+    memcpy(txn->chunk + txn->chunklen, buf, len);
+    txn->chunklen += len;
+    txn->wsize += len;
+    return ZS_OK;
+}
+
+/* Bytes [off, off+len) of the active file, valid until the TRANSACTION ends.
+ *
+ * This is A-4's mechanism for the transaction's own records: mappings
+ * accumulate -- each new one at least doubles the last and may extend past
+ * the current EOF, which MAP_SHARED fills in as the file grows -- and none
+ * is unmapped until the transaction ends, so no pointer a read returned is
+ * ever invalidated.  O(log bytes) mappings, total address space at most a
+ * small multiple of the final size, zero copies.  Never dereferences past
+ * wsize, so the beyond-EOF tail of a mapping is never touched. */
+static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len)
+{
+    size_t need = off + len;
+
+    if (need < off) return NULL;                    /* overflow */
+    if (need > txn->wsize) return NULL;
+
+    /* Flush BEFORE the covering-mapping early return: a record still in the
+     * chunk buffer is not in the file yet, and a mapping large enough to
+     * cover its offset happily shows the stale bytes there instead. */
+    if (need > txn->flushed && zsi_txn_flush(txn) != ZS_OK) return NULL;
+
+    if (txn->nmaps && need <= txn->maps[txn->nmaps - 1].len)
+        return txn->maps[txn->nmaps - 1].base + off;
+
+    size_t want = need;
+    if (txn->nmaps && want < txn->maps[txn->nmaps - 1].len * 2)
+        want = txn->maps[txn->nmaps - 1].len * 2;
+    if (want < (size_t)1 << 20) want = (size_t)1 << 20;
+
+    if (txn->nmaps == txn->amaps) {
+        size_t grow = txn->amaps ? txn->amaps * 2 : 8;
+        struct zsi_txnmap *p = realloc(txn->maps, grow * sizeof(*p));
+        if (!p) return NULL;
+        txn->maps = p;
+        txn->amaps = grow;
+    }
+
+    void *m = mmap(NULL, want, PROT_READ, MAP_SHARED, txn->wfd, 0);
+    if (m == MAP_FAILED) {
+        /* Mapping ahead of EOF can be refused; the exact size cannot, short
+         * of a real failure. */
+        want = need;
+        m = mmap(NULL, want, PROT_READ, MAP_SHARED, txn->wfd, 0);
+        if (m == MAP_FAILED) return NULL;
+    }
+
+    txn->maps[txn->nmaps].base = (char *)m;
+    txn->maps[txn->nmaps].len = want;
+    txn->nmaps++;
+
+    return txn->maps[txn->nmaps - 1].base + off;
+}
+
+/* First store: choose the file this transaction streams into (D-9 applied at
+ * the first store rather than at commit -- the write lock is held from begin,
+ * so only the moment moves), pin the snapshot the rollover may have replaced,
+ * and record the FILE's checksum engine (A-6, F-5a): using the handle's
+ * engine to checksum a span appended to a file recording a different one is
+ * silent data loss -- the terminator validates under neither, so the next
+ * reader rejects the whole span (F-22 doing its job). */
+static int zsi_txn_stream_begin(struct zs_txn *txn)
+{
+    struct zs_db *db = txn->db;
+
+    if (txn->wfd >= 0) return ZS_OK;
+
+    int fd;
+    uint32_t gen;
+    int r = zsi_writer_active(db, &fd, &gen);
+    if (r != ZS_OK) return r;
+
+    /* The snapshot may have been replaced by a rollover, and both the
+     * ancestor search and this transaction's own reads must see the file set
+     * as it is now. */
+    zsi_snapshot_release(&txn->snap);
+    txn->snap = db->snap;
+    txn->snap->refcount++;
+
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    zs_csum *cs = act && act->hdr_valid
+                ? act->csum
+                : zsi_csum_for_id(db->create_csum_id, db->external_csum);
+    unsigned csum_id = act && act->hdr_valid ? act->csum_id
+                                             : db->create_csum_id;
+    if (!cs) { close(fd); return ZS_BADUSAGE; }
+
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) { close(fd); return ZS_IOERROR; }
+
+    if (!txn->chunk) {
+        txn->chunk = malloc(ZSI_TXN_CHUNK);
+        if (!txn->chunk) { close(fd); return ZS_INTERNAL; }
+        txn->chunkcap = ZSI_TXN_CHUNK;
+    }
+
+    txn->wfd = fd;
+    txn->wgen = gen;
+    txn->wcs = cs;
+    txn->wcsum_id = csum_id;
+    txn->span_base = (size_t)sb.st_size;
+    txn->wsize = (size_t)sb.st_size;
+    txn->flushed = (size_t)sb.st_size;
+
+    return ZS_OK;
+}
+
 /* Record a write.  val == NULL is a deletion; a non-NULL zero-length value is an
- * empty value, and the two are distinct states (A-1, F-14). */
+ * empty value, and the two are distinct states (A-1, F-14).
+ *
+ * The record is encoded and STREAMED here (C-8); only the key and the record's
+ * offset are kept.  The ancestor is computed now, against the transaction's
+ * snapshot: repack can change the file SET mid-transaction, but never which
+ * generation range holds a key's previous version -- an output covers its
+ * inputs' ranges (D-5a) and ancestors resolve by range (F-16c).  An intra-
+ * transaction overwrite needs no special case: the previous version is in the
+ * active file, so the ancestor is the active generation and F-17 omits it --
+ * the same answer zsi_ancestor_for gives for a create. */
 static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
                         const char *val, size_t vallen)
 {
@@ -5026,51 +5214,65 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
      * misses a write, and only one of those is a bug (D-14j). */
     txn->pend_seq++;
 
-    char *kcopy = NULL, *vcopy = NULL;
+    int r = zsi_txn_stream_begin(txn);
+    if (r != ZS_OK) return r;
+
+    uint32_t anc = zsi_ancestor_for(txn->db, txn->snap, txn->wgen,
+                                    key, keylen);
+    bool store_anc = (anc != txn->wgen);            /* F-17 */
+
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, store_anc);
+    if (!n) return ZS_BADUSAGE;
+
+    /* One record's transient encode buffer -- the only per-store allocation
+     * proportional to the VALUE, gone before this returns. */
+    char *rec = malloc(n);
+    if (!rec) return ZS_INTERNAL;
+    zsi_rec_encode(rec, txn->wcs, key, keylen, val, vallen, store_anc, anc);
+
+    /* EVERYTHING fallible happens before the stream: a streamed record MUST
+     * be indexed, or this handle's fold at commit would disagree with every
+     * other reader's replay of the same span. */
+    char *kcopy = NULL;
     if (!found) {
         kcopy = malloc(keylen);
-        if (!kcopy) return ZS_INTERNAL;
+        if (!kcopy) { free(rec); return ZS_INTERNAL; }
         memcpy(kcopy, key, keylen);
+
+        if (txn->npend == txn->apend) {
+            size_t want = txn->apend ? txn->apend * 2 : 16;
+            struct zsi_pending *p = realloc(txn->pend, want * sizeof(*p));
+            if (!p) { free(kcopy); free(rec); return ZS_INTERNAL; }
+            txn->pend = p;
+            txn->apend = want;
+        }
     }
-    if (val) {
-        vcopy = malloc(vallen ? vallen : 1);
-        if (!vcopy) { free(kcopy); return ZS_INTERNAL; }
-        if (vallen) memcpy(vcopy, val, vallen);
+
+    size_t off = txn->wsize;
+    r = zsi_txn_stream(txn, rec, n);
+    free(rec);
+    if (r != ZS_OK) {
+        /* A short write may have left a torn record inside the span.  The
+         * transaction is POISONED: commit must refuse, because a COMMIT
+         * terminator over a torn record makes replay complete the file at
+         * the tear (F-24) and lose the span. */
+        txn->broken = true;
+        free(kcopy);
+        return r;
     }
 
     if (found) {
-        /* RETIRE the old buffer, never free it: a fetch of this key handed it
-         * out under A-4's transaction-lifetime promise.  Capacity is ensured
-         * before the swap, so a failure changes nothing. */
-        if (txn->pend[pos].val) {
-            if (txn->nretired == txn->aretired) {
-                size_t want = txn->aretired ? txn->aretired * 2 : 8;
-                char **p = realloc(txn->retired, want * sizeof(*p));
-                if (!p) { free(vcopy); return ZS_INTERNAL; }
-                txn->retired = p;
-                txn->aretired = want;
-            }
-            txn->retired[txn->nretired++] = txn->pend[pos].val;
-        }
-        txn->pend[pos].val = vcopy;
-        txn->pend[pos].vallen = val ? vallen : 0;
+        txn->pend[pos].off = off;
+        txn->pend[pos].len = n;
         return ZS_OK;
-    }
-
-    if (txn->npend == txn->apend) {
-        size_t want = txn->apend ? txn->apend * 2 : 16;
-        struct zsi_pending *p = realloc(txn->pend, want * sizeof(*p));
-        if (!p) { free(kcopy); free(vcopy); return ZS_INTERNAL; }
-        txn->pend = p;
-        txn->apend = want;
     }
 
     memmove(txn->pend + pos + 1, txn->pend + pos,
             (txn->npend - pos) * sizeof(*txn->pend));
     txn->pend[pos].key = kcopy;
     txn->pend[pos].keylen = keylen;
-    txn->pend[pos].val = vcopy;
-    txn->pend[pos].vallen = val ? vallen : 0;
+    txn->pend[pos].off = off;
+    txn->pend[pos].len = n;
     txn->npend++;
 
     return ZS_OK;
@@ -5163,13 +5365,16 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
     }
     if (ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
 
+    /* The record was streamed to the active file when it was stored (C-8);
+     * decode it back through the transaction's accumulated mappings, whose
+     * pointers live until the transaction ends (A-4). */
     struct zsi_pending *p = &txn->pend[ti];
-    memset(&fc->cur, 0, sizeof(fc->cur));
-    fc->cur.type = p->val ? ZSI_KEYVALUE : ZSI_DELETION;
-    fc->cur.key = p->key;
-    fc->cur.keylen = p->keylen;
-    fc->cur.val = p->val;
-    fc->cur.vallen = p->vallen;
+    const char *b = zsi_txn_at(txn, p->off, p->len);
+    if (!b
+        || zsi_rec_decode(b, p->len, txn->wgen, &fc->cur) != ZS_OK) {
+        fc->exhausted = true;
+        return ZS_IOERROR;
+    }
     fc->exhausted = false;
 
     return ZS_OK;
@@ -5291,7 +5496,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
     if (act && zsi_unordered_is_clean(act)
             && act->size < db->rollover_size) {
         snprintf(path, sizeof(path), "%s", act->fname);
-        int fd = open(path, O_WRONLY | O_APPEND);
+        int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
         if (fd < 0) return ZS_IOERROR;
         *fdp = fd;
         *genp = act->hdr.start;
@@ -5317,7 +5522,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 
     zsi_name_format(name, db->uuid, next, 0);
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
-    int fd = open(path, O_WRONLY | O_APPEND);
+    int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
     if (fd < 0) return ZS_IOERROR;
 
     *fdp = fd;
@@ -5341,107 +5546,64 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
  * C-7c: ZS_NOSYNC omits BOTH gates.  Atomicity survives, because a torn tail is
  * still detectable (F-22); durability does not, and neither does C-7a's ordering
  * guarantee. */
-static int zsi_txn_write_span(struct zs_txn *txn, int fd, uint32_t active_start,
-                              zs_csum *cs, unsigned csum_id,
-                              bool rollback_only, size_t base_off,
-                              size_t **offs_out, size_t *noffs_out,
-                              size_t *term_off_out, uint32_t *term_csum_out)
+static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
+                             size_t *term_off_out, uint32_t *term_csum_out)
 {
     struct zs_db *db = txn->db;
-    char *span = NULL;
-    size_t spanlen = 0, alloc = 0;
-    size_t *offs = NULL, noffs = 0;
-    int r = ZS_OK;
+    size_t spanlen = txn->wsize - txn->span_base;
 
-    if (offs_out) { *offs_out = NULL; *noffs_out = 0; }
+    int r = zsi_txn_flush(txn);
+    if (r != ZS_OK) return r;
 
-    if (!rollback_only && txn->npend) {
-        offs = malloc(txn->npend * sizeof(*offs));
-        if (!offs) return ZS_INTERNAL;
+    /* The terminator's checksum covers the span's BYTES plus the terminator
+     * (C-4f), the engine is one-shot -- and engine 2 is the caller's, so no
+     * incremental variant is possible -- so the streamed span is re-read
+     * through the mapping: one warm pass, where the buffered writer paid the
+     * same pass over RAM.  A ROLLBACK's checksum matters as much as a
+     * COMMIT's: an invalid rolled-back span completes the file early (F-24)
+     * and costs everything after it. */
+    const char *span = zsi_txn_at(txn, txn->span_base, spanlen);
+    if (!span) return ZS_IOERROR;
+
+    /* Gate 1: the data records, then a sync.  If this fails, no terminator
+     * was written, so the transaction plainly did not happen (C-7a).  C-8: an
+     * abort syncs NEITHER gate -- the next commit's own gate 1 is what orders
+     * the ROLLBACK ahead of the next COMMIT terminator (C-8a). */
+    if (!db->nosync && !rollback) {
+        if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
     }
 
-    if (!rollback_only) {
-        for (size_t i = 0; i < txn->npend; i++) {
-            struct zsi_pending *p = &txn->pend[i];
-
-            uint32_t anc = zsi_ancestor_for(db, txn->snap, active_start,
-                                            p->key, p->keylen);
-            bool store_anc = (anc != active_start);      /* F-17 */
-
-            size_t n = zsi_rec_encoded_len(p->keylen, p->vallen,
-                                           p->val == NULL, store_anc);
-            if (!n) { free(span); free(offs); return ZS_BADUSAGE; }
-
-            if (spanlen + n > alloc) {
-                size_t want = alloc ? alloc * 2 : 4096;
-                while (want < spanlen + n) want *= 2;
-                char *q = realloc(span, want);
-                if (!q) { free(span); free(offs); return ZS_INTERNAL; }
-                span = q;
-                alloc = want;
-            }
-
-            zsi_rec_encode(span + spanlen, cs, p->key, p->keylen, p->val,
-                           p->vallen, store_anc, anc);
-            if (offs) offs[noffs++] = base_off + spanlen;
-            spanlen += n;
-        }
-    }
-
-    /* Gate 1: the data records, then a sync.  If this fails, no terminator was
-     * written, so the transaction plainly did not happen (C-7a). */
-    if (spanlen) {
-        r = zsi_write_all(fd, span, spanlen);
-        if (r != ZS_OK) { free(span); free(offs); return r; }
-    }
-
-    if (!db->nosync && !rollback_only) {
-        if (ZS_FDATASYNC(fd) < 0) { free(span); free(offs); return ZS_IOERROR; }
-    }
-
-    /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may or
-     * may not be durable -- and either outcome is correct, so the error is
-     * reported and nothing else is done.
-     *
-     * An implementation MUST NOT retry a failed sync and treat success as
-     * evidence the data survived: a second call can succeed after the dirty pages
-     * were discarded.  Retrying a failed syscall is the reflex, which is why this
-     * says so at the call site rather than only in the spec. */
     char term[ZSI_TERMLEN_LONG];
     size_t termlen = zsi_term_encoded_len((uint64_t)spanlen);
 
-    /* The engine is the ACTIVE FILE'S, not this handle's.
+    /* The engine is the ACTIVE FILE'S, not this handle's (A-6, F-5a) --
+     * recorded at the first store, where the file was chosen. */
+    zsi_term_encode(term, (uint64_t)spanlen, rollback, span,
+                    txn->wcs, txn->wcsum_id);
+
+    r = zsi_write_all(txn->wfd, term, termlen);
+    if (r != ZS_OK) return r;
+    txn->flushed += termlen;
+    txn->wsize += termlen;
+
+    /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may
+     * or may not be durable -- and either outcome is correct, so the error is
+     * reported and nothing else is done.
      *
-     * A-6: a ZS_CSUM_* flag chooses the engine for files this handle CREATES; it
-     * never overrides what an existing file records, because each file's engine
-     * comes from its own header (F-5a).  Using the handle's engine to checksum a
-     * span appended to a file that records a different one is silent data loss:
-     * the terminator validates under neither engine, so the next reader rejects
-     * the span (F-22 doing exactly its job) and every record in it vanishes. */
-    zsi_term_encode(term, (uint64_t)spanlen, rollback_only,
-                    span ? span : "", cs, csum_id);
-
-    r = zsi_write_all(fd, term, termlen);
-    free(span);
-    if (r != ZS_OK) { free(offs); return r; }
-
-    /* C-8: an aborted transaction appends a ROLLBACK and syncs NEITHER gate.  If
-     * a crash loses it the active file is simply no longer clean, so the next
-     * writer moves to a new file and reaches the same state.  Nothing is being
-     * promised to a caller, so there is nothing to make durable. */
-    if (!db->nosync && !rollback_only) {
-        if (ZS_FDATASYNC(fd) < 0) { free(offs); return ZS_IOERROR; }
+     * An implementation MUST NOT retry a failed sync and treat success as
+     * evidence the data survived: a second call can succeed after the dirty
+     * pages were discarded.  Retrying a failed syscall is the reflex, which
+     * is why this says so at the call site rather than only in the spec. */
+    if (!db->nosync && !rollback) {
+        if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
     }
-
-    if (offs_out) { *offs_out = offs; *noffs_out = noffs; }
-    else free(offs);
 
     /* Where the terminator landed and what checksum it carries (P-10).  Handed
      * back rather than recovered later because terminators are only ever found
      * by scanning FORWARD (F-20): a caller that skipped the replay -- which is
      * the whole point of the incremental index path -- has no other way to know,
      * and re-walking the span it just wrote would checksum it twice. */
-    if (term_off_out) *term_off_out = base_off + spanlen;
+    if (term_off_out) *term_off_out = txn->span_base + spanlen;
     if (term_csum_out) *term_csum_out = zsi_get32(term + termlen - 4);
 
     return ZS_OK;
@@ -5453,8 +5615,16 @@ static void zsi_txn_free(struct zs_txn *txn)
 
     zsi_pend_clear(txn);
     free(txn->pend);
-    for (size_t i = 0; i < txn->nretired; i++) free(txn->retired[i]);
-    free(txn->retired);
+
+    /* The mappings outlive every pointer this transaction's reads returned
+     * (A-4), so HERE -- the end of the transaction -- is the first moment any
+     * of them may go. */
+    for (size_t i = 0; i < txn->nmaps; i++)
+        munmap(txn->maps[i].base, txn->maps[i].len);
+    free(txn->maps);
+    free(txn->chunk);
+    if (txn->wfd >= 0) close(txn->wfd);
+
     zsi_snapshot_release(&txn->snap);
     free(txn);
 }
@@ -5474,6 +5644,7 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
     if (!txn) return ZS_INTERNAL;
     txn->db = db;
     txn->readonly = shared;
+    txn->wfd = -1;              /* no stream until the first store */
 
     if (!shared) {
         /* The write lock is held for the whole transaction (C-1).  A read
@@ -5515,7 +5686,7 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
 static int zsi_txn_commit(struct zs_txn *txn)
 {
     struct zs_db *db = txn->db;
-    int fd = -1, r;
+    int r;
     uint32_t gen = 0;
     size_t *offs = NULL, noffs = 0;
     size_t term_off = 0;
@@ -5523,43 +5694,45 @@ static int zsi_txn_commit(struct zs_txn *txn)
 
     if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
 
-    /* Nothing to write: no span, no syncs, no rollover.  An empty transaction is
-     * not an error and must not leave a trace. */
-    if (txn->npend == 0) {
+    /* Nothing streamed: no span, no syncs, no trace.  An empty transaction is
+     * not an error.  (An open stream with nothing appended is the same case:
+     * a failed first store may have chosen the file and then written
+     * nothing, and the file is exactly as it was.) */
+    if (txn->wfd < 0 || txn->wsize == txn->span_base) {
         db->write_txn = NULL;
         zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
         zsi_txn_free(txn);
         return ZS_OK;
     }
 
-    r = zsi_writer_active(db, &fd, &gen);
+    /* A stream failure left a possibly-torn record inside the span.  A
+     * COMMIT terminator over it would make replay complete the file at the
+     * tear (F-24) and lose the whole span -- so refuse, and void the span
+     * the way an abort does (C-8). */
+    if (txn->broken) {
+        (void)zsi_txn_terminate(txn, true, NULL, NULL);
+        r = ZS_IOERROR;
+        goto out;
+    }
+
+    /* The records are already on disk (C-8): everything between the two
+     * gates is the terminator's. */
+    r = zsi_txn_terminate(txn, false, &term_off, &term_csum);
     if (r != ZS_OK) goto out;
 
-    /* The snapshot may have been replaced by a rollover, and the ancestor search
-     * must see the file set as it is now. */
-    zsi_snapshot_release(&txn->snap);
-    txn->snap = db->snap;
-    txn->snap->refcount++;
-
+    gen = txn->wgen;
     struct zsi_file *act = zsi_snapshot_active(db->snap);
-    size_t base_off = act ? act->size : 0;
 
-    /* The engine the file we are appending to records (A-6, F-5a).  A file whose
-     * header did not validate has no engine to honour, so a newly created file's
-     * engine is used instead -- but that case cannot arise here, because an
-     * unclean file is never appended to (D-9). */
-    zs_csum *cs = act && act->hdr_valid
-                ? act->csum
-                : zsi_csum_for_id(db->create_csum_id, db->external_csum);
-    unsigned csum_id = act && act->hdr_valid ? act->csum_id
-                                             : db->create_csum_id;
-    if (!cs) { r = ZS_BADUSAGE; goto out; }
-
-    r = zsi_txn_write_span(txn, fd, gen, cs, csum_id, false, base_off,
-                           &offs, &noffs, &term_off, &term_csum);
-    close(fd);
-    fd = -1;
-    if (r != ZS_OK) goto out;
+    /* The D-13b fold takes its offsets from the pending index: the FINAL
+     * record per key, which is exactly what D-13a wants folded -- a version
+     * this transaction itself overwrote is shadowed inside the span, and
+     * replay resolves it by offset order (D-17b) just as the fold does by
+     * skipping it here. */
+    offs = malloc(txn->npend * sizeof(*offs));
+    if (offs) {
+        for (size_t i = 0; i < txn->npend; i++) offs[i] = txn->pend[i].off;
+        noffs = txn->npend;
+    }
 
     /* D-13b: a writer is a reader that also maintains the active file's index
      * INCREMENTALLY.  It already knows every record it appended, so it folds them
@@ -5656,41 +5829,38 @@ static int zsi_txn_commit(struct zs_txn *txn)
 
 out:
     free(offs);
-    if (fd >= 0) close(fd);
     db->write_txn = NULL;
     zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
     zsi_txn_free(txn);
     return r;
 }
 
-/* Abort.
+/* Abort (C-8, F-21).
  *
- * This writer BUFFERS a transaction's records in memory and writes them only at
- * commit, so an abort has nothing on disk to void and writes nothing at all -- not
- * even a ROLLBACK.
+ * The records were streamed to the active file as they were stored, so the
+ * abort MUST void them: without a ROLLBACK terminator, a later commit's span
+ * would begin before the aborted records and enclose them, making them live.
+ * The ROLLBACK syncs neither gate (C-8) -- the next commit's own first gate
+ * orders it ahead of the next COMMIT terminator (C-8a), and a crash that
+ * loses it leaves a torn span F-22 already discards, which is the same
+ * outcome reached the slower way.
  *
- * That is a deliberate departure from the shape C-8 and F-21 describe.  Those
- * assume a writer that streams records to the active file as they are stored, in
- * which case a ROLLBACK is essential: without one, a later commit's span would
- * begin before the aborted records and enclose them, making them live.  With
- * buffering that span never exists.
- *
- * The asymmetry is interop-visible and worth stating plainly: this implementation
- * READS ROLLBACK spans (a streaming peer produces them, and F-25 requires skipping
- * them wherever they sit) but never WRITES one.  Both behaviours are conforming --
- * the format permits either writer -- and the corresponding trade is that a
- * transaction must fit in memory.  A streaming writer would need the ROLLBACK path
- * restored, which is why zsi_term_encode still takes the flag. */
+ * A failure writing the ROLLBACK is likewise left as a torn span; it is not
+ * reported, because the caller is already abandoning the transaction and
+ * there is nothing they could do differently. */
 static int zsi_txn_abort(struct zs_txn *txn)
 {
     struct zs_db *db = txn->db;
-    int r = ZS_OK;
 
     if (txn->readonly) { zsi_txn_free(txn); return ZS_OK; }
+
+    if (txn->wfd >= 0 && txn->wsize > txn->span_base)
+        (void)zsi_txn_terminate(txn, true, NULL, NULL);
+
     db->write_txn = NULL;
     zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
     zsi_txn_free(txn);
-    return r;
+    return ZS_OK;
 }
 
 /********** CONVERSION *************/

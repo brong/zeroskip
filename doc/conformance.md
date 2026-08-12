@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 259 |
-| With an enforcing test | 250 |
+| Requirements | 261 |
+| With an enforcing test | 252 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -224,7 +224,8 @@ a spec label is missing here.
 | `C-7a` | Together the gates make "a valid terminator implies its data is | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
 | `C-7b` | The cost is two syncs per commit rather than one. It is paid per | `zsbench (store, N per txn)` |
 | `C-7c` | `ZS_NOSYNC` omits **both** gates. Atomicity survives, because a torn | `crash/crash_nosync_mode` |
-| `C-8` | An aborted transaction appends a `ROLLBACK` and syncs **neither** gate. | `write_abort` |
+| `C-8` | An aborted transaction appends a `ROLLBACK` and syncs **neither** gate. | `write_abort`, `stream_abort_writes_rollback` |
+| `C-8a` | The unsynced `ROLLBACK` is still **ordered** ahead of any later | `stream_abort_writes_rollback`, `crash/sync_failure_gate1` |
 
 ## Open and recovery (`R-n`)
 
@@ -307,6 +308,7 @@ a spec label is missing here.
 |---|---|---|
 | `T-0` | The corpus is language-neutral. `tests/corpus/` holds data files | `corpus`, `dump_shows_rollback` |
 | `T-0a` | Driver contract. Each implementation MUST provide a small executable | `dump_line_format`, `tool.sh` |
+| `T-0b` | Corpus workloads avoid writer-choice-dependent bytes. A buffered | `corpus` (no case stores or deletes one key twice in a transaction) |
 | `T-1` | to T-11 are per-implementation tests , run | `corpus`, `dump_shows_rollback`, `open_with_uuid`, +1 more |
 | `T-2` | Magic and versions. All 16 magic bytes required (F-6); each | `magic_designed_corruptions`, `staging_names` |
 | `T-2a` | The trailer. Opening an in-order file depends entirely on it, so: the | `inorder_trailer_negatives` |

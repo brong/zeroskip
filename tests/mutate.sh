@@ -1205,12 +1205,29 @@ mutant "cursor: txn re-seek skips the sort" catch \
 mutant "cursor: refresh forgets the start key" catch \
   's/    if \(!c->last_key\) return zsi_cursor_seek_arm_start\(c, fc\);/    if (!c->last_key) return zsi_fcur_seek_first(fc);/'
 
-# A-4.  Freeing a replaced pending value in place dangles every earlier fetch
-# of that key -- found downstream by sqlite-on-zeroskip, whose undo log held
-# exactly such a pointer across the overwrite.  This mutant IS that bug,
-# preserved.
-mutant "txn: replaced pending value freed, not retired" catch \
-  's/            txn->retired\[txn->nretired\+\+\] = txn->pend\[pos\].val;/            free(txn->pend[pos].val);/'
+# A-4 under streaming.  Unmapping a superseded mapping "to save address
+# space" dangles every pointer a read returned out of it -- the same bug the
+# retire list fixed for the buffered writer, in its streaming shape.
+mutant "txn: superseded mappings unmapped early" catch \
+  's/    txn->maps\[txn->nmaps\].base = \(char \*\)m;\n    txn->maps\[txn->nmaps\].len = want;\n    txn->nmaps\+\+;/    if (txn->nmaps) munmap(txn->maps[txn->nmaps - 1].base, txn->maps[txn->nmaps - 1].len);\n    txn->maps[txn->nmaps].base = (char *)m;\n    txn->maps[txn->nmaps].len = want;\n    txn->nmaps++;/'
+
+# C-8/F-21, the writer side.  No ROLLBACK terminator: the aborted records are
+# either resurrected into the next span or invalidate its structure -- both
+# ways the abort stops meaning anything.
+mutant "abort: no ROLLBACK terminator" catch \
+  's/    if \(txn->wfd >= 0 && txn->wsize > txn->span_base\)\n        \(void\)zsi_txn_terminate\(txn, true, NULL, NULL\);/    \/* no rollback *\//'
+
+# F-21 the other way: a COMMIT terminator on the abort path makes the aborted
+# records live outright.  Applies to the poisoned-commit path too, which
+# voids its torn span the same way.
+mutant "abort: writes COMMIT instead of ROLLBACK" catch \
+  's/\(void\)zsi_txn_terminate\(txn, true, NULL, NULL\);/(void)zsi_txn_terminate(txn, false, NULL, NULL);/g'
+
+# The flush-before-covering-mapping ordering: a record still in the chunk
+# buffer is not in the file, and a mapping that covers its OFFSET shows the
+# stale bytes there instead.  This was a real bug during bring-up.
+mutant "txn: covering mapping wins over the unflushed chunk" catch \
+  's/    if \(need > txn->flushed && zsi_txn_flush\(txn\) != ZS_OK\) return NULL;\n\n    if \(txn->nmaps && need <= txn->maps\[txn->nmaps - 1\].len\)\n        return txn->maps\[txn->nmaps - 1\].base \+ off;/    if (txn->nmaps \&\& need <= txn->maps[txn->nmaps - 1].len)\n        return txn->maps[txn->nmaps - 1].base + off;\n\n    if (need > txn->flushed \&\& zsi_txn_flush(txn) != ZS_OK) return NULL;/'
 
 echo
 echo "reverse iteration (D-14k, D-14l, A-12, A-13)"
