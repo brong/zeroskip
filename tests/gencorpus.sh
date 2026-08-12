@@ -153,6 +153,27 @@ if [ "$SKIP" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3a. rolled-back-span: an aborted transaction between two commits (C-8, F-25).
+# ---------------------------------------------------------------------------
+# Only a streaming writer generates this natively -- the records were on disk
+# before the abort, and the ROLLBACK terminator is what voids them.  A peer
+# validates READING it: the middle span's keys must be invisible while the
+# spans on either side stay live, which is exactly F-25's per-span visibility.
+begin_case rolled-back-span
+if [ "$SKIP" -eq 0 ]; then
+    hdr "A rolled-back span sitting between two committed ones (C-8, F-25)." 1
+    TOOL "$DB" create --uuid "$UUID"
+    TOOL "$DB" store 61 3031; emit "op store 61 3031"
+    emit "op batch"
+    emit "store 62 3032"
+    emit "store 63 3033"
+    emit "abort"
+    printf 'store 62 3032\nstore 63 3033\nabort\n' | TOOL "$DB" batch
+    TOOL "$DB" store 64 3034; emit "op store 64 3034"
+    finish_case
+fi
+
+# ---------------------------------------------------------------------------
 # 4. deletion: a tombstone, and an empty value beside it (A-1).
 # ---------------------------------------------------------------------------
 begin_case deletion

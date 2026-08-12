@@ -8784,6 +8784,11 @@ static bool corpus_replay(const char *txt, const char *dir, const char *uuid,
         } else if (!strcmp(verb, "end")) {
             if (zs_txn_commit(&batch) != ZS_OK) return false;
             batch = NULL;
+        } else if (!strcmp(verb, "abort")) {
+            /* T-0a: end the batch WITHOUT committing.  The streamed records
+             * become a ROLLBACK span, which is the point of the case. */
+            if (!batch || zs_txn_abort(&batch) != ZS_OK) return false;
+            batch = NULL;
         } else if (!strcmp(verb, "store")) {
             char *sp = arg ? strchr(arg, ' ') : NULL;
             size_t kl, vl = 0;
