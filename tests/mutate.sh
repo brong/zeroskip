@@ -904,12 +904,34 @@ mutant "idx: syncs before publishing" catch \
 # P-16.  A sweep that ignores the uuid deletes another database's tables out of a
 # shared cache directory: not a correctness bug for us, entirely one for them.
 mutant "idx: sweeps other databases' tables" catch \
-  's/        if \(strncmp\(nm, want, 36\) != 0\) continue;/        \/* P-16 uuid check removed *\//'
+  's/        if \(!cfg->local && strncmp\(nm, want, 36\) != 0\) continue;/        \/* P-16 uuid check removed *\//'
+
+# P-2b's relaxation applies ONLY to zeroskip.cache.  Applying the shared-root
+# uuid rule there instead strands a foreign table in a directory that serves
+# exactly one database, forever.
+mutant "idx: local sweep spares foreign uuids" catch \
+  's/        if \(!cfg->local && strncmp\(nm, want, 36\) != 0\) continue;/        if (strncmp(nm, want, 36) != 0) continue;/'
 
 # P-16 again, the other way: sweeping a generation that is still live throws away
 # a table the very next open would have used.
 mutant "idx: sweeps live generations too" catch \
   's/        if \(alive\) continue;/        \/* P-16 liveness check removed *\//'
+
+# P-2a.  Tables published into the shared root itself defeat the per-database
+# scoping: every database's sweep readdirs every other database's tables, and
+# a peer resolving <root>/<uuid> never finds them.
+mutant "cache: uuid subdirectory dropped" catch \
+  's/        if \(\(size_t\)snprintf\(path, sizeof\(path\), "%s\/%s",\n                             setup->index_dir, uu\) < sizeof\(path\)\) \{/        if ((size_t)snprintf(path, sizeof(path), "%s", setup->index_dir) < sizeof(path)) {/'
+
+# P-2b/R-3.  A read-only handle creating a directory inside the database is a
+# visible side effect on a forensic copy or a read-only mount.
+mutant "cache: read-only handle creates zeroskip.cache" catch \
+  's/            if \(!db->readonly && mkdir\(path, 0700\) != 0 && errno != EEXIST\)/            if (mkdir(path, 0700) != 0 \&\& errno != EEXIST)/'
+
+# A-8a.  The two name different locations for the same tables; accepting both
+# silently picks one and hides the misconfiguration.
+mutant "open: index_dir and ZS_INDEX_LOCAL together accepted" catch \
+  's/    if \(db->index_local && setup->index_dir\) \{/    if (0) {/'
 
 # P-1.  SUBSUMED, with the combined mutant below: an in-order file has no private
 # index -- it uses its pointer section -- so the !f->index line answers first and

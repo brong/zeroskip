@@ -67,6 +67,11 @@ enum zs_flagspec {
                                   OTHER processes (D-14j).  Costs a re-scan per
                                   record; a cursor already sees writes made
                                   through its own handle without it. */
+    ZS_INDEX_LOCAL   = 1<<19,  /* open: cache pointer tables in zeroskip.cache
+                                  inside the database directory (P-2b).  Only a
+                                  writable handle creates the directory; a
+                                  read-only handle uses it if present.  Mutually
+                                  exclusive with index_dir (A-8a). */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */
@@ -87,13 +92,17 @@ struct zs_open_data {
     size_t       rollover_size;  /* 0 = default 2MB */
     void       (*error)(const char *msg, const char *fmt, ...);
 
-    /* Pointer table cache (spec section 8).  NULL disables it, which is the
-     * default: the library never picks a directory itself (P-2), because a
-     * planted table yields wrong records and a world-writable default such as
-     * /tmp would make planting one trivial.  MUST NOT name the database
-     * directory -- that would let a read-only handle write into the database,
-     * which is exactly what R-3 forbids.  Not created by the library; a missing
-     * or unwritable directory disables the cache rather than failing the open. */
+    /* Pointer table cache (spec section 8).  Names the cache ROOT: tables for
+     * this database live in <index_dir>/<uuid>/, which the library creates as
+     * needed (P-2a); the root itself is never created, and a missing or
+     * unwritable root disables the cache rather than failing the open.  NULL
+     * disables the cache unless ZS_INDEX_LOCAL asks for the in-database
+     * directory instead (A-8a); with neither, no cache, which is the default:
+     * the library never picks a location itself (P-2), because a planted
+     * table yields wrong records and a world-writable default such as /tmp
+     * would make planting one trivial.  MUST NOT name the database directory
+     * -- that would let a read-only handle write into the database, which is
+     * exactly what R-3 forbids. */
     const char  *index_dir;        /* A-8 */
     size_t       index_threshold;  /* A-9: 0 = a measured default, 32KB */
 };

@@ -505,6 +505,7 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
 #define ZSI_NAME_PREFIX_LEN 9
 #define ZSI_LOCK_NAME       "zeroskip.lock"
 #define ZSI_STAGING_PREFIX  "zeroskip.tmp."
+#define ZSI_CACHE_DIR_NAME  "zeroskip.cache"   /* P-2b, in the metadata namespace (D-2) */
 
 /* "zeroskip-" + 36 + "-" + 8 + "-" + 8 + NUL = 64.  Rounded up for headroom. */
 #define ZSI_NAME_MAX 80
@@ -2706,10 +2707,18 @@ static void zsi_name_format_index(char *out, const zsi_uuid_t uuid,
 }
 
 /* Where a handle's tables live, and how far past the last one it lets the file
- * grow before publishing another (P-13).  dir NULL disables the cache. */
+ * grow before publishing another (P-13).  dir NULL disables the cache.
+ *
+ * dir is the RESOLVED per-database directory -- <root>/<uuid> for a configured
+ * root (P-2a), or <dbdir>/zeroskip.cache under ZS_INDEX_LOCAL (P-2b) --
+ * resolved once at open, so publish, load, sweep and dump all take it as
+ * given.  `local` marks the P-2b case, whose sweep may also remove
+ * foreign-uuid tables: the directory serves exactly one database, so a table
+ * carrying any other uuid there is garbage by construction. */
 struct zsi_idxcfg {
     const char *dir;
     size_t      threshold;
+    bool        local;
 };
 
 /* Load and fully validate the pointer table for this file (P-11).
@@ -3042,9 +3051,10 @@ static void zsi_idx_sweep(const struct zsi_idxcfg *cfg, const zsi_uuid_t uuid,
         if (strncmp(nm, ZSI_IDX_NAME_PREFIX, plen) != 0) continue;
         nm += plen;
 
-        /* Another database's tables, in a cache directory serving several, are
-         * not ours to remove. */
-        if (strncmp(nm, want, 36) != 0) continue;
+        /* Another database's tables are not ours to remove -- except inside
+         * zeroskip.cache (P-2b), which serves exactly one database, where a
+         * foreign uuid is garbage by construction. */
+        if (!cfg->local && strncmp(nm, want, 36) != 0) continue;
         nm += 36;
         if (*nm != '-') continue;
         nm++;
@@ -3928,9 +3938,13 @@ struct zs_db {
     size_t       rollover_size;
     void       (*error)(const char *msg, const char *fmt, ...);
 
-    /* Pointer table cache (spec section 8).  index_dir NULL disables it. */
+    /* Pointer table cache (spec section 8).  index_dir NULL disables it.
+     * Resolved at open to the PER-DATABASE directory: <root>/<uuid> for a
+     * configured root (P-2a), <dbdir>/zeroskip.cache under ZS_INDEX_LOCAL
+     * (P-2b, index_local set). */
     char        *index_dir;          /* owned */
     size_t       index_threshold;    /* P-13 */
+    bool         index_local;        /* A-8a */
     bool         idx_publish_warned; /* P-15: report the first failure only */
 
     bool         readonly;          /* ZS_SHARED (A-5) */
@@ -4034,7 +4048,8 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
 static int zsi_db_refresh(struct zs_db *db)
 {
     struct zsi_snapshot *s = NULL;
-    struct zsi_idxcfg idxcfg = { db->index_dir, db->index_threshold };
+    struct zsi_idxcfg idxcfg = { db->index_dir, db->index_threshold,
+                                 db->index_local };
     int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
                               db->compar, db->compar_name, db->external_csum,
                               db->nocsum, &idxcfg, db->error, &s);
@@ -5285,7 +5300,8 @@ static int zsi_txn_commit(struct zs_txn *txn)
          * swept at the next opportunity (P-16). */
         bool sealing = act->size >= db->rollover_size;
         if (r == ZS_OK && db->index_dir && !sealing) {
-            struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold };
+            struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold,
+                                      db->index_local };
             int pr = zsi_idx_publish(act, &cfg, db->compar, db->nocsum);
 
             if (pr != ZS_OK && pr != ZS_DONE && !db->idx_publish_warned) {
@@ -6580,6 +6596,7 @@ int zs_db_index_dump(struct zs_db *db)
 
     cfg.dir = db->index_dir;
     cfg.threshold = db->index_threshold;
+    cfg.local = db->index_local;
 
     if (!db->index_dir) {
         printf("INDEXDIR none\n");
@@ -6724,6 +6741,16 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     db->dir = strdup(dir);
     if (!db->dir) { free(db); return ZS_INTERNAL; }
 
+    db->index_local = (setup->flags & ZS_INDEX_LOCAL) != 0;
+
+    /* A-8a: the two name different locations for the same tables, so setting
+     * both is ambiguous, not a preference order. */
+    if (db->index_local && setup->index_dir) {
+        free(db->dir);
+        free(db);
+        return ZS_BADUSAGE;
+    }
+
     if (setup->index_dir) {
         /* A-8/P-2, the cheap half: identical strings, caught before anything is
          * created.  The resolved-path half has to wait until the database
@@ -6736,7 +6763,9 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
 
         db->index_dir = strdup(setup->index_dir);
         if (!db->index_dir) { free(db->dir); free(db); return ZS_INTERNAL; }
+    }
 
+    if (setup->index_dir || db->index_local) {
         /* A-9.  Zero means the measured default, so a caller that sets index_dir
          * and nothing else still gets bounded publishing.
          *
@@ -6809,6 +6838,55 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
             && strcmp(rd, rc) == 0) {
             zs_db_close(&db);
             return ZS_BADUSAGE;
+        }
+    }
+
+    /* A-8/A-8a: resolve the EFFECTIVE cache directory once, here, where the
+     * uuid is known and the database directory exists, so publish, load,
+     * sweep and dump all take a per-database path as given and none of them
+     * changes.  Every failure disables the cache for this handle rather than
+     * failing the open (P-15): the cache is never load-bearing. */
+    if (db->index_local) {
+        char path[PATH_MAX];
+        struct stat st;
+
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s",
+                             dir, ZSI_CACHE_DIR_NAME) >= sizeof(path)) {
+            db->index_local = false;
+        } else {
+            /* P-2b/R-3: only a writable handle creates it.  A read-only
+             * handle uses it if present and is otherwise simply without a
+             * cache -- creating a directory inside the database is a visible
+             * side effect R-3 forbids. */
+            if (!db->readonly && mkdir(path, 0700) != 0 && errno != EEXIST)
+                db->error("could not create the cache directory; continuing "
+                          "without the index cache", "dir=<%s>", path);
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                db->index_dir = strdup(path);
+                if (!db->index_dir) { zs_db_close(&db); return ZS_INTERNAL; }
+            } else {
+                db->index_local = false;
+            }
+        }
+    } else if (db->index_dir) {
+        char uu[ZSI_UUID_STR_LEN], path[PATH_MAX];
+        struct stat st;
+
+        zsi_uuid_unparse(db->uuid, uu);
+
+        /* P-2a: the per-uuid level is created as needed, by ANY handle -- it
+         * is outside the database, so R-3 is untouched.  The ROOT is never
+         * created (A-8): a missing root fails this mkdir with ENOENT, the
+         * stat below fails too, and the cache is disabled for the handle. */
+        free(db->index_dir);
+        db->index_dir = NULL;
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s",
+                             setup->index_dir, uu) < sizeof(path)) {
+            (void)mkdir(path, 0700);
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                db->index_dir = strdup(path);
+                if (!db->index_dir) { zs_db_close(&db); return ZS_INTERNAL; }
+            }
         }
     }
 

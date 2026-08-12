@@ -10316,6 +10316,16 @@ static void idxcache_mkdir(char *out, size_t outlen)
     }
 }
 
+/* P-2a: a handle's tables live under <root>/<uuid>/, which open resolves and
+ * creates.  Tests that plant or inspect tables need the same path. */
+static void idxcache_dbdir(struct zs_db *db, const char *root,
+                           char *out, size_t outlen)
+{
+    char uu[ZSI_UUID_STR_LEN];
+    zsi_uuid_unparse(db->uuid, uu);
+    snprintf(out, outlen, "%s/%s", root, uu);
+}
+
 /* A-8, P-2, R-3: the cache directory must not be the database directory.
  * Allowing it would let a read-only handle write into the database, which is
  * precisely what R-3 forbids -- the amendment permits publishing only because a
@@ -10371,7 +10381,15 @@ static void test_idxcache_threshold_defaults(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_NOT_NULL(db);
     ASSERT_EQU(db->index_threshold, (unsigned long long)ZSI_DEFAULT_INDEX_THRESHOLD);
-    ASSERT_STR_EQ(db->index_dir, cachedir);
+    {
+        /* A-8/P-2a: the handle resolves the root to its per-uuid child. */
+        char want[PATH_MAX];
+        struct stat sb;
+        idxcache_dbdir(db, cachedir, want, sizeof(want));
+        ASSERT_STR_EQ(db->index_dir, want);
+        ASSERT_EQ(stat(want, &sb), 0);
+        ASSERT(S_ISDIR(sb.st_mode));
+    }
     ASSERT_OK(zs_db_close(&db));
 
     /* Capped at a quarter of rollover_size, so small generations still publish
@@ -10661,17 +10679,19 @@ static int idxcache_spew(const char *path, const char *buf, size_t len)
     return ZS_OK;
 }
 
-/* Fill `out` with the path of the table for the active file's generation, and
- * return that generation. */
+/* Fill `out` with the path of the table for the active file's generation --
+ * under the per-uuid subdirectory the open resolved (P-2a) -- and return that
+ * generation. */
 static uint32_t idxcache_table_path(struct zs_db *db, const char *cachedir,
                                     char *out, size_t outlen)
 {
     struct zsi_file *act = zsi_snapshot_active(db->snap);
-    char name[ZSI_NAME_MAX];
+    char name[ZSI_NAME_MAX], dir[PATH_MAX];
 
     if (!act) return 0;
+    idxcache_dbdir(db, cachedir, dir, sizeof(dir));
     zsi_name_format_index(name, act->hdr.uuid, act->hdr.start);
-    snprintf(out, outlen, "%s/%s", cachedir, name);
+    snprintf(out, outlen, "%s/%s", dir, name);
     return act->hdr.start;
 }
 
@@ -10682,7 +10702,7 @@ static uint32_t idxcache_table_path(struct zs_db *db, const char *cachedir,
  * able to make a readable database look unreadable. */
 static void test_idxcache_rejection_rules(void)
 {
-    char cachedir[PATH_MAX], tabpath[PATH_MAX];
+    char cachedir[PATH_MAX], resolved[PATH_MAX], tabpath[PATH_MAX];
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zsi_idxcfg cfg;
     struct zs_db *db = NULL;
@@ -10691,13 +10711,17 @@ static void test_idxcache_rejection_rules(void)
     size_t tablen = 0;
 
     idxcache_mkdir(cachedir, sizeof(cachedir));
-    cfg.dir = cachedir;
-    cfg.threshold = 1;
 
     setup.flags = ZS_CREATE;
     setup.index_dir = cachedir;
     setup.index_threshold = 1;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* The loader takes the RESOLVED per-database directory (P-2a). */
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+    cfg.dir = resolved;
+    cfg.threshold = 1;
+    cfg.local = false;
 
     for (int i = 0; i < 30; i++) {
         char key[32];
@@ -10933,7 +10957,7 @@ static void test_idxcache_rejection_rules(void)
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
         uint32_t tc = 0;
-        struct zsi_idxcfg off = { NULL, 0 };
+        struct zsi_idxcfg off = { NULL, 0, false };
 
         ASSERT_EQ(zsi_idx_load(f, &off, db->compar_name, false,
                                &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
@@ -11244,15 +11268,21 @@ static void test_idxcache_publish_failure_is_not_fatal(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
 
-    /* Take the cache directory away underneath the open handle. */
-    d = opendir(cachedir);
-    ASSERT_NOT_NULL(d);
-    while ((de = readdir(d))) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        snprintf(p, sizeof(p), "%s/%s", cachedir, de->d_name);
-        unlink(p);
+    /* Take the cache directory away underneath the open handle -- the
+     * per-uuid child the open resolved (P-2a) first, then the root. */
+    {
+        char resolved[PATH_MAX];
+        idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+        d = opendir(resolved);
+        ASSERT_NOT_NULL(d);
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            snprintf(p, sizeof(p), "%s/%s", resolved, de->d_name);
+            unlink(p);
+        }
+        closedir(d);
+        ASSERT_EQ(rmdir(resolved), 0);
     }
-    closedir(d);
     ASSERT_EQ(rmdir(cachedir), 0);
 
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
@@ -11297,13 +11327,17 @@ static void test_idxcache_only_unordered_files(void)
 
     /* Every surviving table must name a generation that is still an unordered
      * file, and after a repack that is at most the active one. */
-    d = opendir(cachedir);
-    ASSERT_NOT_NULL(d);
-    while ((de = readdir(d)))
-        if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
-                     strlen(ZSI_IDX_NAME_PREFIX)))
-            tables++;
-    closedir(d);
+    {
+        char resolved[PATH_MAX];
+        idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+        d = opendir(resolved);
+        ASSERT_NOT_NULL(d);
+        while ((de = readdir(d)))
+            if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                         strlen(ZSI_IDX_NAME_PREFIX)))
+                tables++;
+        closedir(d);
+    }
 
     ASSERT(tables <= 1);
 
@@ -11316,7 +11350,9 @@ static void test_idxcache_only_unordered_files(void)
      * nonzero threshold refuses it for a reason that has nothing to do with its
      * kind, and the assertion would hold whatever P-1 said. */
     {
-        struct zsi_idxcfg cfg = { cachedir, 0 };
+        char resolved[PATH_MAX];
+        idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+        struct zsi_idxcfg cfg = { resolved, 0, false };
         struct zsi_file *inorder = NULL;
 
         for (size_t i = 0; i < db->snap->nfiles; i++)
@@ -11333,7 +11369,7 @@ static void test_idxcache_only_unordered_files(void)
             char name[ZSI_NAME_MAX], p[PATH_MAX];
             struct stat sb;
             zsi_name_format_index(name, inorder->hdr.uuid, inorder->hdr.start);
-            snprintf(p, sizeof(p), "%s/%s", cachedir, name);
+            snprintf(p, sizeof(p), "%s/%s", resolved, name);
             ASSERT_EQ(stat(p, &sb), -1);
         }
     }
@@ -11378,20 +11414,24 @@ static void test_idxcache_sweeps_dead_generations(void)
     ASSERT(gen != 0);
     ASSERT_EQ(stat(live, &sb), 0);
 
+    char resolved[PATH_MAX];
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+
     /* A table for a generation that has never existed.  Its contents do not
      * matter: the sweep works on names. */
     zsi_name_format_index(name, db->uuid, gen + 100);
-    snprintf(dead, sizeof(dead), "%s/%s", cachedir, name);
+    snprintf(dead, sizeof(dead), "%s/%s", resolved, name);
     ASSERT_OK(idxcache_spew(dead, junk, sizeof(junk)));
 
-    /* And one for a different database sharing the directory, at a generation
-     * that is NOT live here.  A live generation would be kept for the wrong
-     * reason -- the liveness test rather than the uuid test -- which leaves the
-     * uuid rule unexercised. */
+    /* And one for a different database, planted in OUR resolved directory at
+     * a generation that is NOT live here.  P-2a makes sharing structural, but
+     * P-16's uuid rule still holds for whatever lands in the directory -- and
+     * a live generation would be kept for the wrong reason, the liveness test
+     * rather than the uuid test, which leaves the uuid rule unexercised. */
     memcpy(alien, db->uuid, 16);
     alien[0] = (unsigned char)(alien[0] ^ 0xFF);
     zsi_name_format_index(name, alien, gen + 100);
-    snprintf(other, sizeof(other), "%s/%s", cachedir, name);
+    snprintf(other, sizeof(other), "%s/%s", resolved, name);
     ASSERT_OK(idxcache_spew(other, junk, sizeof(junk)));
 
     /* A store refreshes the snapshot, and the sweep runs with it. */
@@ -11400,6 +11440,149 @@ static void test_idxcache_sweeps_dead_generations(void)
     ASSERT_EQ(stat(dead, &sb), -1);      /* dead generation gone */
     ASSERT_EQ(stat(other, &sb), 0);      /* another database untouched */
     ASSERT_EQ(stat(live, &sb), 0);       /* our own live generation kept */
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-8a/P-2b: the flag creates zeroskip.cache inside the database and
+ * publishes into it, and a reopen seeds from it. */
+static void test_index_local_publishes(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cache[PATH_MAX];
+    DIR *d;
+    struct dirent *de;
+    int ntables = 0;
+
+    setup.flags = ZS_CREATE | ZS_INDEX_LOCAL;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    /* Tables live DIRECTLY in zeroskip.cache -- one database per directory,
+     * so P-2a's uuid level would be redundant (P-2b). */
+    snprintf(cache, sizeof(cache), "%s/%s", dbdir, ZSI_CACHE_DIR_NAME);
+    d = opendir(cache);
+    ASSERT_NOT_NULL(d);
+    while ((de = readdir(d)))
+        if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                     strlen(ZSI_IDX_NAME_PREFIX))) ntables++;
+    closedir(d);
+    ASSERT_EQ(ntables, 1);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* A reopen with the flag seeds from the published table. */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT(act->cached_upto > ZSI_HEADER_LEN);
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And the database itself is untouched by the extra directory: a handle
+     * WITHOUT the flag reads it as a plain file set. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NULL(db->index_dir);
+    {
+        const char *v = NULL;
+        size_t vl = 0;
+        ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-2b/R-3: a read-only open never creates the directory -- creating anything
+ * inside the database is a visible side effect -- but uses one if present. */
+static void test_index_local_readonly_creates_nothing(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cache[PATH_MAX];
+    struct stat sb;
+
+    /* Create the database with NO cache. */
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Read-only with the flag: works, creates nothing, cache disabled. */
+    setup.flags = ZS_SHARED | ZS_INDEX_LOCAL;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NULL(db->index_dir);
+    {
+        const char *v = NULL;
+        size_t vl = 0;
+        ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    snprintf(cache, sizeof(cache), "%s/%s", dbdir, ZSI_CACHE_DIR_NAME);
+    ASSERT_EQ(stat(cache, &sb), -1);
+
+    /* A writable handle creates it; a read-only one then USES it. */
+    setup.flags = ZS_INDEX_LOCAL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+    ASSERT_EQ(stat(cache, &sb), 0);
+
+    setup.flags = ZS_SHARED | ZS_INDEX_LOCAL;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_NOT_NULL(db->index_dir);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-8a: naming both locations is ambiguous, not a preference order. */
+static void test_index_local_and_dir_is_badusage(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cachedir[PATH_MAX];
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+    setup.flags = ZS_CREATE | ZS_INDEX_LOCAL;
+    setup.index_dir = cachedir;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    ASSERT_NULL(db);
+}
+
+/* P-2b: inside zeroskip.cache a foreign-uuid table is garbage by construction
+ * and is swept; under a shared root the P-16 uuid rule still protects it
+ * (test_idxcache_sweeps_dead_generations holds that side). */
+static void test_index_local_sweeps_foreign_uuid(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cache[PATH_MAX], foreign[PATH_MAX], name[ZSI_NAME_MAX];
+    char junk[ZSI_IDX_HEADER_LEN + 4];
+    zsi_uuid_t alien;
+    struct stat sb;
+
+    memset(junk, 0, sizeof(junk));
+    setup.flags = ZS_CREATE | ZS_INDEX_LOCAL;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+
+    /* Plant a well-formed table name carrying another database's uuid, at a
+     * generation that is not live here. */
+    memcpy(alien, db->uuid, 16);
+    alien[0] = (unsigned char)(alien[0] ^ 0xFF);
+    zsi_name_format_index(name, alien, 101);
+    snprintf(cache, sizeof(cache), "%s/%s", dbdir, ZSI_CACHE_DIR_NAME);
+    snprintf(foreign, sizeof(foreign), "%s/%s", cache, name);
+    ASSERT_OK(idxcache_spew(foreign, junk, sizeof(junk)));
+
+    /* A store refreshes the snapshot, and the sweep runs with it. */
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_EQ(stat(foreign, &sb), -1);
 
     ASSERT_OK(zs_db_close(&db));
 }
@@ -11460,13 +11643,19 @@ static void test_corpus_index_table(void)
         }
 
         snprintf(idxdir, sizeof(idxdir), "%s/%s", dir, sub);
-        cfg.dir = idxdir;
         cfg.threshold = (size_t)1 << 40;
+        cfg.local = false;
 
         setup.flags = ZS_SHARED;
         setup.index_dir = idxdir;
         setup.index_threshold = cfg.threshold;
         ASSERT_OK(zs_db_open(dir, &setup, &db));
+
+        /* The case ships its table under the per-uuid level open resolves
+         * (P-2a); the direct loads below need the same directory. */
+        char resolved[PATH_MAX];
+        idxcache_dbdir(db, idxdir, resolved, sizeof(resolved));
+        cfg.dir = resolved;
 
         f = zsi_snapshot_active(db->snap);
         ASSERT_NOT_NULL(f);
@@ -11527,9 +11716,9 @@ static void test_idxcache_uses_file_engine(void)
     char *tab;
     size_t tablen;
 
+    char resolved[PATH_MAX];
+
     idxcache_mkdir(cachedir, sizeof(cachedir));
-    cfg.dir = cachedir;
-    cfg.threshold = 1;
 
     /* Create under engine 0. */
     setup.flags = ZS_CREATE | ZS_CSUM_NONE;
@@ -11544,6 +11733,11 @@ static void test_idxcache_uses_file_engine(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_EQ(db->create_csum_id, ZSI_CSUM_XXHASH);
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+    cfg.dir = resolved;
+    cfg.threshold = 1;
+    cfg.local = false;
 
     f = zsi_snapshot_active(db->snap);
     ASSERT_NOT_NULL(f);
@@ -13652,6 +13846,13 @@ static struct test_entry tests[] = {
     { "test_idxcache_uses_file_engine", test_idxcache_uses_file_engine },
     { "test_idxcache_valid_upto_is_span_boundary",
                                         test_idxcache_valid_upto_is_span_boundary },
+    { "test_index_local_publishes",     test_index_local_publishes },
+    { "test_index_local_readonly_creates_nothing",
+                                        test_index_local_readonly_creates_nothing },
+    { "test_index_local_and_dir_is_badusage",
+                                        test_index_local_and_dir_is_badusage },
+    { "test_index_local_sweeps_foreign_uuid",
+                                        test_index_local_sweeps_foreign_uuid },
 
     { "test_seal_converts_the_active_file",
                                         test_seal_converts_the_active_file },
