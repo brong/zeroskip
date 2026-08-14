@@ -3,15 +3,52 @@
 ```
 make bench          # --selftest, then a small smoke run
 ./zsbench           # the full run
-./zsbench -n 100000 --value 500 --reps 5
+./zsbench -n 100000 --valsize 500 --reps 5
+./zsbench store     # only workloads whose name contains "store"
+./zsbench --csv out.csv
 ```
 
 `--selftest` exists because a benchmark that silently ran against a failed open
 would report excellent numbers. It stores and reads back 500 records and runs the
 consistency checks, then exits.
 
-Workloads are kept comparable with the sibling `twom` library's `twombench`, so
-numbers can be read side by side.
+Every workload runs `--reps` times and reports the **median**. Until 2026-08-14
+only `store, one txn each` did — the other nine timed a single run while the
+banner printed the repetition count over the whole report — so figures recorded
+before that date are single runs whatever they say. The median is used rather
+than the best because the minimum is the luckiest run, and for the workloads
+dominated by `fdatasync` it is the one where the filesystem happened to be idle.
+
+Repetitions are not free of setup: a workload that mutates rebuilds its database
+each time. `repack cascade` most of all, since a cascade consumes the file
+layout it measures — timing the same database twice would find nothing to merge
+on the second pass and post an excellent number for doing nothing.
+
+## Comparing against twom
+
+The sibling `twom` library's `twombench` writes the same CSV schema, and
+`tests/benchcmp.sh` runs both with matching flags and joins the results:
+
+```
+./tests/benchcmp.sh -n 200000 --keysize 16
+TWOMBENCH=/path/to/twombench ./tests/benchcmp.sh
+```
+
+The long options (`--records`, `--keysize`, `--valsize`, `--reps`, `--csum`,
+`--path`, `--csv`, and a bare name filter) are spelled as twombench spells them
+so both tools take the same words. zsbench's original `--value` and `--dir` still
+work. `--keysize` defaults to 11, zsbench's historical `key%08d` shape, so the
+default run is unchanged and every figure below remains comparable; a
+side-by-side run should pass the same `--keysize` to both.
+
+**The overlap is partial, and the script prints what it could not pair.** Only
+one row is durability-matched — twom's `fillsync` against `store, one txn each`,
+both committing per record. `fillseq` puts every record in one transaction while
+zeroskip's nearest batched figure commits every 1000, so that row compares
+batching policy as much as it compares libraries. twom has no file set, so
+nothing on its side corresponds to rollover, conversion, pointer tables or
+compaction; zeroskip has no mutable-file operations to answer `overwrite` or
+`deleterandom`.
 
 ## What each workload is for
 
