@@ -136,9 +136,11 @@ whether a pointer section must be present.
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
   byte-range lock. Because the kernel releases `fcntl` locks on process death, a
   killed writer never blocks the next one; no lock state can outlive a process.
-  A handle is not thread-safe, and a process MUST NOT open two write handles on
-  one database: `fcntl` locks are per-process, so neither would exclude the
-  other (C-1f). Concurrent writers MUST be separate processes.
+  A handle is not thread-safe. Two write handles on one database within a
+  process are excluded from each other by C-1j, so the second blocks or reports
+  `ZS_LOCKED` exactly as a second process would — but that is exclusion between
+  *handles*, not thread safety: two threads sharing one handle remain the
+  caller's problem, and no lock in this specification helps them.
 - **G-6 No shared mutable state.** Nothing a reader may be reading is ever
   rewritten beneath it: files are append-only, a new file is published by
   `rename`, and every index is private to the process that built it. There is no
@@ -1194,10 +1196,32 @@ The per-file cursors are held in an array kept sorted by:
   filesystems.
 - **C-1f** `fcntl` locks are per-process, not per-thread: two threads of one
   process both acquire the same lock successfully, and two handles in one process
-  do not exclude each other. Excluding threads would require a process-global
-  registry keyed by the lock file's identity, which this specification does not
-  require: a caller needing concurrent writers MUST use separate processes, and a
-  binding SHOULD document its handles as not thread-safe.
+  do not exclude each other. The `fcntl` lock alone therefore does not deliver
+  G-5 within a process; C-1j is what closes that, and a binding SHOULD still
+  document its handles as not thread-safe, which is a different property.
+- **C-1j Same-process exclusion.** An implementation SHOULD exclude two handles
+  on one database within a single process, so that the second blocks or reports
+  `ZS_LOCKED` exactly as a second process would. This is a **binding property,
+  not interoperability surface**: it changes nothing on disk and nothing another
+  implementation can observe, so a peer that omits it still interoperates.
+  Two mechanisms, in order of preference:
+
+  1. `F_OFD_SETLK` (C-1i) where the platform has it, which is scoped to an open
+     file description and so already excludes two handles with no extra state;
+  2. otherwise a **process-global registry** keyed by the lock file's identity
+     — its `st_dev` and `st_ino`, not its path, since two paths can reach one
+     inode — recording which of C-1's three locks are held within this process.
+     It MUST be consulted before the `fcntl` lock and released after it, so the
+     two agree on C-1d's ordering.
+
+  A **mutex is not one of the mechanisms**, and the distinction is the whole
+  point: a per-handle mutex is two different objects and excludes only threads
+  sharing one handle, which is not what G-5 promises. The registry excludes by
+  the *database's* identity, which is.
+
+  An implementation MUST NOT let the registry substitute for the `fcntl` lock.
+  The registry is invisible outside the process; the `fcntl` lock is what a peer
+  implementation sees (C-1e). Both are taken, always.
 - **C-1g** `fcntl` locks are released by closing **any** descriptor for the file
   in that process. An implementation MUST hold exactly one descriptor for
   `zeroskip.lock` for the handle's lifetime, and MUST NOT open a second.
@@ -2192,13 +2216,21 @@ bugs, since they exercise the locking interop surface (C-1e):
   appearing to pass.
 
 **T-14 Two handles in one process.** Two write handles on one database from a
-single process, asserting the implementation does **not** claim to exclude them
-(C-1f) — either by refusing the second open, or by documenting the hazard. The
-test exists to stop an implementation quietly acquiring a mutex and appearing to
-offer a guarantee the format cannot enforce: `fcntl` sees one process and grants
-both, so a per-handle mutex excludes only threads that share a handle, which is
-not the same property. An implementation using `F_OFD_SETLK` (C-1i) MAY exclude
-them, and if it does it should say so.
+single process, asserting that the second is excluded (C-1j): it blocks, or
+reports `ZS_LOCKED` under `ZS_NONBLOCKING`. Where the implementation has both
+of C-1j's mechanisms, the test MUST run against **each** — the registry path is
+otherwise dead code on every platform that has `F_OFD_SETLK`, which is where
+development happens, so it would rot unexercised and be discovered by the one
+platform that depends on it.
+
+The test began as the opposite assertion — that an implementation does *not*
+claim to exclude them — because a per-handle mutex excludes only threads
+sharing a handle and would have been a guarantee the format cannot enforce.
+That hazard is unchanged; what changed is that C-1j names two mechanisms which
+key on the *database's* identity rather than the handle's, and so deliver the
+property the mutex only appeared to. An implementation that excludes them by a
+mutex is still wrong, and this test cannot tell the two apart — only reading
+the code can.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close. Each
