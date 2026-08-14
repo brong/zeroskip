@@ -192,9 +192,20 @@ whether a pointer section must be present.
 - **F-5d** Engine 2 makes a file readable only by a caller supplying the same
   function, so the conformance corpus covers engines 0 and 1 only.
 - **F-5e** `ZS_NOCSUM` is distinct from engine 0: it skips verification of
-  checksums that are nonetheless written. It is a **read-path** flag only: an
+  **record** checksums at materialization (F-32a) — checksums that are
+  nonetheless written — and nothing else. It is a **read-path** flag only: an
   operation that writes a new file from existing records MUST still verify its
-  inputs (D-20b).
+  inputs (D-20b). Span and terminator checksums are outside its reach:
+  **verification rides indexing**. A span's checksum MUST be verified by
+  whoever adds that span to an index — the replay of C-4 step 4 — in every
+  mode, because the replay is what decides which records exist, and a
+  post-crash reopen under relaxed durability (C-7c) can meet a terminator
+  whose data never landed; accepting it on the strength of its length field
+  surfaces garbage as committed records, which no read-time flag was ever
+  meant to permit. Conversely a span already indexed is not re-verified: a
+  pointer table carries its builder's verification (P-11's flags bit 4), and
+  a writer's own fold (D-13b) indexes spans whose checksums it computed
+  itself.
 
 ### 4.2 Magic
 
@@ -1264,9 +1275,14 @@ any point.
   span the writer is still writing. The terminator's checksum covers the span's
   data (F-19), so a terminator whose data is not yet fully visible fails
   validation and reads as absent — the reader stops there, exactly as it would
-  after a crash. The checksum therefore supplies the ordering guarantee that no
-  memory barrier can provide between independent processes sharing a mapping,
-  which is what permits reading a live file without a lock.
+  after a crash. In the running system the kernel already orders most of this
+  — a walk is bounded by a size read whose synchronization makes the bytes
+  below it visible — but the checksum makes the guarantee unconditional: it
+  holds for the crash-written state, where the *disk* reorders freely and a
+  terminator can be durable while its data never landed (the state C-7's gate
+  1 exists to prevent and C-7c permits), and for any reader whose walk is not
+  so bounded. That is what permits reading a live file without a lock, and
+  why the check runs in every mode (F-5e).
 - **C-4g Lifetime.** Once its descriptors are open a packer may (subject to
   D-23) `unlink` superseded files immediately: the kernel keeps each inode alive
   until the last descriptor *and mapping* is gone. There is no reference table
@@ -1507,9 +1523,12 @@ unreadable one.
   - the recorded engine is the one the data file's header names (P-7);
   - uuid and `start` match the data file;
   - the comparator name matches both the data file's field and the reader's own;
-  - flags bit 4 is set, unless the reader is itself not verifying checksums
-    (F-5e) — an index built without verification may contain records a verifying
-    reader would reject, so it MUST NOT be handed to one;
+  - flags bit 4 is set. A conforming builder always sets it, since span
+    verification rides indexing in every mode (F-5e); a table without it
+    was built by an implementation that indexed spans nobody verified, and
+    accepting it would seed an index with them. (Bit 4 was reader-exempted
+    under `ZS_NOCSUM` until 2026-08-14, when F-5e narrowed to record
+    checksums.);
   - `H ≤ valid_upto ≤` the data file's size, where `H` is the data file's header
     length;
   - every offset lies in `[H, valid_upto)`;
@@ -1755,7 +1774,7 @@ different calls, though not every flag is meaningful everywhere:
 |---|---|---|
 | `ZS_CREATE` | open | create the database if absent |
 | `ZS_SHARED` | open, txn | read-only (A-5) |
-| `ZS_NOCSUM` | open | do not verify checksums on read (F-5e) |
+| `ZS_NOCSUM` | open | skip record-checksum verification at materialization (F-5e); span checksums are still verified at indexing |
 | `ZS_NOSYNC` | open | omit both durability gates on commit, and nothing else (C-7c, C-6b) |
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
