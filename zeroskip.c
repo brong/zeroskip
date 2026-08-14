@@ -119,6 +119,33 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * needs bytes it still holds and at every terminator. */
 #define ZSI_TXN_CHUNK (64 * 1024)
 
+#ifdef ZS_MMAP_WRITE
+/* The mmap-write spike: the handle's writable window reservation over the
+ * active file, and the granule the file is ftruncated ahead by.  A MAP_SHARED
+ * store past st_size is SIGBUS, not extension, so the physical size must
+ * always lead the write point. */
+#define ZSI_MMAP_RESERVE ((size_t)1 << 30)
+#define ZSI_MMAP_CHUNK   ((size_t)1 << 20)
+
+/* Extension strategy (measured on Darwin/APFS): an ftruncate whose EOF page
+ * is dirty in a MAP_SHARED mapping forces a synchronous page cleaning --
+ * ~57us extending, ~169us shrinking -- while a 1-byte pwrite extends over
+ * the same dirty page in ~1.7us.  So small spans extend EXACTLY by pwrite
+ * (no slop ever exists, no down-truncate is ever owed), and only a span
+ * that has already paid many extension calls switches to chunked
+ * ftruncate-ahead, whose single exact down-truncate at the terminator then
+ * amortises.  128 calls * 1.7us is about one down-truncate. */
+#define ZSI_MMAP_EXACT_CALLS 128
+
+/* pwrite on an O_APPEND descriptor APPENDS on Linux (documented), ignoring
+ * the offset -- so the stream descriptor must not carry O_APPEND under this
+ * flag.  Nothing write()s to it: every append is a pwrite at an explicit
+ * offset or a memcpy through the mapping. */
+#define ZSI_WFD_OPEN_FLAGS (O_RDWR)
+#else
+#define ZSI_WFD_OPEN_FLAGS (O_RDWR | O_APPEND)
+#endif
+
 /********** LIBRARY SUPPORT *************/
 
 static void *zsi_zmalloc(size_t bytes)
@@ -4427,6 +4454,18 @@ struct zs_db {
     int          wfd_cache;
     uint32_t     wfd_gen;
 
+#ifdef ZS_MMAP_WRITE
+    /* The giant writable window over the active file (spike): one per
+     * generation, valid only while base is non-NULL, replaced at the first
+     * stream begin after the generation changes.  Gen equality identifies
+     * the inode for the same reason wfd_gen's does (D-9b). */
+    char        *wmap_base;
+    size_t       wmap_len;
+    uint32_t     wmap_gen;
+    size_t       wlast_span;  /* previous span's length: the chunk-vs-exact
+                                 predictor for the next one */
+#endif
+
     /* Backing for pointers returned by the non-transactional calls, whose
      * implicit transaction has ended by the time the caller sees them (A-4). */
     char        *retbuf;
@@ -5347,6 +5386,13 @@ struct zs_txn {
     size_t               span_base;   /* where this transaction's span begins */
     size_t               wsize;
     size_t               flushed;
+#ifdef ZS_MMAP_WRITE
+    size_t               wphys;       /* physical size: the extended extent,
+                                         always >= wsize */
+    unsigned             wext_calls;  /* extension calls this txn: the first
+                                         ZSI_MMAP_EXACT_CALLS go exact via
+                                         pwrite, the rest chunk ahead */
+#endif
     char                *chunk;
     size_t               chunklen, chunkcap;
     struct zsi_txnmap   *maps;
@@ -5386,6 +5432,133 @@ static void zsi_pend_clear(struct zs_txn *txn)
         free(txn->pend[i].key);
     txn->npend = 0;
 }
+
+#ifdef ZS_MMAP_WRITE
+
+/* The mmap-write spike: stores go through a writable MAP_SHARED window
+ * instead of write(2).  The file is extended AHEAD of the write point in
+ * chunks -- a store must never touch a page past st_size, which is SIGBUS,
+ * not extension -- stores are memcpy, and the exact ftruncate back to the
+ * logical end at every terminator keeps slop from outliving the write lock,
+ * so every unlocked state shows st_size == complete-at exactly as the
+ * write() path does.  A crash mid-transaction leaves slop and/or a torn
+ * span: the file is not clean, and R-4 already covers it -- the next writer
+ * moves to a new generation and never appends here again. */
+
+/* The writable mapping covering [0, off+len) of the active file: the
+ * handle's giant per-generation window when it reaches, else the
+ * transaction's accumulate list, which unmaps nothing until the transaction
+ * ends -- the same rule as the read path's, and for the same reason (A-4). */
+static char *zsi_txn_wptr(struct zs_txn *txn, size_t off, size_t len)
+{
+    struct zs_db *db = txn->db;
+    size_t need = off + len;
+
+    if (need < off) return NULL;                    /* overflow */
+
+    if (db->wmap_base && db->wmap_gen == txn->wgen && need <= db->wmap_len)
+        return db->wmap_base + off;
+
+    if (txn->nmaps && need <= txn->maps[txn->nmaps - 1].len)
+        return txn->maps[txn->nmaps - 1].base + off;
+
+    size_t want = need;
+    if (txn->nmaps && want < txn->maps[txn->nmaps - 1].len * 2)
+        want = txn->maps[txn->nmaps - 1].len * 2;
+    if (want < (size_t)1 << 20) want = (size_t)1 << 20;
+
+    if (txn->nmaps == txn->amaps) {
+        size_t grow = txn->amaps ? txn->amaps * 2 : 8;
+        struct zsi_txnmap *p = realloc(txn->maps, grow * sizeof(*p));
+        if (!p) return NULL;
+        txn->maps = p;
+        txn->amaps = grow;
+    }
+
+    void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   txn->wfd, 0);
+    if (m == MAP_FAILED) {
+        want = need;
+        m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 txn->wfd, 0);
+        if (m == MAP_FAILED) return NULL;
+    }
+
+    txn->maps[txn->nmaps].base = (char *)m;
+    txn->maps[txn->nmaps].len = want;
+    txn->nmaps++;
+
+    return txn->maps[txn->nmaps - 1].base + off;
+}
+
+/* There is no flush: every streamed byte is in the page cache the moment
+ * its memcpy returns, so nothing under this flag ever buffers. */
+
+/* Append by memcpy.  The physical extension comes FIRST -- a MAP_SHARED
+ * store past st_size is SIGBUS -- and its mechanism is the measured choice
+ * in the TUNING note: exact 1-byte pwrite for the first extensions, chunked
+ * ftruncate-ahead once the span has proven long enough to amortise the one
+ * exact down-truncate the chunking owes at the terminator. */
+static int zsi_txn_stream(struct zs_txn *txn, const char *buf, size_t len)
+{
+    size_t need = txn->wsize + len;
+
+    if (need < txn->wsize) return ZS_IOERROR;       /* overflow */
+
+    if (need > txn->wphys) {
+        /* Exact extension is the default: measured on Darwin, a shrinking
+         * ftruncate costs ~190us whether or not a sync preceded it, while a
+         * 1-byte pwrite is ~1.7us -- so a span only chunks (and owes that
+         * one truncate) once per-record pwrites would cost more.  The
+         * previous span's size predicts this one: bulk loads are
+         * repetitive, so the first big transaction pays both and the rest
+         * chunk from byte 0. */
+        bool chunky = txn->wext_calls >= ZSI_MMAP_EXACT_CALLS
+                   || txn->db->wlast_span >= (size_t)64 << 10;
+        if (!chunky) {
+            txn->wext_calls++;
+            static const char z = 0;
+            if (pwrite(txn->wfd, &z, 1, (off_t)(need - 1)) != 1)
+                return ZS_IOERROR;
+            txn->wphys = need;
+        } else {
+            /* Chunked lead, still extended by pwrite: ftruncate across a
+             * dirty mapped EOF page is the expensive op, in either
+             * direction.  The slop this creates is repaid by the one
+             * down-truncate the terminator path owes. */
+            size_t want = need + need / 4;
+            if (want < need) want = need;
+            want = (want + ZSI_MMAP_CHUNK - 1) & ~(ZSI_MMAP_CHUNK - 1);
+            if (want < need) want = need;
+            static const char z = 0;
+            if (pwrite(txn->wfd, &z, 1, (off_t)(want - 1)) != 1)
+                return ZS_IOERROR;
+            txn->wphys = want;
+        }
+    }
+
+    char *dst = zsi_txn_wptr(txn, txn->wsize, len);
+    if (!dst) return ZS_IOERROR;
+    memcpy(dst, buf, len);
+
+    txn->wsize = need;
+    txn->flushed = need;
+    return ZS_OK;
+}
+
+/* Bytes [off, off+len) of the active file, valid until the TRANSACTION ends
+ * (A-4).  No flush: there is no buffer for the bytes to still be in. */
+static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len)
+{
+    size_t need = off + len;
+
+    if (need < off) return NULL;                    /* overflow */
+    if (need > txn->wsize) return NULL;
+
+    return zsi_txn_wptr(txn, off, len);
+}
+
+#else /* !ZS_MMAP_WRITE */
 
 /* Flush the chunk buffer to the fd.  Called before any read that needs bytes
  * the buffer still holds, and at every terminator. */
@@ -5473,6 +5646,8 @@ static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len)
     return txn->maps[txn->nmaps - 1].base + off;
 }
 
+#endif /* !ZS_MMAP_WRITE */
+
 /* First store: choose the file this transaction streams into (D-9 applied at
  * the first store rather than at commit -- the write lock is held from begin,
  * so only the moment moves), pin the snapshot the rollover may have replaced,
@@ -5519,11 +5694,39 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
     struct stat sb;
     if (fstat(fd, &sb) < 0) { close(fd); return ZS_IOERROR; }
 
+#ifdef ZS_MMAP_WRITE
+    txn->wphys = (size_t)sb.st_size;
+
+    /* The handle's writable window: one per generation, replaced here when
+     * a seal or rollover moved the stream to a new file.  A refused giant
+     * reservation falls back to a modest one, and a refused fallback to the
+     * per-transaction list in zsi_txn_wptr -- refusal costs speed, never
+     * correctness. */
+    if (db->wmap_base && db->wmap_gen != gen) {
+        munmap(db->wmap_base, db->wmap_len);
+        db->wmap_base = NULL;
+        db->wmap_len = 0;
+    }
+    if (!db->wmap_base) {
+        size_t want = ZSI_MMAP_RESERVE;
+        void *m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) {
+            want = (size_t)32 << 20;
+            m = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        }
+        if (m != MAP_FAILED) {
+            db->wmap_base = (char *)m;
+            db->wmap_len = want;
+            db->wmap_gen = gen;
+        }
+    }
+#else
     if (!txn->chunk) {
         txn->chunk = malloc(ZSI_TXN_CHUNK);
         if (!txn->chunk) { close(fd); return ZS_INTERNAL; }
         txn->chunkcap = ZSI_TXN_CHUNK;
     }
+#endif
 
     txn->wfd = fd;
     txn->wgen = gen;
@@ -5851,7 +6054,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
         if (db->wfd_cache >= 0) { close(db->wfd_cache); db->wfd_cache = -1; }
 
         snprintf(path, sizeof(path), "%s", act->fname);
-        int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
+        int fd = open(path, ZSI_WFD_OPEN_FLAGS);  /* RDWR: the streaming reads mmap this fd (A-4) */
         if (fd < 0) return ZS_IOERROR;
         *fdp = fd;
         *genp = act->hdr.start;
@@ -5879,7 +6082,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 
     zsi_name_format(name, db->uuid, next, 0);
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
-    int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
+    int fd = open(path, ZSI_WFD_OPEN_FLAGS);  /* RDWR: the streaming reads mmap this fd (A-4) */
     if (fd < 0) return ZS_IOERROR;
 
     *fdp = fd;
@@ -5908,7 +6111,12 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
 {
     struct zs_db *db = txn->db;
     size_t spanlen = txn->wsize - txn->span_base;
-    int r;
+    int r = ZS_OK;
+    (void)r;
+
+#ifdef ZS_MMAP_WRITE
+    db->wlast_span = spanlen;       /* the next span's chunk-vs-exact hint */
+#endif
 
     /* The terminator's checksum covers the span's BYTES plus the terminator
      * (C-4f), and the engine is one-shot -- engine 2 is the caller's, so no
@@ -5921,6 +6129,57 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
      * ROLLBACK's checksum matters as much as a COMMIT's: an invalid
      * rolled-back span completes the file early (F-24) and costs everything
      * after it. */
+#ifdef ZS_MMAP_WRITE
+    /* The span re-read comes straight from the mapping: the bytes are in the
+     * page cache, and this is the same one warm pass the write() path pays. */
+    const char *span = zsi_txn_at(txn, txn->span_base, spanlen);
+    if (!span) return ZS_IOERROR;
+
+    char term[ZSI_TERMLEN_LONG];
+    size_t termlen = zsi_term_encoded_len((uint64_t)spanlen);
+
+    /* The engine is the ACTIVE FILE'S, not this handle's (A-6, F-5a). */
+    zsi_term_encode(term, (uint64_t)spanlen, rollback, span,
+                    txn->wcs, txn->wcsum_id);
+
+    /* Gate 1: the data pages, then a sync -- fdatasync flushes mmap-dirtied
+     * pages of the file exactly as it flushes written ones.  C-8: an abort
+     * syncs neither gate. */
+    if (!db->nosync && !rollback && ZS_FDATASYNC(txn->wfd) < 0)
+        return ZS_IOERROR;
+
+    /* The exact truncate, BEFORE the terminator: slop MUST NOT outlive the
+     * write lock, or a conforming peer's O_APPEND lands past a zero gap and
+     * its span is never replayed.  Every durability mode -- structure, not
+     * durability (C-6b's precedent).  Placed here because the gate above
+     * just CLEANED the EOF page in the gated case, and a shrinking
+     * ftruncate across a clean mapped page is a metadata op where across a
+     * dirty one it is a synchronous page cleaning (~169us measured). */
+    if (txn->wphys > txn->wsize) {
+        if (ftruncate(txn->wfd, (off_t)txn->wsize) < 0) return ZS_IOERROR;
+        txn->wphys = txn->wsize;
+    }
+
+    /* The terminator extends EXACTLY -- pwrite over a dirty page is the
+     * cheap extension -- so it creates no slop and owes no truncate. */
+    {
+        static const char z = 0;
+        if (pwrite(txn->wfd, &z, 1, (off_t)(txn->wsize + termlen - 1)) != 1)
+            return ZS_IOERROR;
+        txn->wphys = txn->wsize + termlen;
+        char *dst = zsi_txn_wptr(txn, txn->wsize, termlen);
+        if (!dst) return ZS_IOERROR;
+        memcpy(dst, term, termlen);
+        txn->wsize += termlen;
+        txn->flushed = txn->wsize;
+    }
+
+    /* Gate 2: the terminator -- and the size, which is metadata a reader
+     * needs -- then a sync. */
+    if (!db->nosync && !rollback) {
+        if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
+    }
+#else
     bool in_chunk = (txn->flushed == txn->span_base);
     const char *span;
     if (in_chunk) {
@@ -5981,6 +6240,7 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
     if (!db->nosync && !rollback) {
         if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
     }
+#endif /* !ZS_MMAP_WRITE */
 
     /* Where the terminator landed and what checksum it carries (P-10).  Handed
      * back rather than recovered later because terminators are only ever found
@@ -6010,6 +6270,16 @@ static void zsi_txn_free(struct zs_txn *txn)
 
     /* A-4a: and the same for what a snapshot swap left behind. */
     zsi_hold_fini(&txn->hold);
+
+#ifdef ZS_MMAP_WRITE
+    /* Safety net for the paths that never reach a terminator -- an empty
+     * commit after a failed first store, an abort with nothing streamed:
+     * slop must not outlive the write lock.  A refused truncate poisons the
+     * descriptor so it is closed rather than handed back. */
+    if (txn->wfd >= 0 && txn->wphys > txn->wsize
+        && ftruncate(txn->wfd, (off_t)txn->wsize) != 0)
+        txn->broken = true;
+#endif
 
     /* Hand the append descriptor back for the next transaction rather than
      * closing it -- unless this one's stream broke, in which case nothing
@@ -7835,6 +8105,9 @@ int zs_db_close(struct zs_db **dbp)
     zsi_lock_close(&db->locks);
     if (db->probe_dh) closedir(db->probe_dh);
     if (db->wfd_cache >= 0) close(db->wfd_cache);
+#ifdef ZS_MMAP_WRITE
+    if (db->wmap_base) munmap(db->wmap_base, db->wmap_len);
+#endif
     free(db->probe_names);
     free(db->retbuf);
     free(db->index_dir);
