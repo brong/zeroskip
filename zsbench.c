@@ -572,10 +572,11 @@ static void bench_index_threshold(void)
         /* How large the surviving table is.  Total bytes written cannot be
          * observed after the fact -- each publish replaces the last -- so this
          * reports the steady-state size, and the store column carries the
-         * republication cost. */
+         * republication cost.  One level down: tables live in a per-uuid
+         * directory under the configured root (P-2a). */
         char cmd[2600];
         snprintf(cmd, sizeof(cmd),
-                 "cat '%s'/zeroskip.index-* 2>/dev/null | wc -c", idx);
+                 "cat '%s'/*/zeroskip.index-* 2>/dev/null | wc -c", idx);
         FILE *fp = popen(cmd, "r");
         long long tb = 0;
         if (fp) { if (fscanf(fp, "%lld", &tb) != 1) tb = 0; pclose(fp); }
