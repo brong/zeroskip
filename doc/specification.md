@@ -1825,6 +1825,26 @@ different calls, though not every flag is meaningful everywhere:
 - **A-4** Returned key and value pointers remain valid for the lifetime of the
   transaction or cursor that produced them; for the non-transactional
   `zs_db_*` calls, until the next call on that `struct zs_db`.
+- **A-4a** A-4 binds across a **snapshot swap**. A transaction or cursor may
+  move to a newer snapshot while it is alive — a write transaction resolves its
+  active file at its first store (D-9), and a `ZS_CURSOR_LIVE` cursor follows
+  the handle's file set (D-14j) — and the snapshot it leaves behind owns the
+  mappings every pointer it already returned points into. Releasing that
+  snapshot at the swap is therefore a **use-after-unmap in the caller**, not a
+  cleanup: the borrowed bytes MUST outlive the swap and MAY only be released
+  when the borrowing transaction or cursor ends.
+
+  A snapshot is the wrong granularity to retain, because it also holds a
+  descriptor per file and a borrower that swaps repeatedly would exhaust the
+  process's descriptor table. An implementation SHOULD retain only the
+  **mappings**, closing descriptors and freeing indexes at the swap as usual:
+  the bytes are page-cache-backed and cost address space alone.
+
+  This is not a fresh guarantee, only the reading of A-4 that a caller depends
+  on. It is called out because both of the swaps above are invisible from the
+  API — nothing the caller did says "the file set moved" — so an implementation
+  passes every single-snapshot test and still hands out dangling pointers the
+  moment a transaction's first store starts a new generation.
 - **A-5** `ZS_SHARED` is read-only and MUST NOT write (R-3).
 - **A-6** A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**;
   it never overrides what an existing file records, since each file's engine comes
