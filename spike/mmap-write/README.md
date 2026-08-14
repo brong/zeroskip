@@ -179,6 +179,62 @@ question and the gated rows never apply. That is worth knowing before anyone
 revisits, but it is not the workload zeroskip is tuned for, and D's variance
 argues against the mapping even there.
 
+## "Reserve the address space and stage through RAM" — cases N and O
+
+The recurring idea for killing the extension cost: reserve a huge `PROT_NONE`
+range, `MAP_FIXED` the file into the front of it, `MAP_FIXED` tmpfs or
+anonymous memory immediately after, write records into the RAM part, and later
+slide the file mapping forward over the same addresses. Contiguous addresses,
+no `ftruncate` in the store path, no SIGBUS from storing past EOF.
+
+**The mechanism works. Every step of it is real** — `MAP_NORESERVE` reservation
+is free, `MAP_FIXED` replaces atomically, and a reader's pointers stay valid
+across the slide because the bytes at those addresses do not change.
+
+**It cannot pay for itself, for a reason that has nothing to do with mapping
+tricks.** `MAP_FIXED`ing the file over the staging region *discards* the
+staging region — the new mapping shows file contents, not what was in tmpfs.
+So the bytes have to reach the file first, by `write`/`pwrite` from the staging
+pages, and there is no zero-copy path from tmpfs or anonymous pages into a ZFS
+file: not `copy_file_range` (a copy, and no reflink across those filesystems),
+not `vmsplice`+`splice` (the final hop goes through the fs write path, and page
+gifting has lifetime hazards that make a buffer reuse silently corrupt data).
+That leaves memcpy-into-RAM **plus** a write of the same bytes — the incumbent's
+two copies, but into freshly faulted pages instead of a 64KB buffer that stays
+cache-hot, and with extra `mmap` syscalls on top. Strictly more work than A′.
+
+**And N is the ceiling on the whole family.** Rather than argue it, `ftbench3`
+measures it: N and O run over a file pre-sized up front, so neither pays any
+extension at all — same bytes, same offsets, same two gates, differing only in
+whether the bytes were dirtied by a store through a `MAP_SHARED` mapping or by
+`pwrite`. No reservation scheme, tmpfs staging region or `fallocate`-ahead can
+do better than a file that was already the right size, so **N bounds every one
+of them.**
+
+| | APFS |
+|---|---|
+| K plain writer | 37.2 µs |
+| M J minus down-truncate | 36.5 µs |
+| **N pre-sized, memcpy + sync** | **36.6 µs** |
+| **O pre-sized, pwrite + sync** | **34.8 µs** |
+| J v4 shape (has the down-truncate) | 230.9 µs |
+
+On Darwin N ≈ O ≈ M ≈ K: with extension removed the mapping is free, and J's
+6x penalty is the down-truncate and nothing else. So on Darwin the idea would
+work — it just has nothing left to win, since K is already there.
+
+**ZFS is the case that decides it, and the prediction is that N loses.** M on
+ZFS chunk-extends by 1MB while each txn adds 192 bytes, so across N=2000 it
+pays roughly *one* extension for the entire run — extension is already
+amortized to nothing there — and it still cost 245 µs against K's 195 µs. If
+that 26% is real it cannot be extension, which leaves `fdatasync` over a dirty
+`MAP_SHARED` range being more expensive on ZFS than `fdatasync` after a write:
+ZFS keeps its own ARC pages behind the page cache and a mapped store has to be
+reconciled into them at sync time. N vs O tests exactly that, with extension
+removed from both. **If N > O on ZFS, the mmap write path is not losing because
+of how it extends, and no addressing scheme — including this one — can rescue
+it.** Run `ftbench3` on the ZFS dataset; N and O are the last two lines.
+
 ## Known gaps if this ever lands
 
 - `zstest-crash`'s NOSYNC sweep precondition fails under the flag: mmap

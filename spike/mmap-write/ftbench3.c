@@ -154,6 +154,59 @@ int main(int argc, char **argv)
         close(fd);
     }
 
+    /* N vs O: the ONE variable, with extension removed entirely.
+     *
+     * Both run over a file pre-sized up front, so neither pays a truncate, a
+     * pwrite-extend or an mmap inside the loop: same bytes, same offsets, same
+     * two gates.  The only difference is how the bytes were dirtied before
+     * fdatasync -- a store through a MAP_SHARED mapping (N) or a pwrite (O).
+     *
+     * N is the CEILING on any scheme that keeps a contiguous mapped address
+     * range and makes extension free -- reserve-and-MAP_FIXED, a tmpfs staging
+     * region, fallocate-ahead, anything.  None of them can beat a file that was
+     * already the right size.  So if N loses to O, the mmap write path is not
+     * losing because of how it extends, and no addressing trick can rescue it;
+     * if N wins, extension is the whole problem and the trick is worth building.
+     */
+    {
+        int fd = fresh(path);
+        size_t total = (size_t)N * (REC + TERM);
+        if (ftruncate(fd, (off_t)total) < 0) { perror("presize"); exit(1); }
+        char *map = mmap(NULL, GIANT, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) { perror("mmap"); exit(1); }
+        size_t wsize = 0;
+        double t0 = now();
+        for (int i = 0; i < N; i++) {
+            memcpy(map + wsize, rec, REC);
+            wsize += REC;
+            if (fdatasync(fd) < 0) { perror("s"); exit(1); }
+            memcpy(map + wsize, term, TERM);
+            wsize += TERM;
+            if (fdatasync(fd) < 0) { perror("s"); exit(1); }
+        }
+        report("N: pre-sized, memcpy+sync (mmap path's ceiling)", now() - t0);
+        munmap(map, GIANT);
+        close(fd);
+    }
+
+    {
+        int fd = fresh(path);
+        size_t total = (size_t)N * (REC + TERM);
+        if (ftruncate(fd, (off_t)total) < 0) { perror("presize"); exit(1); }
+        size_t wsize = 0;
+        double t0 = now();
+        for (int i = 0; i < N; i++) {
+            if (pwrite(fd, rec, REC, (off_t)wsize) != REC) { perror("p"); exit(1); }
+            wsize += REC;
+            if (fdatasync(fd) < 0) { perror("s"); exit(1); }
+            if (pwrite(fd, term, TERM, (off_t)wsize) != TERM) { perror("p"); exit(1); }
+            wsize += TERM;
+            if (fdatasync(fd) < 0) { perror("s"); exit(1); }
+        }
+        report("O: pre-sized, pwrite+sync (same bytes, no mapping)", now() - t0);
+        close(fd);
+    }
+
     unlink(path);
     return 0;
 }
