@@ -1501,9 +1501,11 @@ mutant "foreach: reverse accepted" catch \
   's/    if \(flags & ZS_REVERSE\) return ZS_BADUSAGE;/    \/* not rejected *\//'
 
 # A-12: SKIPROOT not forwarded -- the strict variants silently become the
-# inclusive ones, in both directions at once.
+# inclusive ones, in both directions at once.  (The pattern also carries
+# ZS_EPHEMERAL since A-4b joined the same forward; SKIPROOT is what the tests
+# below isolate.)
 mutant "fetch: point forms ignore SKIPROOT" catch \
-  's/                        \| \(\(uint32_t\)flags & ZS_SKIPROOT\);/                        ;/'
+  's/                        \| \(\(uint32_t\)flags & \(ZS_SKIPROOT \| ZS_EPHEMERAL\)\);/                        ;/'
 
 # A-12: the inclusive-≥ form silently made strict again -- the pre-2026-08-13
 # bare FETCHNEXT, under which a present key answers with its successor and
@@ -1518,6 +1520,30 @@ mutant "fetch: FETCHNEXT skips the root" catch \
 # test chasing it.
 mutant "cursor: txn_seq not taken at open" subsumed \
   's/    c->txn_seq = zsi_txn_seq\(txn\);/    \/* not taken *\//'
+
+# A-4b: the chunk-serving branch removed, so ZS_EPHEMERAL is accepted and does
+# nothing.  The whole point of the flag: without this branch a read of a record
+# the transaction just stored still drags the buffer out to the file, and
+# read-after-write costs one write(2) per record.  Silent -- every answer stays
+# correct, only the write combining is gone.
+mutant "fetch: ephemeral still flushes" catch \
+  's/    if \(ephemeral && off >= txn->flushed\n        && need <= txn->flushed \+ txn->chunklen\)\n        return txn->chunk \+ \(off - txn->flushed\);/    \/* served from the file as ever *\//'
+
+# A-4b: the conditional-store probe made durable again.  ZS_IFNOTEXIST and
+# ZS_IFEXIST look up a record only to decide, and never let it escape, so a
+# durable probe flushes the chunk on every conditional store for bytes it
+# discards.
+mutant "store: conditional probe is not ephemeral" catch \
+  's/        rc = zsi_lookup\(txn->db, txn->snap, txn, key, keylen, true, &r\);/        rc = zsi_lookup(txn->db, txn->snap, txn, key, keylen, false, \&r);/'
+
+# A-4b: ZS_EPHEMERAL accepted on a cursor the CALLER holds, which is the one
+# place it must not be -- a cursor yields across steps, so the record it handed
+# back dies under the caller at the next one.  Anchored on the brace and
+# zsi_cursor_open call that follow, because the identical reject line appears
+# three times (both cursor forms and foreach) and mutate.sh replaces the FIRST
+# match: without the anchor this silently lands on zs_txn_foreach's copy.
+mutant "cursor: ephemeral accepted on a held cursor" catch \
+  's/    if \(flags & ZS_EPHEMERAL\) return ZS_BADUSAGE;\n    \{\n        int r = zsi_cursor_open/    \/* not rejected *\/\n    {\n        int r = zsi_cursor_open/'
 
 echo
 if [ "$ROTONLY" -eq 1 ]; then

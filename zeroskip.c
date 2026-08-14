@@ -3263,6 +3263,16 @@ struct zsi_fcur {
      * pi-1, the index cursor's are bi-1/di-1, and 0 is exhausted -- so no
      * unsigned position ever underflows. */
     bool              reverse;
+
+    /* A-4b: this source may answer out of the writer's chunk buffer rather than
+     * forcing it to the file first, because whoever asked accepts a pointer
+     * that dies at their next call.  Only ever set on a ZSI_SRC_TXN source --
+     * nothing else has a buffer -- and only by a fetch: zsi_lookup's own stack
+     * cursor, or the throwaway one ZS_FETCHNEXT/ZS_FETCHPREV open and free
+     * within the call.  A cursor the CALLER holds must never set it, which is
+     * why ZS_EPHEMERAL is rejected at the public cursor and foreach forms
+     * rather than merely ignored there. */
+    bool              ephemeral;
     struct zsi_rec    cur;       /* valid iff !exhausted */
 
     /* kind-specific position */
@@ -4950,9 +4960,13 @@ static int zsi_db_freshen(struct zs_db *db)
  *
  * D-14c: ancestors are not consulted.  They exist solely for repacking, so a
  * lookup never follows a chain. */
+/* `ephemeral` is A-4b: the caller accepts key and value pointers that live only
+ * until its next call, which lets the transaction's own records be read where
+ * they already are.  It reaches only the ZSI_SRC_TXN source below, since that
+ * is the only one with anywhere else to read from. */
 static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
                       struct zs_txn *txn, const char *key, size_t keylen,
-                      struct zsi_rec *out)
+                      bool ephemeral, struct zsi_rec *out)
 {
     struct zsi_fcur fc;
 
@@ -4966,6 +4980,7 @@ static int zsi_lookup(struct zs_db *db, struct zsi_snapshot *snap,
         fc.txn = txn;
         fc.compar = db->compar;
         fc.gen = ZSI_GEN_TXN;
+        fc.ephemeral = ephemeral;
 
         int r = zsi_fcur_find(&fc, key, keylen, out);
         zsi_fcur_fini(&fc);
@@ -5245,6 +5260,10 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
         fc->txn = txn;
         fc->compar = db->compar;
         fc->gen = ZSI_GEN_TXN;
+        /* A-4b, and only reachable from the throwaway cursor ZS_FETCHNEXT and
+         * ZS_FETCHPREV open and free inside one call (D-14l): the public
+         * cursor and foreach forms reject the flag before they get here. */
+        fc->ephemeral = (flags & ZS_EPHEMERAL) != 0;
     }
 
     if ((flags & ZS_SKIPROOT) && key && keylen) {
@@ -5714,7 +5733,8 @@ static int zsi_txn_stream(struct zs_txn *txn, const char *buf, size_t len)
     return ZS_OK;
 }
 
-/* Bytes [off, off+len) of the active file, valid until the TRANSACTION ends.
+/* Bytes [off, off+len) of the active file, valid until the TRANSACTION ends --
+ * or, when `ephemeral`, only until the caller's next call (A-4b).
  *
  * This is A-4's mechanism for the transaction's own records: mappings
  * accumulate -- each new one at least doubles the last and may extend past
@@ -5723,12 +5743,29 @@ static int zsi_txn_stream(struct zs_txn *txn, const char *buf, size_t len)
  * ever invalidated.  O(log bytes) mappings, total address space at most a
  * small multiple of the final size, zero copies.  Never dereferences past
  * wsize, so the beyond-EOF tail of a mapping is never touched. */
-static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len)
+static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len,
+                              bool ephemeral)
 {
     size_t need = off + len;
 
     if (need < off) return NULL;                    /* overflow */
     if (need > txn->wsize) return NULL;
+
+    /* A-4b: a caller that only needs the bytes until its next call can have
+     * them where they already are, and the chunk keeps filling.  This is the
+     * whole point of the flag: without it a read of a record this transaction
+     * just stored costs one write(2), so read-after-write defeats the write
+     * combining entirely -- 100k flushes instead of 135 over 100k records.
+     *
+     * Sound because a record NEVER STRADDLES the boundary: zsi_txn_append
+     * flushes first and then copies the record in whole, or writes it straight
+     * through when it is too big for the chunk at all.  So a range at or above
+     * `flushed` is either wholly buffered or wholly beyond wsize, which the
+     * check above has already rejected.  A range that is partly below
+     * `flushed` therefore cannot exist, and needs no case here. */
+    if (ephemeral && off >= txn->flushed
+        && need <= txn->flushed + txn->chunklen)
+        return txn->chunk + (off - txn->flushed);
 
     /* Flush BEFORE the covering-mapping early return: a record still in the
      * chunk buffer is not in the file yet, and a mapping large enough to
@@ -6014,9 +6051,11 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
 
     /* The record was streamed to the active file when it was stored (C-8);
      * decode it back through the transaction's accumulated mappings, whose
-     * pointers live until the transaction ends (A-4). */
+     * pointers live until the transaction ends (A-4) -- or straight out of the
+     * chunk buffer, if whoever opened this source accepted A-4b's shorter
+     * lifetime. */
     struct zsi_pending *p = &txn->pend[ti];
-    const char *b = zsi_txn_at(txn, p->off, p->len);
+    const char *b = zsi_txn_at(txn, p->off, p->len, fc->ephemeral);
     if (!b
         || zsi_rec_decode(b, p->len, txn->wgen, &fc->cur) != ZS_OK) {
         fc->exhausted = true;
@@ -6268,7 +6307,9 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
     } else {
         r = zsi_txn_flush(txn);
         if (r != ZS_OK) return r;
-        span = zsi_txn_at(txn, txn->span_base, spanlen);
+        /* Never ephemeral: the flush just emptied the chunk, so these bytes
+         * are in the file and the mapping is the only place to read them. */
+        span = zsi_txn_at(txn, txn->span_base, spanlen, false);
         if (!span) return ZS_IOERROR;
     }
 
@@ -8353,8 +8394,12 @@ int zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
      * bounds, and a point lookup cannot disagree with a walk (G-7). */
     if (flags & (ZS_FETCHNEXT | ZS_FETCHPREV)) {
         struct zs_cursor *c = NULL;
+        /* ZS_EPHEMERAL rides along (A-4b).  Safe here and nowhere else a
+         * cursor is involved: this one is opened and freed inside this call,
+         * so the single record it yields is the caller's, under exactly the
+         * lifetime they asked for. */
         uint32_t cflags = ((flags & ZS_FETCHNEXT) ? 0u : (uint32_t)ZS_REVERSE)
-                        | ((uint32_t)flags & ZS_SKIPROOT);
+                        | ((uint32_t)flags & (ZS_SKIPROOT | ZS_EPHEMERAL));
         rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
                              key, keylen, cflags, &c);
         if (rc != ZS_OK) return rc;
@@ -8372,7 +8417,7 @@ int zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
     }
 
     rc = zsi_lookup(txn->db, txn->snap, txn->readonly ? NULL : txn,
-                    key, keylen, &r);
+                    key, keylen, (flags & ZS_EPHEMERAL) != 0, &r);
     if (rc != ZS_OK) return rc;
 
     if (keyp) *keyp = r.key;
@@ -8426,7 +8471,12 @@ int zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
     /* ZS_IFNOTEXIST / ZS_IFEXIST are evaluated against the transaction's own
      * view, so they compose with earlier writes in the same transaction (A-1a). */
     if (flags & (ZS_IFNOTEXIST | ZS_IFEXIST)) {
-        rc = zsi_lookup(txn->db, txn->snap, txn, key, keylen, &r);
+        /* Always ephemeral (A-4b): this probe wants the ANSWER, not the bytes.
+         * `r` never leaves this function, so forcing the chunk out to the file
+         * to look at a record we are about to discard is pure loss -- and a
+         * conditional store is otherwise read-after-write on every call, which
+         * is exactly the shape the flag exists for. */
+        rc = zsi_lookup(txn->db, txn->snap, txn, key, keylen, true, &r);
         if ((flags & ZS_IFNOTEXIST) && rc == ZS_OK) return ZS_EXISTS;
         if ((flags & ZS_IFEXIST) && rc == ZS_NOTFOUND) return ZS_NOTFOUND;
         if (rc != ZS_OK && rc != ZS_NOTFOUND) return rc;
@@ -8471,6 +8521,11 @@ int zs_txn_foreach(struct zs_txn *txn, const char *start, size_t startlen,
      * backwards drives a cursor -- and a rejected flag is cheaper than an
      * untested promise. */
     if (flags & ZS_REVERSE) return ZS_BADUSAGE;
+
+    /* A-4b: no ephemeral traversal, for the same reason.  A callback holding
+     * the record it was handed while the walk moves on is the ordinary shape
+     * here, and the flag would quietly break it. */
+    if (flags & ZS_EPHEMERAL) return ZS_BADUSAGE;
 
     rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
                          startlen ? start : NULL, startlen,
@@ -8517,6 +8572,11 @@ int zs_txn_begin_cursor(struct zs_txn *txn, const char *key, size_t keylen,
 {
     if (!txn || !curp) return ZS_BADUSAGE;
     *curp = NULL;
+    /* A-4b: a cursor yields across steps, so the caller holds what it was
+     * handed while the walk moves on.  Rejected rather than ignored -- the
+     * flag is only meaningful where the result dies at the next call, and
+     * that is not what a cursor is. */
+    if (flags & ZS_EPHEMERAL) return ZS_BADUSAGE;
     {
         int r = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
                                 keylen ? key : NULL, keylen,
@@ -8534,6 +8594,11 @@ int zs_db_begin_cursor(struct zs_db *db, const char *key, size_t keylen,
 
     if (!db || !curp) return ZS_BADUSAGE;
     *curp = NULL;
+
+    /* A-4b, before the begin below: without ZS_SHARED that begin takes the
+     * WRITE LOCK, and taking it for a call already known to fail would block
+     * every other handle for nothing. */
+    if (flags & ZS_EPHEMERAL) return ZS_BADUSAGE;
 
     /* An implicit transaction, owned by the cursor: a cursor from a database
      * needs somewhere for its snapshot to live, and zs_cursor_commit/abort is

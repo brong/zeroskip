@@ -108,6 +108,17 @@ enum zs_flagspec {
                                   ZS_CURSOR_PREFIX composes: the scan begins at
                                   the last key carrying the prefix.  Not valid
                                   on foreach or with ZS_CURSOR_LIVE. */
+    ZS_EPHEMERAL     = 1<<21,  /* fetch:   the returned key and value pointers
+                                  live only until the NEXT CALL on this
+                                  transaction (or handle, for zs_db_fetch), not
+                                  for its whole lifetime as A-4 promises
+                                  (A-4b).  Copy before then.  Lets a read of a
+                                  record this transaction just stored be
+                                  answered out of the writer's buffer instead
+                                  of forcing it to the file first, which is
+                                  what read-after-write otherwise costs.
+                                  A usage error on a cursor or foreach, which
+                                  yield across steps. */
 
     ZS_CSUM_NONE     = 1<<27,  /* open: write engine 0 into files this handle creates */
     ZS_CSUM_XXHASH   = 1<<28,  /* open: engine 1, the default */

@@ -5849,7 +5849,7 @@ static void db_get(struct zs_db *db, const char *key, size_t keylen,
                    char *out, size_t outlen)
 {
     struct zsi_rec r;
-    int rc = zsi_lookup(db, db->snap, NULL, key, keylen, &r);
+    int rc = zsi_lookup(db, db->snap, NULL, key, keylen, false, &r);
 
     if (rc != ZS_OK) { snprintf(out, outlen, "-"); return; }
     size_t n = r.vallen < outlen - 1 ? r.vallen : outlen - 1;
@@ -15334,6 +15334,187 @@ static void test_reverse_a4_lifetime(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* A-4b: what ZS_EPHEMERAL is FOR.  A read of a record this transaction just
+ * stored must otherwise see it in the file, which forces out the chunk the
+ * writer was filling -- one write(2) per record instead of one per 64KB.  The
+ * observable is txn->flushed: with the flag it stays where the stores left it,
+ * because every read is answered out of the buffer.
+ *
+ * The durable half of the test is not decoration.  Without it a chunk-serving
+ * branch that never fires still passes, since both runs would simply flush. */
+static void test_ephemeral_avoids_the_flush(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    size_t durable_grew, ephemeral_grew, ephemeral_buffered;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+
+    /* Measured from the STREAM base, not from zero: flushed starts at the
+     * active file's existing size, which the first store fills in and each
+     * run inherits from the one before. */
+
+    /* Durable: each read-back drags the chunk into the file. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "key00000", 8, "value", 5, 0));
+    size_t dbase = txn->flushed;
+    for (int i = 1; i < 200; i++) {
+        char k[16];
+        const char *v = NULL;
+        size_t kl = (size_t)snprintf(k, sizeof(k), "key%05d", i), vl = 0;
+        ASSERT_OK(zs_txn_store(txn, k, kl, "value", 5, 0));
+        ASSERT_OK(zs_txn_fetch(txn, k, kl, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "value", 5);
+    }
+    durable_grew = txn->flushed - dbase;
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* Ephemeral: identical loop, and nothing reaches the file at all.  200
+     * records of this size are far short of the 64KB chunk, so a correct
+     * implementation flushes not once. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "key00000", 8, "value", 5, 0));
+    size_t ebase = txn->flushed;
+    for (int i = 1; i < 200; i++) {
+        char k[16];
+        const char *v = NULL;
+        size_t kl = (size_t)snprintf(k, sizeof(k), "key%05d", i), vl = 0;
+        ASSERT_OK(zs_txn_store(txn, k, kl, "value", 5, 0));
+        ASSERT_OK(zs_txn_fetch(txn, k, kl, NULL, NULL, &v, &vl,
+                               ZS_EPHEMERAL));
+        ASSERT_MEM_EQ(v, "value", 5);
+    }
+    ephemeral_grew = txn->flushed - ebase;
+    ephemeral_buffered = txn->wsize - txn->flushed;
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    ASSERT_EQU(ephemeral_grew, 0u);        /* not one write(2) */
+    ASSERT(durable_grew > 0);              /* and the durable half did flush */
+    ASSERT(ephemeral_buffered > 0);        /* the records really were made */
+
+    /* A CONDITIONAL store is read-after-write on every call, and its probe
+     * wants the answer rather than the bytes -- so it takes A-4b internally
+     * whether the caller asked or not (nothing escapes zs_txn_store). */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "c00000", 6, "v", 1, 0));
+    size_t cbase = txn->flushed;
+    for (int i = 1; i < 200; i++) {
+        char k[16];
+        size_t kl = (size_t)snprintf(k, sizeof(k), "c%05d", i);
+        ASSERT_OK(zs_txn_store(txn, k, kl, "v", 1, ZS_IFNOTEXIST));
+        ASSERT_EQ(zs_txn_store(txn, k, kl, "v", 1, ZS_IFNOTEXIST), ZS_EXISTS);
+    }
+    ASSERT_EQU(txn->flushed - cbase, 0u);
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-4b: the weaker lifetime is the ONLY difference.  An ephemeral fetch has to
+ * answer exactly what a durable one would, including for the cases where the
+ * record is not sitting conveniently in the chunk: one already flushed out of
+ * it, an overwrite, a tombstone, and a key that lives in a committed file
+ * rather than in this transaction at all. */
+static void test_ephemeral_matches_durable(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+    char big[70000];
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "committed", 9, "old", 3, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    /* A committed record: no chunk involved, and the flag changes nothing. */
+    ASSERT_OK(zs_txn_fetch(txn, "committed", 9, NULL, NULL, &v, &vl,
+                           ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(v, "old", 3);
+
+    /* In the chunk. */
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "first", 5, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v, &vl, ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(v, "first", 5);
+
+    /* Overwritten in the chunk: the newest version wins, as ever (D-17b). */
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "SECOND", 6, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v, &vl, ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(v, "SECOND", 6);
+
+    /* Pushed OUT of the chunk by a record too big for it: "k" is now in the
+     * file, so the ephemeral read has to fall through to the mapping. */
+    memset(big, 'B', sizeof(big));
+    ASSERT_OK(zs_txn_store(txn, "big", 3, big, sizeof(big), 0));
+    ASSERT_OK(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v, &vl, ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(v, "SECOND", 6);
+    ASSERT_OK(zs_txn_fetch(txn, "big", 3, NULL, NULL, &v, &vl, ZS_EPHEMERAL));
+    ASSERT_EQU(vl, sizeof(big));
+    ASSERT_MEM_EQ(v, big, sizeof(big));
+
+    /* A tombstone reads as absent either way. */
+    ASSERT_OK(zs_txn_delete(txn, "k", 1, 0));
+    ASSERT_EQ(zs_txn_fetch(txn, "k", 1, NULL, NULL, &v, &vl, ZS_EPHEMERAL),
+              ZS_NOTFOUND);
+
+    /* And the committed record is still reachable under the flag after all
+     * that streaming. */
+    ASSERT_OK(zs_txn_fetch(txn, "committed", 9, NULL, NULL, &v, &vl,
+                           ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(v, "old", 3);
+
+    /* A-12's forms take it too, through the throwaway cursor they open and
+     * free inside the call (D-14l).  Their answers must not move either. */
+    const char *k = NULL;
+    size_t kl = 0;
+    ASSERT_OK(zs_txn_store(txn, "m", 1, "mid", 3, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "l", 1, &k, &kl, &v, &vl,
+                           ZS_FETCHNEXT | ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(k, "m", 1);
+    ASSERT_MEM_EQ(v, "mid", 3);
+    ASSERT_OK(zs_txn_fetch(txn, "n", 1, &k, &kl, &v, &vl,
+                           ZS_FETCHPREV | ZS_EPHEMERAL));
+    ASSERT_MEM_EQ(k, "m", 1);
+    ASSERT_MEM_EQ(v, "mid", 3);
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-4b: rejected where results are held across steps.  A cursor yields the
+ * previous record while the caller looks at the next one, so an ephemeral
+ * pointer there would be a promise nothing keeps -- A-13's reasoning, that a
+ * rejected flag is cheaper than an untested one. */
+static void test_ephemeral_rejected_on_cursor(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+
+    ASSERT_EQ(zs_db_begin_cursor(db, NULL, 0, &c, ZS_EPHEMERAL),
+              ZS_BADUSAGE);
+    ASSERT_NULL(c);
+    ASSERT_EQ(zs_db_foreach(db, NULL, 0, NULL, api_collect_cb, NULL,
+                            ZS_EPHEMERAL), ZS_BADUSAGE);
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_EQ(zs_txn_begin_cursor(txn, NULL, 0, &c, ZS_EPHEMERAL),
+              ZS_BADUSAGE);
+    ASSERT_NULL(c);
+    ASSERT_EQ(zs_txn_foreach(txn, NULL, 0, NULL, api_collect_cb, NULL,
+                             ZS_EPHEMERAL), ZS_BADUSAGE);
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /*
  * ============================================================
  * Test runner
@@ -15689,6 +15870,9 @@ static struct test_entry tests[] = {
     { "test_txn_fetch_survives_overwrite",
                                         test_txn_fetch_survives_overwrite },
     { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },
+    { "test_ephemeral_avoids_the_flush", test_ephemeral_avoids_the_flush },
+    { "test_ephemeral_matches_durable", test_ephemeral_matches_durable },
+    { "test_ephemeral_rejected_on_cursor", test_ephemeral_rejected_on_cursor },
 
     { "test_txn_cursor_store_behind_not_yielded",
                                         test_txn_cursor_store_behind_not_yielded },

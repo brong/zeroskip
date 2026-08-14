@@ -297,6 +297,7 @@ a spec label is missing here.
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
 | `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime`, `txn_fetch_survives_overwrite`, `reverse_a4_lifetime` |
 | `A-4a` | A-4 binds across a **snapshot swap**. A transaction or cursor may | `a4_borrow_survives_new_generation`, `a4_borrow_survives_cursor_swap`, `a4_borrow_survives_shared_snapshot_swap` |
+| `A-4b` | `ZS_EPHEMERAL` on a fetch **weakens A-4 for that result**: the key and | `ephemeral_matches_durable`, `ephemeral_avoids_the_flush`, `ephemeral_rejected_on_cursor` |
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
 | `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
