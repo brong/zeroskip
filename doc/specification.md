@@ -84,7 +84,7 @@ tolerate compaction happening out of band.
 | replay | walking an unordered file's span chain from the header (or a known span boundary) forward, verifying each terminator, to find its records and its complete point (F-20–F-24) |
 | snapshot | the fixed set of files, with their indexes, that one read observes — taken lock-free by the C-4 protocol, private to its holder |
 | handle | one process's open database object; not thread-safe, and never two writers in one process (G-5) |
-| rollover | a writer moving to a new active file once the current one exceeds `rollover_size` (D-9a) |
+| rollover | a writer moving to a new active file once the current one exceeds `rollover_size`, or holds too many spans to replay cheaply (D-9a, D-9d) |
 | conversion | rewriting one non-active unordered file as an in-order file covering the same generation (D-12) |
 | repack | merging adjacent in-order files into one file covering their combined range (D-16–D-23) |
 | seal | converting the active file in place, so every file in the database is in-order (D-25) |
@@ -834,8 +834,9 @@ without opening a single file.
   file, write a valid header, and append spans to that — making it the new
   active file.
 - **D-9a** A writer moves to a new file when the active file is not clean, or
-  when it exceeds `rollover_size` (default 2MB). Rollover is cheap: a new
-  header and nothing else, since no pointers are written (D-11).
+  when it exceeds `rollover_size` (default 2MB), or on D-9d's span condition.
+  Rollover is cheap: a new header and nothing else, since no pointers are
+  written (D-11).
 - **D-9b** The next generation is one above the highest present: the highest
   `end` among in-order files, or the active file's own generation if that is
   higher (D-1b — read from its header, since its name no longer carries one).
@@ -848,6 +849,39 @@ without opening a single file.
   `end + 1`. Allocating past `0xFFFFFFFF` MUST fail with `ZS_FULL` rather than
   wrap. At the 2MB default that bound is around 8PB of cumulative writes, and
   the remedy is to dump and reload into a fresh database.
+- **D-9d** A writer MAY additionally treat the active file as due for rollover
+  (D-9a) or sealing (D-25d) when its **replay window** holds more than some
+  number of spans. The replay window is the span sequence a reader must walk to
+  rebuild this file's index: from the `valid_upto` of the pointer table its
+  index was seeded from (P-13), or from the end of the header if there was none.
+
+  What this bounds is the rebuild, which is linear in the spans in the window
+  and is paid at every snapshot rebuild — at open, and at a write begin that
+  follows another process's commit (C-4i). Nothing else bounds it.
+  `rollover_size` bounds *bytes*, and many small transactions put many spans
+  into few bytes: measured on the reference implementation with no cache
+  configured, a fresh open costs 0.23ms at 1024 spans, 0.52ms at 4096 and
+  2.01ms at 16384, growing without limit until the byte threshold is finally
+  reached. A sole writer never rebuilds and never notices; writers alternating
+  across processes rebuild at every begin, so for them this is a per-transaction
+  cost.
+
+  **The window, not the file.** Counting spans in the file instead would be the
+  intuitive reading and is the wrong quantity. Where a cache is configured,
+  P-13's threshold already bounds the window — the same measurement shows 311
+  spans replayed for a file holding 16384, flat as the file grows — so a writer
+  counting the window correctly never rolls over on this condition, while one
+  counting the file would seal files whose rebuild was already cheap. A table
+  records no span count (P-5), so the window is also the only quantity a writer
+  can obtain without the walk it is trying to avoid.
+
+  This is **writer-local policy, not a layout requirement**. Two conforming
+  writers, or one writer configured two ways, MAY seal at different points; every
+  resulting layout is valid, D-5 resolves any file set, and no reader can tell
+  which rule produced it. It is stated here rather than left unwritten because a
+  writer that bounds only bytes has an unbounded rebuild, which presents as a
+  database that is slow to open and slow to begin rather than as anything
+  identifiable.
 - **D-10** An active file with a corrupt header or zero length is treated as a
   **complete file with zero spans**. It is not an error, and no record in it is
   recoverable either way. Its generation is **not** discoverable, since D-1b
@@ -1230,9 +1264,9 @@ The per-file cursors are held in an array kept sorted by:
   the complete point (F-24), so content past it does not survive into the
   output — the same outcome R-4 already produces, reached sooner.
 - **D-25d** A writer SHOULD seal at the end of any commit that leaves the
-  active file at or above `rollover_size`, while still holding the write
-  lock, and after D-12's pending conversions so D-12b's oldest-first order is
-  preserved. This is the one case D-12d's bound cannot cover: a single
+  active file at or above `rollover_size`, or over D-9d's span bound, while
+  still holding the write lock, and after D-12's pending conversions so D-12b's
+  oldest-first order is preserved. This is the one case D-12d's bound cannot cover: a single
   transaction larger than `rollover_size` grows the active file past the
   threshold in one append, and deferring the conversion hands its full,
   unbounded cost to the next writer's commit — a writer that did nothing to
@@ -2124,6 +2158,15 @@ different calls, though not every flag is meaningful everywhere:
   latency spike, needs a way to say so. `zs_db_should_repack` still reports the
   work either way, and a caller that sets this flag and never repacks gets a
   read path that degrades linearly in the file count.
+- **A-15** `rollover_txns` is D-9d's span bound. Zero selects an
+  implementation-defined default, so a caller that sets nothing still gets a
+  bounded rebuild; the reference implementation uses 1024, which its own figures
+  put at about 0.23ms of replay. Like `ZS_NOAUTOREPACK` it changes no on-disk
+  state and nothing another implementation can observe — a database written
+  under any value of it is indistinguishable from any other, only differently
+  divided. It is a knob rather than a constant for `rollover_size`'s reason: a
+  caller that knows its transaction sizes, or that has configured a pointer
+  table cache and would rather let P-13 do this work, can say so.
 
 ## 11. Conformance suite
 
