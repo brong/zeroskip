@@ -53,7 +53,7 @@ a spec label is missing here.
 | `F-5b` | Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the | `interop_constants_csum` |
 | `F-5c` | Engine 0 weakens G-2 and G-3, because F-22's property — that a | `header_checksum`, `span_engine_zero` |
 | `F-5d` | Engine 2 makes a file readable only by a caller supplying the same | `corpus` |
-| `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_records_checksum`, `span_terminator_without_data` |
+| `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_records_checksum`, `span_terminator_without_data`, `nocsum_still_rejects_bad_span`, `idxcache_rejection_rules` |
 | `F-6` | A reader MUST validate all 16 bytes, not a prefix. | `magic` |
 | `F-6a` | The magic is **not valid UTF-8**: `0x89` lies in the continuation-byte | `magic`, `staging_names` |
 | `F-7` | Split read and write versions let an older library determine that it | `header_versions` |

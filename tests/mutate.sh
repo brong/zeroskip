@@ -325,7 +325,7 @@ mutant "D-10: active bad header reported too" catch \
 # Step 4 must build an index for every unordered file, or a reader sees an empty
 # source where committed records are.
 mutant "step 4: index not built" catch \
-  's/                r = zsi_index_build_cached\(f, compar, compar_name, nocsum,\n                                           idxcfg\);/                r = ZS_OK; (void)compar; (void)compar_name;\n                (void)nocsum; (void)idxcfg;/'
+  's/                r = zsi_index_build_cached\(f, compar, compar_name, idxcfg\);/                r = ZS_OK; (void)compar; (void)compar_name; (void)idxcfg;/'
 
 mutant "step 4: pointers not loaded" catch \
   's/                r = zsi_ptrs_load\(f\);/                r = ZS_OK;/'
@@ -825,8 +825,8 @@ mutant "idx: drops the uuid check" catch \
 mutant "idx: drops the generation check" catch \
   's/    if \(h\.start != f->hdr\.start\) goto out;/    \/* P-11 generation check removed *\//'
 
-mutant "idx: accepts a nocsum-built table" catch \
-  's/    if \(!nocsum && !\(h\.flags & ZSI_IDX_FLAG_CSUM_VERIFIED\)\) goto out;/    \/* P-11 verified-flag check removed *\//'
+mutant "idx: accepts an unverified table" catch \
+  's/    if \(!\(h\.flags & ZSI_IDX_FLAG_CSUM_VERIFIED\)\) goto out;/    \/* P-11 verified-flag check removed *\//'
 
 # SUBSUMED, with the combined mutant below.  Every wrong size the suite can
 # construct shifts the trailing 4 bytes, so the offset-array checksum rejects it
@@ -949,7 +949,7 @@ mutant "idx: drops BOTH the kind and index checks" catch \
 # P-12.  Seeding the index but replaying from the top of the file duplicates
 # every record the table already covers.
 mutant "idx: seeds but replays from the header" catch \
-  's/    r = zsi_index_build_from\(f, compar, nocsum, base, nbase, vu\);/    r = zsi_index_build_from(f, compar, nocsum, base, nbase, ZSI_HEADER_LEN);/'
+  's/    r = zsi_index_build_from\(f, compar, base, nbase, vu\);/    r = zsi_index_build_from(f, compar, base, nbase, ZSI_HEADER_LEN);/'
 
 # P-10.  A publisher that records the wrong terminator writes tables every reader
 # then rejects -- silently, so the cache simply stops working.
@@ -1025,11 +1025,13 @@ mutant "compact: reports success regardless" catch \
 mutant "repack: inputs not verified before merge" catch \
   's/        r = zsi_ptrs_verify_records\(snap->files\[first \+ i\]\);/        r = ZS_OK;/'
 
-# D-20b again, the natural wrong version on the conversion path: verifying with
-# the HANDLE's nocsum setting.  F-5e scopes ZS_NOCSUM to reads, and conversion
-# writes -- a NOCSUM handle that seals a corrupt span certifies it as good.
-mutant "convert: verification honours ZS_NOCSUM" catch \
-  's/        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, false, NULL, NULL\);/        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, db->nocsum, NULL, NULL);/'
+# D-20b again, on the conversion path.  Since replay verifies spans in every
+# mode (F-5e), the old wrong version -- honouring the handle's nocsum -- is no
+# longer expressible; the surviving wrong version is dropping the walk, which
+# certifies in-place damage the C-4i probe cannot see (size unchanged) into an
+# output that validates while D-23 removes the evidence.
+mutant "convert: the D-20b re-verify removed" catch \
+  's/    \{\n        struct zsi_file scratch = \*f;\n        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, NULL, NULL\);\n        if \(r != ZS_OK\) return r;\n        if \(scratch\.complete < f->complete\) \{/    if (0) {\n        struct zsi_file scratch = *f;\n        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, NULL, NULL);\n        if (r != ZS_OK) return r;\n        if (scratch.complete < f->complete) {/'
 
 # F-32a.  Skipping verification at the yield is the headline gap the whole
 # format change exists to close: corrupt bytes served without a word.

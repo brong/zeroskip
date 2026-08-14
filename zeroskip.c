@@ -1544,17 +1544,19 @@ typedef int zsi_replay_cb(void *rock, const struct zsi_rec *rec, size_t off);
  * f->complete carry the answer.  Content beyond the complete point is simply not
  * part of the database.
  *
- * nocsum skips checksum verification (F-5e).  That is the caller's choice and it
- * costs tear detection: without the checksum, a span whose data never landed is
- * accepted on the strength of its length field alone.  F-22's guarantee does not
- * hold under it, and neither does C-4f's.
+ * The span checksum is verified in EVERY mode -- verification rides indexing
+ * (F-5e), and this replay is where spans are indexed.  ZS_NOCSUM does not
+ * reach it: skipping here would accept, on the strength of its length field
+ * alone, a terminator whose data never landed -- the state a crash under
+ * relaxed durability (C-7c) really leaves, since gate 1 is what ordered data
+ * before terminator on the DISK.  F-22 and C-4f hold for every reader.
  *
  * Two passes per span, deliberately.  Pass one finds the terminator and validates
  * the whole span; pass two replays its records.  Records are therefore decoded
  * twice.  The alternative is buffering an unbounded span's records in memory, and
  * the second decode costs nothing measurable because the span is already in page
  * cache from the first. */
-static int zsi_unordered_replay(struct zsi_file *f, size_t from, bool nocsum,
+static int zsi_unordered_replay(struct zsi_file *f, size_t from,
                                 zsi_replay_cb *cb, void *rock)
 {
     /* D-10: an active file with a corrupt header or zero length is treated as a
@@ -1673,7 +1675,7 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from, bool nocsum,
          * independent processes sharing a mapping -- which is what permits reading
          * a live file with no lock at all (C-4f).  It looks like an ordinary
          * checksum check and is not. */
-        if (!nocsum) {
+        {
             uint32_t want = zsi_csum2(f->csum, f->csum_id,
                                       spandata ? spandata : "", datalen,
                                       termbytes, term.len - 4);
@@ -2248,8 +2250,7 @@ static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
  *
  * Sets f->complete as a side effect, since the replay establishes it. */
 static int zsi_index_build_from(struct zsi_file *f, zs_compar *compar,
-                                bool nocsum, size_t *base, size_t nbase,
-                                size_t from)
+                                size_t *base, size_t nbase, size_t from)
 {
     struct zsi_index_build b;
     struct zsi_index *ix;
@@ -2258,7 +2259,7 @@ static int zsi_index_build_from(struct zsi_file *f, zs_compar *compar,
     zsi_index_free(&f->index);
 
     memset(&b, 0, sizeof(b));
-    r = zsi_unordered_replay(f, from, nocsum, zsi_index_build_cb, &b);
+    r = zsi_unordered_replay(f, from, zsi_index_build_cb, &b);
     if (r != ZS_OK) { free(b.offs); free(base); return r; }
     if (b.oom) { free(b.offs); free(base); return ZS_INTERNAL; }
 
@@ -2315,10 +2316,10 @@ static int zsi_index_build_from(struct zsi_file *f, zs_compar *compar,
 }
 
 /* The plain full build: no seed, from the top of the records region. */
-static int zsi_index_build(struct zsi_file *f, zs_compar *compar, bool nocsum)
+static int zsi_index_build(struct zsi_file *f, zs_compar *compar)
 {
     f->cached_upto = ZSI_HEADER_LEN;
-    return zsi_index_build_from(f, compar, nocsum, NULL, 0, ZSI_HEADER_LEN);
+    return zsi_index_build_from(f, compar, NULL, 0, ZSI_HEADER_LEN);
 }
 
 /* Point lookup.  Consults the delta first, so a key present in both yields the
@@ -2830,7 +2831,7 @@ struct zsi_idxcfg {
  *
  * On ZS_OK, *base is an owned array of *nbase offsets in key order. */
 static int zsi_idx_load(struct zsi_file *f, const struct zsi_idxcfg *cfg,
-                        const char *compar_name, bool nocsum,
+                        const char *compar_name,
                         size_t **base, size_t *nbase, size_t *valid_upto,
                         size_t *term_off, uint32_t *term_csum)
 {
@@ -2889,9 +2890,11 @@ static int zsi_idx_load(struct zsi_file *f, const struct zsi_idxcfg *cfg,
         goto out;
     if (memcmp(h.compar_name, compar_name, ZSI_COMPAR_NAME_LEN) != 0) goto out;
 
-    /* An index built without verification may hold records a verifying reader
-     * would reject, so it must not be handed to one.  The converse is fine. */
-    if (!nocsum && !(h.flags & ZSI_IDX_FLAG_CSUM_VERIFIED)) goto out;
+    /* A conforming builder always verifies spans at indexing (F-5e), so a
+     * table without bit 4 indexed spans nobody verified, and accepting it
+     * would seed OUR index with them -- for every reader, NOCSUM included,
+     * since NOCSUM stops at record checksums. */
+    if (!(h.flags & ZSI_IDX_FLAG_CSUM_VERIFIED)) goto out;
 
     /* Exact size, so a truncated or padded table is rejected rather than read
      * short.  The division guards the multiply. */
@@ -2970,7 +2973,7 @@ out:
 
 /* Build the private index, seeded from a table if one is usable (P-12). */
 static int zsi_index_build_cached(struct zsi_file *f, zs_compar *compar,
-                                  const char *compar_name, bool nocsum,
+                                  const char *compar_name,
                                   const struct zsi_idxcfg *cfg)
 {
     size_t *base = NULL, nbase = 0;
@@ -2978,12 +2981,12 @@ static int zsi_index_build_cached(struct zsi_file *f, zs_compar *compar,
     uint32_t tc = 0;
     int r;
 
-    if (zsi_idx_load(f, cfg, compar_name, nocsum,
+    if (zsi_idx_load(f, cfg, compar_name,
                      &base, &nbase, &vu, &to, &tc) != ZS_OK)
-        return zsi_index_build(f, compar, nocsum);
+        return zsi_index_build(f, compar);
 
     f->cached_upto = vu;
-    r = zsi_index_build_from(f, compar, nocsum, base, nbase, vu);
+    r = zsi_index_build_from(f, compar, base, nbase, vu);
     if (r != ZS_OK) return r;
 
     /* A replay that found no new span leaves last_term_* at the values it
@@ -3011,7 +3014,7 @@ static int zsi_index_build_cached(struct zsi_file *f, zs_compar *compar,
  * would put a third sync on a commit path C-7 defines as exactly two -- which is
  * the cost this whole mechanism exists to reduce. */
 static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
-                           zs_compar *compar, bool nocsum)
+                           zs_compar *compar)
 {
     char name[ZSI_NAME_MAX], path[PATH_MAX], tmp[PATH_MAX];
     unsigned char rnd[4];
@@ -3051,7 +3054,8 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
      * that using the handle's engine to append to an existing file causes
      * (A-6, F-5a). */
     h.flags = (uint16_t)(f->csum_id & ZSI_CSUM_MASK);
-    if (!nocsum) h.flags |= ZSI_IDX_FLAG_CSUM_VERIFIED;
+    /* Always: the replay that built this index verified its spans (F-5e). */
+    h.flags |= ZSI_IDX_FLAG_CSUM_VERIFIED;
     memcpy(h.uuid, f->hdr.uuid, 16);
     h.start = f->hdr.start;
     memcpy(h.compar_name, f->hdr.compar_name, ZSI_COMPAR_NAME_LEN);
@@ -3833,7 +3837,7 @@ static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
 static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                              zs_compar *compar, const char *compar_name,
                              zs_csum *external_csum,
-                             bool nocsum, const struct zsi_idxcfg *idxcfg,
+                             const struct zsi_idxcfg *idxcfg,
                              void (*report)(const char *, const char *, ...),
                              struct zsi_snapshot **out)
 {
@@ -3903,8 +3907,7 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                  * Seeded from a published pointer table when one is usable
                  * (P-12), which turns the replay from "the whole file" into
                  * "whatever has been appended since somebody last published". */
-                r = zsi_index_build_cached(f, compar, compar_name, nocsum,
-                                           idxcfg);
+                r = zsi_index_build_cached(f, compar, compar_name, idxcfg);
                 if (r != ZS_OK) {
                     zsi_snapshot_release(&s);
                     zsi_fileset_fini(&fs);
@@ -3919,7 +3922,7 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                  * than reported.  The write path, which has a handle to warn
                  * through, does report the first failure. */
                 if (idxcfg && idxcfg->dir)
-                    (void)zsi_idx_publish(f, idxcfg, compar, nocsum);
+                    (void)zsi_idx_publish(f, idxcfg, compar);
             } else {
                 r = zsi_ptrs_load(f);
                 if (r != ZS_OK) {
@@ -4272,7 +4275,7 @@ static int zsi_db_refresh(struct zs_db *db)
                                  db->index_local };
     int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
                               db->compar, db->compar_name, db->external_csum,
-                              db->nocsum, &idxcfg, db->error, &s);
+                              &idxcfg, db->error, &s);
     if (r != ZS_OK) return r;
 
     zsi_snapshot_release(&db->snap);
@@ -5907,7 +5910,7 @@ static int zsi_txn_commit(struct zs_txn *txn)
         if (r == ZS_OK && db->index_dir && !sealing) {
             struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold,
                                       db->index_local };
-            int pr = zsi_idx_publish(act, &cfg, db->compar, db->nocsum);
+            int pr = zsi_idx_publish(act, &cfg, db->compar);
 
             if (pr != ZS_OK && pr != ZS_DONE && !db->idx_publish_warned) {
                 db->idx_publish_warned = true;
@@ -6283,7 +6286,7 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
      * this handle admitted fails its checksum. */
     {
         struct zsi_file scratch = *f;
-        r = zsi_unordered_replay(&scratch, ZSI_HEADER_LEN, false, NULL, NULL);
+        r = zsi_unordered_replay(&scratch, ZSI_HEADER_LEN, NULL, NULL);
         if (r != ZS_OK) return r;
         if (scratch.complete < f->complete) {
             db->error("unordered file fails a span checksum; not converted",
@@ -7010,8 +7013,7 @@ static int zsi_check_unordered_file(struct zs_db *db, struct zsi_file *f)
 
     /* The replay validates every span's checksum as it goes, so a torn or
      * corrupted span shows up as a complete point short of the file's end. */
-    r = zsi_unordered_replay(f, ZSI_HEADER_LEN, db->nocsum,
-                             zsi_check_rec_cb, &ctx);
+    r = zsi_unordered_replay(f, ZSI_HEADER_LEN, zsi_check_rec_cb, &ctx);
     if (r != ZS_OK) return r;
 
     if (f->complete != f->size) {
@@ -7221,7 +7223,7 @@ int zs_db_index_dump(struct zs_db *db)
 
         zsi_name_format_index(name, f->hdr.uuid, f->hdr.start);
 
-        if (zsi_idx_load(f, &cfg, db->compar_name, db->nocsum,
+        if (zsi_idx_load(f, &cfg, db->compar_name,
                          &base, &nbase, &vu, &to, &tc) != ZS_OK) {
             printf("TABLE %s state=absent\n", name);
             continue;

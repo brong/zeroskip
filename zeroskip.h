@@ -48,7 +48,12 @@ enum zs_ret {
 enum zs_flagspec {
     ZS_CREATE        = 1<<0,   /* open:    create the database if absent */
     ZS_SHARED        = 1<<1,   /* open,txn: read-only */
-    ZS_NOCSUM        = 1<<2,   /* open:    do not verify checksums on read */
+    ZS_NOCSUM        = 1<<2,   /* open:    skip record-checksum verification
+                                  at materialization (F-5e) -- and nothing
+                                  else.  Span checksums are still verified
+                                  whenever a span is indexed, so crash
+                                  recovery and torn-tail detection (F-22,
+                                  C-4f) hold in every mode. */
     ZS_NOSYNC        = 1<<3,   /* open:    omit both durability gates on commit,
                                   and nothing else (C-7c).  Structure is still
                                   synced (C-6b), so a crash costs at most the
