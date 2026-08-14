@@ -213,6 +213,7 @@ a spec label is missing here.
 | `C-4a` | Completeness. Step 2's tiling check *is* the completeness proof: every | `crash/snapshot_gap_retry` |
 | `C-4b` | Why a retry suffices. `readdir` may miss entries, and a file may be | `crash/snapshot_gap_retry` |
 | `C-4c` | Immutability of what was opened. In-order files are never modified. | `mp_writer_and_readers`, `snapshot_boundary` |
+| `C-4c-a` | Immutability makes a file **shareable between snapshots**, which | `snapshot_reuses_immutable_files`, `fcache_sweeps_superseded_files` |
 | `C-4d` | Every index is private (D-13c), so a snapshot needs no synchronisation | `mp_writer_and_readers` |
 | `C-4f` | Concurrent visibility. A reader scanning the active file may meet a | `mp_reader_sees_torn_span`, `span_terminator_without_data` |
 | `C-4g` | Lifetime. Once its descriptors are open a packer may (subject to | `mp_reader_across_repack`, `snapshot_refcount` |

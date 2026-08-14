@@ -856,7 +856,9 @@ own index, in private memory, for each unordered file in its snapshot.
   reclaimed by the kernel when the last reader closes.
 - **D-13d** The cost is that each snapshot replays the unordered files it
   includes. That is bounded twice over: each such file is at most
-  `rollover_size`, and D-12 keeps their number at one in the steady state.
+  `rollover_size`, and D-12 keeps their number at one in the steady state. With
+  C-4c-a's sharing a *rebuild* pays even less — only files the previous snapshot
+  did not already hold, which in the steady state is the active one alone.
 
 ### 5.5 Reading
 
@@ -1293,8 +1295,19 @@ any point.
   below the snapshot boundary is immutable — a prefix of an append-only file is
   stable by construction. Growth beyond the boundary is invisible: the mapping
   covers the prefix and the reader never looks past it.
+- **C-4c-a** Immutability makes a file **shareable between snapshots**, which
+  is what keeps a rebuild from costing the whole set: an implementation MAY
+  carry an already-opened, already-indexed file object from one snapshot into
+  the next, since nothing about it can have changed. The **active file is
+  excluded**, and the exclusion is not an optimisation detail — its index and
+  its `complete` boundary are properties of the snapshot that built them, so
+  sharing it would let an older snapshot observe records committed after it was
+  taken, which is exactly the isolation G-4 promises. A generation that has
+  stopped being active is settled from then on and may be shared like any other.
 - **C-4d** Every index is private (D-13c), so a snapshot needs no synchronisation
-  against a writer beyond what C-4c already provides.
+  against a writer beyond what C-4c already provides. "Private" means private to
+  the **process**: sharing an index between two snapshots inside one process
+  (C-4c-a) is not a weakening of it, because no other process can see either.
 - **C-4f Concurrent visibility.** A reader scanning the active file may meet a
   span the writer is still writing. The terminator's checksum covers the span's
   data (F-19), so a terminator whose data is not yet fully visible fails
@@ -1866,21 +1879,28 @@ different calls, though not every flag is meaningful everywhere:
   cleanup: the borrowed bytes MUST outlive the swap and MAY only be released
   when the borrowing transaction or cursor ends.
 
-  A snapshot is the wrong granularity to retain, because it also holds a
-  descriptor per file and a borrower that swaps repeatedly would exhaust the
-  process's descriptor table. An implementation SHOULD retain only the
-  **mappings**, closing descriptors and freeing indexes at the swap as usual:
-  the bytes are page-cache-backed and cost address space alone.
+  A snapshot is the wrong granularity to reason about, because the lifetime in
+  question is the **file's**, and a snapshot is only one of its users. An
+  implementation SHOULD reference-count the file objects and have the borrower
+  hold a reference to each file it may have returned pointers into, released
+  when the borrower ends.
 
-  **A snapshot that is still shared at the swap is not thereby safe.** Taking
-  the mappings over is only available to the *last* holder; while others remain,
-  an implementation MUST keep its own reference rather than drop it. Dropping it
-  assumes the remaining holder outlives the borrower, and nothing establishes
-  that: a transaction that fetches, opens a cursor and then stores leaves the
-  outgoing snapshot held by that cursor alone, and closing the cursor unmaps
-  bytes the *transaction* was promised for its whole life. The reference is what
-  bounds the lifetime; the refcount says who may take the mappings, not who may
-  forget about them.
+  Reference-counting anything coarser leads to the two mistakes worth naming,
+  because both look like sound reasoning about a snapshot:
+
+  - **"Someone else still holds the snapshot, so the bytes are safe."** That
+    assumes the other holder outlives the borrower, and nothing establishes it.
+    A transaction that fetches, opens a cursor and then stores leaves the
+    outgoing snapshot held by that cursor alone; closing the cursor then unmaps
+    bytes the *transaction* was promised for its whole life.
+  - **"The snapshot's reference count tells me whether anyone is reading this
+    file."** It does not — it counts holders of a *set*. An implementation that
+    uses it as a proxy, for instance to decide whether the active file may be
+    remapped or its index extended in place (D-13b), silently couples that
+    decision to unrelated bookkeeping elsewhere.
+
+  With the count on the file, both questions are asked directly and neither
+  needs the other's answer.
 
   This is not a fresh guarantee, only the reading of A-4 that a caller depends
   on. It is called out because both of the swaps above are invisible from the
