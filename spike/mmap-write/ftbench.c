@@ -26,6 +26,8 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include "fsname.h"
+
 #define N     20000
 #define REC   152
 #define CHUNK (1u << 20)
@@ -54,6 +56,8 @@ static void report(const char *label, double dt)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/tmp/ftbench.dat";
+
+    banner("ftbench", path, N, REC);
     char rec[REC];
     memset(rec, 'r', sizeof(rec));
 

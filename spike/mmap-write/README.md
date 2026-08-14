@@ -22,17 +22,19 @@ whose EOF page is dirty in a MAP_SHARED mapping costs ~57µs (extending) to
 ## The Linux question (why this branch exists)
 
 Linux's truncate path has no `ubc_setsize` equivalent, so the penalty may
-not exist there. To find out, in order of increasing effort — step 1 is now
-answered, see "Linux primitives" below:
+not exist there. To find out, in order of increasing effort — and **on the
+filesystem that will run it**, which for us means a ZFS dataset, not `/tmp`
+(`$ZD` below):
 
 ```
 # 1. Primitives: does Linux punish ftruncate near dirty mapped pages?
-cc -O2 -std=c99 spike/mmap-write/ftbench.c  -o ftbench  && ./ftbench
-cc -O2 -std=c99 spike/mmap-write/ftbench2.c -o ftbench2 && ./ftbench2
-cc -O2 -std=c99 spike/mmap-write/ftbench3.c -o ftbench3 && ./ftbench3
+cc -O2 -std=c99 spike/mmap-write/ftbench.c  -o ftbench  && ./ftbench  $ZD/ft1.dat
+cc -O2 -std=c99 spike/mmap-write/ftbench2.c -o ftbench2 && ./ftbench2 $ZD/ft2.dat
+cc -O2 -std=c99 spike/mmap-write/ftbench3.c -o ftbench3 && ./ftbench3 $ZD/ft3.dat
+# Each prints the path and filesystem it ran on; check that line says zfs.
 # macOS baseline: A 1.9us, B 169us, C 4.9us, E/F ~0.01us, G 57us, H 1.7us;
 #                 K 51us, J 234us, L 40us, M 39us per txn.
-# If B/G/J are ~as cheap as C on Linux, the naive chunk+truncate design wins
+# If B/G/J are ~as cheap as C, the naive chunk+truncate design wins there
 # and the pwrite/heuristic complexity in zeroskip.c can be simplified away.
 
 # 2. End-to-end, sync-free (isolates the stream path).  Built through make, so
@@ -41,7 +43,7 @@ make clean && make -s libzeroskip.a && \
   cc -O2 -std=c99 -I. spike/mmap-write/nsbench.c libzeroskip.a -o nsb-plain
 make clean && make -s libzeroskip.a EXTRA_CFLAGS=-DZS_MMAP_WRITE && \
   cc -O2 -std=c99 -I. spike/mmap-write/nsbench.c libzeroskip.a -o nsb-mmap
-for per in 1 100 1000; do ./nsb-plain /tmp/nsdb 20000 $per; ./nsb-mmap /tmp/nsdb 20000 $per; done
+for per in 1 100 1000; do ./nsb-plain $ZD/nsdb 20000 $per; ./nsb-mmap $ZD/nsdb 20000 $per; done
 
 # 3. Full suites and matrix:
 make check
@@ -50,7 +52,16 @@ make clean && make zsbench && ./zsbench --reps 5           # plain
 make clean && make zsbench EXTRA_CFLAGS=-DZS_MMAP_WRITE && ./zsbench --reps 5
 ```
 
-## Linux primitives, measured 2026-08-14 (stl-imap-09)
+## Linux primitives, measured 2026-08-14 (stl-imap-09, `/tmp`)
+
+**Not ZFS, and ZFS is the case that decides this.** These runs took the default
+path under `/tmp` on that host — not tmpfs (a gated txn costing 1157 µs rules
+that out) but not the deployment filesystem either. ZFS is the one whose answer
+matters, and it is the one most likely to differ: it keeps its own ARC pages
+behind the page cache, so a truncate over a dirty mapped range and an
+`fdatasync` through the ZIL are both its own code paths, not the generic ones
+these numbers priced. Each `ftbench*` now prints the path and filesystem it ran
+on, so a pasted result says which — check that line before believing a number.
 
 Per-op, `ftbench*`, next to the Darwin figures above:
 

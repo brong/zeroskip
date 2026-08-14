@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include "fsname.h"
+
 #define N     2000
 #define REC   152
 #define TERM  40
@@ -51,6 +53,8 @@ static void report(const char *label, double dt)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/tmp/ftbench3.dat";
+
+    banner("ftbench3", path, N, REC);
     char rec[REC], term[TERM];
     static const char z = 0;
     memset(rec, 'r', sizeof(rec));

@@ -14,6 +14,8 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include "fsname.h"
+
 #define N     20000
 #define REC   152
 #define GIANT ((size_t)1 << 30)
@@ -41,6 +43,8 @@ static void report(const char *label, double dt)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/tmp/ftbench2.dat";
+
+    banner("ftbench2", path, N, REC);
     char rec[REC];
     memset(rec, 'r', sizeof(rec));
 
