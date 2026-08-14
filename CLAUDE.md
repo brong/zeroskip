@@ -16,7 +16,8 @@ Its sibling library `twom` (`../twom/`) is a mutable single-file skiplist. zeros
 
 ```bash
 make                # libzeroskip.a, libzeroskip.so/.dylib, zstool, zstest, zsbench
-make check          # run the test suite (alias: make test)
+make check          # run the test suite (alias: make test); includes stdcheck
+make stdcheck       # every source compiles clean at -std=c11 and -std=c17
 ./zstest            # run all tests directly
 ./zstest record     # run tests matching a substring filter
 make asan           # rebuild under ASan + UBSan and run the suite
@@ -28,6 +29,8 @@ make clean
 ```
 
 Requires: C99 compiler, POSIX (`mmap`, `fcntl` locking, `/dev/urandom`). Builds on Linux, macOS and the BSDs with no external libraries.
+
+**C99 is the target and should stay the target.** `zeroskip.c` is *vendored* into other projects, so whatever standard it requires, every host build has to meet — the same papercut as requiring a feature macro the host does not set, which is exactly how a downstream Linux build broke on `_GNU_SOURCE` (`PATH_MAX`, `strdup`, `nanosleep`, `realpath` and `fdatasync` all vanish at once, and every error points at `zeroskip.c` rather than at the missing `-D`). Nothing in the code is written around a missing C11/C17 feature: `_Static_assert` would assert nothing real here, because the on-disk layout is deliberately not struct layout (G-0 — encode and decode go through explicit `memcpy` at literal offsets, so `sizeof`/`offsetof` describe nothing a file depends on, and the real hazard of an encoder and decoder agreeing on a *wrong* layout is only catchable by `test_header_byte_layout`'s byte literals). C11 atomics are optional (`__STDC_NO_ATOMICS__`), so the C-1j registry would keep its `__atomic_*` fallback either way. `make stdcheck` guards the other direction — a consumer *building* at a newer standard — and runs inside `make check` at about a third of a second.
 
 Default `CFLAGS` are `-Wall -Wextra -g -O2 -fno-strict-aliasing -std=c99`. Append to them with `EXTRA_CFLAGS=...` rather than overriding `CFLAGS`, which would drop the platform feature defines.
 

@@ -68,7 +68,7 @@ LINKNAME = libzeroskip.so
 SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME)
 endif
 
-.PHONY: all clean check check-noprobe crashtest conformance test asan leaks mutate bench corpus install uninstall zeroskip.pc
+.PHONY: all clean check check-noprobe crashtest conformance stdcheck test asan leaks mutate bench corpus install uninstall zeroskip.pc
 
 all: libzeroskip.a $(LINKNAME) zstool zstest zsbench
 
@@ -116,10 +116,33 @@ zsbench: zsbench.c zeroskip.h libzeroskip.a
 # format is what a cross-implementation runner compares (T-0a) and a change to it
 # breaks other implementations rather than this one.
 check: zstest zstool zstest-crash
+	@$(MAKE) --no-print-directory stdcheck
 	./zstest
 	./zstest-crash
 	./tests/tool.sh
 	./tests/conformance.sh
+
+# The library targets C99 and should keep targeting it: zeroskip.c is VENDORED
+# into other projects, so whatever standard it requires, every host build has to
+# meet -- and a vendored file demanding a newer -std than its host is the same
+# papercut as one demanding a feature macro the host does not set.
+#
+# What this guards is the other direction: a consumer may build at a newer
+# standard, and nothing here may FAIL at one.  Syntax-only, because conformance
+# is a front-end question, which keeps the whole tree at about a third of a
+# second -- cheap enough to run inside check rather than be a target nobody
+# remembers.  -Werror because Cyrus builds that way.
+STDCHECK_STDS = c11 c17
+STDCHECK_SRCS = zeroskip.c zstool.c zsbench.c zstest.c zstest-crash.c
+
+stdcheck:
+	@for std in $(STDCHECK_STDS); do \
+	    for f in $(STDCHECK_SRCS); do \
+	        $(CC) $(CFLAGS) -std=$$std -Werror -fsyntax-only $$f \
+	            || { echo "stdcheck: $$f does not compile under -std=$$std"; exit 1; }; \
+	    done; \
+	    echo "  -std=$$std: $(words $(STDCHECK_SRCS)) files clean"; \
+	done
 
 # T-11: check doc/conformance.md against the spec in both directions, and that
 # every test it cites still exists.  A citation is only evidence while the test it
