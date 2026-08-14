@@ -57,44 +57,60 @@ opening a table, reading it and validating it costs more than the replay it
 saves. That is the honest shape of the trade, and it is why the feature is
 opt-in rather than on by default.
 
-### Writing, which is the bigger effect
+### Writing: who pays the replay
 
-A write transaction refreshes its snapshot at begin (C-4), and that refresh
-replays the active file **from the last published `valid_upto`**. With no table
-there is no published point, so every commit replays the whole file and a
-one-store-per-transaction load is quadratic. 16 000 such transactions over a
-2 MB active file:
+A snapshot **rebuild** replays the active file from the last published
+`valid_upto` — and with no table there is no published point, so the replay is
+the whole file. What changed on 2026-08-13 is *when a writer rebuilds*: a
+write begin runs the same C-4i probe a read does, and a sole writer's steady
+state rebuilds nothing at all — its commits keep the snapshot current through
+the D-13b fold. The replay is paid at open, and at any begin that follows
+another process's commit. (Before the probe, every write begin rebuilt, and
+single-record commit throughput decayed linearly with the active file's size —
+a sawtooth against `rollover_size`, found by a downstream benchmark.)
 
-| threshold | store | open | steady-state table |
-|---|---|---|---|
-| no cache | 26.8 s | 1.60 ms | — |
-| 1 byte | 6.5 s | 0.09 ms | 125 KB |
-| 4 KB | **2.7 s** | 0.09 ms | 125 KB |
-| 32 KB | **2.8 s** | 0.10 ms | 124 KB |
-| 256 KB | 6.5 s | 0.37 ms | 112 KB |
-| 1 MB | 18.6 s | 1.33 ms | 64 KB |
+16 000 single-store transactions over a 2 MB active file, in both shapes —
+"rebuild per begin" is measured with the pre-probe writer, which is what an
+alternation of one-store transactions across processes still pays, since every
+begin there follows another process's commit:
 
-So the cache is a **10× improvement on writes** in this workload, not only on
-opens — and that was not the effect it was built for.
+| threshold | sole writer | rebuild per begin | open | steady-state table |
+|---|---|---|---|---|
+| no cache | **1.2 s** | 13.2 s | 1.5 ms | — |
+| 1 byte | 5.0 s | 5.7 s | 0.09 ms | 125 KB |
+| 4 KB | 1.4 s | **2.0 s** | 0.09 ms | 125 KB |
+| 32 KB | **1.3 s** | **2.0 s** | 0.09 ms | 124 KB |
+| 256 KB | 1.2 s | 3.5 s | 0.13 ms | 121 KB |
+| 1 MB | 1.3 s | 8.8 s | 0.13 ms | 121 KB |
+
+So for the alternating shape the cache is still a **6× improvement on
+writes**, not only on opens. For the sole writer it is no longer a write-side
+effect at all — no cache is its fastest configuration, because the only
+replays left in that run are a handful of opens.
 
 ### Reading the threshold curve
 
-It is U-shaped, and both ends are real:
+The two shapes disagree about which end is expensive, and the default must
+serve both:
 
-- **Too low**, and every commit pays an O(records) merge and rewrites the whole
-  table. Threshold 1 byte writes roughly a gigabyte of tables over one
-  generation. It costs 2.4× the minimum rather than something catastrophic,
-  because a table is never `fsync`ed (P-14).
-- **Too high**, and the refresh replay grows without bound. This is the
-  expensive end: 1 MB costs 7× the minimum, and approaches having no cache
-  at all.
+- **Too low** costs the *writer*, in both shapes: every commit pays an
+  O(records) merge and rewrites the whole table. Threshold 1 byte writes
+  roughly a gigabyte of tables over one generation, and is the one setting
+  that makes a sole writer 4× *slower* than having no cache at all. Never
+  catastrophic, because a table is never `fsync`ed (P-14).
+- **Too high** costs whoever *rebuilds*: at 1 MB the alternating shape pays
+  4× its minimum and approaches having no cache at all. The sole writer never
+  notices — its curve is flat from 4 KB up — which is why this end has to be
+  measured with a rebuild forced per begin: the shape that pays it is not the
+  one a single-process benchmark runs.
 
-The default is **32 KB**, from the flat region, capped at a quarter of
-`rollover_size` so a caller using small generations still publishes within one.
-It is an absolute byte count rather than a fraction of `rollover_size`, because
-the knee is set by how much data a replay walks — which has nothing to do with
-how large a caller lets a generation grow. An earlier `rollover_size / 8` put
-the default at 256 KB, squarely on the wrong side.
+The default is **32 KB**, from the region both shapes tolerate, capped at a
+quarter of `rollover_size` so a caller using small generations still publishes
+within one. It is an absolute byte count rather than a fraction of
+`rollover_size`, because the knee is set by how much data a replay walks —
+which has nothing to do with how large a caller lets a generation grow. An
+earlier `rollover_size / 8` put the default at 256 KB, squarely on the wrong
+side of the rebuilding shape's knee.
 
 ### What it costs
 
