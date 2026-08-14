@@ -1,4 +1,12 @@
-# mmap-write spike (throwaway — not for merging as-is)
+# mmap-write spike (throwaway — **concluded: do not land**)
+
+> **Answer, 2026-08-14.** Measured on ZFS, the filesystem that decides it: the
+> plain `write(2)` writer beats every mmap shape on the gated transaction, by
+> 60% against the v4 design. The `/tmp` run that suggested otherwise was
+> measuring `/tmp`'s ~1157 µs syncs, not the stream path. Details in
+> [ZFS, measured](#zfs-measured-2026-08-14-stl-imap-09-mntvfstmpbrong--the-answer)
+> below. The branch stays as the record of the question and the harness that
+> answered it; the `-DZS_MMAP_WRITE` code is not a landing candidate.
 
 `-DZS_MMAP_WRITE` replaces the streaming writer's chunk-buffer + `write(2)`
 with a giant per-generation `PROT_READ|PROT_WRITE MAP_SHARED` window over the
@@ -32,8 +40,8 @@ cc -O2 -std=c99 spike/mmap-write/ftbench.c  -o ftbench  && ./ftbench  $ZD/ft1.da
 cc -O2 -std=c99 spike/mmap-write/ftbench2.c -o ftbench2 && ./ftbench2 $ZD/ft2.dat
 cc -O2 -std=c99 spike/mmap-write/ftbench3.c -o ftbench3 && ./ftbench3 $ZD/ft3.dat
 # Each prints the path and filesystem it ran on; check that line says zfs.
-# macOS baseline: A 1.9us, B 169us, C 4.9us, E/F ~0.01us, G 57us, H 1.7us;
-#                 K 51us, J 234us, L 40us, M 39us per txn.
+# macOS baseline: A 1.079us, A' 0.020us, B 159us, C 4.5us, E/F ~0.015us,
+#                 G 57us, H 1.7us; K 51us, J 234us, L 40us, M 39us per txn.
 # If B/G/J are ~as cheap as C, the naive chunk+truncate design wins there
 # and the pwrite/heuristic complexity in zeroskip.c can be simplified away.
 
@@ -89,7 +97,10 @@ that exact `ftruncate` per store (G, 9.3 µs) loses to `pwrite`-extension (H,
 chunk+truncate design does not win on Linux either, and the extension policy in
 `zeroskip.c` keeps earning its complexity.
 
-**Under real durability the verdict inverts from Darwin's.** A gated txn costs
+**Under real durability the verdict inverts from Darwin's.** *(Superseded — see
+the ZFS section below. This paragraph was measuring `/tmp`'s syncs, not the
+stream path, exactly as its own last sentence suspected. Kept because being
+wrong for a stated reason is the useful part of the record.)* A gated txn costs
 1157 µs here against 51 µs on the mac, and every shape carries the same two
 gates (C-7), so whatever the per-sync cost is, it is ~20x Darwin's and it
 swamps a 9–19 µs truncate: the mmap shapes come out 14% (J) to 19% (M) *faster*
@@ -104,6 +115,69 @@ x86-64 that still passes a 64-bit `off_t` correctly, so the figures should
 stand — but the gated rows (K/J/L/M) are within 20% of each other on a host
 whose syncs cost ~1 ms, which is exactly where one run proves nothing. Replace
 them with a repeated post-fix run.
+
+## ZFS, measured 2026-08-14 (stl-imap-09, `/mnt/vfs/tmp/brong`) — the answer
+
+Four runs of each binary, post-fix, filesystem line confirmed `zfs`. Median,
+against the same host's `/tmp` and the Darwin baseline:
+
+| | scenario | **ZFS** | /tmp | Darwin |
+|---|---|---|---|---|
+| A | `write(2)` append, one syscall per record | 5.5 µs | 0.4 µs | 1.9 µs |
+| B | chunked ft-up + memcpy + exact ft-down | 23.7 µs | 19.3 µs | 169 µs |
+| C | ftruncate pair, no mapping | 6.8 µs | 4.5 µs | 4.9 µs |
+| D | ftruncate pair, 1GB window present | 8.8–16.2 µs | 12.0 µs | — |
+| E | memcpy into a pre-sized file | 0.6 µs | 0.1 µs | 0.015 µs |
+| F | chunked ft-up + memcpy, no down-truncate | 0.6 µs | 0.1 µs | 0.014 µs |
+| G | exact ft-up per store + memcpy | 12.0 µs | 9.3 µs | 57 µs |
+| H | pwrite-extend per store + memcpy | 6.4 µs | 0.8 µs | 1.7 µs |
+| I | exact ft-up per 10-store batch | 1.6 µs | 1.0 µs | — |
+| K | **gated txn, plain writer** | **195 µs** | 1157 µs | 51 µs |
+| J | **gated txn, v4 mmap shape** | **313 µs** | 998 µs | 234 µs |
+| L | gated txn, exact-pwrite only | 231 µs | 1145 µs | 40 µs |
+| M | J minus the down-truncate | 245 µs | 935 µs | 39 µs |
+
+**Verdict: no. Close the spike.** On the gated transaction — the shape C-7
+defines and the only one a caller actually pays — the plain writer wins on ZFS
+by a margin nothing here closes: K 195 µs against J 313 µs (**60% slower**),
+and every other mmap variant loses too (L +18%, M +26%).
+
+**The `/tmp` result that looked like a win was an artifact of `/tmp` being
+slow.** Syncs there cost ~1157 µs per gated txn and swamped everything, which
+is what made J come out 14% ahead. ZFS's ZIL makes the same transaction **6x
+cheaper** (195 µs), so the sync no longer hides the truncate — and the ordering
+snaps back to Darwin's, just milder. The lesson is the one the section above
+already warned about: a benchmark whose dominant term is not the thing under
+test ranks noise.
+
+**The extension policy stops paying for itself.** `pwrite`-extension is what
+the Darwin measurements bought all that complexity for, at 1.7 µs against
+`ftruncate`'s 57 µs. On ZFS it costs 6.4 µs (H) — indistinguishable from just
+calling `write()` (A, 5.5 µs). The policy's whole justification is a Darwin
+number that does not survive the move to the deployment filesystem.
+
+**And the surviving per-store win was against a strawman.** F (0.6 µs) beating
+A (5.5 µs) 9x was the last argument for the design, but A is one `write(2)`
+per record and `zsi_txn_stream` has never done that: it memcpys into a 64KB
+`ZSI_TXN_CHUNK` and calls `write` when it fills, so ~430 records share a
+syscall. Case **A′** now measures the incumbent as it really is. On APFS it is
+0.020 µs/op against A's 1.079 — a 54x gap, the batching factor — while F is
+0.014 µs. So even where the mapping wins it wins by ~1.4x over a reused hot
+buffer, not 9x over a syscall per record. Re-run `ftbench` on ZFS for A′; the
+expectation is that A′ lands near E/F rather than near A, because a 64KB buffer
+that stays in cache has no per-page fault to pay and E/F's 0.6 µs on ZFS is
+mostly minor faults over the 1GB window.
+
+**One more reason not to want it:** D is the only case that moved between runs
+— 8.8, 10.8, 12.6 and 16.2 µs across four — while C, unmapped, held 6.7–6.9 µs.
+A truncate near a dirty mapping is not just more expensive on ZFS, it is less
+predictable, and a database cares about the tail more than the mean.
+
+What would reopen this: a workload dominated by per-store cost rather than by
+syncs — a bulk load of one enormous transaction, where A′ vs F is the whole
+question and the gated rows never apply. That is worth knowing before anyone
+revisits, but it is not the workload zeroskip is tuned for, and D's variance
+argues against the mapping even there.
 
 ## Known gaps if this ever lands
 

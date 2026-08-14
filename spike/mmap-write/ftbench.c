@@ -33,6 +33,10 @@
 #define CHUNK (1u << 20)
 #define GIANT ((size_t)1 << 30)
 
+/* ZSI_TXN_CHUNK, kept in step with zeroskip.c: case A' has to be the
+ * incumbent as it really is, or the comparison is against nothing. */
+#define CHUNK64 (64 * 1024)
+
 static double now(void)
 {
     struct timeval tv;
@@ -50,7 +54,10 @@ static int fresh(const char *path)
 
 static void report(const char *label, double dt)
 {
-    printf("  %-58s %8.0f/s  %6.1f us/op\n", label, N / dt, dt / N * 1e6);
+    /* 3 decimals: the memcpy-only cases are tens of nanoseconds, and at one
+     * decimal every one of them printed "0.0 us/op" -- which reads as "free"
+     * when the whole question is which of them is least free. */
+    printf("  %-58s %10.0f/s  %8.3f us/op\n", label, N / dt, dt / N * 1e6);
 }
 
 int main(int argc, char **argv)
@@ -61,13 +68,44 @@ int main(int argc, char **argv)
     char rec[REC];
     memset(rec, 'r', sizeof(rec));
 
-    /* A: plain write() append */
+    /* A: plain write() append -- one syscall per record.
+     *
+     * NOT what the library does, and the distinction decides the spike: A is
+     * the strawman, A' is the incumbent. */
     {
         int fd = fresh(path);
         double t0 = now();
         for (int i = 0; i < N; i++)
             if (write(fd, rec, REC) != REC) { perror("write"); exit(1); }
-        report("A: write() append", now() - t0);
+        report("A: write() append (one syscall per record)", now() - t0);
+        close(fd);
+    }
+
+    /* A': what zsi_txn_stream ACTUALLY does -- memcpy into a reused chunk
+     * buffer, one write() when it fills.  ZSI_TXN_CHUNK is 64KB, so at this
+     * record size ~430 records share a syscall and the buffer stays hot in
+     * cache instead of faulting in fresh pages of a giant mapping.
+     *
+     * Every mmap case below has to beat THIS to be worth its complexity, not
+     * A.  Comparing against A flatters the spike by the entire batching
+     * factor, which is where its apparent per-store win came from. */
+    {
+        int fd = fresh(path);
+        char *chunk = malloc(CHUNK64);
+        size_t used = 0;
+        if (!chunk) { perror("malloc"); exit(1); }
+        double t0 = now();
+        for (int i = 0; i < N; i++) {
+            if (used + REC > CHUNK64) {
+                if (write(fd, chunk, used) != (ssize_t)used) { perror("write"); exit(1); }
+                used = 0;
+            }
+            memcpy(chunk + used, rec, REC);
+            used += REC;
+        }
+        if (used && write(fd, chunk, used) != (ssize_t)used) { perror("write"); exit(1); }
+        report("A': chunked write() (64KB buffer, the incumbent)", now() - t0);
+        free(chunk);
         close(fd);
     }
 
