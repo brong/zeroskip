@@ -111,7 +111,7 @@ a spec label is missing here.
 | `D-0` | The `<uuid>` in a filename is the **36-character lowercase hyphenated | `interop_constants_uuid` |
 | `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_rejections`, `filenames` |
 | `D-1a` | Data files carry **no extension**, so `zeroskip-*` stays | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
-| `D-1b` | **The active file is named `zeroskip-<uuid>-current`.** It does | **none** |
+| `D-1b` | **The active file is named `zeroskip-<uuid>.current`.** It does | **none** |
 | `D-2` | `zeroskip-*` matches data files only and `zeroskip.*` matches | `filename_rejections`, `fileset_ignores_foreign`, `staging_names` |
 | `D-3` | `zeroskip.lock` MUST be a distinct file that is never replaced. | `staging_names` |
 | `D-3a` | It is created with the database (D-8a), and is created on open with | `lock_basic`, `open_lock_file_recreated` |

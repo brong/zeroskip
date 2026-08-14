@@ -686,17 +686,25 @@ filesize-4    4   checksum of the pointer section
   identical, and hexadecimal keeps names short.
 - **D-1a** Data files carry **no extension**, so `zeroskip-*` stays
   prefix-globbable (D-2) and no name can collide with a staging name.
-- **D-1b The active file is named `zeroskip-<uuid>-current`.** It does **not**
+- **D-1b The active file is named `zeroskip-<uuid>.current`.** It does **not**
   carry a generation, and there is exactly one such name, so a database has at
   most one unordered file **structurally** rather than by policy (D-12a).
+
+  The separator before `current` is a **dot, not a hyphen**, and that is the
+  whole point of the choice: `zeroskip-<uuid>-*` then matches the
+  generation-named files and *only* those, so every glob, `readdir` filter and
+  shell one-liner that wants "the files with generations in their names" gets
+  them without having to exclude the active file by hand. `zeroskip-<uuid>*`
+  still matches the whole database. A name that has to be grepped out of the
+  common pattern is one that eventually is not.
 
   Its generation is read from its **header**, which costs nothing: the active
   file is the one file a snapshot must open and replay anyway (D-13a). Every
   other file still carries its range in its name, so one `readdir` still yields
   the whole set without opening anything except this one.
 
-  `current` sorts **after** every generation name, because lowercase `c` is
-  above the uppercase hex digits `0`–`9A`–`F`. The active file therefore sorts
+  It sorts **after** every generation name, because `.` (0x2E) is above `-`
+  (0x2D) at the position where the two diverge. The active file therefore sorts
   last, which is where its generation puts it — the ordering D-5's sweep wants
   is preserved without the name carrying a number.
 
@@ -706,6 +714,10 @@ filesize-4    4   checksum of the pointer section
   local filesystem is a dentry-cache hit either way and on a network or ZFS
   mount is the difference between one round trip and several. It was measured
   costing about as much as the `fdatasync`es it sits beside.
+
+  It remains a **data** file for D-2's purposes: the discriminator there is the
+  character after `zeroskip`, which is still `-`, so `zeroskip.*` continues to
+  mean metadata and staging names are untouched.
 
   This replaces a scheme in which the active file was named for its generation,
   `zeroskip-<uuid>-00000005`, a strict prefix of the in-order name covering the
@@ -740,9 +752,10 @@ There is no manifest. **The directory is the file set.** Filenames carry each
 file's generation range (D-1), so one `readdir` yields the set and every range
 without opening a single file.
 
-- **D-4** A file participates if its name matches `zeroskip-<uuid>-*` for this
-  database's UUID. Staging files and other databases' files are ignored by
-  construction.
+- **D-4** A file participates if its name matches `zeroskip-<uuid>*` for this
+  database's UUID — that is, a generation-named file under `zeroskip-<uuid>-`
+  or the active file at `zeroskip-<uuid>.current` (D-1b). Staging files and
+  other databases' files are ignored by construction.
 - **D-4a** On first open the UUID is not yet known, so it is **discovered**: take
   the names matching `zeroskip-*`, parse the UUID from each, and require they all
   agree. Disagreement means two databases' files have been mixed into one
