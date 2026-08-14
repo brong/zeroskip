@@ -1298,6 +1298,16 @@ any point.
 - **C-6a** A directory sync is **not** required after `unlink`. If a removed name
   reappears after a crash it is a file an enclosing range already supersedes,
   which readers ignore (D-5) and a later pass removes again (D-23).
+- **C-6b Output durability.** A conversion or repack output MUST be
+  `fdatasync`ed before the rename that publishes it, and a new active file's
+  header before its creation returns. These syncs — and C-6's directory
+  syncs — are **integrity**, not durability, and hold in every durability
+  mode: no flag relaxes them. Publication asserts completeness (D-21), so a
+  name that exists pointing at a partial file is corruption *created by* a
+  rename — and the inputs it entitles a later pass to retire (D-23) were the
+  data's only complete copy. An output-sync failure fails the conversion or
+  repack; a directory-sync failure is reported and tolerated (C-6), because a
+  lost name merely un-happens a publication the inputs still cover.
 - **C-7 Two gates per commit.** Under default durability a commit is:
 
   1. append the span's data records, then **`fdatasync`**;
@@ -1319,11 +1329,20 @@ any point.
   *transaction*, not per record, so a caller that batches many operations into one
   transaction amortises it — which is the reason `zs_txn_*` exists alongside the
   single-operation `zs_db_*` calls.
-- **C-7c** `ZS_NOSYNC` omits **both** gates. Atomicity survives, because a torn
-  tail is still detectable (F-22); durability does not, and neither does the
-  ordering guarantee of C-7a — so under `ZS_NOSYNC` a valid terminator no longer
-  implies durable data, and the caller is asserting it has that guarantee
-  elsewhere.
+- **C-7c** `ZS_NOSYNC` omits **both** gates — and nothing else. The structural
+  syncs stay in every mode: C-6's directory syncs and C-6b's output syncs are
+  integrity, and only the two per-commit gates were ever durability. Atomicity
+  survives, because a torn tail is still detectable (F-22); C-7a's ordering
+  guarantee does not — a valid terminator no longer implies durable data — and
+  per-commit durability becomes the caller's affair (`zs_db_sync` is the
+  on-demand gate). What a crash leaves is a valid **prefix** of the active
+  generation, possibly empty, on top of every generation a conversion or
+  repack already published: the loss bound is the active file's unconverted
+  tail, at most `rollover_size` — not the database. An implementation that
+  also skipped the structural syncs would have no bound at all: a rename could
+  publish a torn in-order file and entitle the retirement of the inputs that
+  were its records' only complete copy (C-6b), so a crash would cost converted
+  generations, which no caller asking to skip *commit* syncs agreed to.
 - **C-8** An aborted transaction appends a `ROLLBACK` and syncs **neither** gate.
   If a crash loses it, the active file is simply no longer clean, so the next
   writer moves to a new file (D-9) and reaches the same state. Nothing is being
@@ -1737,7 +1756,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_CREATE` | open | create the database if absent |
 | `ZS_SHARED` | open, txn | read-only (A-5) |
 | `ZS_NOCSUM` | open | do not verify checksums on read (F-5e) |
-| `ZS_NOSYNC` | open | omit both durability gates on commit (C-7c) |
+| `ZS_NOSYNC` | open | omit both durability gates on commit, and nothing else (C-7c, C-6b) |
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |

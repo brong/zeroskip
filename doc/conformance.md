@@ -220,6 +220,7 @@ a spec label is missing here.
 | `C-5` | The accepted cost of C-4g is that disk space is held until the last | `mp_reader_across_repack` |
 | `C-6` | Directory durability. After creating a **data file** (a new active | `crash/dirsync_justifies_c6` |
 | `C-6a` | A directory sync is **not** required after `unlink`. If a removed name | `crash/dirsync_justifies_c6` |
+| `C-6b` | Output durability. A conversion or repack output MUST be | `crash/sync_failure_every_point` |
 | `C-7` | Two gates per commit. Under default durability a commit is: | `crash/crash_at_every_call`, `mp_reader_sees_torn_span`, `zsbench` |
 | `C-7a` | Together the gates make "a valid terminator implies its data is | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
 | `C-7b` | The cost is two syncs per commit rather than one. It is paid per | `zsbench (store, N per txn)` |
