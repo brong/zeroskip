@@ -1760,7 +1760,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
-| `ZS_FETCHNEXT` | fetch | return the record *after* the given key |
+| `ZS_FETCHNEXT` | fetch | return the record with the smallest key ≥ the given key; with `ZS_SKIPROOT`, strictly > (A-12) |
 | `ZS_FETCHPREV` | fetch | return the record with the largest key ≤ the given key; with `ZS_SKIPROOT`, strictly < (A-12) |
 | `ZS_REVERSE` | cursor | iterate toward smaller keys (D-14k); not valid on `foreach` or with `ZS_CURSOR_LIVE` (A-13) |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
@@ -1836,12 +1836,19 @@ different calls, though not every flag is meaningful everywhere:
 - **A-11** `zs_db_compact` performs D-26, returning `ZS_OK` only when the
   database is a single file and `ZS_BADFORMAT` otherwise, having merged whatever
   it could first (D-28).
-- **A-12** `ZS_FETCHPREV` on `zs_db_fetch` and `zs_txn_fetch` returns the
-  record with the largest key ≤ the given key, resolved by D-14l; composed
-  with `ZS_SKIPROOT` the bound is strict (< the given key). The transactional
-  form sees the transaction's own pending writes, like every other read
-  (A-1a). `ZS_FETCHNEXT` and `ZS_FETCHPREV` together are a usage error
-  (`ZS_BADUSAGE`). A-4's lifetime applies to the result unchanged.
+- **A-12** The point-lookup forms on `zs_db_fetch` and `zs_txn_fetch`:
+  `ZS_FETCHPREV` returns the record with the largest key ≤ the given key,
+  and `ZS_FETCHNEXT` the record with the smallest key ≥ it — each resolved
+  by the same merge as iteration in its direction (D-14l, G-7), so a point
+  lookup structurally cannot disagree with a walk. Composed with
+  `ZS_SKIPROOT` either bound is strict, exactly as a cursor's seek treats
+  it: the family is two directions by two bounds, with one spelling each.
+  The transactional form sees the transaction's own pending writes, like
+  every other read (A-1a). `ZS_FETCHNEXT` and `ZS_FETCHPREV` together are a
+  usage error (`ZS_BADUSAGE`). A-4's lifetime applies to the result
+  unchanged. (History: bare `ZS_FETCHNEXT` was the strict bound until
+  2026-08-13, when the strictness moved to the modifier for symmetry with
+  `ZS_FETCHPREV`; every known consumer was updated with the change.)
 - **A-13** `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor`
   opens a D-14k cursor: a null or empty start key positions at the last key
   in the database; a non-empty one at the largest key ≤ it, with
