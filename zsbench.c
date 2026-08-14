@@ -245,6 +245,24 @@ static void bench_fetch(void)
     free(val);
 }
 
+static void bench_scan_once(struct zs_db *db, const char *label)
+{
+    printf("  %-34s", label);
+    fflush(stdout);
+
+    double t0 = now();
+    struct zs_cursor *c = NULL;
+    long seen = 0;
+    if (zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED) == ZS_OK) {
+        const char *k, *v;
+        size_t kl, vl;
+        while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) seen++;
+        zs_cursor_abort(&c);
+    }
+    double dt = now() - t0;
+    printf("%8.0f/s  %5.2fs  %ld records\n", seen / dt, dt, seen);
+}
+
 static void bench_scan(void)
 {
     char dir[1200];
@@ -261,23 +279,19 @@ static void bench_scan(void)
     }
     zs_db_close(&db);
 
+    /* Two lines, because per-record stores build the most fragmented file
+     * the format can produce -- one span per record -- and a scan of that is
+     * the write-heavy worst case, not the steady state.  The compacted line
+     * is what long-lived data reads like. */
     db = open_at(dir, 0, 0);
-    printf("  %-34s", "full scan");
-    fflush(stdout);
-
-    double t0 = now();
-    struct zs_cursor *c = NULL;
-    long seen = 0;
-    if (zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED) == ZS_OK) {
-        const char *k, *v;
-        size_t kl, vl;
-        while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) seen++;
-        zs_cursor_abort(&c);
-    }
-    double dt = now() - t0;
-    printf("%8.0f/s  %5.2fs  %ld records\n", seen / dt, dt, seen);
-
+    bench_scan_once(db, "full scan");
     zs_db_close(&db);
+
+    db = open_at(dir, 0, 0);
+    zs_db_compact(db);
+    bench_scan_once(db, "full scan, compacted");
+    zs_db_close(&db);
+
     cleanup(dir);
     free(val);
 }
