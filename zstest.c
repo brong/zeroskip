@@ -6986,19 +6986,23 @@ static void test_api_three_forms(void)
     ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     ASSERT_EQ(zs_db_delete(db, "k", 1, ZS_IFEXIST), ZS_NOTFOUND);
 
-    /* ZS_FETCHNEXT: the record AFTER the given key, through both forms. */
+    /* ZS_FETCHNEXT: the record AFTER the given key -- the strict bound, which
+     * since 2026-08-13 is spelled with ZS_SKIPROOT (A-12) -- through both
+     * forms. */
     ASSERT_OK(zs_db_store(db, "a", 1, "A", 1, 0));
     ASSERT_OK(zs_db_store(db, "b", 1, "B", 1, 0));
     ASSERT_OK(zs_db_store(db, "c", 1, "C", 1, 0));
 
     const char *k2;
     size_t kl2;
-    ASSERT_OK(zs_db_fetch(db, "a", 1, &k2, &kl2, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_OK(zs_db_fetch(db, "a", 1, &k2, &kl2, &v, &vl,
+                          ZS_FETCHNEXT | ZS_SKIPROOT));
     ASSERT_EQU(kl2, 1u);
     ASSERT_MEM_EQ(k2, "b", 1);
 
     ASSERT_OK(zs_db_begin_txn(db, 1, &txn));
-    ASSERT_OK(zs_txn_fetch(txn, "a", 1, &k2, &kl2, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_OK(zs_txn_fetch(txn, "a", 1, &k2, &kl2, &v, &vl,
+                           ZS_FETCHNEXT | ZS_SKIPROOT));
     ASSERT_MEM_EQ(k2, "b", 1);
     ASSERT_OK(zs_txn_abort(&txn));
 
@@ -14131,6 +14135,80 @@ static void test_fetchprev_sees_txn_writes(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* A-12: bare ZS_FETCHNEXT is the inclusive-≥ point form -- the family's
+ * fourth cell, spelled by moving the strictness to ZS_SKIPROOT exactly as
+ * FETCHPREV and a cursor seek already do.  (Bare FETCHNEXT was the strict
+ * bound until 2026-08-13; this test is the semantics change.) */
+static void test_fetchnext_inclusive(void)
+{
+    struct zs_db *db = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "d", 1, "4", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    /* Exact hit: inclusive means the key itself. */
+    ASSERT_OK(zs_db_fetch(db, "d", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "d", 1);
+    ASSERT_MEM_EQ(v, "4", 1);
+
+    /* Exact hit on the newest store, which sits in the index's DELTA rather
+     * than its base -- the two sides take separate inclusive branches. */
+    ASSERT_OK(zs_db_fetch(db, "f", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "f", 1);
+
+    /* Gap: the smallest above. */
+    ASSERT_OK(zs_db_fetch(db, "c", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "d", 1);
+
+    /* Below everything. */
+    ASSERT_OK(zs_db_fetch(db, "a", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "b", 1);
+
+    /* Above everything. */
+    ASSERT_EQ(zs_db_fetch(db, "z", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT),
+              ZS_NOTFOUND);
+
+    /* SKIPROOT: strictly greater -- the old bare-FETCHNEXT answer. */
+    ASSERT_OK(zs_db_fetch(db, "d", 1, &k, &kl, &v, &vl,
+                          ZS_FETCHNEXT | ZS_SKIPROOT));
+    ASSERT_MEM_EQ(k, "f", 1);
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-12: the transactional form sees pending writes -- a pending store can BE
+ * the inclusive answer (A-1a, G-7). */
+static void test_fetchnext_inclusive_sees_txn_writes(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(zs_db_store(db, "f", 1, "6", 1, 0));
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "d", 1, "4", 1, 0));
+
+    ASSERT_OK(zs_txn_fetch(txn, "d", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "d", 1);           /* the pending store IS the answer */
+
+    ASSERT_OK(zs_txn_delete(txn, "d", 1, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "c", 1, &k, &kl, &v, &vl, ZS_FETCHNEXT));
+    ASSERT_MEM_EQ(k, "f", 1);           /* the tombstone pushed it higher */
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-1c: several cursors on one transaction at once, directions mixed,
  * interleaved -- the sqlite shape, one query over several trees. */
 static void test_txn_many_cursors(void)
@@ -14805,6 +14883,9 @@ static struct test_entry tests[] = {
                                         test_reverse_rejected_compositions },
     { "test_fetchprev_basic",           test_fetchprev_basic },
     { "test_fetchprev_sees_txn_writes", test_fetchprev_sees_txn_writes },
+    { "test_fetchnext_inclusive",       test_fetchnext_inclusive },
+    { "test_fetchnext_inclusive_sees_txn_writes",
+                                test_fetchnext_inclusive_sees_txn_writes },
     { "test_txn_many_cursors",          test_txn_many_cursors },
     { "test_txn_insert_select_self",    test_txn_insert_select_self },
     { "test_index_cur_reverse_base_delta",

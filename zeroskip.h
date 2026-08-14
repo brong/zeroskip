@@ -61,7 +61,11 @@ enum zs_flagspec {
 
     ZS_IFNOTEXIST    = 1<<11,  /* store:   only if absent, else ZS_EXISTS */
     ZS_IFEXIST       = 1<<12,  /* store:   only if present, else ZS_NOTFOUND */
-    ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record AFTER the given key */
+    ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record with the smallest
+                                  key >= the given key; with ZS_SKIPROOT,
+                                  strictly > (A-12).  Exclusive with
+                                  ZS_FETCHPREV.  (Bare FETCHNEXT was the
+                                  strict bound until 2026-08-13.) */
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
     ZS_FETCHPREV     = 1<<15,  /* fetch:   return the record with the largest key
                                   <= the given key; with ZS_SKIPROOT, strictly <

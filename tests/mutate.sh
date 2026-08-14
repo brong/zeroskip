@@ -1302,10 +1302,16 @@ mutant "cursor: reverse accepts ZS_CURSOR_LIVE" catch \
 mutant "foreach: reverse accepted" catch \
   's/    if \(flags & ZS_REVERSE\) return ZS_BADUSAGE;/    \/* not rejected *\//'
 
-# A-12: SKIPROOT not forwarded -- the strictly-less variant silently becomes
-# the inclusive one.
-mutant "fetch: FETCHPREV ignores SKIPROOT" catch \
-  's/                        : ZS_REVERSE \| \(\(uint32_t\)flags & ZS_SKIPROOT\);/                        : ZS_REVERSE;/'
+# A-12: SKIPROOT not forwarded -- the strict variants silently become the
+# inclusive ones, in both directions at once.
+mutant "fetch: point forms ignore SKIPROOT" catch \
+  's/                        \| \(\(uint32_t\)flags & ZS_SKIPROOT\);/                        ;/'
+
+# A-12: the inclusive-≥ form silently made strict again -- the pre-2026-08-13
+# bare FETCHNEXT, under which a present key answers with its successor and
+# the point form disagrees with a walk (G-7).
+mutant "fetch: FETCHNEXT skips the root" catch \
+  's/        uint32_t cflags = \(\(flags & ZS_FETCHNEXT\) \? 0u : \(uint32_t\)ZS_REVERSE\)/        uint32_t cflags = ((flags \& ZS_FETCHNEXT) ? (uint32_t)ZS_SKIPROOT : (uint32_t)ZS_REVERSE)/'
 
 # Initialising the counter at open is a PERFORMANCE fix, not a correctness one:
 # with the fallback above in place a spurious refresh resumes correctly, it just

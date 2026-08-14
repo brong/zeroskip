@@ -7644,19 +7644,18 @@ int zs_txn_fetch(struct zs_txn *txn, const char *key, size_t keylen,
     if ((flags & ZS_FETCHNEXT) && (flags & ZS_FETCHPREV))
         return ZS_BADUSAGE;                                 /* A-12 */
 
-    /* ZS_FETCHNEXT: return the record AFTER the given key.  A cursor seeked to
-     * the key with ZS_SKIPROOT is exactly that, so it shares the merge rather than
-     * reimplementing "next".
+    /* ZS_FETCHNEXT: the smallest key >= (or, with ZS_SKIPROOT, >) the given
+     * key -- a forward cursor's first yield from that seek, so it shares the
+     * merge rather than reimplementing it.
      *
      * ZS_FETCHPREV: the largest key <= (or, with ZS_SKIPROOT, <) the given
      * key.  A REVERSE cursor seeked at the key is exactly that (D-14l), so it
-     * shares the merge too -- the fetch family stays two shapes, not three,
-     * and predecessor lookup cannot disagree with reverse iteration (G-7). */
+     * shares the merge too -- the fetch family stays two directions by two
+     * bounds, and a point lookup cannot disagree with a walk (G-7). */
     if (flags & (ZS_FETCHNEXT | ZS_FETCHPREV)) {
         struct zs_cursor *c = NULL;
-        uint32_t cflags = (flags & ZS_FETCHNEXT)
-                        ? ZS_SKIPROOT
-                        : ZS_REVERSE | ((uint32_t)flags & ZS_SKIPROOT);
+        uint32_t cflags = ((flags & ZS_FETCHNEXT) ? 0u : (uint32_t)ZS_REVERSE)
+                        | ((uint32_t)flags & ZS_SKIPROOT);
         rc = zsi_cursor_open(txn->db, txn->readonly ? NULL : txn, txn->snap,
                              key, keylen, cflags, &c);
         if (rc != ZS_OK) return rc;

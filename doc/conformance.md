@@ -300,7 +300,7 @@ a spec label is missing here.
 | `A-9` | `index_threshold` is P-13's threshold in bytes. Zero selects an | `idxcache_threshold_defaults` |
 | `A-10` | `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's | `seal_noop_cases`, `seal_readonly` |
 | `A-11` | `zs_db_compact` performs D-26, returning `ZS_OK` only when the | `compact_to_one_file`, `compact_reports_and_fails_on_bad_file` |
-| `A-12` | `ZS_FETCHPREV` on `zs_db_fetch` and `zs_txn_fetch` returns the | `fetchprev_basic`, `fetchprev_sees_txn_writes`, `reverse_rejected_compositions` |
+| `A-12` | The point-lookup forms on `zs_db_fetch` and `zs_txn_fetch`: | `fetchprev_basic`, `fetchprev_sees_txn_writes`, `fetchnext_inclusive`, `fetchnext_inclusive_sees_txn_writes`, `reverse_rejected_compositions` |
 | `A-13` | `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor` | `cursor_reverse_seek_and_skiproot`, `reverse_a4_lifetime`, `reverse_rejected_compositions` |
 
 ## Conformance suite (`T-n`)
