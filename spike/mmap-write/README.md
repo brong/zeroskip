@@ -1,12 +1,25 @@
 # mmap-write spike (throwaway — **concluded: do not land**)
 
-> **Answer, 2026-08-14.** Measured on ZFS, the filesystem that decides it: the
-> plain `write(2)` writer beats every mmap shape on the gated transaction, by
-> 60% against the v4 design. The `/tmp` run that suggested otherwise was
-> measuring `/tmp`'s ~1157 µs syncs, not the stream path. Details in
-> [ZFS, measured](#zfs-measured-2026-08-14-stl-imap-09-mntvfstmpbrong--the-answer)
-> below. The branch stays as the record of the question and the harness that
-> answered it; the `-DZS_MMAP_WRITE` code is not a landing candidate.
+> **Closed 2026-08-14. Measured on ZFS, the filesystem that decides it.**
+>
+> The plain `write(2)` writer beats every mmap shape on the gated transaction —
+> 191 µs against the v4 design's 304 µs. The `/tmp` run that suggested otherwise
+> was measuring `/tmp`'s ~1157 µs syncs, not the stream path.
+>
+> **The cost is in the sync, not the truncate**, which is what shuts the whole
+> family rather than just this design. Cases N and O price a pre-sized file with
+> extension removed entirely — same bytes, same offsets, same two gates, differing
+> only in whether the pages were dirtied through a `MAP_SHARED` store or by
+> `pwrite`. N loses by **33%**. Since no scheme that keeps a contiguous mapped
+> range can beat a file that was already the right size, N bounds all of them:
+> reserve-and-`MAP_FIXED`, tmpfs staging, `fallocate`-ahead. There is no version
+> of this that wins on ZFS.
+>
+> The branch stays as the record of the question and the harness that answered
+> it. `-DZS_MMAP_WRITE` is **not** a landing candidate and this is not a
+> "revisit later" — the ceiling has been measured. One unrelated lead did fall
+> out of it, [O beating K by 10%](#the-one-thing-worth-taking-from-this-o-beats-k-by-10),
+> which belongs to the existing writer and to a spec question about slop.
 
 `-DZS_MMAP_WRITE` replaces the streaming writer's chunk-buffer + `write(2)`
 with a giant per-generation `PROT_READ|PROT_WRITE MAP_SHARED` window over the
@@ -223,19 +236,65 @@ On Darwin N ≈ O ≈ M ≈ K: with extension removed the mapping is free, and J
 6x penalty is the down-truncate and nothing else. So on Darwin the idea would
 work — it just has nothing left to win, since K is already there.
 
-**ZFS is the case that decides it, and the prediction is that N loses.** M on
-ZFS chunk-extends by 1MB while each txn adds 192 bytes, so across N=2000 it
-pays roughly *one* extension for the entire run — extension is already
-amortized to nothing there — and it still cost 245 µs against K's 195 µs. If
-that 26% is real it cannot be extension, which leaves `fdatasync` over a dirty
-`MAP_SHARED` range being more expensive on ZFS than `fdatasync` after a write:
-ZFS keeps its own ARC pages behind the page cache and a mapped store has to be
-reconciled into them at sync time. N vs O tests exactly that, with extension
-removed from both. **If N > O on ZFS, the mmap write path is not losing because
-of how it extends, and no addressing scheme — including this one — can rescue
-it.** Run `ftbench3` on the ZFS dataset; N and O are the last two lines.
+### ZFS answers it: N loses to O by a third
 
-## Known gaps if this ever lands
+Four runs, medians (K's one 307.5 µs reading is a cold first-run outlier the
+median absorbs; N was the *tightest* case of all six at 230.5–234.4):
+
+| case | ZFS median | vs O |
+|---|---|---|
+| **O** pre-sized, pwrite + sync | **174.1 µs** | — |
+| K plain writer (append) | 191.1 µs | +10% |
+| L exact pwrite-extend | 221.8 µs | +27% |
+| **N** pre-sized, memcpy + sync | **232.0 µs** | **+33%** |
+| M J minus down-truncate | 235.5 µs | +35% |
+| J v4 shape | 303.9 µs | +75% |
+
+**N is 33% slower than O with extension removed from both.** Same bytes, same
+offsets, same two gates; the only difference is that N dirtied the pages
+through a `MAP_SHARED` store. So the mmap path's loss on ZFS is in the
+**sync**, not the truncate — ZFS keeps its own ARC pages behind the page cache
+and a mapped store has to be reconciled into them when `fdatasync` runs.
+
+Since N bounds every scheme that keeps a contiguous mapped range, **the
+reserve-and-slide idea is capped at 33% worse than the writer we already have**,
+before paying for its staging copy and `mmap` syscalls. There is nothing left
+to try in this direction. The earlier "M still loses by 26%, so it must be the
+sync" was an inference; this is the experiment, and it agrees.
+
+### The one thing worth taking from this: O beats K by 10%
+
+Both are plain writes with identical syncs. O `pwrite`s into a **pre-sized**
+file; K appends into a growing one. The likely mechanism is that a growing
+file forces a size-metadata update through the ZIL on every `fdatasync`, and a
+pre-sized file does not.
+
+That is a lead for the *existing* writer, not a rescue for this branch — and
+it is not free, because pre-sizing means slop, which collides with two
+load-bearing invariants:
+
+- **C-4i's probe** detects another process's commit by the active file
+  *growing*. Pre-size it and every peer commit becomes invisible.
+- **D-9 cleanliness** is "valid spans with nothing after the last". Trailing
+  slop is something after the last, so a writer would roll over at every open.
+
+Managing that slop is exactly what J and M paid down-truncates for, and what
+those truncates cost is the top half of this table. **Pre-growing only what
+the current commit needs does not recover it either**: the size still changes
+once inside the commit, so the sync still carries a metadata update — it halves
+those updates rather than removing them. And there is no "just write it as one
+write" available, because C-8 streams records at `zs_txn_store`, so for any
+transaction of more than one record the data is in the file long before commit
+and only the terminator remains; C-7's two gates are normative besides. Any
+real attempt here is a spec question about slop and the C-4i probe, not a
+continuation of this spike.
+
+## What it would still have needed (recorded, not to be done)
+
+Kept because it prices the design honestly: even had the numbers come out the
+other way, this is what stood between the branch and a landing. The last item
+is the one that turned out to matter — slop management is what J and M were
+paying for, and paying for it is what put them at the bottom of the table.
 
 - `zstest-crash`'s NOSYNC sweep precondition fails under the flag: mmap
   stores are invisible to `zs_hook_write`, leaving only 3 hookable calls.
