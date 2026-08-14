@@ -4200,7 +4200,11 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
 
     ssize_t n = ZS_WRITE(fd, hdr, sizeof(hdr));
     if (n != (ssize_t)sizeof(hdr)) { close(fd); return ZS_IOERROR; }
-    if (!db->nosync && ZS_FDATASYNC(fd) < 0) { close(fd); return ZS_IOERROR; }
+    /* C-6b: in EVERY durability mode.  ZS_NOSYNC relaxes only C-7's commit
+     * gates; the structural syncs are integrity, and skipping them here and
+     * below is how a crash under NOSYNC costs converted generations instead
+     * of the active tail the caller agreed to risk. */
+    if (ZS_FDATASYNC(fd) < 0) { close(fd); return ZS_IOERROR; }
     close(fd);
 
     /* C-6: fdatasync the DIRECTORY after creating a data file, or the name may be
@@ -4212,7 +4216,7 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
      * indistinguishable from the transaction not having happened, and recoverable
      * (C-6a).  Failing the create would be worse: it would leave a file the caller
      * has been told does not exist. */
-    if (!db->nosync) {
+    {
         int dfd = open(db->dir, O_RDONLY);
         if (dfd >= 0) {
             if (ZS_FDATASYNC(dfd) < 0)
@@ -6115,8 +6119,10 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
     free(sec);
 
     /* The file's contents durable BEFORE the rename, or the name could exist
-     * pointing at a partial file after a crash. */
-    if (r == ZS_OK && !db->nosync && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
+     * pointing at a partial file after a crash -- in every durability mode
+     * (C-6b): the rename entitles retiring the inputs, which are these
+     * records' only other copy. */
+    if (r == ZS_OK && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
     fd = -1;
 
@@ -6136,7 +6142,7 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * the name may be absent after a crash even though the contents are durable.
      * Reported rather than fatal: a lost name leaves the inputs in place, which
      * still tile, so a later pass simply converts again (C-6a, R-5). */
-    if (!db->nosync) {
+    {
         int dfd = open(db->dir, O_RDONLY);
         if (dfd >= 0) {
             if (ZS_FDATASYNC(dfd) < 0)
@@ -6580,7 +6586,8 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
     if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
     free(sec);
-    if (r == ZS_OK && !db->nosync && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
+    /* Durable before the rename, in every durability mode (C-6b). */
+    if (r == ZS_OK && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
     fd = -1;
 
@@ -6593,7 +6600,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
     if (ZS_RENAME(spath, fpath) < 0) { ZS_UNLINK(spath); r = ZS_IOERROR; goto out; }
 
-    if (!db->nosync) {                          /* C-6 */
+    {                                           /* C-6, every mode (C-6b) */
         int dfd = open(db->dir, O_RDONLY);
         if (dfd >= 0) {
             if (ZS_FDATASYNC(dfd) < 0)

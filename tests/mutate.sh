@@ -1229,6 +1229,20 @@ mutant "abort: writes COMMIT instead of ROLLBACK" catch \
 mutant "txn: covering mapping wins over the unflushed chunk" catch \
   's/    if \(need > txn->flushed && zsi_txn_flush\(txn\) != ZS_OK\) return NULL;\n\n    if \(txn->nmaps && need <= txn->maps\[txn->nmaps - 1\].len\)\n        return txn->maps\[txn->nmaps - 1\].base \+ off;/    if (txn->nmaps \&\& need <= txn->maps[txn->nmaps - 1].len)\n        return txn->maps[txn->nmaps - 1].base + off;\n\n    if (need > txn->flushed \&\& zsi_txn_flush(txn) != ZS_OK) return NULL;/'
 
+# C-6b: the structural syncs hold in EVERY durability mode.  Each mutant
+# re-adds the nosync guard the fix removed at one site; under ZS_NOSYNC that
+# site then publishes (or creates) without making the bytes durable first, and
+# a crash costs converted generations rather than the active tail.  Caught by
+# the crash suite's exact sync signatures.
+mutant "creation: header sync skipped under NOSYNC" catch \
+  's/    if \(ZS_FDATASYNC\(fd\) < 0\) \{ close\(fd\); return ZS_IOERROR; \}/    if (!db->nosync \&\& ZS_FDATASYNC(fd) < 0) { close(fd); return ZS_IOERROR; }/'
+
+mutant "conversion: output sync skipped under NOSYNC" catch \
+  's/     \* records. only other copy\. \*\/\n    if \(r == ZS_OK && ZS_FDATASYNC\(fd\) < 0\) r = ZS_IOERROR;/     * records only other copy. *\/\n    if (r == ZS_OK \&\& !db->nosync \&\& ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;/'
+
+mutant "repack: output sync skipped under NOSYNC" catch \
+  's/    \/\* Durable before the rename, in every durability mode \(C-6b\)\. \*\/\n    if \(r == ZS_OK && ZS_FDATASYNC\(fd\) < 0\) r = ZS_IOERROR;/    if (r == ZS_OK \&\& !db->nosync \&\& ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;/'
+
 # C-4i's probe must stay stale across a FAILED refresh.  Committing the
 # baseline first poisons the probe: after a transient refresh failure the
 # names already match, and a snapshot with no active file has no size to

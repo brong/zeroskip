@@ -78,6 +78,10 @@ static long syncs_after_failure;
 static bool a_sync_failed;
 static bool suppress_dirsync;   /* for the test that justifies C-6 */
 static long dir_syncs;          /* fdatasyncs whose fd was a DIRECTORY */
+static long renames_seen;       /* renames so far */
+static long syncs_at_first_rename;   /* sync_calls when the first rename ran,
+                                      * or -1 if none has: C-6b's ordering --
+                                      * the output sync BEFORE the publish */
 
 static void tick(void)
 {
@@ -121,6 +125,7 @@ static int hook_fdatasync(int fd)
 static int hook_rename(const char *a, const char *b)
 {
     tick();
+    if (renames_seen++ == 0) syncs_at_first_rename = sync_calls;
     return rename(a, b);
 }
 
@@ -148,6 +153,8 @@ static void hooks_reset(void)
     a_sync_failed = false;
     suppress_dirsync = false;
     dir_syncs = 0;
+    renames_seen = 0;
+    syncs_at_first_rename = -1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -434,6 +441,73 @@ static void test_crash_nosync_mode(void)
 
     passed++;
     fprintf(stderr, "  crash under ZS_NOSYNC (%ld points)       ok\n", calls);
+}
+
+static void test_nosync_structural_syncs(void)
+{
+    /* C-6b/C-7c: ZS_NOSYNC omits the two commit gates and NOTHING else.  The
+     * structural syncs are integrity, not durability: an implementation that
+     * skipped them could publish a name pointing at a partial file and then
+     * retire the inputs that were the records' only complete copy -- a crash
+     * would cost converted generations, not the active tail the caller
+     * agreed to risk.  Each structural operation has an exact signature --
+     * the output fdatasync BEFORE its publishing rename, the directory
+     * fdatasync after -- and the counts are asserted exactly: a commit
+     * contributing even one sync, or a structural site contributing one
+     * fewer, is a named bug either way. */
+    struct zs_db *db;
+    const char *v; size_t vl;
+    total++;
+
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    db = open_db(ZS_CREATE | ZS_NOSYNC);
+    CHECK(db != NULL, "nosync open failed");
+
+    /* Commits sync nothing under ZS_NOSYNC -- the flag working (C-7c). */
+    hooks_reset();
+    CHECK(zs_db_store(db, "a", 1, "1", 1, 0) == ZS_OK, "store a failed");
+    CHECK(zs_db_store(db, "b", 1, "2", 1, 0) == ZS_OK, "store b failed");
+    CHECK(sync_calls == 0, "a NOSYNC commit synced (%ld calls)", sync_calls);
+
+    /* A conversion: the output before the publishing rename (C-6b), the
+     * directory after it (C-6).  Exactly one of each. */
+    hooks_reset();
+    CHECK(zs_db_seal(db) == ZS_OK, "seal failed");
+    CHECK(sync_calls == 2 && dir_syncs == 1,
+          "conversion made %ld syncs, %ld of them directory; C-6b wants "
+          "output + directory", sync_calls, dir_syncs);
+    CHECK(syncs_at_first_rename == 1,
+          "%ld syncs before the publishing rename; C-6b wants the output "
+          "durable first", syncs_at_first_rename);
+
+    /* Creating the next active file: header, then directory (C-6b, C-6). */
+    hooks_reset();
+    CHECK(zs_db_store(db, "c", 1, "3", 1, 0) == ZS_OK, "store c failed");
+    CHECK(sync_calls == 2 && dir_syncs == 1,
+          "creation made %ld syncs, %ld of them directory; C-6b wants "
+          "header + directory", sync_calls, dir_syncs);
+
+    /* A repack output carries the same signature as a conversion's. */
+    CHECK(zs_db_seal(db) == ZS_OK, "second seal failed");
+    hooks_reset();
+    CHECK(zs_db_compact(db) == ZS_OK, "compact failed");
+    CHECK(sync_calls == 2 && dir_syncs == 1,
+          "repack made %ld syncs, %ld of them directory; C-6b wants "
+          "output + directory", sync_calls, dir_syncs);
+    CHECK(syncs_at_first_rename == 1,
+          "%ld syncs before the repack's publishing rename",
+          syncs_at_first_rename);
+
+    /* And nothing was lost along the way. */
+    CHECK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0) == ZS_OK, "fetch a");
+    CHECK(zs_db_fetch(db, "c", 1, NULL, NULL, &v, &vl, 0) == ZS_OK, "fetch c");
+    zs_db_close(&db);
+
+    passed++;
+    fprintf(stderr, "  NOSYNC keeps the structural syncs (C-6b) ok\n");
 }
 
 static void test_dirsync_justifies_c6(void)
@@ -1052,6 +1126,7 @@ int main(int argc, char **argv)
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "crash_at_every_call",            test_crash_at_every_call },
         { "crash_nosync_mode",              test_crash_nosync_mode },
+        { "nosync_structural_syncs",        test_nosync_structural_syncs },
         { "dirsync_justifies_c6",           test_dirsync_justifies_c6 },
         { "sync_failure_gate1",             test_sync_failure_gate1 },
         { "sync_failure_gate2",             test_sync_failure_gate2 },
