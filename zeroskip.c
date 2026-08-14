@@ -7210,7 +7210,10 @@ static void zsi_report(struct zs_db *db, const char *what, const char *fname,
  * answers over a misordered array rather than noticing. */
 static int zsi_check_inorder(struct zs_db *db, struct zsi_file *f)
 {
-    struct zsi_rec prev, cur;
+    /* `prev` is read only under `i > 0`, where the previous iteration's
+     * `prev = cur` has run -- but GCC 15 cannot follow that across the loop and
+     * reports it -Wmaybe-uninitialized, which Cyrus's -Werror turns fatal. */
+    struct zsi_rec prev = {0}, cur;
     int r = ZS_OK;
 
     for (uint64_t i = 0; i < f->nptrs; i++) {

@@ -159,6 +159,29 @@ static int cb_failures = 0;
     if (nf_ && *nf_) SKIP("fork tests disabled (ZS_TEST_NO_FORK)"); \
 } while (0)
 
+/* Path and command formatting, for the sites where the compiler cannot see the
+ * bound.  A dbdir under $TMPDIR plus a 63-character zeroskip filename fits
+ * PATH_MAX with room to spare, but the argument's DECLARED size is PATH_MAX (or
+ * NAME_MAX for a `d_name`), so GCC's -Wformat-truncation flags every such join.
+ * The library holds itself to a clean build because Cyrus compiles it -Werror;
+ * the tests are held to the same standard, and clang does not have the warning
+ * at all, so it is only ever seen on the other platform.
+ *
+ * USING the return value is what silences it -- level 1 deliberately spares
+ * calls whose result is checked, which is the same trick zsi_ptrtable_sweep
+ * uses inline.  Checking it is also better than not: a truncated path would
+ * otherwise surface as a puzzling ENOENT several lines later. */
+#define XSNPRINTFN(buf, len, ...) do { \
+    int xn_ = snprintf((buf), (len), __VA_ARGS__); \
+    if (xn_ < 0 || (size_t)xn_ >= (size_t)(len)) { \
+        fprintf(stderr, "\n    FAIL %s:%d: formatted output truncated\n", \
+                __FILE__, __LINE__); \
+        abort(); \
+    } \
+} while (0)
+
+#define XSNPRINTF(buf, ...) XSNPRINTFN((buf), sizeof(buf), __VA_ARGS__)
+
 /*
  * ============================================================
  * Per-test scratch directory
@@ -585,7 +608,7 @@ static int mkdbdir(void)
 static char *dbpath(const char *name)
 {
     static char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", dbdir, name);
+    XSNPRINTF(path, "%s/%s", dbdir, name);
     return path;
 }
 
@@ -6834,7 +6857,6 @@ static void test_write_rollover(void)
      * the writer never appends a pointer section to an unordered file (D-11). */
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
-    char got[4096];
 
     clear_db();
     setup.flags = ZS_CREATE;
@@ -6889,7 +6911,6 @@ static void test_write_rollover(void)
     }
 
     /* And the scan yields exactly 40, in order. */
-    got[0] = '\0';
     size_t count = 0;
     struct zs_cursor *c = NULL;
     ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED));
@@ -8902,7 +8923,7 @@ static void list_data_files(const char *dir, char *out, size_t outlen)
     if (!d) return;
     while ((de = readdir(d)) && n < 64)
         if (!strncmp(de->d_name, "zeroskip-", 9))
-            snprintf(names[n++], ZSI_NAME_MAX, "%s", de->d_name);
+            XSNPRINTFN(names[n++], ZSI_NAME_MAX, "%s", de->d_name);
     closedir(d);
 
     for (size_t i = 0; i < n; i++)
@@ -8964,9 +8985,9 @@ static size_t corpus_cases(char names[][64], size_t max)
         if (de->d_name[0] == '.') continue;
         if (!strcmp(de->d_name, "README.md")) continue;
         char path[PATH_MAX];
-        snprintf(path, sizeof(path), CORPUS_DIR "/%s/case.txt", de->d_name);
+        XSNPRINTF(path, CORPUS_DIR "/%s/case.txt", de->d_name);
         if (fexists(path) != 0) continue;
-        snprintf(names[n++], 64, "%s", de->d_name);
+        XSNPRINTFN(names[n++], 64, "%s", de->d_name);
     }
     closedir(d);
 
@@ -8990,8 +9011,8 @@ static void test_corpus_decode(void)
 
     for (size_t i = 0; i < ncases; i++) {
         char dir[PATH_MAX], txtpath[PATH_MAX];
-        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
-        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
+        XSNPRINTF(dir, CORPUS_DIR "/%s", cases[i]);
+        XSNPRINTF(txtpath, "%s/case.txt", dir);
 
         char *txt = slurp(txtpath, NULL);
         if (!txt) {
@@ -9155,7 +9176,7 @@ static bool corpus_replay(const char *txt, const char *dir, const char *uuid,
             if (!d) return false;
             while ((de = readdir(d)) && nn < 64)
                 if (!strncmp(de->d_name, "zeroskip-", 9))
-                    snprintf(names[nn++], ZSI_NAME_MAX, "%s", de->d_name);
+                    XSNPRINTFN(names[nn++], ZSI_NAME_MAX, "%s", de->d_name);
             closedir(d);
             if (!nn) return false;
             for (size_t i = 0; i < nn; i++)
@@ -9205,9 +9226,9 @@ static void test_corpus_encode_byte_identical(void)
 
     for (size_t i = 0; i < ncases; i++) {
         char dir[PATH_MAX], txtpath[PATH_MAX], out[PATH_MAX];
-        snprintf(dir, sizeof(dir), CORPUS_DIR "/%s", cases[i]);
-        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", dir);
-        snprintf(out, sizeof(out), "%s/replay-%s", basedir, cases[i]);
+        XSNPRINTF(dir, CORPUS_DIR "/%s", cases[i]);
+        XSNPRINTF(txtpath, "%s/case.txt", dir);
+        XSNPRINTF(out, "%s/replay-%s", basedir, cases[i]);
 
         char *txt = slurp(txtpath, NULL);
         ASSERT_NOT_NULL(txt);
@@ -9243,8 +9264,8 @@ static void test_corpus_encode_byte_identical(void)
              nm = strtok_r(NULL, "\n", &save)) {
             char a[PATH_MAX], b[PATH_MAX];
             size_t alen = 0, blen = 0;
-            snprintf(a, sizeof(a), "%s/%s", dir, nm);
-            snprintf(b, sizeof(b), "%s/%s", out, nm);
+            XSNPRINTF(a, "%s/%s", dir, nm);
+            XSNPRINTF(b, "%s/%s", out, nm);
 
             char *abuf = slurp(a, &alen);
             char *bbuf = slurp(b, &blen);
@@ -9421,12 +9442,12 @@ static bool damage_setup(struct damage_target *t, const char *casedir,
 
     snprintf(t->dir, sizeof(t->dir), "%s/damage", basedir);
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s' && mkdir -p '%s'", t->dir, t->dir);
+    XSNPRINTF(cmd, "rm -rf '%s' && mkdir -p '%s'", t->dir, t->dir);
     if (system(cmd)) return false;
 
     snprintf(t->name, sizeof(t->name), "%s", name);
     snprintf(src, sizeof(src), "%s/%s", casedir, name);
-    snprintf(dst, sizeof(dst), "%s/%s", t->dir, name);
+    XSNPRINTF(dst, "%s/%s", t->dir, name);
 
     t->orig = slurp(src, &t->len);
     if (!t->orig) return false;
@@ -9462,7 +9483,7 @@ static bool damage_write_and_scan(struct damage_target *t, const char *buf,
     char path[PATH_MAX];
     bool opened;
 
-    snprintf(path, sizeof(path), "%s/%s", t->dir, t->name);
+    XSNPRINTF(path, "%s/%s", t->dir, t->name);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return false;
     if (len && write(fd, buf, len) != (ssize_t)len) { close(fd); return false; }
@@ -9490,7 +9511,7 @@ static void test_malformed_truncation(void)
 
     for (size_t i = 0; i < ncases; i++) {
         char casedir[PATH_MAX], names[4096];
-        snprintf(casedir, sizeof(casedir), CORPUS_DIR "/%s", cases[i]);
+        XSNPRINTF(casedir, CORPUS_DIR "/%s", cases[i]);
         list_data_files(casedir, names, sizeof(names));
 
         char *save = NULL;
@@ -9553,7 +9574,7 @@ static void test_malformed_bitflips(void)
 
     for (size_t i = 0; i < ncases; i++) {
         char casedir[PATH_MAX], names[4096];
-        snprintf(casedir, sizeof(casedir), CORPUS_DIR "/%s", cases[i]);
+        XSNPRINTF(casedir, CORPUS_DIR "/%s", cases[i]);
         list_data_files(casedir, names, sizeof(names));
 
         char *save = NULL;
@@ -10669,7 +10690,7 @@ static void idxcache_dbdir(struct zs_db *db, const char *root,
 {
     char uu[ZSI_UUID_STR_LEN];
     zsi_uuid_unparse(db->uuid, uu);
-    snprintf(out, outlen, "%s/%s", root, uu);
+    XSNPRINTFN(out, outlen, "%s/%s", root, uu);
 }
 
 /* A-8, P-2, R-3: the cache directory must not be the database directory.
@@ -11036,7 +11057,7 @@ static uint32_t idxcache_table_path(struct zs_db *db, const char *cachedir,
     if (!act) return 0;
     idxcache_dbdir(db, cachedir, dir, sizeof(dir));
     zsi_name_format_index(name, act->hdr.uuid, act->hdr.start);
-    snprintf(out, outlen, "%s/%s", dir, name);
+    XSNPRINTFN(out, outlen, "%s/%s", dir, name);
     return act->hdr.start;
 }
 
@@ -11640,7 +11661,7 @@ static void test_idxcache_publish_failure_is_not_fatal(void)
         ASSERT_NOT_NULL(d);
         while ((de = readdir(d))) {
             if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            snprintf(p, sizeof(p), "%s/%s", resolved, de->d_name);
+            XSNPRINTF(p, "%s/%s", resolved, de->d_name);
             unlink(p);
         }
         closedir(d);
@@ -11732,7 +11753,7 @@ static void test_idxcache_only_unordered_files(void)
             char name[ZSI_NAME_MAX], p[PATH_MAX];
             struct stat sb;
             zsi_name_format_index(name, inorder->hdr.uuid, inorder->hdr.start);
-            snprintf(p, sizeof(p), "%s/%s", resolved, name);
+            XSNPRINTF(p, "%s/%s", resolved, name);
             ASSERT_EQ(stat(p, &sb), -1);
         }
     }
@@ -11783,7 +11804,7 @@ static void test_idxcache_sweeps_dead_generations(void)
     /* A table for a generation that has never existed.  Its contents do not
      * matter: the sweep works on names. */
     zsi_name_format_index(name, db->uuid, gen + 100);
-    snprintf(dead, sizeof(dead), "%s/%s", resolved, name);
+    XSNPRINTF(dead, "%s/%s", resolved, name);
     ASSERT_OK(idxcache_spew(dead, junk, sizeof(junk)));
 
     /* And one for a different database, planted in OUR resolved directory at
@@ -11794,7 +11815,7 @@ static void test_idxcache_sweeps_dead_generations(void)
     memcpy(alien, db->uuid, 16);
     alien[0] = (unsigned char)(alien[0] ^ 0xFF);
     zsi_name_format_index(name, alien, gen + 100);
-    snprintf(other, sizeof(other), "%s/%s", resolved, name);
+    XSNPRINTF(other, "%s/%s", resolved, name);
     ASSERT_OK(idxcache_spew(other, junk, sizeof(junk)));
 
     /* The sweep runs with a snapshot rebuild (P-16), and a steady-state
@@ -11944,7 +11965,7 @@ static void test_index_local_sweeps_foreign_uuid(void)
     alien[0] = (unsigned char)(alien[0] ^ 0xFF);
     zsi_name_format_index(name, alien, 101);
     snprintf(cache, sizeof(cache), "%s/%s", dbdir, ZSI_CACHE_DIR_NAME);
-    snprintf(foreign, sizeof(foreign), "%s/%s", cache, name);
+    XSNPRINTF(foreign, "%s/%s", cache, name);
     ASSERT_OK(idxcache_spew(foreign, junk, sizeof(junk)));
 
     /* The sweep runs with a snapshot rebuild (P-16), which a steady-state
@@ -11990,8 +12011,8 @@ static void test_corpus_index_table(void)
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
         uint32_t tc = 0;
 
-        snprintf(src, sizeof(src), CORPUS_DIR "/%s", cases[i]);
-        snprintf(txtpath, sizeof(txtpath), "%s/case.txt", src);
+        XSNPRINTF(src, CORPUS_DIR "/%s", cases[i]);
+        XSNPRINTF(txtpath, "%s/case.txt", src);
 
         txt = slurp(txtpath, NULL);
         if (!txt) continue;
@@ -12002,8 +12023,7 @@ static void test_corpus_index_table(void)
         free(txt);
 
         snprintf(dir, sizeof(dir), "%s/corpuscase", basedir);
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s' && cp -R '%s' '%s'",
-                 dir, src, dir);
+        XSNPRINTF(cmd, "rm -rf '%s' && cp -R '%s' '%s'", dir, src, dir);
         if (system(cmd) != 0) {
             fprintf(stderr, "\n    FAIL %s: could not copy the case\n",
                     cases[i]);
@@ -12011,7 +12031,7 @@ static void test_corpus_index_table(void)
             return;
         }
 
-        snprintf(idxdir, sizeof(idxdir), "%s/%s", dir, sub);
+        XSNPRINTF(idxdir, "%s/%s", dir, sub);
         cfg.threshold = (size_t)1 << 40;
         cfg.local = false;
 
