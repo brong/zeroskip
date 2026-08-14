@@ -17,9 +17,9 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 264 |
-| With an enforcing test | 256 |
-| Gaps, each with a reason | 8 |
+| Requirements | 267 |
+| With an enforcing test | 258 |
+| Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -110,7 +110,8 @@ a spec label is missing here.
 |---|---|---|
 | `D-0` | The `<uuid>` in a filename is the **36-character lowercase hyphenated | `interop_constants_uuid` |
 | `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_rejections`, `filenames` |
-| `D-1a` | Data files carry **no extension**. An unordered file's name is | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
+| `D-1a` | Data files carry **no extension**, so `zeroskip-*` stays | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
+| `D-1b` | **The active file is named `zeroskip-<uuid>-current`.** It does | **none** |
 | `D-2` | `zeroskip-*` matches data files only and `zeroskip.*` matches | `filename_rejections`, `fileset_ignores_foreign`, `staging_names` |
 | `D-3` | `zeroskip.lock` MUST be a distinct file that is never replaced. | `staging_names` |
 | `D-3a` | It is created with the database (D-8a), and is created on open with | `lock_basic`, `open_lock_file_recreated` |
@@ -350,6 +351,7 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`D-14g`** — Not yet attributed.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
 - **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
+- **`D-1b`** — Specified, not yet implemented. The active file is still named for its generation; D-1b renames it to a fixed `current`, which is what lets C-4i's freshness check be a single `stat` instead of a directory sweep. Landing it regenerates the golden corpus (T-0) and is a format break taken deliberately at version 2 (F-7a), since no database exists outside the test sets.
 - **`T-13`** — Needs a second implementation. zstool provides hold-write for it.
 
 ## What this implementation does not claim

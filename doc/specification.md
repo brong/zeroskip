@@ -266,6 +266,14 @@ Each part earns its place, following the reasoning behind the PNG signature:
   released, so this is a pre-release clean break — not a compatibility path
   dropped for a format that shipped — made necessary by the per-record
   checksum (F-32): a version-1 record has no trailing checksum field to read.
+
+  D-1b's active-file rename is a second such break and likewise carries **no
+  version bump**, for the same reason: no database exists outside the project's
+  own test sets, so there is nothing to be compatible with. A reader of a
+  version-2 file written before that change would see an active file named for
+  its generation and no `zeroskip-<uuid>-current`; since no such database
+  survives, the case is not specified and MUST NOT be implemented as a
+  fallback. The golden corpus (T-0) is regenerated with the change.
 - **F-8** Reserved fields MUST be written as zero and MUST be ignored on read.
   Compatibility decisions belong to the version fields, not to reserved bytes.
 - **F-9** Generations start at 1, so `end == 0` is never a legitimate
@@ -676,10 +684,34 @@ filesize-4    4   checksum of the pointer section
   a 32-bit generation, so every representable generation has a name and the
   width never needs to change. Fixed width also keeps lexical and numeric order
   identical, and hexadecimal keeps names short.
-- **D-1a** Data files carry **no extension**. An unordered file's name is
-  therefore a strict **prefix** of the in-order name covering the same generation —
-  `...-00000005` against `...-00000005-00000005` — and so sorts before it, which
-  D-5's rule requires. Any suffix sorting after `-` would reverse that pair.
+- **D-1a** Data files carry **no extension**, so `zeroskip-*` stays
+  prefix-globbable (D-2) and no name can collide with a staging name.
+- **D-1b The active file is named `zeroskip-<uuid>-current`.** It does **not**
+  carry a generation, and there is exactly one such name, so a database has at
+  most one unordered file **structurally** rather than by policy (D-12a).
+
+  Its generation is read from its **header**, which costs nothing: the active
+  file is the one file a snapshot must open and replay anyway (D-13a). Every
+  other file still carries its range in its name, so one `readdir` still yields
+  the whole set without opening anything except this one.
+
+  `current` sorts **after** every generation name, because lowercase `c` is
+  above the uppercase hex digits `0`–`9A`–`F`. The active file therefore sorts
+  last, which is where its generation puts it — the ordering D-5's sweep wants
+  is preserved without the name carrying a number.
+
+  What this buys is C-4i: a static name means a handle can detect every commit
+  by looking at **one file** instead of re-reading the directory. That check is
+  a single `stat` per transaction rather than a `getdents` sweep, which on a
+  local filesystem is a dentry-cache hit either way and on a network or ZFS
+  mount is the difference between one round trip and several. It was measured
+  costing about as much as the `fdatasync`es it sits beside.
+
+  This replaces a scheme in which the active file was named for its generation,
+  `zeroskip-<uuid>-00000005`, a strict prefix of the in-order name covering the
+  same generation. No version bump accompanies the change: nothing outside the
+  project's own test sets has ever been written, so this is a pre-release clean
+  break exactly as F-7a describes for version 1.
 - **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable. Staging
   names begin `zeroskip.` and therefore never match the data-file pattern.
@@ -726,6 +758,11 @@ without opening a single file.
   > whose `start` equals the current generation, then set the current generation
   > to that file's `end + 1` (or `start + 1` for an unordered file). Stop when no
   > file starts at the current generation.
+
+  Every file's `start` comes from its name except the active file's (D-1b),
+  which comes from its header. An active file whose header does not validate
+  has no discoverable generation and therefore **does not participate**: it is
+  excluded from the scan and reported (D-10).
 
   The files taken are the resolved set; every other file is superseded, and is
   ignored for reading and removable under D-23.
@@ -774,7 +811,9 @@ without opening a single file.
 - **D-9a** A writer moves to a new file when the active file is not clean, or
   when it exceeds `rollover_size` (default 2MB). Rollover is cheap: a new
   header and nothing else, since no pointers are written (D-11).
-- **D-9b** The next generation is one above the highest present in the directory.
+- **D-9b** The next generation is one above the highest present: the highest
+  `end` among in-order files, or the active file's own generation if that is
+  higher (D-1b — read from its header, since its name no longer carries one).
   No counter is stored, and none is needed: a file is visible the moment it is
   created (D-8), and is only removed once an enclosing file covers its
   generation (D-23), so the highest generation present never regresses and a
@@ -785,10 +824,18 @@ without opening a single file.
   wrap. At the 2MB default that bound is around 8PB of cumulative writes, and
   the remedy is to dump and reload into a fresh database.
 - **D-10** An active file with a corrupt header or zero length is treated as a
-  **complete file with zero spans**. It is not an error and its generation is
-  taken from its filename. Because it is not clean, a writer moves to a new
-  file rather than appending, so no chain is ever built on an untrustworthy
-  boundary.
+  **complete file with zero spans**. It is not an error, and no record in it is
+  recoverable either way. Its generation is **not** discoverable, since D-1b
+  took it out of the name and the header is what failed, so it does not
+  participate in D-5's scan at all — which costs nothing, because the set
+  without it still tiles: it would have been the generation above the highest,
+  and nothing depends on that generation existing.
+
+  A writer MUST NOT append to it. Because there is exactly one active-file name
+  (D-1b), a writer starting a new generation **replaces** it, which is
+  permitted precisely because it holds nothing: R-4's "no in-place repair"
+  is untouched, since nothing is being repaired. A read-only handle leaves it
+  alone (R-3) and reads the rest of the database.
 - **D-10a** A **non-active** file with an invalid header MUST be **reported**
   through the error callback, and its generation treated as holding no records.
   It MUST NOT be fatal. Discarding the file still requires an explicit tool
@@ -808,20 +855,20 @@ without opening a single file.
   `<uuid>-N` becomes `<uuid>-N-N` — before it finishes, oldest first, and MUST
   NOT go further: it does not merge in-order files, which is the repacker's job
   (D-16).
-- **D-12a** This is what keeps the steady state at **exactly one unordered file,
-  the active one**, so a snapshot normally replays only that file and nothing
-  else (D-13d). A non-active unordered file exists only transiently — between a
-  rollover and the next writer's conversion, or after a crash left an unclean
-  file behind (D-10). With D-25d in play the rollover case is rarer still — a
-  commit normally seals the file it overgrew — so a non-active unordered file
-  is chiefly a crash artefact. Several can accumulate only across several
-  crashes, and each is converted in turn.
-- **D-12b** A writer MUST convert **oldest first**. That keeps the generation
-  range split into a prefix of in-order files followed by a suffix of unordered
-  ones, the last of which is the active file. Converting out of order would leave
-  an unordered file stranded between in-order ones, and since only adjacent files
-  may be merged (D-19), that hole would block the repacker's cascade until it was
-  filled.
+- **D-12a** With D-1b there is exactly one active-file name, so **at most one
+  unordered file can exist at all** — the invariant is structural, not a
+  steady state maintained by policy. A snapshot replays that file and nothing
+  else (D-13d). No non-active unordered file is representable, so none of the
+  transient and crash cases that used to produce them arise: a crash leaves the
+  one active file, unclean at worst, and D-10 covers it.
+- **D-12b** A writer MUST convert the active file to its in-order form
+  **before** creating a new one, because both would want the same name. The
+  in-order files therefore remain a contiguous prefix of the generation range
+  with the active file above them, which is what keeps the repacker's inputs
+  adjacent (D-16c, D-19). An unclean active file converts like any other: the
+  conversion reads to its complete point (F-24) and the garbage beyond is not
+  carried over, so no chain is built on an untrustworthy boundary. Only the
+  invalid-header case has nothing to convert, and D-10 handles it.
 - **D-12c** Conversion never takes the repack lock. It renames its output in
   without any lock, and takes the remove lock only momentarily to retire the
   input, so a writer never waits on a repack.
@@ -1362,12 +1409,34 @@ any point.
   hours reads as current as one opened for the call; snapshot isolation (G-4)
   is a property of a transaction's lifetime, never of a handle's. A cached
   snapshot MAY be reused only after an inspection that would have detected
-  any such commit. Inspecting the directory's **name set** and the active
-  file's **size** is sufficient and exact — not a heuristic — because every
-  commit either appends to the active file or publishes a file by `rename`
-  (C-3, D-21), and file timestamps, whose granularity is a filesystem
-  property, play no part. `ZS_CURSOR_LIVE`'s per-step check (D-14j) MAY use
-  the same inspection rather than rebuilding a snapshot each step.
+  any such commit.
+
+  Inspecting the **active file alone** is sufficient and exact — its
+  `st_dev`/`st_ino` and its size, at the fixed path D-1b gives it. It is exact
+  because of what a commit can do. A commit either **appends** to the active
+  file, which changes its size, or **starts a new generation**, which by D-12b
+  converts the current active file and creates a new one at the same name — a
+  different inode. Nothing else makes committed data visible: publishing an
+  in-order file by `rename` (C-3, D-21) only republishes records that were
+  already readable from the file it was built from, so a reorganisation —
+  conversion output, repack output, or a removal under D-23 — is invisible to
+  this check **and harmless**, because no record appears or disappears.
+
+  A superseded file being removed underneath a reader is therefore not
+  something to detect in advance: in-order files are immutable, so an open
+  either succeeds on the file we expected or fails with `ENOENT`, and C-4b's
+  retry rescans and converges. Detection is lazy exactly where laziness costs
+  nothing.
+
+  File timestamps, whose granularity is a filesystem property, play no part.
+  `ZS_CURSOR_LIVE`'s per-step check (D-14j) MAY use the same inspection rather
+  than rebuilding a snapshot each step.
+
+  This replaces an inspection of the directory's whole **name set**, which was
+  equally exact and cost a `getdents` sweep on every transaction. On a local
+  filesystem that is a dentry-cache hit; on a network or ZFS mount it was
+  measured costing about what the `fdatasync`es beside it cost, which is what
+  motivated D-1b.
 - **C-5** The accepted cost of C-4g is that disk space is held until the last
   reader holding an old snapshot exits.
 - **C-6 Directory durability.** After creating a **data file** (a new active
