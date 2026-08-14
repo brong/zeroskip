@@ -1229,6 +1229,13 @@ mutant "abort: writes COMMIT instead of ROLLBACK" catch \
 mutant "txn: covering mapping wins over the unflushed chunk" catch \
   's/    if \(need > txn->flushed && zsi_txn_flush\(txn\) != ZS_OK\) return NULL;\n\n    if \(txn->nmaps && need <= txn->maps\[txn->nmaps - 1\].len\)\n        return txn->maps\[txn->nmaps - 1\].base \+ off;/    if (txn->nmaps \&\& need <= txn->maps[txn->nmaps - 1].len)\n        return txn->maps[txn->nmaps - 1].base + off;\n\n    if (need > txn->flushed \&\& zsi_txn_flush(txn) != ZS_OK) return NULL;/'
 
+# C-4i's probe must stay stale across a FAILED refresh.  Committing the
+# baseline first poisons the probe: after a transient refresh failure the
+# names already match, and a snapshot with no active file has no size to
+# disagree, so a peer's commits read as fresh indefinitely.
+mutant "freshen: baseline committed before the refresh" catch \
+  's/    r = zsi_db_refresh\(db\);\n    if \(r != ZS_OK\) \{ free\(names\); return r; \}\n\n    free\(db->probe_names\);\n    db->probe_names = names;\n    db->probe_names_len = len;\n    return ZS_OK;/    free(db->probe_names);\n    db->probe_names = names;\n    db->probe_names_len = len;\n    return zsi_db_refresh(db);/'
+
 # C-4i at write begin.  Rebuilding unconditionally is CORRECT -- every store
 # still lands and every read is fresh, so no data test can see it -- but it
 # replays the active file on every begin, O(active file) per commit, the

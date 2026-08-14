@@ -6518,6 +6518,52 @@ static void test_probe_no_change_reuses_snapshot(void)
     zs_db_close(&db);
 }
 
+static void test_failed_refresh_keeps_probe_stale(void)
+{
+    /* C-4i promises the probe is EXACT, and that holds only if the baseline
+     * is committed by a refresh that succeeded.  Committing it first leaves
+     * a poisoned baseline behind a transient refresh failure: the next
+     * probe's names already match, and a snapshot holding NO active file has
+     * no size left to disagree, so a peer's commit into a file this handle
+     * has never opened reads as fresh -- indefinitely, since every commit
+     * lands in the file the baseline already names.  The seal is what makes
+     * the shape harmful: it is the act == NULL case. */
+    struct zs_db *db, *other;
+    const char *v = NULL; size_t vl = 0;
+    char newest[PATH_MAX];
+
+    if (geteuid() == 0) SKIP("chmod 000 cannot fail an open for root");
+
+    clear_db();
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "old", 3, "1", 1, 0));
+    ASSERT_OK(zs_db_seal(db));          /* the snapshot holds no active file */
+    ASSERT_OK(zs_db_fetch(db, "old", 3, NULL, NULL, &v, &vl, 0)); /* baseline */
+
+    /* A peer creates a new active file and commits into it. */
+    other = open_db(0);
+    ASSERT_NOT_NULL(other);
+    ASSERT_OK(zs_db_store(other, "new", 3, "2", 1, 0));
+    snprintf(newest, sizeof(newest), "%s",
+             zsi_snapshot_active(other->snap)->fname);
+    zs_db_close(&other);
+
+    /* The probe fires -- the name set changed -- and the refresh it triggers
+     * fails.  The failure is the point. */
+    ASSERT_EQ(chmod(newest, 0), 0);
+    ASSERT_EQ(zs_db_fetch(db, "new", 3, NULL, NULL, &v, &vl, 0), ZS_IOERROR);
+    ASSERT_EQ(chmod(newest, 0644), 0);
+
+    /* The failed refresh must not have committed the baseline: this read
+     * must probe stale AGAIN, refresh for real, and see the peer's commit. */
+    ASSERT_OK(zs_db_fetch(db, "new", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_MEM_EQ(v, "2", 1);
+
+    zs_db_close(&db);
+}
+
 static void test_write_begin_reuses_snapshot(void)
 {
     /* C-4i says "shared or exclusive": a WRITE begin may reuse the handle's
@@ -14573,6 +14619,8 @@ static struct test_entry tests[] = {
     { "test_read_freshens_after_rollover", test_read_freshens_after_rollover },
     { "test_probe_no_change_reuses_snapshot",
                                     test_probe_no_change_reuses_snapshot },
+    { "test_failed_refresh_keeps_probe_stale",
+                                    test_failed_refresh_keeps_probe_stale },
     { "test_write_begin_reuses_snapshot",
                                     test_write_begin_reuses_snapshot },
     { "test_cursor_live_sees_other_handle_commit",

@@ -4325,11 +4325,22 @@ static int zsi_db_freshen(struct zs_db *db)
 
     if (!stale) { free(names); return ZS_OK; }
 
+    /* The baseline is committed only by a refresh that SUCCEEDED.  The names
+     * were still captured before the refresh's own scan -- that ordering is
+     * what keeps a file appearing in between a spurious refresh rather than
+     * a missed commit -- but committing them before the refresh poisons the
+     * probe behind a transient failure: the next probe's names match, and a
+     * snapshot holding no active file has no size left to disagree, so a
+     * peer's commit into a file this handle never opened reads as fresh,
+     * indefinitely.  That is C-4i broken exactly where it promises
+     * exactness. */
+    r = zsi_db_refresh(db);
+    if (r != ZS_OK) { free(names); return r; }
+
     free(db->probe_names);
     db->probe_names = names;
     db->probe_names_len = len;
-
-    return zsi_db_refresh(db);
+    return ZS_OK;
 }
 
 /********** READ PATH *************/
