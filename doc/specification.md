@@ -1019,6 +1019,32 @@ The per-file cursors are held in an array kept sorted by:
 
   This yields geometrically sized in-order files and amortised O(log n)
   rewrites per record.
+- **D-16e Who runs it.** A writer SHOULD run the cascade itself, at the start of
+  a write transaction that is about to **start a new generation** — the D-9a
+  condition: no clean active file, or one already past `rollover_size`. That is
+  the only way the file count grows, so it is the only moment new work can
+  appear; a transaction appending to an existing active file cannot have created
+  any.
+
+  **Before the write lock, not after the commit.** C-1d orders repack before
+  write, so a commit — which holds the write lock for its whole life — cannot
+  take the repack lock at all. At the start of a transaction nothing is held yet
+  and the chain is available in order.
+
+  Both the "new generation" test and D-24's are made against a snapshot that may
+  be stale, and neither decides anything except whether the repack lock is worth
+  taking: the selection MUST be redone under that lock, so losing the race to
+  another process costs a lock acquisition and a rescan rather than a wrong
+  decision. A failure or a refusal MUST NOT fail the transaction — the database
+  is then merely unmerged, which is what the next writer will find and retry.
+
+  The cost lands on the transaction that finds the work, the same amortisation
+  D-12 uses for conversion. Since a cascade is unbounded (D-16b) this is a
+  latency spike on whichever writer trips it; what it buys is that no caller has
+  to remember. Forgetting is expensive and hard to attribute — every read merges
+  across every file, so the read path degrades **linearly in the file count**
+  while the database merely looks slow. `ZS_NOAUTOREPACK` (A-14) is for callers
+  who would rather schedule the cascade themselves.
 - **D-16d** Step 2's comparison MUST include equality. Rollover produces files of
   near-identical size, so equal sizes are the common case rather than a boundary:
   with a strict comparison neither step 2 nor step 3 fires, no merge ever happens,
@@ -1814,6 +1840,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_NOCSUM` | open | skip record-checksum verification at materialization (F-5e); span checksums are still verified at indexing |
 | `ZS_NOSYNC` | open | omit both durability gates on commit, and nothing else (C-7c, C-6b) |
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
+| `ZS_NOAUTOREPACK` | open | do not run D-16e's cascade from a write transaction (A-14) |
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
 | `ZS_FETCHNEXT` | fetch | return the record with the smallest key ≥ the given key; with `ZS_SKIPROOT`, strictly > (A-12) |
@@ -1960,6 +1987,15 @@ different calls, though not every flag is meaningful everywhere:
   `ZS_CURSOR_LIVE`, or on either `foreach` form, is a usage error
   (`ZS_BADUSAGE`): neither is needed by any known consumer, and a rejected
   flag is cheaper than an untested promise.
+- **A-14** `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only
+  when the caller asks for it through `zs_db_repack`. It changes no on-disk
+  state and nothing another implementation can observe — a database written by a
+  handle using it is indistinguishable from any other, just less merged. It
+  exists because D-16e puts an unbounded operation on the write path: a caller
+  that would rather run the cascade from idle time, or that cannot accept the
+  latency spike, needs a way to say so. `zs_db_should_repack` still reports the
+  work either way, and a caller that sets this flag and never repacks gets a
+  read path that degrades linearly in the file count.
 
 ## 11. Conformance suite
 
