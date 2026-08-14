@@ -15484,6 +15484,99 @@ static void test_ephemeral_matches_durable(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* D-9d / A-15: rollover_txns seals a file that has taken too many SPANS, not
+ * enough bytes.  rollover_size alone cannot see this -- 8 tiny commits are
+ * nowhere near 2MB -- and the cost being bounded is the replay a rebuild pays,
+ * which is linear in spans.
+ *
+ * Also, and not separably, this pins the count surviving the D-13b fold: a sole
+ * writer never replays its own active file, so if the commit-site fold did not
+ * carry nspans forward the count would sit at zero forever and nothing here
+ * would ever seal.  ZS_NOAUTOREPACK because the subject is a file layout. */
+static void test_rollover_txns_seals_on_span_count(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_txns = 8;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* Seven spans: under the bound, so still one unordered file, and the count
+     * is visibly tracking. */
+    for (int i = 0; i < 7; i++) {
+        char k[16];
+        size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, "v", 1, 0));
+    }
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT(zsi_file_is_unordered(act));
+        ASSERT_EQU(act->nspans, 7u);
+        ASSERT(act->size < db->rollover_size);   /* nowhere near the bytes */
+    }
+
+    /* The eighth reaches the bound and the commit seals in place (D-25d). */
+    ASSERT_OK(zs_db_store(db, "k007", 4, "v", 1, 0));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    ASSERT(db->snap->files[0]->size < db->rollover_size);
+
+    /* Every record survived the seal. */
+    for (int i = 0; i < 8; i++) {
+        char k[16];
+        const char *v = NULL;
+        size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i), vl = 0;
+        ASSERT_OK(zs_db_fetch(db, k, kl, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "v", 1);
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* D-9d: the count is over the REPLAY WINDOW, not over the file.  A published
+ * pointer table moves the window's base, so a reader seeded from it replays
+ * only what came after -- and a writer counting the file instead would seal
+ * files whose rebuild was already cheap.
+ *
+ * With a threshold small enough to publish constantly, the window keeps
+ * resetting and the same 8-span bound is never reached, though the file
+ * accumulates far more than 8 spans. */
+static void test_rollover_txns_counts_the_replay_window(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char cachedir[PATH_MAX];
+
+    clear_db();
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_txns = 8;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 64;      /* publish about every other commit */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 40; i++) {
+        char k[16];
+        size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, "v", 1, 0));
+    }
+
+    /* Still unordered after 40 commits: the window never held 8 at once. */
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    ASSERT(zsi_file_is_unordered(act));
+    ASSERT(act->nspans < 8u);
+    ASSERT(act->cached_upto > ZSI_HEADER_LEN);   /* a table really did publish */
+
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-4b: rejected where results are held across steps.  A cursor yields the
  * previous record while the caller looks at the next one, so an ephemeral
  * pointer there would be a promise nothing keeps -- A-13's reasoning, that a
@@ -15870,6 +15963,10 @@ static struct test_entry tests[] = {
     { "test_txn_fetch_survives_overwrite",
                                         test_txn_fetch_survives_overwrite },
     { "test_reverse_a4_lifetime",       test_reverse_a4_lifetime },
+    { "test_rollover_txns_seals_on_span_count",
+      test_rollover_txns_seals_on_span_count },
+    { "test_rollover_txns_counts_the_replay_window",
+      test_rollover_txns_counts_the_replay_window },
     { "test_ephemeral_avoids_the_flush", test_ephemeral_avoids_the_flush },
     { "test_ephemeral_matches_durable", test_ephemeral_matches_durable },
     { "test_ephemeral_rejected_on_cursor", test_ephemeral_rejected_on_cursor },

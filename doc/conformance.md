@@ -17,7 +17,7 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 267 |
+| Requirements | 270 |
 | With an enforcing test | 259 |
 | Gaps, each with a reason | 8 |
 
@@ -131,6 +131,7 @@ a spec label is missing here.
 | `D-9a` | A writer moves to a new file when the active file is not clean, or | `write_rollover` |
 | `D-9b` | The next generation is one above the highest present in the directory. | `fileset_next_gen` |
 | `D-9c` | Generations are never reused and never reset, not even by a repack | `fileset_next_gen`, `header_roundtrip` |
+| `D-9d` | A writer MAY additionally treat the active file as due for rollover | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
 | `D-10` | An active file with a corrupt header or zero length is treated as a | `file_bad_header`, `file_zero_length`, `open_bad_nonactive`, +3 more |
 | `D-10a` | A **non-active** file with an invalid header MUST be **reported** | `file_bad_header`, `open_bad_nonactive`, `snapshot_bad_nonactive` |
 | `D-10b` | An earlier version of D-10a made this fatal, which contradicts D-10 | `open_bad_nonactive`, `snapshot_bad_nonactive` |
@@ -309,6 +310,7 @@ a spec label is missing here.
 | `A-12` | The point-lookup forms on `zs_db_fetch` and `zs_txn_fetch`: | `fetchprev_basic`, `fetchprev_sees_txn_writes`, `fetchnext_inclusive`, `fetchnext_inclusive_sees_txn_writes`, `reverse_rejected_compositions` |
 | `A-13` | `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor` | `cursor_reverse_seek_and_skiproot`, `reverse_a4_lifetime`, `reverse_rejected_compositions` |
 | `A-14` | `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only | `noautorepack_leaves_the_files` |
+| `A-15` | `rollover_txns` is D-9d's span bound. Zero selects an | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
 
 ## Conformance suite (`T-n`)
 

@@ -91,6 +91,26 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * (D-12d). */
 #define ZSI_DEFAULT_ROLLOVER (2 * 1024 * 1024)
 
+/* And a writer also moves on when the active file's REPLAY WINDOW holds this
+ * many spans (D-9d), whatever its size.  rollover_size bounds bytes; the
+ * rebuild it stands in for is linear in spans, and many small transactions put
+ * many spans into few bytes -- so with no cache configured the two come apart
+ * completely.  Measured, a fresh open with no cache:
+ *
+ *      1024 spans   0.23ms
+ *      4096 spans   0.52ms
+ *     16384 spans   2.01ms      still far below 2MB of records
+ *
+ * 1024 sits at the point where the replay is still cheaper than the open's
+ * other fixed costs.  A sole writer never rebuilds and never notices any of
+ * this; writers alternating across processes rebuild at every begin (C-4i), so
+ * for them the figures above are per transaction.
+ *
+ * With a cache configured, P-13's threshold bounds the window first -- 311
+ * spans replayed for a file holding 16384 -- so this condition simply never
+ * fires, which is the correct outcome rather than a missed one. */
+#define ZSI_DEFAULT_ROLLOVER_TXNS 1024
+
 /* How far past the last published pointer table the active file may grow before
  * another is published (P-13).  Measured, not guessed -- zsbench's "publish
  * threshold" table, 16000 single-store transactions over a 2MB active file:
@@ -1369,6 +1389,13 @@ struct zsi_file {
      * here. */
     size_t            cached_upto;
 
+    /* D-9d: spans in the REPLAY WINDOW -- the ones a reader must walk from
+     * cached_upto to rebuild this index -- not spans in the file.  That is the
+     * quantity a rebuild costs, and the only one obtainable without the walk
+     * this exists to avoid, since a table records no span count (P-5).  Reset
+     * wherever cached_upto moves, because the window moves with it. */
+    size_t            nspans;
+
     /* in-order (hdr.end != 0), filled by the POINTER SECTION section */
     size_t            ptr_off;
     uint64_t          nptrs;
@@ -1640,6 +1667,12 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
 
     f->complete = pos;
 
+    /* D-9d: `pos` is the window's base, so the count starts here.  This is the
+     * one place the window is established -- the other assignments to
+     * cached_upto are each followed immediately by a call to this walk, which
+     * recomputes the count from scratch. */
+    f->nspans = 0;
+
     /* Recorded so a publisher has the boundary's terminator without a second
      * walk (P-10).  A caller seeding from a table overwrites these when the
      * walk finds nothing new -- see zsi_index_build_cached. */
@@ -1757,6 +1790,7 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
         }
 
         f->complete = after;
+        f->nspans++;                            /* D-9d */
         f->last_term_off  = p;
         f->last_term_csum = term.csum;
         pos = after;
@@ -3154,7 +3188,12 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
 
     if (ZS_RENAME(tmp, path) < 0) goto out_unlink;
 
+    /* D-9d: the window moves with its base.  A reader seeded from the table
+     * just published replays nothing, so the spans it covers stop counting
+     * toward the bound -- which is why a configured cache makes this condition
+     * quiet rather than making it fire on a file's lifetime total. */
     f->cached_upto = f->complete;
+    f->nspans = 0;
     rc = ZS_OK;
     goto out;
 
@@ -4675,6 +4714,7 @@ struct zs_db {
     zs_csum     *external_csum;
     unsigned     create_csum_id;    /* engine for files THIS handle creates */
     size_t       rollover_size;
+    size_t       rollover_txns;      /* D-9d, A-15 */
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* Pointer table cache (spec section 8).  index_dir NULL disables it.
@@ -6183,13 +6223,26 @@ static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
  *
  * D-10 and R-4: an unclean file is not repaired.  Because it is not clean the
  * writer moves on, so no chain is ever built on an untrustworthy boundary. */
+/* Whether the active file has reached the point where a writer moves on: too
+ * many BYTES (D-9a), or too many spans in the replay window (D-9d).
+ *
+ * One predicate rather than the condition written out at each site, because
+ * there are four of them -- the rollover below, the repack cascade's
+ * new-generation probe, D-25d's commit-site seal, and the oversized-file
+ * fallback -- and they MUST agree.  Teach one half of the condition to only
+ * some of them and the writer oscillates: the seal fires on a span-bound file
+ * while zsi_writer_active goes on appending to the file it just sealed. */
+static bool zsi_active_full(const struct zs_db *db, const struct zsi_file *f)
+{
+    return f->size >= db->rollover_size || f->nspans >= db->rollover_txns;
+}
+
 static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 {
     struct zsi_file *act = zsi_snapshot_active(db->snap);
     char name[ZSI_NAME_MAX], path[PATH_MAX];
 
-    if (act && zsi_unordered_is_clean(act)
-            && act->size < db->rollover_size) {
+    if (act && zsi_unordered_is_clean(act) && !zsi_active_full(db, act)) {
         /* The descriptor the last transaction handed back, if it is for THIS
          * generation.  O_APPEND means every write lands at the true EOF
          * regardless of which transaction opened the descriptor. */
@@ -6457,7 +6510,7 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
         if (!db->no_auto_repack) {
             struct zsi_file *act = zsi_snapshot_active(db->snap);
             bool new_gen = !(act && zsi_unordered_is_clean(act)
-                             && act->size < db->rollover_size);
+                             && !zsi_active_full(db, act));
 
             if (new_gen && zsi_should_repack(db->snap))
                 (void)zsi_repack(db);
@@ -6618,6 +6671,13 @@ static int zsi_txn_commit(struct zs_txn *txn)
              * branch and terminators are only found by scanning forward. */
             act->last_term_off  = term_off;
             act->last_term_csum = term_csum;
+            /* D-9d, and hand-carried for the same reason: this branch never
+             * replays, so the count has to come from the writer that knows it
+             * just added a span.  A sole writer takes this path at EVERY
+             * commit, so leaving it out does not merely lose accuracy -- the
+             * count sits at whatever the last rebuild left and the bound never
+             * fires for the one writer shape it was written for. */
+            act->nspans++;
             for (size_t i = 0; i < noffs && r == ZS_OK; i++)
                 r = zsi_index_insert(act->index, db->compar, offs[i]);
         }
@@ -6634,7 +6694,7 @@ static int zsi_txn_commit(struct zs_txn *txn)
          * D-25e: no table for a file this commit is about to seal.  A table
          * covers only unordered files (P-1), so it would be born stale and
          * swept at the next opportunity (P-16). */
-        bool sealing = act->size >= db->rollover_size;
+        bool sealing = zsi_active_full(db, act);
         if (r == ZS_OK && db->index_dir && !sealing) {
             struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold,
                                       db->index_local };
@@ -6663,20 +6723,21 @@ static int zsi_txn_commit(struct zs_txn *txn)
         (void)cr;
     }
 
-    /* D-25d: a commit that grew the active file past rollover_size seals it
-     * now, while the write lock is still held, so the conversion cost lands on
-     * the transaction that incurred it rather than on the next writer -- the
-     * one case D-12d's bound cannot cover, since a span is never split across
-     * files and a bulk load writes its whole transaction as one span.  After
-     * zsi_convert_pending, so D-12b's oldest-first order holds.  Never fatal:
-     * the records are durable, and an unsealed oversized file is exactly what
-     * D-9a's rollover already recovers at the next commit. */
+    /* D-25d: a commit that left the active file past rollover_size, or past
+     * D-9d's span bound, seals it now, while the write lock is still held, so
+     * the conversion cost lands on the transaction that incurred it rather
+     * than on the next writer -- the one case D-12d's bound cannot cover,
+     * since a span is never split across files and a bulk load writes its
+     * whole transaction as one span.  After zsi_convert_pending, so D-12b's
+     * oldest-first order holds.  Never fatal: the records are durable, and an
+     * unsealed full file is exactly what D-9a's rollover already recovers at
+     * the next commit. */
     if (r == ZS_OK) {
-        struct zsi_file *oversized = zsi_snapshot_active(db->snap);
-        if (oversized && oversized->hdr_valid
-            && oversized->size >= db->rollover_size
-            && oversized->complete > ZSI_HEADER_LEN) {
-            int sr = zsi_convert_one(db, oversized);
+        struct zsi_file *full = zsi_snapshot_active(db->snap);
+        if (full && full->hdr_valid
+            && zsi_active_full(db, full)
+            && full->complete > ZSI_HEADER_LEN) {
+            int sr = zsi_convert_one(db, full);
             if (sr == ZS_OK) (void)zsi_db_refresh(db);
         }
     }
@@ -8050,6 +8111,8 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     db->nonblocking = (setup->flags & ZS_NONBLOCKING) != 0;
     db->rollover_size = setup->rollover_size ? setup->rollover_size
                                              : ZSI_DEFAULT_ROLLOVER;
+    db->rollover_txns = setup->rollover_txns ? setup->rollover_txns
+                                             : ZSI_DEFAULT_ROLLOVER_TXNS;
     db->error = setup->error ? setup->error : zsi_default_error;
     db->external_csum = setup->csum;
     db->create_csum_id = zsi_csum_id_for_flags(setup->flags);

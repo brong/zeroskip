@@ -137,6 +137,15 @@ struct zs_open_data {
     const char  *compar_name;    /* stored in every file header */
     zs_csum     *csum;           /* required for engine 2 */
     size_t       rollover_size;  /* 0 = default 2MB */
+
+    /* A-15/D-9d: also move on once the active file's replay window holds this
+     * many spans, however few bytes they are.  0 = default 1024.
+     * rollover_size bounds BYTES; what that is standing in for is the index
+     * rebuild, which is linear in SPANS -- so many small transactions slip
+     * under it and leave a rebuild that grows without limit.  A handle with
+     * index_dir set is already bounded by P-13 and will not reach this. */
+    size_t       rollover_txns;
+
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* Pointer table cache (spec section 8).  Names the cache ROOT: tables for
@@ -154,7 +163,7 @@ struct zs_open_data {
     size_t       index_threshold;  /* A-9: 0 = a measured default, 32KB */
 };
 
-#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, NULL, NULL, 0 }
+#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, NULL, NULL, 0 }
 
 /* database operations
  *

@@ -638,7 +638,7 @@ mutant "F-24: complete advanced before validation" catch \
   's/        size_t datalen = p - span_start;/        f->complete = p;\n        size_t datalen = p - span_start;/'
 
 mutant "F-24: complete set past the terminator" catch \
-  's/        f->complete = after;\n        f->last_term_off  = p;/        f->complete = f->size;\n        f->last_term_off  = p;/'
+  's/        f->complete = after;\n        f->nspans\+\+;                            \/\* D-9d \*\/\n        f->last_term_off  = p;/        f->complete = f->size;\n        f->nspans++;\n        f->last_term_off  = p;/'
 
 # D-9: clean requires a VALID HEADER as well as nothing after the last span.  A
 # zero-length file has complete == size == 0 and would otherwise look clean, so a
@@ -1018,12 +1018,12 @@ mutant "seal: writes from a read-only handle" catch \
 # oversized unordered file that every open must replay and whose conversion the
 # NEXT writer pays for.
 mutant "commit: oversized active never sealed" catch \
-  's/            int sr = zsi_convert_one\(db, oversized\);/            int sr = ZS_OK;/'
+  's/            int sr = zsi_convert_one\(db, full\);/            int sr = ZS_OK;/'
 
 # D-25d's gate inverted: every small commit pays a conversion, and the one
 # commit that should seal does not.
 mutant "commit: seal threshold inverted" catch \
-  's/            && oversized->size >= db->rollover_size/            \&\& oversized->size < db->rollover_size/'
+  's/            && zsi_active_full\(db, full\)\n            && full->complete > ZSI_HEADER_LEN/            \&\& !zsi_active_full(db, full)\n            \&\& full->complete > ZSI_HEADER_LEN/'
 
 # D-25e.  A table published for a file the same commit seals is born stale --
 # but the seal's own refresh sweeps it (P-16) before the commit returns, so the
@@ -1415,7 +1415,7 @@ mutant "autorepack: trigger removed" catch \
 # as a reminder that "more eager" is a behaviour change here, not a tuning
 # knob.
 mutant "autorepack: probes on every begin, not just new generations" catch \
-  's/            bool new_gen = !\(act && zsi_unordered_is_clean\(act\)\n                             && act->size < db->rollover_size\);/            bool new_gen = true;/'
+  's/            bool new_gen = !\(act && zsi_unordered_is_clean\(act\)\n                             && !zsi_active_full\(db, act\)\);/            bool new_gen = true;/'
 
 # A-14 must actually suppress it, or a caller who asked to schedule the
 # cascade themselves gets it on the write path anyway.
@@ -1544,6 +1544,26 @@ mutant "store: conditional probe is not ephemeral" catch \
 # match: without the anchor this silently lands on zs_txn_foreach's copy.
 mutant "cursor: ephemeral accepted on a held cursor" catch \
   's/    if \(flags & ZS_EPHEMERAL\) return ZS_BADUSAGE;\n    \{\n        int r = zsi_cursor_open/    \/* not rejected *\/\n    {\n        int r = zsi_cursor_open/'
+
+# D-9d: the span count dropped from the D-13b commit-site fold.  That branch
+# never replays, so nothing else advances the count -- and a SOLE WRITER takes
+# it at every commit, which is exactly the shape with no cache and an unbounded
+# rebuild.  The bound then never fires for the only writer it was written for,
+# while every test that seals on BYTES still passes.
+mutant "rollover: span count lost at the commit fold" catch \
+  's/            act->nspans\+\+;/            \/* not counted *\//'
+
+# D-9d: counting spans in the FILE rather than in the replay window -- the
+# intuitive reading.  A published table stops bounding anything, so a writer
+# with a cache configured seals files whose rebuild was already cheap.
+mutant "rollover: span count survives publication" catch \
+  's/    f->cached_upto = f->complete;\n    f->nspans = 0;/    f->cached_upto = f->complete;/'
+
+# D-9d: the span half dropped from the shared predicate, leaving rollover_txns
+# accepted and inert -- rollover_size alone again, and a rebuild that grows
+# without limit under many small transactions.
+mutant "rollover: only bytes are counted" catch \
+  's/    return f->size >= db->rollover_size \|\| f->nspans >= db->rollover_txns;/    return f->size >= db->rollover_size;/'
 
 echo
 if [ "$ROTONLY" -eq 1 ]; then
