@@ -216,7 +216,7 @@ a spec label is missing here.
 | `C-4f` | Concurrent visibility. A reader scanning the active file may meet a | `mp_reader_sees_torn_span`, `span_terminator_without_data` |
 | `C-4g` | Lifetime. Once its descriptors are open a packer may (subject to | `mp_reader_across_repack`, `snapshot_refcount` |
 | `C-4h` | Termination. A retry happens only when the file set changed during | `snapshot_retries_and_bounds` |
-| `C-4i` | Freshness. Beginning a transaction — shared or exclusive — MUST | `mp_read_sees_other_process_commit`, `read_freshens_after_rollover`, `probe_no_change_reuses_snapshot` |
+| `C-4i` | Freshness. Beginning a transaction — shared or exclusive — MUST | `mp_read_sees_other_process_commit`, `read_freshens_after_rollover`, `probe_no_change_reuses_snapshot`, `write_begin_reuses_snapshot` |
 | `C-5` | The accepted cost of C-4g is that disk space is held until the last | `mp_reader_across_repack` |
 | `C-6` | Directory durability. After creating a **data file** (a new active | `crash/dirsync_justifies_c6` |
 | `C-6a` | A directory sync is **not** required after `unlink`. If a removed name | `crash/dirsync_justifies_c6` |

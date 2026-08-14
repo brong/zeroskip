@@ -1229,6 +1229,15 @@ mutant "abort: writes COMMIT instead of ROLLBACK" catch \
 mutant "txn: covering mapping wins over the unflushed chunk" catch \
   's/    if \(need > txn->flushed && zsi_txn_flush\(txn\) != ZS_OK\) return NULL;\n\n    if \(txn->nmaps && need <= txn->maps\[txn->nmaps - 1\].len\)\n        return txn->maps\[txn->nmaps - 1\].base \+ off;/    if (txn->nmaps \&\& need <= txn->maps[txn->nmaps - 1].len)\n        return txn->maps[txn->nmaps - 1].base + off;\n\n    if (need > txn->flushed \&\& zsi_txn_flush(txn) != ZS_OK) return NULL;/'
 
+# C-4i at write begin.  Rebuilding unconditionally is CORRECT -- every store
+# still lands and every read is fresh, so no data test can see it -- but it
+# replays the active file on every begin, O(active file) per commit, the
+# quadratic bulk load the D-13b fold exists to prevent.  Found downstream as
+# a throughput sawtooth against rollover_size.  The anchor is the comment's
+# closing line, because the shared-begin path calls zsi_db_freshen too.
+mutant "write begin: rebuilds the snapshot unconditionally" catch \
+  's/         \* snapped back at rollover\. \*\/\n        r = zsi_db_freshen\(db\);/         * snapped back at rollover. *\/\n        r = zsi_db_refresh(db);/'
+
 echo
 echo "reverse iteration (D-14k, D-14l, A-12, A-13)"
 

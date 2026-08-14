@@ -5654,10 +5654,20 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
         if (r != ZS_OK) { free(txn); return r; }
         txn->holds_write_lock = true;
 
-        /* Refresh only after the lock: the set may have changed while we waited,
+        /* Freshen only after the lock: the set may have changed while we waited,
          * and appending to a stale view of the active file would append to a file
-         * another writer has already moved past. */
-        r = zsi_db_refresh(db);
+         * another writer has already moved past.
+         *
+         * The C-4i probe, NOT an unconditional rebuild.  C-4i is "shared or
+         * exclusive", and the probe is exact, so a stale view is impossible;
+         * what an unconditional rebuild adds is a replay of the active file
+         * on every begin -- the sole writer's commit already left db->snap
+         * current via the D-13b fold, so it re-derives a snapshot it already
+         * holds, at O(active file) per commit.  Found downstream as a
+         * throughput sawtooth against rollover_size: single-record commits
+         * decayed from 6000/s on a fresh active file to 800/s near 2MB, then
+         * snapped back at rollover. */
+        r = zsi_db_freshen(db);
         if (r != ZS_OK) {
             zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
             free(txn);

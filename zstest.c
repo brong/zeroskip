@@ -6518,6 +6518,58 @@ static void test_probe_no_change_reuses_snapshot(void)
     zs_db_close(&db);
 }
 
+static void test_write_begin_reuses_snapshot(void)
+{
+    /* C-4i says "shared or exclusive": a WRITE begin may reuse the handle's
+     * snapshot after the same exact probe a read uses.  The commit-site fold
+     * (D-13b) keeps db->snap current across a sole writer's commits, so its
+     * next begin has nothing to rebuild -- and rebuilding anyway replays the
+     * active file, an O(active file) cost per commit that made a
+     * one-store-per-transaction load quadratic.  Found downstream as a
+     * throughput sawtooth against rollover_size. */
+    struct zs_db *db, *other;
+    struct zsi_snapshot *s1;
+    struct zs_txn *txn = NULL;
+    const char *v; size_t vl;
+
+    clear_db();
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+
+    /* Two stores to reach the steady state: the first write begin has no
+     * probe baseline and must refresh regardless, and its commit's fold
+     * leaves db->snap current for the second. */
+    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+
+    /* Pinned so it survives a rebuild: two live snapshots cannot share an
+     * address, so pointer equality means reuse rather than a recycled
+     * allocation. */
+    s1 = db->snap;
+    s1->refcount++;
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT(db->snap == s1);                         /* reused, not rebuilt */
+    ASSERT_OK(zs_txn_store(txn, "c", 1, "3", 1, 0));
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* The probe is what keeps reuse honest: another handle's commit grew the
+     * active file, so the next write begin must see it -- appending against
+     * a stale view is the one direction reuse must never err in. */
+    other = open_db(0);
+    ASSERT_NOT_NULL(other);
+    ASSERT_OK(zs_db_store(other, "d", 1, "4", 1, 0));
+    zs_db_close(&other);
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT(db->snap != s1);                         /* the probe fired */
+    ASSERT_OK(zs_txn_fetch(txn, "d", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    zsi_snapshot_release(&s1);
+    zs_db_close(&db);
+}
+
 static void test_write_abort(void)
 {
     /* An aborted transaction leaves no visible records, and the ROLLBACK it
@@ -11461,8 +11513,12 @@ static void test_idxcache_sweeps_dead_generations(void)
     snprintf(other, sizeof(other), "%s/%s", resolved, name);
     ASSERT_OK(idxcache_spew(other, junk, sizeof(junk)));
 
-    /* A store refreshes the snapshot, and the sweep runs with it. */
-    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    /* The sweep runs with a snapshot rebuild (P-16), and a steady-state
+     * store no longer forces one -- C-4i's probe lets a sole writer's begin
+     * reuse its snapshot -- so trigger the rebuild honestly: reopen, which is
+     * the C-4 protocol from scratch (R-1). */
+    ASSERT_OK(zs_db_close(&db));
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
 
     ASSERT_EQ(stat(dead, &sb), -1);      /* dead generation gone */
     ASSERT_EQ(stat(other, &sb), 0);      /* another database untouched */
@@ -11607,8 +11663,10 @@ static void test_index_local_sweeps_foreign_uuid(void)
     snprintf(foreign, sizeof(foreign), "%s/%s", cache, name);
     ASSERT_OK(idxcache_spew(foreign, junk, sizeof(junk)));
 
-    /* A store refreshes the snapshot, and the sweep runs with it. */
-    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    /* The sweep runs with a snapshot rebuild (P-16), which a steady-state
+     * store no longer forces (C-4i) -- reopen to trigger one honestly. */
+    ASSERT_OK(zs_db_close(&db));
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_EQ(stat(foreign, &sb), -1);
 
     ASSERT_OK(zs_db_close(&db));
@@ -14515,6 +14573,8 @@ static struct test_entry tests[] = {
     { "test_read_freshens_after_rollover", test_read_freshens_after_rollover },
     { "test_probe_no_change_reuses_snapshot",
                                     test_probe_no_change_reuses_snapshot },
+    { "test_write_begin_reuses_snapshot",
+                                    test_write_begin_reuses_snapshot },
     { "test_cursor_live_sees_other_handle_commit",
                                     test_cursor_live_sees_other_handle_commit },
     { "test_write_abort",               test_write_abort },
