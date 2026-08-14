@@ -1,9 +1,27 @@
 # zeroskip C Implementation Plan
 
-> **HISTORICAL:** this plan predates format version 2 (F-32 per-record
-> checksums, 2026-08-10). Where it disagrees with `doc/specification.md` —
-> version constants, record layouts, `zsi_rec_encode`'s signature, "records
-> carry no checksum" — the spec is right and this is the v1 snapshot.
+> **HISTORICAL:** this plan is the original build order, and the library has
+> moved past it. **Where it disagrees with `doc/specification.md`, the spec is
+> right** — this document is never the authority on behaviour. Known
+> divergences, largest first:
+>
+> - It predates **format version 2** (F-32 per-record checksums, 2026-08-10):
+>   version constants, record layouts, `zsi_rec_encode`'s signature and
+>   "records carry no checksum" are all the v1 snapshot.
+> - It predates **D-1b** (2026-08-14): the active file is
+>   `zeroskip-<uuid>.current` and its generation is in its header, not its
+>   name. Tasks 5 and 11 have been corrected in place, because the naming
+>   rationale they carried was not merely old but *false*; anything else here
+>   that reasons from an unordered file being named for its generation is v1.
+> - Whole features arrived with no task in this plan: salvage (S-1…S-12),
+>   sealing and compaction (D-25…D-29), same-process exclusion (C-1j), the
+>   repack cascade at write begin (D-16e), and the streaming writer (C-8) —
+>   which replaced Task 16's buffer-until-commit design outright.
+> - **Test names here are the names proposed at planning time**, and about
+>   three dozen of them no longer exist under those names. The live map from
+>   requirement to enforcing test is `doc/conformance.md`, which
+>   `tests/conformance.sh` keeps honest in both directions; a name in this
+>   document is a description of intent, not a citation.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -681,28 +699,31 @@ git commit -am "feat: record and terminator encoding, all fourteen type bytes"
 
 **Files:** `zeroskip.c` (FILENAMES), `zstest.c`
 
-**Requirements:** D-0, D-1, D-1a, D-2, D-4, D-20a, T-2c, part of T-9
+**Requirements:** D-0, D-1, D-1a, D-1b, D-2, D-4, D-20a, T-2c, part of T-9
 
 **Interfaces produced:**
 
 ```c
 #define ZSI_NAME_MAX 128
+#define ZSI_CURRENT_SUFFIX ".current"
 
 enum zsi_nametype {
     ZSI_NAME_OTHER = 0,      /* not ours -- ignore */
-    ZSI_NAME_UNORDERED,      /* zeroskip-<uuid>-<gen> */
+    ZSI_NAME_UNORDERED,      /* zeroskip-<uuid>.current, the active file */
     ZSI_NAME_INORDER,        /* zeroskip-<uuid>-<start>-<end> */
 };
 
 /* Parse a directory entry.  Returns the kind; fills uuid/start/end when it is
- * a data file.  For ZSI_NAME_UNORDERED, *end is set to 0 (F-9). */
+ * a data file.  For ZSI_NAME_UNORDERED, *end is set to 0 (F-9) and *start to
+ * 0 as well -- the active file's generation is in its HEADER (D-1b), so the
+ * name cannot supply it and the caller must read it. */
 static enum zsi_nametype zsi_name_parse(const char *name, zsi_uuid_t uuid,
                                         uint32_t *start, uint32_t *end);
 
-/* Format into out, which must hold ZSI_NAME_MAX bytes.  end == 0 gives the
- * unordered form. */
+/* Format into out, which must hold ZSI_NAME_MAX bytes. */
 static void zsi_name_format(char *out, const zsi_uuid_t uuid,
                             uint32_t start, uint32_t end);
+static void zsi_name_current(char *out, const zsi_uuid_t uuid);
 
 #define ZSI_LOCK_NAME "zeroskip.lock"
 static void zsi_staging_name(char *out, unsigned n);   /* zeroskip.tmp.<pid>.<n> */
@@ -710,15 +731,24 @@ static void zsi_staging_name(char *out, unsigned n);   /* zeroskip.tmp.<pid>.<n>
 
 - [ ] **Step 1: Implement**
 
-`zsi_name_format`: `"zeroskip-%s-%08X"` or `"zeroskip-%s-%08X-%08X"` with the
-lowercase unparsed UUID. Uppercase hex for generations (D-1), lowercase UUID
-(D-0) — the contrast is deliberate, note it in a comment.
+`zsi_name_format`: `"zeroskip-%s-%08X-%08X"` with the lowercase unparsed UUID.
+Uppercase hex for generations (D-1), lowercase UUID (D-0) — the contrast is
+deliberate, note it in a comment. `zsi_name_current`:
+`"zeroskip-%s" ZSI_CURRENT_SUFFIX`, with no generation at all (D-1b).
 
 `zsi_name_parse` must be strict: exactly 8 hex digits per generation, uppercase
-only, no leading `0x`, nothing trailing. A data file carries **no extension**
-(D-1a) so a trailing `.zs` or `.tmp` makes it `ZSI_NAME_OTHER`. Reject
-generation 0 as a `start` (F-9). Anything beginning `zeroskip.` is metadata, not
-data (D-2), and returns `ZSI_NAME_OTHER`.
+only, no leading `0x`, nothing trailing. A generation-named file carries **no
+extension** (D-1a) so a trailing `.zs` or `.tmp` makes it `ZSI_NAME_OTHER`.
+Reject generation 0 as a `start` (F-9). The required prefix is `zeroskip-`, so
+anything beginning `zeroskip.` — the lock file, staging names — is metadata and
+returns `ZSI_NAME_OTHER` (D-2) without further parsing. The active file is
+matched after the UUID and before the generations, on the whole remainder being
+`.current`.
+
+The separator before `current` is a **dot**, and it is load-bearing twice
+(D-1b): `zeroskip-<uuid>-*` then matches the generation-named files and only
+those, and `.` (0x2E) is above `-` (0x2D) so the active file still collates
+last. The old bare-generation spelling must **not** parse as a fallback.
 
 - [ ] **Step 2: Tests**
 
@@ -728,22 +758,22 @@ forms. Round-trip parse. Reject: lowercase hex generations, 7 or 9 digits, a
 `.zs` suffix, a trailing `-`, a missing UUID hyphen, `zeroskip.tmp.1.0`,
 `zeroskip.lock`, and unrelated names.
 
-`test_filename_prefix_property`: **the D-1a property asserted directly on
-generated names** — for a range of generations, `strncmp(unordered_name,
-inorder_name, strlen(unordered_name)) == 0` and `strcmp(unordered_name,
-inorder_name) < 0`. D-5's whole resolution rule rests on this, and T-9 requires
-it be a test so that adding an extension later breaks a test rather than the
-database.
+`test_filename_sort_property`: **D-1b's naming property asserted directly on
+generated names** — the active file's name sorts after the in-order name for
+every generation, including `FFFFFFFF`, and for a shared start the narrow range
+sorts before the wider one (D-1's fixed width making lexical order numeric).
+T-9 requires it be a test so that changing the separator breaks a test rather
+than a listing.
 
-`test_filename_lexical_order`: for a set of ranges, lexical order of the
-formatted names matches numeric order of `(start, end)` — the property fixed
-width buys (D-1).
+Note what this test does **not** buy: resolution order. D-5b requires that to
+come from each file's range and kind, never from collating the names — see
+Task 11.
 
 - [ ] **Step 3: Verify and commit**
 
 ```bash
 make check
-git commit -am "feat: data file naming, with the D-1a prefix property under test"
+git commit -am "feat: data file naming, with D-1b's sort property under test"
 ```
 
 ---
@@ -1272,8 +1302,8 @@ static int zsi_fileset_scan(struct zs_db *db, const char *dir,
                             struct zsi_fileset *out);
 static void zsi_fileset_fini(struct zsi_fileset *fs);
 
-/* D-5's single sweep over the sorted names.  Returns ZS_OK when the resolved
- * set tiles (D-6), ZS_AGAIN when it leaves a gap (D-7 -- retry), or
+/* D-5's single sweep, over the entries in D-5a's order.  Returns ZS_OK when the
+ * resolved set tiles (D-6), ZS_AGAIN when it leaves a gap (D-7 -- retry), or
  * ZS_BADFORMAT for a partial overlap (D-5c). */
 static int zsi_fileset_resolve(struct zsi_fileset *fs);
 
@@ -1290,9 +1320,12 @@ all agree; **disagreement is `ZS_BADFORMAT`, never a majority vote** — silentl
 adopting one would read half a database and call it whole. A directory with no
 data files leaves `have_uuid = false`, the empty case D-8a handles.
 
-Sort `all` by name, lexically. D-1's fixed-width hex makes lexical order numeric
-and D-1a makes the unordered name a prefix of the in-order one — the two
-properties D-5's rule rests on, both under test from Task 5.
+Leave `all` in `readdir` order. The scan has no order of its own to impose, and
+a lexical sort of the names is the one to avoid: it looks meaningful and is
+wrong (D-5b). Fill in the active file's `start` here instead, by reading its
+header (D-1b) — one open and 72 bytes, only when an active file is present.
+An active file whose header does not validate has no discoverable generation
+and drops out of the set (D-10).
 
 - [ ] **Step 2: Implement resolve**
 
@@ -1303,9 +1336,17 @@ D-5 verbatim:
 > to that file's `end + 1` (or `start + 1` for an unordered file). Stop when no
 > file starts at the current generation.
 
-Taking the **last** is the whole rule, and it is correct only because of the
-sort — D-5a's table is the proof, and T-9 asserts that taking the *first*
-fails, so the error is caught rather than rediscovered.
+Sort the entries into D-5a's order first: `start` ascending, then reach (`end`,
+or `start` for the active file) ascending, then unordered before in-order.
+Taking the **last** is then the whole rule — D-5a's table is the proof, and T-9
+asserts that taking the *first* fails, so the error is caught rather than
+rediscovered.
+
+The order comes from the ranges and the kinds, **not** from the names (D-5b).
+`.current` collates above every in-order name while its generation need not be
+above every in-order range: in the conversion window — output renamed in, input
+not yet removed — a name sort takes the superseded active file over the file
+that just replaced it.
 
 After the sweep, D-6's completeness test: the resolved ranges must tile a
 contiguous interval from the lowest generation present through the highest.
@@ -1323,18 +1364,23 @@ regress.
 - [ ] **Step 3: Tests — T-9**
 
 These need only *names*, so most cases are driven by `touch`ing files with the
-right names into a temp directory. Add a helper `seed_names(const char *dir,
-const char *const *names)`.
+right names into a temp directory. Add a helper `seed_names(const char *const
+*names)` — and, since D-1b, `seed_names_cur(names, gen)`, which writes a real
+72-byte header into the active file because that is the one range no name
+supplies.
 
-`test_fileset_derives_from_names`: the set and every range derived from
-filenames alone, asserted by seeding names with **empty** files — if anything
-opened them it would fail.
+Every case below then doubles as the derived-from-names assertion, because
+`seed_names` writes **zero-length** files: an in-order range that survives the
+scan cannot have been read out of the file. The active file is the exception
+and the only one — an empty placeholder there parses as D-10's "no discoverable
+generation" and is dropped, which is correct and useless as a fixture.
 
 `test_fileset_overlap_table`: each row of D-5a — a repack output `[1-4]` with
 inputs `[1-1]`..`[4-4]`, asserting `[1-4]` wins and the contained files are
-ignored for reading; a conversion output `5-5` with its input `5`, asserting the
-in-order file wins; all three of `5`, `5-5`, `5-9` at once, asserting `[5-9]`.
-The same with some inputs already unlinked, asserting the set still tiles.
+ignored for reading; a conversion output `5-5` alongside the active file at
+generation 5, asserting the in-order file wins; the active file, `5-5` and
+`5-9` at once, asserting `[5-9]`. The same with some inputs already unlinked,
+asserting the set still tiles.
 
 `test_fileset_first_vs_last`: taking the **first** file at each step asserted to
 produce a wrong set, so D-5b's requirement is under test rather than assumed.
@@ -1343,20 +1389,22 @@ produce a wrong set, so D-5b's requirement is under test rather than assumed.
 generation; a gap at the bottom. And `ZS_BADFORMAT` for two files claiming
 overlapping ranges that are not nested (D-5c).
 
-`test_fileset_uuid_disagreement`: two UUIDs in one directory → `ZS_BADFORMAT`,
-not a majority choice (D-4a).
+`test_fileset_uuid_discovery`: two UUIDs in one directory → `ZS_BADFORMAT`, not
+a majority choice (D-4a).
 
 `test_fileset_ignores_foreign`: staging names (`zeroskip.tmp.123.0`), the lock
 file, another database's UUID, and unrelated files are all ignored (D-4, D-2).
 
 `test_fileset_next_gen`: one above the highest present, **including after files
-have been removed** — seed `1-4` and `5`, remove `5`, assert the next generation
-is still computed from what is present (D-9b). And `ZS_FULL` when the highest is
-`0xFFFFFFFF` (D-9c).
+have been removed** — seed `1-4` and an active file at 5, remove the active
+file, assert the next generation is still computed from what is present (D-9b).
+And `ZS_FULL` when the highest is `0xFFFFFFFF` (D-9c).
 
-`test_fileset_mid_conversion_stable`: a directory left mid-conversion (`5` and
-`5-5` both present) is judged complete, and leaving it that way indefinitely —
-as a writer death would — does not make readers retry forever.
+`test_fileset_mid_conversion_stable`: a directory left mid-conversion (the
+active file at generation 5 and `5-5` both present) is judged complete, and
+leaving it that way indefinitely — as a writer death would — does not make
+readers retry forever. This is also where D-5b bites: seeded names alone would
+put `.current` last and resolve to the file the writer is about to delete.
 
 - [ ] **Step 4: Verify and commit**
 
