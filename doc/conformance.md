@@ -18,8 +18,8 @@ that scanning could not attribute were filled in by hand.
 | | |
 |---|---|
 | Requirements | 267 |
-| With an enforcing test | 258 |
-| Gaps, each with a reason | 9 |
+| With an enforcing test | 259 |
+| Gaps, each with a reason | 8 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -110,8 +110,8 @@ a spec label is missing here.
 |---|---|---|
 | `D-0` | The `<uuid>` in a filename is the **36-character lowercase hyphenated | `interop_constants_uuid` |
 | `D-1` | Generations in filenames are **uppercase hexadecimal, zero-padded to | `filename_rejections`, `filenames` |
-| `D-1a` | Data files carry **no extension**, so `zeroskip-*` stays | `filename_prefix_property`, `filename_rejections`, `fileset_overlap_table` |
-| `D-1b` | **The active file is named `zeroskip-<uuid>.current`.** It does | **none** |
+| `D-1a` | Data files carry **no extension**, so `zeroskip-*` stays | `filename_sort_property`, `filename_rejections`, `fileset_overlap_table` |
+| `D-1b` | **The active file is named `zeroskip-<uuid>.current`.** It does | `filenames`, `filename_sort_property`, `filename_rejections` |
 | `D-2` | `zeroskip-*` matches data files only and `zeroskip.*` matches | `filename_rejections`, `fileset_ignores_foreign`, `staging_names` |
 | `D-3` | `zeroskip.lock` MUST be a distinct file that is never replaced. | `staging_names` |
 | `D-3a` | It is created with the database (D-8a), and is created on open with | `lock_basic`, `open_lock_file_recreated` |
@@ -119,8 +119,8 @@ a spec label is missing here.
 | `D-3c` | The lock file is empty and its contents are never read. Nothing about | `lock_basic` |
 | `D-4` | A file participates if its name matches `zeroskip-<uuid>-*` for this | `filename_rejections`, `fileset_ignores_foreign` |
 | `D-4a` | On first open the UUID is not yet known, so it is **discovered**: take | `fileset_uuid_discovery`, `open_create`, `open_uuid_mismatch` |
-| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_prefix_property`, `filename_rejections`, `snapshot_resolves_overlap` |
-| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_prefix_property`, `fileset_overlap_table` |
+| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_sort_property`, `filename_rejections`, `snapshot_resolves_overlap` |
+| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_sort_property`, `fileset_overlap_table` |
 | `D-5b` | The rule requires an unordered file's name to sort before the in-order | `fileset_first_vs_last` |
 | `D-5c` | A **partial** overlap, where neither range contains the other, cannot | `fileset_gaps`, `mp_racing_removers` |
 | `D-6` | Completeness. A set is complete if and only if the scan of D-5 consumes | `convert_steady_state`, `fileset_gaps`, `mp_repack_and_writer_concurrent`, +1 more |
@@ -137,7 +137,7 @@ a spec label is missing here.
 | `D-11` | The writer never appends a pointer section to an unordered file. When | `write_rollover` |
 | `D-12` | Immediate conversion. A writer that finds a **non-active unordered | `api_pointer_lifetime`, `conversion_avoids_the_repack_lock`, `convert_basic`, +2 more |
 | `D-12a` | This is what keeps the steady state at **exactly one unordered file, | `convert_basic`, `convert_steady_state`, `write_rollover` |
-| `D-12b` | A writer MUST convert **oldest first**. That keeps the generation | `convert_backlog_oldest_first` |
+| `D-12b` | A writer MUST convert the active file to its in-order form **before** | `convert_only_one_unordered_file`, `write_rollover` |
 | `D-12c` | Conversion never takes the repack lock. It renames its output in | `conversion_avoids_the_repack_lock` |
 | `D-12d` | Each conversion is bounded by `rollover_size` — sort the keys, write | `zsbench (store, rollover Nk)` |
 | `D-13` | The private index MUST support point lookup, lower-bound seek and | `index_ordered_traversal` |
@@ -162,7 +162,7 @@ a spec label is missing here.
 | `D-16` | The repacker works **only on in-order files**; converting unordered | `corpus`, `repack_cascade`, `repack_never_touches_unordered`, +1 more |
 | `D-16a` | The two jobs divide by whether a file has an `end`, which is what | `mp_repack_and_writer_concurrent` |
 | `D-16b` | A cascade writes one output for the whole selected set, not one per | `repack_selection`, `zsbench` |
-| `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_backlog_oldest_first` |
+| `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_only_one_unordered_file` |
 | `D-16e` | **Who runs it.** A writer SHOULD run the cascade itself, at the start of | `autorepack_bounds_the_file_count`, `noautorepack_leaves_the_files` |
 | `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
 | `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
@@ -330,9 +330,9 @@ a spec label is missing here.
 | `T-7` | Ancestors and repacking. For every arrangement of create, update and | `convert_readonly_does_nothing` |
 | `T-8` | Crash injection. A test build interposes `write`, `fdatasync`, `rename` | `crash/crash_after_invalid_terminator`, `crash/crash_leaves_unaligned_length`, `crash/sync_failure_every_point` |
 | `T-8a` | Sync failure. The case C-7a exists for, which no crash test reaches: | `crash/dirsync_justifies_c6` |
-| `T-9` | File set discovery. That the set and every range are derived from | `fcur_deletions_visible`, `filename_prefix_property`, `fileset_first_vs_last`, +3 more |
+| `T-9` | File set discovery. That the set and every range are derived from | `fcur_deletions_visible`, `filename_sort_property`, `fileset_first_vs_last`, +3 more |
 | `T-10` | Multi-process. Real forked processes. A writer plus *N* readers | `malformed_never_hangs`, `mp_racing_removers` |
-| `T-10a` | Steady state. That the number of unordered files returns to one after | `api_pointer_lifetime`, `convert_backlog_oldest_first`, `convert_steady_state` |
+| `T-10a` | Steady state. That the number of unordered files returns to one after | `api_pointer_lifetime`, `convert_only_one_unordered_file`, `convert_steady_state` |
 | `T-10b` | The snapshot protocol. Each step of C-4 attacked directly, since these | `crash/crash_after_invalid_terminator`, `malformed_never_hangs`, `mp_reader_sees_torn_span` |
 | `T-11` | Traceability. `doc/conformance.md` maps every normative requirement | this document |
 | `T-12` | to T-14 are cross-implementation tests , | **none** |
@@ -351,7 +351,6 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`D-14g`** — Not yet attributed.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
 - **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
-- **`D-1b`** — Specified, not yet implemented. The active file is still named for its generation; D-1b renames it to a fixed `current`, which is what lets C-4i's freshness check be a single `stat` instead of a directory sweep. Landing it regenerates the golden corpus (T-0) and is a format break taken deliberately at version 2 (F-7a), since no database exists outside the test sets.
 - **`T-13`** — Needs a second implementation. zstool provides hold-write for it.
 
 ## What this implementation does not claim

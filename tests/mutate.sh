@@ -259,19 +259,28 @@ echo "filenames (Task 5)"
 # files reverses the sort order of an unordered name against the in-order name for
 # the same generation, and overlap resolution silently picks the wrong file.
 mutant "names: .zs extension added" catch \
-  's/        snprintf\(out, ZSI_NAME_MAX, "%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X.zs", ZSI_NAME_PREFIX, ustr, start);/'
+  's/"%s%s-%08X-%08X",\n             ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%08X-%08X.zs",\n             ZSI_NAME_PREFIX, ustr, start, end);/'
 
 mutant "names: lowercase generations" catch \
-  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%08x", ZSI_NAME_PREFIX, ustr, start);/'
+  's/"%s%s-%08X-%08X",\n             ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%08x-%08x",\n             ZSI_NAME_PREFIX, ustr, start, end);/'
 
 mutant "names: unpadded generations" catch \
-  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%X", ZSI_NAME_PREFIX, ustr, start);/'
+  's/"%s%s-%08X-%08X",\n             ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%X-%X",\n             ZSI_NAME_PREFIX, ustr, start, end);/'
 
 mutant "names: 4-digit generations" catch \
-  's/"%s%s-%08X-%08X",\n                 ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%04X-%04X",\n                 ZSI_NAME_PREFIX, ustr, start, end);/'
+  's/"%s%s-%08X-%08X",\n             ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%04X-%04X",\n             ZSI_NAME_PREFIX, ustr, start, end);/'
 
 mutant "names: decimal generations" catch \
-  's/"%s%s-%08X", ZSI_NAME_PREFIX, ustr, start\);/"%s%s-%08u", ZSI_NAME_PREFIX, ustr, start);/'
+  's/"%s%s-%08X-%08X",\n             ZSI_NAME_PREFIX, ustr, start, end\);/"%s%s-%08u-%08u",\n             ZSI_NAME_PREFIX, ustr, start, end);/'
+
+# D-1b: the active file's name is what makes C-4i one stat, and the DOT is what
+# keeps it out of the generation glob.  A hyphen still parses and still sorts
+# last, so only a test that looks at the spelling can see this.
+mutant "names: active file uses a hyphen, not a dot" catch \
+  's/#define ZSI_CURRENT_SUFFIX  "\.current"/#define ZSI_CURRENT_SUFFIX  "-current"/'
+
+mutant "names: active file carries a generation" catch \
+  's/    snprintf\(out, ZSI_NAME_MAX, "%s%s%s",\n             ZSI_NAME_PREFIX, ustr, ZSI_CURRENT_SUFFIX\);/    snprintf(out, ZSI_NAME_MAX, "%s%s%s0", ZSI_NAME_PREFIX, ustr, ZSI_CURRENT_SUFFIX);/'
 
 mutant "parse: lowercase hex accepted" catch \
   's/        else if \(c >= .A. && c <= .F.\) d = c - .A. \+ 10;/        else if (c >= 0x41 \&\& c <= 0x46) d = c - 0x41 + 10;\n        else if (c >= 0x61 \&\& c <= 0x66) d = c - 0x61 + 10;/'
@@ -280,7 +289,11 @@ mutant "parse: lowercase hex accepted" catch \
 # NUL literal through two layers of quoting -- which is what defeated the previous
 # attempt at this pattern.
 mutant "parse: trailing junk allowed" catch \
-  's/    \/\* No extension, and nothing trailing \(D-1a\)\. \*\/\n    if [^\n]*\n/    \/* trailing check removed *\/\n/'
+  's/    \/\* Nothing trailing: an in-order name ends at its second generation\. \*\/\n    if [^\n]*\n/    \/* trailing check removed *\/\n/'
+
+# F-7a: the OLD active-file spelling must NOT be readable as a fallback.
+mutant "parse: accepts the old bare-generation name" catch \
+  's/    if \(\*p != .-.\) return ZSI_NAME_OTHER;\n    p\+\+;\n\n    if \(zsi_parse_gen8\(p, &e\) != 8\) return ZSI_NAME_OTHER;/    if (*p == 0) { *start = s; *end = 0; return ZSI_NAME_UNORDERED; }\n    if (*p != \x27-\x27) return ZSI_NAME_OTHER;\n    p++;\n\n    if (zsi_parse_gen8(p, \&e) != 8) return ZSI_NAME_OTHER;/'
 
 mutant "parse: generation 0 allowed" catch \
   's/    if \(s == 0\) return ZSI_NAME_OTHER;/    \/* F-9 check removed *\//'
@@ -288,8 +301,11 @@ mutant "parse: generation 0 allowed" catch \
 mutant "parse: backwards range allowed" catch \
   's/    if \(e == 0 \|\| e < s\) return ZSI_NAME_OTHER;/    if (e == 0) return ZSI_NAME_OTHER;/'
 
+# D-2: zeroskip- is data, zeroskip. is metadata.  The OFFSET has to move with
+# the comparison, or every later check still rejects and the mutant is
+# equivalent -- which is how it read until 2026-08-14.
 mutant "parse: metadata matches data pattern" catch \
-  's/    if \(strncmp\(name, ZSI_NAME_PREFIX, ZSI_NAME_PREFIX_LEN\) != 0\)\n        return ZSI_NAME_OTHER;/    if (strncmp(name, "zeroskip", 8) != 0)\n        return ZSI_NAME_OTHER;/'
+  's/    if \(strncmp\(name, ZSI_NAME_PREFIX, ZSI_NAME_PREFIX_LEN\) != 0\)\n        return ZSI_NAME_OTHER;\n\n    const char \*p = name \+ ZSI_NAME_PREFIX_LEN;/    if (strncmp(name, "zeroskip", 8) != 0)\n        return ZSI_NAME_OTHER;\n\n    const char *p = name + 8;/'
 
 mutant "parse: 7 hex digits accepted" catch \
   's/    for \(size_t i = 0; i < 8; i\+\+\) \{\n        unsigned char c = \(unsigned char\)p\[i\];/    for (size_t i = 0; i < 7; i++) {\n        unsigned char c = (unsigned char)p[i];/'
@@ -1074,12 +1090,21 @@ mutant "begin: shared reuses the handle snapshot" catch \
 # C-4i.  The probe is exact only because it checks BOTH halves.  Appends grow
 # the active file without changing any name...
 mutant "freshen: ignores the active file size" catch \
-  's/        if \(act\) \{\n            struct stat sb;/        if (act \&\& 0) {\n            struct stat sb;/'
+  's/             \|\| \(\(size_t\)sb.st_size != act->size\);/             || 0;/'
 
 # ...and a rollover, conversion or repack changes the name set without growing
 # any file the stale snapshot knows about.
-mutant "freshen: ignores the name set" catch \
-  's/    stale = !db->probe_names\n         \|\| db->probe_names_len != len\n         \|\| memcmp\(db->probe_names, names, len\) != 0;/    stale = !db->probe_names;/'
+# C-4i: the inode is what distinguishes a ROLLOVER from an append.  A
+# replacement can be the same size as what it replaced, so size alone misses it.
+mutant "freshen: ignores the active file identity" catch \
+  's/        stale = \(sb.st_dev != db->act_dev\)\n             \|\| \(sb.st_ino != db->act_ino\)/        stale = (false)\n             || (false)/'
+
+# And the two ends of the "was there one at all" comparison.
+mutant "freshen: a vanished active file reads as fresh" catch \
+  's/        stale = \(act != NULL\);/        stale = false;/'
+
+mutant "freshen: a NEW active file reads as fresh" catch \
+  's/        stale = true;                   \/\* one appeared: a peer rolled over \*\//        stale = false;/'
 
 # D-14j/C-4i.  A live cursor that stops looking is just a cursor: the flag's
 # entire meaning is observing other processes mid-traversal.
@@ -1127,7 +1152,12 @@ mutant "salvage: recovers unverified without the flag" catch \
 # S-2.  Applying the tiling check makes salvage refuse the database it exists
 # for -- one missing generation, every other file perfectly readable.
 mutant "salvage: applies the tiling check" catch \
-  's/    r = zsi_fileset_scan\(from, NULL, &fs\);/    r = zsi_fileset_scan(from, NULL, \&fs);\n    if (r == ZS_OK) { int rr_ = zsi_fileset_resolve(\&fs);\n        if (rr_ != ZS_OK) { zsi_fileset_fini(\&fs); return rr_; } }/'
+  's/    r = zsi_fileset_scan_raw\(from, NULL, &fs\);   \/\* keeps a bad header \(S-1\) \*\//    r = zsi_fileset_scan_raw(from, NULL, \&fs);\n    if (r == ZS_OK) { int rr_ = zsi_fileset_resolve(\&fs);\n        if (rr_ != ZS_OK) { zsi_fileset_fini(\&fs); return rr_; } }/'
+
+# S-1: salvage must NOT use the scan that drops an unreadable active file --
+# that file is often the one it was called to rescue (D-1b, D-10).
+mutant "salvage: uses the header-filling scan" catch \
+  's/    r = zsi_fileset_scan_raw\(from, NULL, &fs\);   \/\* keeps a bad header \(S-1\) \*\//    r = zsi_fileset_scan(from, NULL, \&fs);/'
 
 # S-3.  Newest first makes an OLDER value win, silently, with no error anywhere.
 mutant "salvage: processes newest first" catch \
@@ -1254,8 +1284,10 @@ mutant "repack: output sync skipped under NOSYNC" catch \
 # baseline first poisons the probe: after a transient refresh failure the
 # names already match, and a snapshot with no active file has no size to
 # disagree, so a peer's commits read as fresh indefinitely.
-mutant "freshen: baseline committed before the refresh" catch \
-  's/    r = zsi_db_refresh\(db\);\n    if \(r != ZS_OK\) \{ free\(names\); return r; \}\n\n    free\(db->probe_names\);\n    db->probe_names = names;\n    db->probe_names_len = len;\n    return ZS_OK;/    free(db->probe_names);\n    db->probe_names = names;\n    db->probe_names_len = len;\n    return zsi_db_refresh(db);/'
+# D-1b: the generation comes from the HEADER.  Inferring it instead is wrong in
+# the conversion window, where the active file is superseded rather than new.
+mutant "scan: infers the active generation instead of reading it" catch \
+  's/    e->start = h.start;\n    return ZS_OK;/    e->start = 0xFFFFu;\n    return ZS_OK;/'
 
 # C-4i at write begin.  Rebuilding unconditionally is CORRECT -- every store
 # still lands and every read is fresh, so no data test can see it -- but it

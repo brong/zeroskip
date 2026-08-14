@@ -41,9 +41,12 @@ DB="$WORK/db"
 
 # --- create, with an explicit UUID so output is reproducible (T-1) ------------
 $TOOL "$DB" create --uuid "$UUID" || { echo "  FAIL create"; exit 1; }
-check "create names the file after the uuid" \
-    "zeroskip-$UUID-00000001" \
+check "create names the active file .current, not a generation (D-1b)" \
+    "zeroskip-$UUID.current" \
     "$(ls "$DB" | grep '^zeroskip-')"
+# The dot is what keeps the generation-named glob clean: no active file in it.
+check "the generation glob excludes the active file" "0" \
+    "$(ls "$DB" | grep -c "^zeroskip-$UUID-")"
 check "create makes a lock file" "zeroskip.lock" \
     "$(ls "$DB" | grep '^zeroskip\.')"
 
@@ -161,11 +164,14 @@ DB2="$WORK/db2"
 $TOOL "$DB2" create --uuid "$UUID"
 $TOOL "$DB2" store 61 3031 --hex
 # Force a new generation by making the active file unclean, as a crash would.
-printf '\336\255\276\357\336\255\276\357' >> "$DB2/zeroskip-$UUID-00000001"
-$TOOL "$DB2" store 62 3032 --hex
+# D-12b: the writer converts the unclean file before taking the name for the
+# next generation, so this leaves an in-order file plus a new active one -- not
+# two unordered files, which D-1b makes unrepresentable.
+printf '\336\255\276\357\336\255\276\357' >> "$DB2/zeroskip-$UUID.current"
+$TOOL "$DB2" store 62 3032 --hex --noautorepack
 check "an unclean active file forces a new generation" "2" \
     "$(ls "$DB2" | grep -c '^zeroskip-')"
-$TOOL "$DB2" convert
+$TOOL "$DB2" convert --noautorepack
 check "convert produced an in-order file" "1" \
     "$($TOOL "$DB2" dump | grep -c 'kind=inorder')"
 check "convert kept the data" "3031" "$($TOOL "$DB2" get 61 --hex)"

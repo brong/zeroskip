@@ -651,9 +651,6 @@ static void test_filenames(void)
     /* T-2c: a generated filename for a known UUID and generation range,
      * character for character.  Lowercase UUID, uppercase 8-digit hex
      * generations, no extension. */
-    zsi_name_format(name, test_uuid, 1, 0);
-    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000001");
-
     zsi_name_format(name, test_uuid, 1, 10);
     ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000001-0000000A");
 
@@ -661,17 +658,27 @@ static void test_filenames(void)
     ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-00000005-00000005");
 
     /* The full 32-bit range has a name, which is what 8 digits buys (D-1). */
-    zsi_name_format(name, test_uuid, 0xFFFFFFFFu, 0);
-    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-FFFFFFFF");
     zsi_name_format(name, test_uuid, 0xABCDEF01u, 0xFEDCBA98u);
     ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR "-ABCDEF01-FEDCBA98");
 
-    /* Round-trip, both kinds. */
-    zsi_name_format(name, test_uuid, 7, 0);
+    /* D-1b: the active file's name carries no generation at all, and there is
+     * exactly one of it.  A DOT, so that "zeroskip-<uuid>-*" matches the
+     * generation-named files and only those. */
+    zsi_name_current(name, test_uuid);
+    ASSERT_STR_EQ(name, "zeroskip-" TEST_UUID_STR ".current");
+
+    /* Round-trip, both kinds.  The active file parses with start == 0: its
+     * generation is in the header, and F-9 makes 0 unambiguous as "unknown". */
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(zsi_name_parse(name, u, &s, &e), ZSI_NAME_UNORDERED);
     ASSERT_MEM_EQ(u, test_uuid, 16);
-    ASSERT_EQU(s, 7u);
+    ASSERT_EQU(s, 0u);
     ASSERT_EQU(e, 0u);
+
+    /* The OLD active-file spelling -- a bare generation -- is not a name this
+     * format produces, and F-7a forbids reading it as a fallback. */
+    ASSERT_EQ(zsi_name_parse("zeroskip-" TEST_UUID_STR "-00000005", u, &s, &e),
+              ZSI_NAME_OTHER);
 
     zsi_name_format(name, test_uuid, 3, 9);
     ASSERT_EQ(zsi_name_parse(name, u, &s, &e), ZSI_NAME_INORDER);
@@ -700,10 +707,22 @@ static void test_filename_rejections(void)
         "zeroskip-" TEST_UUID_STR "-000000001",
         "zeroskip-" TEST_UUID_STR "-1",
         "zeroskip-" TEST_UUID_STR "-00000001-000000",
-        /* an extension: D-1a forbids one, and D-5's ordering depends on it */
+        /* an extension: only ".current" is a legal suffix (D-1a, D-1b) */
         "zeroskip-" TEST_UUID_STR "-00000001.zs",
         "zeroskip-" TEST_UUID_STR "-00000001-00000004.zs",
         "zeroskip-" TEST_UUID_STR "-00000001.tmp",
+        /* the OLD active-file spelling: a bare generation.  D-1b replaced it
+         * and F-7a forbids reading it as a fallback, so it is not ours. */
+        "zeroskip-" TEST_UUID_STR "-00000001",
+        "zeroskip-" TEST_UUID_STR "-0000000A",
+        "zeroskip-" TEST_UUID_STR "-FFFFFFFF",
+        /* near misses on the active file's name (D-1b) */
+        "zeroskip-" TEST_UUID_STR "-current",
+        "zeroskip-" TEST_UUID_STR ".CURRENT",
+        "zeroskip-" TEST_UUID_STR ".current2",
+        "zeroskip-" TEST_UUID_STR ".curren",
+        "zeroskip-" TEST_UUID_STR "..current",
+        "zeroskip-" TEST_UUID_STR ".current-00000001",
         /* trailing junk */
         "zeroskip-" TEST_UUID_STR "-00000001-",
         "zeroskip-" TEST_UUID_STR "-00000001-00000004-",
@@ -726,6 +745,9 @@ static void test_filename_rejections(void)
         "zeroskip.lock",
         "zeroskip.tmp.1234.0",
         "zeroskip.tmp.1234.17",
+        /* no separator at all: the prefix is "zeroskip-", not "zeroskip" */
+        "zeroskip" TEST_UUID_STR ".current",
+        "zeroskip" TEST_UUID_STR "-00000001-00000001",
         /* not ours at all */
         "zeroskip",
         "zeroskip-",
@@ -752,50 +774,62 @@ static void test_filename_rejections(void)
      * file set's job (D-4), not the parser's.  Asserted so the division of
      * responsibility is explicit. */
     ASSERT_EQ(zsi_name_parse("zeroskip-00000000-0000-4000-8000-000000000000"
-                             "-00000001", u, &s, &e), ZSI_NAME_UNORDERED);
+                             "-00000001-00000001", u, &s, &e), ZSI_NAME_INORDER);
+    ASSERT_EQ(zsi_name_parse("zeroskip-00000000-0000-4000-8000-000000000000"
+                             ".current", u, &s, &e), ZSI_NAME_UNORDERED);
 }
 
-static void test_filename_prefix_property(void)
+static void test_filename_sort_property(void)
 {
-    /* D-1a, asserted directly on generated names.
+    /* D-1b, asserted directly on generated names.
      *
-     * D-5 resolves an overlap by taking the LAST file whose start matches, which
-     * is only correct because an unordered file's name sorts before the in-order
-     * name for the same generation.  That holds because the unordered name is a
-     * strict prefix of the in-order one -- which is true only while data files
-     * carry no extension.
+     * D-5 resolves an overlap by taking the LAST file whose start matches, so
+     * where the active file's name sorts is load-bearing.  It has to sort AFTER
+     * every generation name, because its generation is above them all.  That
+     * holds because '.' (0x2E) is above '-' (0x2D) at the position where the
+     * names diverge.
      *
-     * T-9 requires this be a test so that adding an extension later breaks a test
+     * This replaced a prefix rule: the active file used to be named for its
+     * generation, so its name was a strict prefix of the in-order name for the
+     * same generation and sorted BEFORE it.  Opposite direction, same purpose.
+     *
+     * T-9 requires this be a test, so that changing the separator breaks a test
      * rather than the database. */
+    char cur[ZSI_NAME_MAX];
+    zsi_name_current(cur, test_uuid);
+
     for (uint32_t g = 1; g <= 300; g++) {
-        char un[ZSI_NAME_MAX], in[ZSI_NAME_MAX];
-        zsi_name_format(un, test_uuid, g, 0);
+        char in[ZSI_NAME_MAX];
         zsi_name_format(in, test_uuid, g, g);
 
-        size_t ul = strlen(un);
-        if (strncmp(un, in, ul) != 0) {
-            fprintf(stderr, "\n    FAIL gen %u: '%s' is not a prefix of '%s'\n",
-                    g, un, in);
-            current_test_failed = 1;
-            return;
-        }
-        if (strcmp(un, in) >= 0) {
-            fprintf(stderr, "\n    FAIL gen %u: '%s' does not sort before '%s'\n",
-                    g, un, in);
+        if (strcmp(cur, in) <= 0) {
+            fprintf(stderr, "\n    FAIL gen %u: '%s' does not sort after '%s'\n",
+                    g, cur, in);
             current_test_failed = 1;
             return;
         }
     }
 
-    /* And the three-way case D-5a's table ends with: unordered N, N-N, and a
-     * wider N-M must sort in that order, so "last" is the widest. */
-    char a[ZSI_NAME_MAX], b[ZSI_NAME_MAX], c[ZSI_NAME_MAX];
-    zsi_name_format(a, test_uuid, 5, 0);
+    /* Including the very top of the range, which is the case a separator
+     * sorting below the hex digits would get wrong. */
+    char top[ZSI_NAME_MAX];
+    zsi_name_format(top, test_uuid, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    ASSERT(strcmp(cur, top) > 0);
+
+    /* D-5a's table: N-N and a wider N-M sort in that order, so "last" is the
+     * widest -- and the active file is last of all. */
+    char b[ZSI_NAME_MAX], c[ZSI_NAME_MAX];
     zsi_name_format(b, test_uuid, 5, 5);
     zsi_name_format(c, test_uuid, 5, 9);
-    ASSERT(strcmp(a, b) < 0);
     ASSERT(strcmp(b, c) < 0);
-    ASSERT(strcmp(a, c) < 0);
+    ASSERT(strcmp(c, cur) < 0);
+
+    /* And the point of the dot: the generation-named files are exactly what
+     * "zeroskip-<uuid>-" prefixes, with nothing to grep back out. */
+    char pfx[ZSI_NAME_MAX];
+    snprintf(pfx, sizeof(pfx), "zeroskip-%s-", TEST_UUID_STR);
+    ASSERT(strncmp(b, pfx, strlen(pfx)) == 0);
+    ASSERT(strncmp(cur, pfx, strlen(pfx)) != 0);
 }
 
 static void test_staging_names(void)
@@ -2185,7 +2219,7 @@ static int replay_file(struct sb *s, uint32_t gen, struct collected *c,
                        struct zsi_file **fp)
 {
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, gen, 0);
+    zsi_name_current(name, test_uuid);
     if (mkdbdir() != 0) return -1;
     if (sb_write(s, name) != 0) return -1;
     memset(c, 0, sizeof(*c));
@@ -2208,7 +2242,7 @@ static void test_file_bounds(void)
 
     ASSERT_EQ(mkdbdir(), 0);
     make_header(hdr, 1, 0, ZSI_CSUM_XXHASH);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
 
@@ -2246,7 +2280,7 @@ static void test_file_zero_length(void)
     struct zsi_file *f = NULL;
 
     ASSERT_EQ(mkdbdir(), 0);
-    zsi_name_format(name, test_uuid, 3, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_EQ(filesize(name), 0);
 
@@ -2273,7 +2307,7 @@ static void test_file_bad_header(void)
     struct zsi_file *f = NULL;
 
     ASSERT_EQ(mkdbdir(), 0);
-    zsi_name_format(name, test_uuid, 4, 0);
+    zsi_name_current(name, test_uuid);
 
     /* Garbage where a header should be (D-10).  Opens, reports the header as
      * invalid, and takes its generation from the name. */
@@ -2324,7 +2358,7 @@ static void test_file_engine_from_header(void)
     struct zsi_file *f = NULL;
 
     ASSERT_EQ(mkdbdir(), 0);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
 
     /* F-5a: a file's engine comes from its OWN header, so files written under
      * different engines coexist and a reader's configuration never overrides
@@ -2380,7 +2414,7 @@ static void test_file_open_failures(void)
     /* A missing file is ZS_NOTFOUND specifically, not a generic I/O error: the
      * snapshot protocol distinguishes them, restarting its scan on ENOENT because
      * a file may legitimately be unlinked mid-scan (C-4 step 3). */
-    zsi_name_format(name, test_uuid, 99, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(zsi_file_open(dbdir, name, 99, NULL, &f), ZS_NOTFOUND);
     ASSERT_NULL(f);
 
@@ -2621,7 +2655,7 @@ static void test_span_torn_tail(void)
 
     for (size_t cut = good_end; cut < full; cut++) {
         char name[ZSI_NAME_MAX];
-        zsi_name_format(name, test_uuid, 1, 0);
+        zsi_name_current(name, test_uuid);
         ASSERT_EQ(mkdbdir(), 0);
         ASSERT_EQ(writefile(name, s.buf, cut), 0);
         memset(&c, 0, sizeof(c));
@@ -2728,7 +2762,7 @@ static void test_nocsum_still_rejects_bad_span(void)
     sb_term(&s, false);
     s.buf[at + 4 + 3 + 1] = 'b';                /* first value byte: aaa -> baa */
 
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -2811,7 +2845,7 @@ static void test_span_bad_header_and_kind(void)
     char buf[ZSI_HEADER_LEN];
 
     ASSERT_EQ(mkdbdir(), 0);
-    zsi_name_format(name, test_uuid, 2, 0);
+    zsi_name_current(name, test_uuid);
 
     /* D-10: an invalid header means zero spans, complete at 0, and NOT clean --
      * so a writer moves on rather than appending past a boundary that failed to
@@ -2946,7 +2980,7 @@ static void test_span_long_terminator(void)
               ZSI_COMMIT_LONG);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -2976,7 +3010,7 @@ static void test_span_long_terminator(void)
 static int index_file(struct sb *s, uint32_t gen, struct zsi_file **fp)
 {
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, gen, 0);
+    zsi_name_current(name, test_uuid);
     if (mkdbdir() != 0) return -1;
     if (sb_write(s, name) != 0) return -1;
     if (zsi_file_open(dbdir, name, gen, TEST_EXTERNAL_CSUM, fp) != ZS_OK)
@@ -3172,7 +3206,7 @@ static void test_index_delta(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -3270,7 +3304,7 @@ static void test_index_delta_shadows_base(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -3391,7 +3425,7 @@ static void test_index_delta_merge_with_duplicates(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -3929,7 +3963,7 @@ static void test_inorder_kind_rules(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -4048,7 +4082,7 @@ static void build_both_kinds(struct sb *s, struct ib *b,
     sb_term(s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(sb_write(s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, uf));
     ASSERT_OK(zsi_index_build(*uf, zsi_compar_default));
@@ -4170,7 +4204,7 @@ static void test_fcur_empty_sources(void)
 
     /* An unordered file with no committed records (F-26h). */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &uf));
     ASSERT_OK(zsi_index_build(uf, zsi_compar_default));
@@ -4243,7 +4277,7 @@ static void test_fcur_no_duplicate_keys(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -4280,7 +4314,7 @@ static void test_fcur_deletions_visible(void)
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -4333,6 +4367,28 @@ static void seed_names(const char *const *names)
         ASSERT_EQ(writefile(names[i], "", 0), 0);
 }
 
+/* D-1b: the active file's generation is in its HEADER, so a fixture that wants
+ * one in the set has to write a real header -- an empty placeholder parses as
+ * D-10's "no discoverable generation" and is dropped from the scan, which is
+ * correct behaviour and useless as a fixture.  cur_gen == 0 means no active
+ * file is expected among `names`. */
+static void seed_names_cur(const char *const *names, uint32_t cur_gen)
+{
+    char cur[ZSI_NAME_MAX];
+
+    seed_names(names);
+    if (!cur_gen) return;
+
+    zsi_name_current(cur, test_uuid);
+    for (size_t i = 0; names[i]; i++) {
+        if (strcmp(names[i], cur) != 0) continue;
+        char hdr[ZSI_HEADER_LEN];
+        make_header(hdr, cur_gen, 0, ZSI_CSUM_XXHASH);
+        ASSERT_EQ(writefile(cur, hdr, sizeof(hdr)), 0);
+        return;
+    }
+}
+
 /* Join the resolved set's names, stripping the common prefix, so an assertion
  * reads as one string. */
 static void resolved_gens(struct zsi_fileset *fs, char *out, size_t outlen)
@@ -4355,13 +4411,16 @@ static void resolved_gens(struct zsi_fileset *fs, char *out, size_t outlen)
     }
 }
 
-/* Format a data-file name for the test UUID into a static rotating buffer. */
+/* Format a data-file name for the test UUID into a static rotating buffer.
+ * end == 0 means the active file, which under D-1b has no generation in its
+ * name -- so `start` is ignored, and there is only ever one such name. */
 static const char *dn(uint32_t start, uint32_t end)
 {
     static char bufs[8][ZSI_NAME_MAX];
     static int which = 0;
     char *b = bufs[which = (which + 1) % 8];
-    zsi_name_format(b, test_uuid, start, end);
+    if (end == 0) zsi_name_current(b, test_uuid);
+    else          zsi_name_format(b, test_uuid, start, end);
     return b;
 }
 
@@ -4378,7 +4437,7 @@ static void test_fileset_overlap_table(void)
     {
         const char *names[] = { dn(1,1), dn(2,2), dn(3,3), dn(4,4), dn(1,4),
                                 dn(5,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_resolve(&fs));
         resolved_gens(&fs, got, sizeof(got));
@@ -4389,7 +4448,7 @@ static void test_fileset_overlap_table(void)
     /* The same with some inputs already unlinked: the set still tiles. */
     {
         const char *names[] = { dn(2,2), dn(1,4), dn(5,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_resolve(&fs));
         resolved_gens(&fs, got, sizeof(got));
@@ -4401,7 +4460,7 @@ static void test_fileset_overlap_table(void)
      * the unordered name is a strict prefix and so sorts first (D-1a). */
     {
         const char *names[] = { dn(5,0), dn(5,5), dn(1,4), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_resolve(&fs));
         resolved_gens(&fs, got, sizeof(got));
@@ -4412,7 +4471,7 @@ static void test_fileset_overlap_table(void)
     /* All three at once: unordered N, N-N, and a wider N-M.  The widest wins. */
     {
         const char *names[] = { dn(1,4), dn(5,0), dn(5,5), dn(5,9), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_resolve(&fs));
         resolved_gens(&fs, got, sizeof(got));
@@ -4429,7 +4488,7 @@ static void test_fileset_first_vs_last(void)
     struct zsi_fileset fs;
 
     const char *names[] = { dn(1,1), dn(1,4), dn(5,0), NULL };
-    seed_names(names);
+    seed_names_cur(names, 5);
     ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
     ASSERT_OK(zsi_fileset_resolve(&fs));
 
@@ -4461,7 +4520,7 @@ static void test_fileset_gaps(void)
     /* A missing middle generation. */
     {
         const char *names[] = { dn(1,1), dn(3,3), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_AGAIN);
         zsi_fileset_fini(&fs);
@@ -4473,7 +4532,7 @@ static void test_fileset_gaps(void)
      * would wrongly reject. */
     {
         const char *names[] = { dn(5,7), dn(8,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 8);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_resolve(&fs));
         ASSERT_EQU(fs.nresolved, 2u);
@@ -4483,7 +4542,7 @@ static void test_fileset_gaps(void)
     /* A gap immediately after the first file. */
     {
         const char *names[] = { dn(1,2), dn(4,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 4);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_AGAIN);
         zsi_fileset_fini(&fs);
@@ -4494,7 +4553,7 @@ static void test_fileset_gaps(void)
      * rather than resolved. */
     {
         const char *names[] = { dn(1,5), dn(3,8), NULL };
-        seed_names(names);
+        seed_names_cur(names, 4);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_EQ(zsi_fileset_resolve(&fs), ZS_BADFORMAT);
         zsi_fileset_fini(&fs);
@@ -4529,15 +4588,18 @@ static void test_fileset_uuid_discovery(void)
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77,
         0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
     };
+    /* In-order files throughout: discovery is about the UUID in the name, and
+     * D-1b would otherwise make "two files of one database" unbuildable from
+     * unordered ones -- there is only one such name per UUID. */
     char othername[ZSI_NAME_MAX];
-    zsi_name_format(othername, other, 1, 0);
+    zsi_name_format(othername, other, 1, 1);
 
-    const char *names[] = { dn(1, 0), othername, NULL };
+    const char *names[] = { dn(1, 1), othername, NULL };
     seed_names(names);
     ASSERT_EQ(zsi_fileset_scan(dbdir, NULL, &fs), ZS_BADFORMAT);
 
     /* Two of one and one of the other: still an error, not a vote. */
-    const char *names2[] = { dn(1, 0), dn(2, 0), othername, NULL };
+    const char *names2[] = { dn(1, 1), dn(2, 2), othername, NULL };
     seed_names(names2);
     ASSERT_EQ(zsi_fileset_scan(dbdir, NULL, &fs), ZS_BADFORMAT);
 
@@ -4570,7 +4632,7 @@ static void test_fileset_ignores_foreign(void)
         "zeroskip-not-a-uuid-00000001",
         NULL
     };
-    seed_names(names);
+    seed_names_cur(names, 1);
 
     ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
     ASSERT_EQU(fs.nall, 1u);
@@ -4605,7 +4667,7 @@ static void test_fileset_next_gen(void)
      * so the highest never regresses and a generation is never reissued. */
     {
         const char *names[] = { dn(1,4), dn(5,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
         ASSERT_EQU(next, 6u);
@@ -4617,7 +4679,7 @@ static void test_fileset_next_gen(void)
     {
         const char *names[] = { dn(1,1), dn(2,2), dn(3,3), dn(4,4), dn(1,4),
                                 dn(5,0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
         ASSERT_EQU(next, 6u);
@@ -4627,7 +4689,7 @@ static void test_fileset_next_gen(void)
     /* And after files have been removed: the highest present still decides. */
     {
         const char *names[] = { dn(1,4), dn(5,5), NULL };
-        seed_names(names);
+        seed_names_cur(names, 5);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
         ASSERT_EQU(next, 6u);
@@ -4645,7 +4707,7 @@ static void test_fileset_next_gen(void)
     }
     {
         const char *names[] = { dn(0xFFFFFFFFu, 0), NULL };
-        seed_names(names);
+        seed_names_cur(names, 0xFFFFFFFFu);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_EQ(zsi_fileset_next_gen(&fs, &next), ZS_FULL);
         zsi_fileset_fini(&fs);
@@ -4654,7 +4716,8 @@ static void test_fileset_next_gen(void)
     /* One below the ceiling still allocates. */
     {
         const char *names[] = { dn(0xFFFFFFFEu, 0), NULL };
-        seed_names(names);
+        /* header carries the generation now (D-1b) */
+        seed_names_cur(names, 0xFFFFFFFEu);
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
         ASSERT_OK(zsi_fileset_next_gen(&fs, &next));
         ASSERT_EQU(next, 0xFFFFFFFFu);
@@ -4675,7 +4738,7 @@ static void test_fileset_mid_conversion_stable(void)
     char got[128];
 
     const char *names[] = { dn(1,4), dn(5,0), dn(5,5), NULL };
-    seed_names(names);
+    seed_names_cur(names, 5);
 
     for (int attempt = 0; attempt < 5; attempt++) {
         ASSERT_OK(zsi_fileset_scan(dbdir, NULL, &fs));
@@ -4713,7 +4776,7 @@ static void put_unordered(uint32_t gen, const char *const *keys)
     for (size_t i = 0; keys && keys[i]; i++)
         sb_rec(&s, keys[i], strlen(keys[i]), "v", 1, false, 0);
     sb_term(&s, false);
-    zsi_name_format(name, test_uuid, gen, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -4890,7 +4953,7 @@ static void test_snapshot_boundary(void)
     sb_term(&s, false);
     size_t boundary = s.len;
     sb_rec(&s, "invisible", 9, "2", 1, false, 0);   /* no terminator */
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(sb_write(&s, name), 0);
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
@@ -4930,18 +4993,35 @@ static void test_snapshot_bad_nonactive(void)
     clear_db();
     put_inorder(1, 1, k);
     put_unordered(2, k);
-    zsi_name_format(name, test_uuid, 2, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(writefile(name, junk, sizeof(junk)), 0);
     report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
                                 counting_error, NULL, &s));
     ASSERT_EQ(report_count, 0);
-    ASSERT_EQU(s->nfiles, 2u);
-    ASSERT(!s->files[1]->hdr_valid);
-    ASSERT_EQU(s->files[1]->complete, 0u);
-    ASSERT(!zsi_unordered_is_clean(s->files[1]));
+
+    /* D-1b/D-10: the active file's generation lives in its header, so a header
+     * that does not validate leaves it with none -- and a file whose generation
+     * is unknown cannot take part in D-5's scan.  It is therefore absent from
+     * the set rather than present-and-empty, which is what the old name-carried
+     * generation allowed.  Nothing is lost: no record in it was recoverable
+     * either way, and the set without it still tiles, because it would have
+     * been the generation above the highest. */
+    ASSERT_EQU(s->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(s->files[0]));
+    ASSERT_EQU(s->files[0]->hdr.start, 1u);
     zsi_snapshot_release(&s);
+
+    /* And it remains resolvable rather than fatal: the set without it tiles,
+     * which is what D-10 promises (G-3). */
+    {
+        struct zsi_fileset fs2;
+        ASSERT_OK(zsi_fileset_scan(dbdir, &test_uuid, &fs2));
+        ASSERT_OK(zsi_fileset_resolve(&fs2));
+        ASSERT_EQU(fs2.nresolved, 1u);
+        zsi_fileset_fini(&fs2);
+    }
 
     /* Corrupt a NON-ACTIVE file: REPORTED, not fatal (D-10a, D-10b).
      *
@@ -4962,16 +5042,18 @@ static void test_snapshot_bad_nonactive(void)
     ASSERT(report_count > 0);       /* not silent */
     zsi_snapshot_release(&s);
 
-    /* A zero-length active file, likewise tolerated (D-10). */
+    /* A zero-length active file, likewise tolerated (D-10) -- and likewise
+     * absent from the set rather than present-and-empty, since a file with no
+     * header has no generation to place it at (D-1b). */
     clear_db();
     put_inorder(1, 1, k);
-    zsi_name_format(name, test_uuid, 2, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
                                 NULL, NULL, &s));
-    ASSERT_EQU(s->nfiles, 2u);
-    ASSERT(!s->files[1]->hdr_valid);
+    ASSERT_EQU(s->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(s->files[0]));
     zsi_snapshot_release(&s);
 }
 
@@ -5427,7 +5509,7 @@ static void test_open_create(void)
     ASSERT_EQ(fexists(dbpath(ZSI_LOCK_NAME)), 0);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_EQ(filesize(name), 72);
     ASSERT_EQU(db->snap->nfiles, 1u);
     ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
@@ -5471,7 +5553,7 @@ static void test_open_with_uuid(void)
     ASSERT_MEM_EQ(db->uuid, test_uuid, 16);
 
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(filesize(name), 72);
     ASSERT_OK(zs_db_close(&db));
 
@@ -5597,7 +5679,7 @@ static void test_open_readonly_no_side_effects(void)
 
     /* Make the active file unclean, which is what a crash leaves (D-10). */
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, test_uuid, 2, 0);
+    zsi_name_current(name, test_uuid);
     int fd = open(dbpath(name), O_WRONLY | O_APPEND);
     ASSERT(fd >= 0);
     ASSERT_EQ(write(fd, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8), 8);
@@ -5710,7 +5792,7 @@ static void test_open_uuid_mismatch(void)
 
     clear_db();
     put_unordered(1, k);
-    zsi_name_format(othername, other, 2, 0);
+    zsi_name_current(othername, other);
     ASSERT_EQ(writefile(othername, "", 0), 0);
 
     ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADFORMAT);
@@ -5787,7 +5869,7 @@ static void put_unordered_kv(uint32_t gen, const struct kv *kvs)
         sb_rec(&s, kvs[i].k, strlen(kvs[i].k),
                kvs[i].v, kvs[i].v ? strlen(kvs[i].v) : 0, false, 0);
     sb_term(&s, false);
-    zsi_name_format(name, test_uuid, gen, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -5998,12 +6080,18 @@ static void test_read_arrangements(void)
     ASSERT_STR_EQ(got, expect);
     zs_db_close(&db);
 
-    /* 2. several unordered files */
+    /* 2. several generations, the newest of them unordered.
+     *
+     * This used to be "several unordered files", which D-1b makes
+     * unrepresentable: there is one active-file name, so at most one unordered
+     * file can exist (D-12a).  The arrangement that remains -- a prefix of
+     * in-order files with the active one above them -- is the one a real
+     * database is ever in, and it still exercises the multi-source merge. */
     clear_db();
     { static const struct kv p[] = {{"a","A"},{"b","B"},{NULL,NULL}};
-      put_unordered_kv(1, p); }
+      put_inorder_kv(1, 1, p); }
     { static const struct kv p[] = {{"c","C"},{NULL,NULL}};
-      put_unordered_kv(2, p); }
+      put_inorder_kv(2, 2, p); }
     { static const struct kv p[] = {{"d","D"},{"e","E"},{NULL,NULL}};
       put_unordered_kv(3, p); }
     db = open_db(0);
@@ -6268,8 +6356,13 @@ static void test_read_model(void)
         kvs[n].k = NULL;
         kvs[n].v = NULL;
 
-        /* Alternate the file kind, so the merge sees both primitives. */
-        if (gen % 2 == 0) {
+        /* Only the NEWEST generation may be unordered: D-1b gives the active
+         * file one name, so an older unordered generation would have been
+         * overwritten rather than sitting beside this one -- leaving a hole in
+         * the set.  Every earlier generation is therefore written in-order,
+         * which is the state a writer leaves behind anyway (D-12b), and the
+         * last one exercises the unordered primitive. */
+        if (gen < 8) {
             /* in-order files need key order and one record per key */
             struct kv sorted[8];
             size_t sn = 0;
@@ -6590,6 +6683,80 @@ static void test_read_freshens_after_rollover(void)
     zs_db_close(&b);
 }
 
+/* C-4i under D-1b: the active file has a FIXED name, so "has anything
+ * committed" is answered by that one file's identity and size.  These two cases
+ * are the ones size alone cannot answer. */
+static void test_freshen_notices_a_rollover_by_inode(void)
+{
+    /* A peer converts the active file and creates a replacement at the SAME
+     * name (D-12b).  The replacement can be any size, including the same size,
+     * so only the inode distinguishes it from "nothing happened". */
+    struct zs_db *a, *b;
+    const char *v; size_t vl;
+    ino_t before, after;
+    struct stat sb;
+    char path[PATH_MAX], name[ZSI_NAME_MAX];
+
+    clear_db();
+    b = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(b);
+    ASSERT_OK(zs_db_store(b, "old", 3, "o", 1, 0));
+
+    a = open_db(0);
+    ASSERT_NOT_NULL(a);
+    ASSERT_OK(zs_db_fetch(a, "old", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(zsi_snapshot_active(a->snap));  /* the premise */
+
+    zsi_name_current(name, a->uuid);
+    snprintf(path, sizeof(path), "%s/%s", dbdir, name);
+    ASSERT_EQ(stat(path, &sb), 0);
+    before = sb.st_ino;
+
+    /* Seal, then write again: the name now holds a different inode. */
+    ASSERT_OK(zs_db_seal(b));
+    ASSERT_OK(zs_db_store(b, "new", 3, "n", 1, 0));
+    ASSERT_EQ(stat(path, &sb), 0);
+    after = sb.st_ino;
+    ASSERT(before != after);                        /* the premise */
+
+    /* The stale handle must see it. */
+    ASSERT_OK(zs_db_fetch(a, "new", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "n", 1);
+    zs_db_close(&a);
+    zs_db_close(&b);
+}
+
+static void test_freshen_notices_the_active_file_going_away(void)
+{
+    /* The other direction: we hold a snapshot WITH an active file, and a peer
+     * seals it away.  Nothing is created, nothing grows -- the file simply
+     * stops existing, and a probe that only compared sizes would never look. */
+    struct zs_db *a, *b;
+    const char *v; size_t vl;
+
+    clear_db();
+    b = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(b);
+    ASSERT_OK(zs_db_store(b, "old", 3, "o", 1, 0));
+    ASSERT_OK(zs_db_store(b, "two", 3, "t", 1, 0));
+
+    a = open_db(0);
+    ASSERT_NOT_NULL(a);
+    ASSERT_OK(zs_db_fetch(a, "old", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(zsi_snapshot_active(a->snap));  /* the premise */
+
+    /* Seal: the active file is converted and its name is gone. */
+    ASSERT_OK(zs_db_seal(b));
+
+    /* The stale handle's snapshot still names a file that no longer exists, so
+     * it must rebuild rather than keep reading a set that has moved. */
+    ASSERT_OK(zs_db_fetch(a, "two", 3, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "t", 1);
+    ASSERT_NULL(zsi_snapshot_active(a->snap));
+    zs_db_close(&a);
+    zs_db_close(&b);
+}
+
 static void test_cursor_live_sees_other_handle_commit(void)
 {
     /* ZS_CURSOR_LIVE (D-14j): a live cursor observes commits from OTHER
@@ -6813,7 +6980,7 @@ static void test_write_abort(void)
     /* An empty transaction commits and aborts cleanly, leaving no trace. */
     long before = 0;
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     before = filesize(name);
     ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
     ASSERT_OK(zs_txn_commit(&txn));
@@ -6954,7 +7121,7 @@ static void test_write_unclean_rollover(void)
 
     ASSERT_NOT_NULL(db);
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     /* Append garbage behind the library's back, as a crash would leave. */
@@ -7699,10 +7866,14 @@ static void test_convert_basic(void)
     ASSERT(db->snap->files[0]->nptrs > 0);
     ASSERT_OK(zsi_ptrs_verify_records(db->snap->files[0]));
 
-    /* The unordered input was retired (D-23). */
-    char iname[ZSI_NAME_MAX];
-    zsi_name_format(iname, db->uuid, 1, 0);
-    ASSERT_EQ(fexists(dbpath(iname)), -ENOENT);
+    /* The unordered input was retired (D-23).  Under D-1b that cannot be
+     * asserted by ABSENCE of a name -- the active file's name is reused by
+     * whatever generation comes next -- so it is asserted by generation: the
+     * file at that name, if there is one at all, is no longer generation 1. */
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        if (act) ASSERT(act->hdr.start > 1u);
+    }
 
     /* The keys survived the conversion, in order.  (The join would include a
      * 300-byte value, so this checks presence and order rather than the text.) */
@@ -7794,66 +7965,64 @@ static void test_convert_steady_state(void)
     zs_db_close(&db);
 }
 
-static void test_convert_backlog_oldest_first(void)
+static void test_convert_only_one_unordered_file(void)
 {
-    /* T-10a's second half: several crashes each leaving an unclean active file,
-     * then a writer draining the backlog.
+    /* T-10a's second half, rewritten for D-1b.
      *
-     * D-12b requires OLDEST FIRST, because converting out of order strands an
-     * unordered file between in-order ones -- and since only adjacent files may be
-     * merged, that hole blocks the repacker's cascade until it is filled (D-16c).
-     */
+     * This used to assert D-12b's OLDEST FIRST ordering, because several
+     * crashes could each leave an unclean unordered file and converting them
+     * out of order stranded one between in-order files, blocking the
+     * repacker's cascade (D-16c).
+     *
+     * That ordering has nothing left to order. There is exactly one
+     * active-file NAME (D-1b), so at most one unordered file can exist at all
+     * -- the invariant is structural now rather than a steady state kept by
+     * policy (D-12a), and "a backlog of unordered files" is not a state the
+     * format can represent. What is asserted instead is that stronger
+     * property, and that the one file still converts. */
     struct zs_db *db = NULL;
     char name[ZSI_NAME_MAX];
-    char got[1024];
+    size_t un, io;
 
     clear_db();
 
-    /* Three unclean unordered files plus a clean active one, as three crashes
-     * would leave: each has a valid span, then trailing garbage. */
+    /* Three crashes in a row, each leaving an unclean active file: a valid
+     * span, then a torn tail. Each one lands on the SAME name, so the third
+     * is all that survives -- which is the point. */
     for (uint32_t gen = 1; gen <= 3; gen++) {
-        struct sb s;
+        struct sb s2;
         char k[16];
-        sb_init(&s, gen, ZSI_CSUM_XXHASH);
+        sb_init(&s2, gen, ZSI_CSUM_XXHASH);
         snprintf(k, sizeof(k), "g%u", gen);
-        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
-        sb_term(&s, false);
-        sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);   /* torn tail */
-        zsi_name_format(name, test_uuid, gen, 0);
+        sb_rec(&s2, k, strlen(k), "v", 1, false, 0);
+        sb_term(&s2, false);
+        sb_raw(&s2, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);   /* torn tail */
+        zsi_name_current(name, test_uuid);
         ASSERT_EQ(mkdbdir(), 0);
-        ASSERT_EQ(sb_write(&s, name), 0);
-        sb_free(&s);
+        ASSERT_EQ(sb_write(&s2, name), 0);
+        sb_free(&s2);
     }
-    put_unordered_kv(4, (const struct kv[]){ {"g4","v"}, {NULL,NULL} });
 
     db = open_db(0);
     ASSERT_NOT_NULL(db);
 
-    size_t un, in;
-    count_kinds(db, &un, &in);
-    ASSERT_EQU(un, 4u);            /* the backlog, before any write */
-    ASSERT_EQU(in, 0u);
+    /* One unordered file, however many crashes preceded it. */
+    count_kinds(db, &un, &io);
+    ASSERT_EQU(un, 1u);
 
-    /* One write drains the whole backlog, oldest first. */
-    ASSERT_OK(zs_db_store(db, "new", 3, "n", 1, 0));
+    /* And a writer converts it: unclean is no obstacle, because the conversion
+     * reads to the complete point (F-24) and the garbage beyond is simply not
+     * carried over. */
+    ASSERT_OK(zs_db_store(db, "after", 5, "v", 1, 0));
+    count_kinds(db, &un, &io);
+    ASSERT(io >= 1);
 
-    count_kinds(db, &un, &in);
-    ASSERT_EQU(un, 1u);            /* drained to one */
-    ASSERT_EQU(in, 3u);
-
-    /* Converted oldest first, so the in-order files form a contiguous PREFIX --
-     * generations 1, 2, 3 -- with the unordered ones after (D-12b). */
-    for (size_t i = 0; i < 3; i++) {
-        ASSERT(!zsi_file_is_unordered(db->snap->files[i]));
-        ASSERT_EQU(db->snap->files[i]->hdr.start, (uint32_t)(i + 1));
-        ASSERT_EQU(db->snap->files[i]->hdr.end, (uint32_t)(i + 1));
-    }
-    ASSERT(zsi_file_is_unordered(db->snap->files[3]));
-
-    /* Every committed record survived the conversions; the torn tails did not
-     * contribute anything. */
-    api_scan(db, got, sizeof(got));
-    ASSERT_STR_EQ(got, "g1=v|g2=v|g3=v|g4=v|new=n");
+    /* The record from the surviving crash is still readable -- conversion kept
+     * the valid prefix rather than discarding the file. */
+    const char *v;
+    size_t vl;
+    ASSERT_OK(zs_db_fetch(db, "g3", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
 
     zs_db_close(&db);
 }
@@ -7947,19 +8116,21 @@ static void test_convert_readonly_does_nothing(void)
     struct zs_db *db = NULL;
 
     clear_db();
+
+    /* One unordered file, because D-1b makes one the maximum -- the point of
+     * the test is the READ-ONLY refusal, not the size of the backlog. */
     put_unordered_kv(1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
-    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
 
     setup.flags = ZS_SHARED;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
 
     size_t un, in;
     count_kinds(db, &un, &in);
-    ASSERT_EQU(un, 2u);
+    ASSERT_EQU(un, 1u);
     ASSERT_EQ(zsi_convert_pending(db), ZS_READONLY);
 
     count_kinds(db, &un, &in);
-    ASSERT_EQU(un, 2u);            /* unchanged */
+    ASSERT_EQU(un, 1u);            /* unchanged */
     ASSERT_EQU(in, 0u);
 
     zs_db_close(&db);
@@ -8501,7 +8672,7 @@ static void test_seal_verifies_spans_nocsum(void)
     for (size_t i = ZSI_HEADER_LEN; i + 5 <= s.len; i++)
         if (memcmp(s.buf + i, "value", 5) == 0) { voff = i; break; }
     ASSERT(voff != 0);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -8602,7 +8773,7 @@ static void test_read_verifies_record_csum_unordered(void)
     sb_rec(&s, "b", 1, "other", 5, false, 0);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
     sb_term(&s, false);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -8634,7 +8805,7 @@ static void test_record_csum_replay_no_truncate(void)
     sb_rec(&s, "b", 1, "other", 5, false, 0);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     sb_term(&s, false);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -8735,14 +8906,18 @@ static void test_repack_cascade(void)
 static void test_repack_never_touches_unordered(void)
 {
     /* D-15: the repacker never touches the active file, and never touches an
-     * unordered file at all.  With several unordered files present -- a crash
-     * backlog -- selection must still consider only the in-order prefix (D-16). */
+     * unordered file at all -- selection considers only the in-order prefix
+     * (D-16).
+     *
+     * One unordered file, not the crash backlog this used to build: D-1b gives
+     * the active file a single name, so a backlog is not a state the format can
+     * represent (D-12a).  The property under test is unchanged, since what it
+     * asserts is that selection stops at the in-order prefix. */
     struct zs_db *db;
 
     clear_db();
     put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
-    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
-    put_unordered_kv(3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
 
     db = open_db(ZS_SHARED);
     ASSERT_NOT_NULL(db);
@@ -8973,7 +9148,7 @@ static void test_check_unclean_reported(void)
     sb_rec(&s, "a", 1, "1", 1, false, 0);
     sb_term(&s, false);
     sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -9061,7 +9236,7 @@ static void test_dump_shows_rollback(void)
     sb_term(&s, false);
     sb_rec(&s, "dead", 4, "2", 1, false, 0);
     sb_term(&s, true);                          /* a rolled-back span */
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -9945,7 +10120,7 @@ static void test_malformed_never_hangs(void)
         }
         sb_raw(&s, junk, sizeof(junk));
     }
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
@@ -10591,7 +10766,7 @@ static void test_mp_reader_sees_torn_span(void)
     ASSERT_NOT_NULL(db);
     ASSERT_OK(zs_db_store(db, "committed", 9, "yes", 3, 0));
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     zs_db_close(&db);
 
     long before = filesize(name);
@@ -10810,7 +10985,15 @@ static void test_reads_never_consult_ancestors(void)
     /* A deletion with a nonsense ancestor still hides the key -- the tombstone is
      * honoured on its own terms, not by chasing its ancestor. */
     zs_db_close(&db);
-    put_unordered_kv(7, (const struct kv[]){ {NULL,NULL} });
+
+    /* Generation 6 becomes in-order, and 7 carries the tombstone.  The active
+     * file has to move out of the way first: D-1b gives it one name, so writing
+     * a new unordered generation over it would drop generation 6 out of the set
+     * and leave a gap where the old naming allowed both to sit side by side. */
+    put_inorder_kv(6, 6, (const struct kv[]){ {"c","C"}, {NULL,NULL} });
+    zsi_name_current(name, test_uuid);
+    ASSERT_EQ(unlink(dbpath(name)), 0);
+
     ib_init(&b, 7, 7, ZSI_CSUM_XXHASH);
     ib_rec(&b, "a", 1, NULL, 0, true, 12345);
     ib_finish(&b);
@@ -10901,11 +11084,15 @@ static void test_conversion_avoids_the_repack_lock(void)
     alarm(20);
     db = open_db(0);
     ASSERT_NOT_NULL(db);
-    ASSERT_OK(zs_db_store(db, "c", 1, "3", 1, 0));
+
+    /* A SEAL, because D-1b leaves no other way to make a writer convert: there
+     * is no such thing as a non-active unordered file to drain (D-12a), so the
+     * conversion that remains is the active file's own (D-25, D-12b). */
+    ASSERT_OK(zs_db_seal(db));
     alarm(0);
 
     /* The conversion happened despite the repack lock being held. */
-    zsi_name_format(name, db->uuid, 1, 1);
+    zsi_name_format(name, db->uuid, 2, 2);
     ASSERT_EQ(fexists(dbpath(name)), 0);
     zs_db_close(&db);
 
@@ -12771,16 +12958,14 @@ static void test_seal_unclean_active_file(void)
     struct zs_db *db = NULL;
     char name[ZSI_NAME_MAX];
     size_t clean_size;
-    uint32_t gen;
     int fd;
 
     setup.flags = ZS_CREATE;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
     clean_size = zsi_snapshot_active(db->snap)->size;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     fd = open(dbpath(name), O_WRONLY | O_APPEND);
@@ -13231,7 +13416,6 @@ static void test_salvage_resyncs_after_a_bad_span(void)
     struct salv s;
     char name[ZSI_NAME_MAX], val[64];
     size_t second_term;
-    uint32_t gen;
     int fd;
 
     /* Four spans, one commit each. */
@@ -13245,8 +13429,7 @@ static void test_salvage_resyncs_after_a_bad_span(void)
     }
     ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
     ASSERT_OK(zs_db_store(db, "k4", 2, "v4", 2, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     /* Corrupt span 2's terminator checksum.  A reader stops there (F-24) and
@@ -13303,7 +13486,6 @@ static void test_salvage_unverified_needs_the_flag(void)
     struct salv s;
     char name[ZSI_NAME_MAX], val[64];
     size_t second_term;
-    uint32_t gen;
     int fd;
 
     setup.flags = ZS_CREATE;
@@ -13312,8 +13494,7 @@ static void test_salvage_unverified_needs_the_flag(void)
     ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
     second_term = zsi_snapshot_active(db->snap)->last_term_off;
     ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     fd = open(dbpath(name), O_WRONLY);
@@ -13398,7 +13579,7 @@ static void test_check_reports_record_csum(void)
     sb_rec(&s, "c", 1, "third", 5, false, 0);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'T';
     sb_term(&s, false);
-    zsi_name_format(name, test_uuid, 2, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(sb_write(&s, name), 0);
     sb_free(&s);
 
@@ -13487,7 +13668,7 @@ static void test_salvage_never_recovers_rollback(void)
     sb_term(&b, false);
     sb_rec(&b, "dead", 4, "2", 1, false, 0);
     sb_term(&b, true);                          /* rolled back */
-    zsi_name_format(name, test_uuid, 1, 0);
+    zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(sb_write(&b, name), 0);
     sb_free(&b);
@@ -13569,7 +13750,10 @@ static void test_salvage_newest_version_wins(void)
     struct zs_db *db = NULL;
     char val[64];
 
-    setup.flags = ZS_CREATE;
+    /* ZS_NOAUTOREPACK: the point is SEVERAL generations each holding a later
+     * version of the same key, and D-16e would merge them into one file --
+     * leaving nothing for the oldest-first ordering to get right (A-14). */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
     setup.rollover_size = 256;
     setup.error = counting_error;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
@@ -13606,7 +13790,6 @@ static void test_salvage_invalid_header(void)
     struct zs_db *db = NULL;
     struct salv s;
     char name[ZSI_NAME_MAX], val[64];
-    uint32_t gen;
     int fd;
 
     setup.flags = ZS_CREATE;
@@ -13614,8 +13797,7 @@ static void test_salvage_invalid_header(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
     ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     /* Destroy the header's checksum, leaving the records intact. */
@@ -13703,7 +13885,6 @@ static void test_salvage_reports_maybe_stale(void)
     struct salv s;
     char name[ZSI_NAME_MAX];
     size_t term_after_old;
-    uint32_t gen;
     int fd;
     bool saw_old = false, saw_new = false;
 
@@ -13714,8 +13895,7 @@ static void test_salvage_reports_maybe_stale(void)
     ASSERT_OK(zs_db_store(db, "doomed", 6, "2", 1, 0));
     term_after_old = zsi_snapshot_active(db->snap)->last_term_off;
     ASSERT_OK(zs_db_store(db, "new", 3, "3", 1, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     /* Lose the "doomed" span, leaving "old" before it and "new" after. */
@@ -13847,7 +14027,6 @@ static void test_salvage_event_fields(void)
     struct zs_db *db = NULL;
     char name[ZSI_NAME_MAX];
     size_t term;
-    uint32_t gen;
     int bad = 0, fd;
 
     setup.flags = ZS_CREATE;
@@ -13857,8 +14036,7 @@ static void test_salvage_event_fields(void)
     ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
     term = zsi_snapshot_active(db->snap)->last_term_off;
     ASSERT_OK(zs_db_store(db, "k3", 2, "v3", 2, 0));
-    gen = zsi_snapshot_active(db->snap)->hdr.start;
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);
     ASSERT_OK(zs_db_close(&db));
 
     fd = open(dbpath(name), O_WRONLY);
@@ -15128,7 +15306,7 @@ static struct test_entry tests[] = {
 
     { "test_filenames",                 test_filenames },
     { "test_filename_rejections",       test_filename_rejections },
-    { "test_filename_prefix_property",  test_filename_prefix_property },
+    { "test_filename_sort_property",    test_filename_sort_property },
     { "test_staging_names",             test_staging_names },
 
     { "test_magic",                     test_magic },
@@ -15238,6 +15416,10 @@ static struct test_entry tests[] = {
     { "test_mp_read_sees_other_process_commit",
                                     test_mp_read_sees_other_process_commit },
     { "test_read_freshens_after_rollover", test_read_freshens_after_rollover },
+    { "test_freshen_notices_a_rollover_by_inode",
+                                        test_freshen_notices_a_rollover_by_inode },
+    { "test_freshen_notices_the_active_file_going_away",
+                                        test_freshen_notices_the_active_file_going_away },
     { "test_probe_no_change_reuses_snapshot",
                                     test_probe_no_change_reuses_snapshot },
     { "test_failed_refresh_keeps_probe_stale",
@@ -15276,7 +15458,8 @@ static struct test_entry tests[] = {
 
     { "test_convert_basic",             test_convert_basic },
     { "test_convert_steady_state",      test_convert_steady_state },
-    { "test_convert_backlog_oldest_first", test_convert_backlog_oldest_first },
+    { "test_convert_only_one_unordered_file",
+                                        test_convert_only_one_unordered_file },
     { "test_convert_staging_exclusive", test_convert_staging_exclusive },
     { "test_convert_remove_refuses_when_needed",
                                         test_convert_remove_refuses_when_needed },

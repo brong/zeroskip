@@ -481,7 +481,7 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
  * carry each file's generation range, so one readdir yields the set and every
  * range without opening a single file.
  *
- *   zeroskip-<uuid>-<gen>            unordered file, one generation
+ *   zeroskip-<uuid>.current          THE active file (unordered), no generation
  *   zeroskip-<uuid>-<start>-<end>    in-order file
  *   zeroskip.tmp.<pid>.<n>           staging for a repack or conversion output
  *   zeroskip.lock                    holds the fcntl locks
@@ -497,11 +497,18 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
  *     Fixed width keeps lexical and numeric order identical, and 8 digits is
  *     exactly the range of a 32-bit generation, so every representable
  *     generation has a name and the width never needs to change.
- *   - data files carry NO extension (D-1a).  An unordered file's name is
- *     therefore a strict *prefix* of the in-order name covering the same
- *     generation -- "...-00000005" against "...-00000005-00000005" -- and so
- *     sorts before it, which D-5's "take the last" rule requires.  Any suffix
- *     sorting after '-' would reverse that pair and silently break resolution.
+ *   - the active file is ".current", with a DOT (D-1b).  Two consequences,
+ *     both deliberate: "zeroskip-<uuid>-*" matches the generation-named files
+ *     and only those, so nothing has to grep the active file back out of the
+ *     common pattern; and '.' (0x2E) is above '-' (0x2D), so it sorts AFTER
+ *     every generation name, which is where its generation puts it and what
+ *     D-5's "take the last" rule requires.
+ *
+ *     Its generation is NOT in its name -- it comes from the header, which is
+ *     free because the active file is the one file a snapshot must open and
+ *     replay anyway (D-13a).  There is one such name, so at most one unordered
+ *     file can exist at all (D-12a): the invariant is structural now, not a
+ *     steady state maintained by policy.
  *
  * The UUID is lowercase (D-0) against those uppercase generations.  The contrast
  * is deliberate: it makes a malformed name obvious on sight. */
@@ -511,27 +518,39 @@ static uint32_t zsi_csum2(zs_csum *csum, unsigned id,
 #define ZSI_LOCK_NAME       "zeroskip.lock"
 #define ZSI_STAGING_PREFIX  "zeroskip.tmp."
 #define ZSI_CACHE_DIR_NAME  "zeroskip.cache"   /* P-2b, in the metadata namespace (D-2) */
+#define ZSI_CURRENT_SUFFIX  ".current"         /* D-1b */
 
 /* "zeroskip-" + 36 + "-" + 8 + "-" + 8 + NUL = 64.  Rounded up for headroom. */
 #define ZSI_NAME_MAX 80
 
 enum zsi_nametype {
     ZSI_NAME_OTHER = 0,      /* not a data file of ours -- ignore (D-4) */
-    ZSI_NAME_UNORDERED,      /* zeroskip-<uuid>-<gen> */
+    ZSI_NAME_UNORDERED,      /* zeroskip-<uuid>.current  -- generation unknown */
     ZSI_NAME_INORDER         /* zeroskip-<uuid>-<start>-<end> */
 };
 
+/* The active file (D-1b).  Takes no generation because its name carries none;
+ * a caller that has one and wants a name for it wants zsi_name_format. */
+static void zsi_name_current(char *out, const zsi_uuid_t uuid)
+{
+    char ustr[ZSI_UUID_STR_LEN];
+    zsi_uuid_unparse(uuid, ustr);
+    snprintf(out, ZSI_NAME_MAX, "%s%s%s",
+             ZSI_NAME_PREFIX, ustr, ZSI_CURRENT_SUFFIX);
+}
+
+/* An in-order file's name.  end == 0 is not a shorthand for the active file:
+ * that name has no generation in it at all, so there is nothing to pass here
+ * and zsi_name_current is a different function on purpose. */
 static void zsi_name_format(char *out, const zsi_uuid_t uuid,
                             uint32_t start, uint32_t end)
 {
     char ustr[ZSI_UUID_STR_LEN];
     zsi_uuid_unparse(uuid, ustr);
 
-    if (end == 0)
-        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X", ZSI_NAME_PREFIX, ustr, start);
-    else
-        snprintf(out, ZSI_NAME_MAX, "%s%s-%08X-%08X",
-                 ZSI_NAME_PREFIX, ustr, start, end);
+    assert(end != 0);
+    snprintf(out, ZSI_NAME_MAX, "%s%s-%08X-%08X",
+             ZSI_NAME_PREFIX, ustr, start, end);
 }
 
 /* Parse exactly 8 uppercase hex digits.  Returns the character count consumed,
@@ -554,7 +573,10 @@ static size_t zsi_parse_gen8(const char *p, uint32_t *out)
 }
 
 /* Classify a directory entry.  Fills uuid/start/end when it is a data file; for
- * an unordered file *end is 0, which F-9 makes unambiguous.
+ * the active file *end is 0, which F-9 makes unambiguous, and *start is 0 too
+ * because its generation is not in its name (D-1b) -- the caller reads it from
+ * the header.  F-9 makes that sentinel unambiguous as well: no real generation
+ * is 0.
  *
  * Strict by design.  A lenient parser here would let two implementations
  * disagree about which files belong to a database, and D-4's "a file
@@ -574,6 +596,14 @@ static enum zsi_nametype zsi_name_parse(const char *name, zsi_uuid_t uuid,
     if (strlen(p) < 36 + 1) return ZSI_NAME_OTHER;
     if (zsi_uuid_parse(p, uuid) != 0) return ZSI_NAME_OTHER;
     p += 36;
+
+    /* D-1b: the active file, whose generation lives in its header. */
+    if (strcmp(p, ZSI_CURRENT_SUFFIX) == 0) {
+        *start = 0;
+        *end = 0;
+        return ZSI_NAME_UNORDERED;
+    }
+
     if (*p != '-') return ZSI_NAME_OTHER;
     p++;
 
@@ -584,19 +614,16 @@ static enum zsi_nametype zsi_name_parse(const char *name, zsi_uuid_t uuid,
     /* F-9: generations start at 1, so 0 is never a legitimate start. */
     if (s == 0) return ZSI_NAME_OTHER;
 
-    if (*p == '\0') {
-        *start = s;
-        *end = 0;
-        return ZSI_NAME_UNORDERED;
-    }
-
+    /* A bare generation with nothing after it was the OLD active-file name.
+     * D-1b replaced it and F-7a forbids a fallback, so it is simply not a name
+     * this format produces. */
     if (*p != '-') return ZSI_NAME_OTHER;
     p++;
 
     if (zsi_parse_gen8(p, &e) != 8) return ZSI_NAME_OTHER;
     p += 8;
 
-    /* No extension, and nothing trailing (D-1a). */
+    /* Nothing trailing: an in-order name ends at its second generation. */
     if (*p != '\0') return ZSI_NAME_OTHER;
 
     /* end == 0 would make an in-order name indistinguishable from an unordered
@@ -3666,8 +3693,113 @@ static int zsi_fileset_scan_dh(DIR *d, const zsi_uuid_t *want_uuid,
     return ZS_OK;
 }
 
+/* D-1b: the active file's generation is in its HEADER, not its name, so the
+ * scan reads it.  One open and 72 bytes, and only when an active file is
+ * present -- which is the trade D-1b makes: the name stops carrying the
+ * generation so that C-4i's freshness probe can be a single stat.
+ *
+ * Inferring the generation instead -- "it must be one above the highest" --
+ * is wrong in exactly the window that matters.  During a conversion the output
+ * is renamed in before the input is removed (D-5), so for that moment the
+ * active file is SUPERSEDED rather than new: its records have just been
+ * published as an in-order file, and its real generation is the one that file
+ * covers, not the next one.  Guessing puts it a generation too high, D-23a's
+ * "same highest generation" check then refuses to remove it, and the writer
+ * cannot create its replacement because the name is still taken.
+ *
+ * An invalid header means no discoverable generation and no recoverable
+ * record, so the entry simply does not participate (D-10).
+ *
+ * ZS_OK filled it in, ZS_NOTFOUND means drop it (D-10), anything else fails
+ * the scan. */
+static int zsi_entry_fill_current(const char *dir, struct zsi_entry *e,
+                                  zs_csum *external_csum)
+{
+    char path[PATH_MAX], buf[ZSI_HEADER_LEN];
+    struct zsi_header h;
+    ssize_t n;
+    int fd;
+
+    snprintf(path, sizeof(path), "%s/%s", dir, e->name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        /* Vanished between readdir and here: a stale scan, not an error.  The
+         * caller's retry (C-4b) rescans and converges. */
+        return errno == ENOENT ? ZS_NOTFOUND : ZS_IOERROR;
+    }
+
+    n = read(fd, buf, sizeof(buf));
+    close(fd);
+
+    if (n != (ssize_t)sizeof(buf)) return ZS_NOTFOUND;             /* D-10 */
+
+    /* Engine 2 with no function supplied is a CONFIGURATION error, not
+     * corruption, and the two must not be conflated (A-6).  Dropping it as
+     * unreadable would make an unverifiable database open as an empty one --
+     * silently, and with the caller's mistake nowhere in sight. */
+    unsigned id = zsi_header_engine_id(buf);
+    if (id == ZSI_CSUM_EXTERNAL && !external_csum) return ZS_BADUSAGE;
+
+    zs_csum *cs = zsi_csum_for_id(id, external_csum);
+    if (!cs || zsi_header_decode(buf, sizeof(buf), cs, &h) != ZS_OK
+            || h.start == 0)
+        return ZS_NOTFOUND;                                        /* D-10 */
+
+    e->start = h.start;
+    return ZS_OK;
+}
+
+static int zsi_fileset_scan_csum(const char *dir, const zsi_uuid_t *want_uuid,
+                                 zs_csum *external_csum,
+                                 struct zsi_fileset *fs)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        memset(fs, 0, sizeof(*fs));
+        return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+    }
+
+    int r = zsi_fileset_scan_dh(d, want_uuid, fs);
+    closedir(d);
+    if (r != ZS_OK) return r;
+
+    for (size_t i = 0; i < fs->nall; i++) {
+        int fr;
+
+        if (!(fs->all[i].end == 0 && fs->all[i].start == 0)) continue;
+
+        fr = zsi_entry_fill_current(dir, &fs->all[i], external_csum);
+        if (fr != ZS_OK && fr != ZS_NOTFOUND) {
+            zsi_fileset_fini(fs);
+            return fr;
+        }
+        if (fr == ZS_NOTFOUND) {
+            memmove(&fs->all[i], &fs->all[i + 1],
+                    (fs->nall - i - 1) * sizeof(fs->all[0]));
+            fs->nall--;
+        }
+        break;                          /* there is only ever one (D-12a) */
+    }
+
+    return ZS_OK;
+}
+
 static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
                             struct zsi_fileset *fs)
+{
+    return zsi_fileset_scan_csum(dir, want_uuid, NULL, fs);
+}
+
+/* The scan WITHOUT D-1b's header read: the active file keeps start == 0 and is
+ * kept even when its header does not validate.
+ *
+ * For salvage only, and for the same reason salvage does not share the read
+ * path at all: §5's rules exist to refuse what cannot be trusted, and salvage
+ * exists to read exactly that.  Dropping an unreadable active file (D-10) is
+ * right for a database being opened and wrong for one being recovered -- it
+ * would discard the file whose records salvage was called to rescue. */
+static int zsi_fileset_scan_raw(const char *dir, const zsi_uuid_t *want_uuid,
+                                struct zsi_fileset *fs)
 {
     DIR *d = opendir(dir);
     if (!d) {
@@ -3699,6 +3831,22 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
  *
  * Returns ZS_OK when the resolved set tiles (D-6), ZS_AGAIN when it leaves a gap
  * (D-7 -- a torn readdir, retry), or ZS_BADFORMAT for a partial overlap (D-5c). */
+/* D-5a's ordering, as a comparison rather than a naming accident. */
+static int zsi_entry_resolve_order(const void *va, const void *vb)
+{
+    const struct zsi_entry *a = va, *b = vb;
+    uint32_t ar = a->end ? a->end : a->start;
+    uint32_t br = b->end ? b->end : b->start;
+
+    if (a->start != b->start) return a->start < b->start ? -1 : 1;
+    if (ar != br)             return ar < br ? -1 : 1;
+
+    /* Same range: the in-order file is the published form and must win, so it
+     * sorts last.  This is the conversion window (D-5). */
+    if ((a->end == 0) != (b->end == 0)) return a->end == 0 ? -1 : 1;
+    return 0;
+}
+
 static int zsi_fileset_resolve(struct zsi_fileset *fs)
 {
     free(fs->resolved);
@@ -3710,8 +3858,33 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
     fs->resolved = malloc(fs->nall * sizeof(*fs->resolved));
     if (!fs->resolved) return ZS_INTERNAL;
 
-    /* The lowest generation present, over every file rather than the resolved
-     * ones: a superseded file still marks where the database begins. */
+    /* D-1b: the active file carries no generation in its name, so it takes no
+     * part in the sweep.  It is held aside here and appended last, at the
+     * generation D-9b says it must have -- one above the highest present.
+     * zsi_snapshot_take checks that against its header when it opens the file,
+     * which is where a disagreement becomes D-10's problem rather than a
+     * silently mis-tiled set.  zsi_name_parse marks it by start == 0, which
+     * F-9 makes unambiguous. */
+    /* D-5a's order, imposed on the ENTRIES rather than inherited from the
+     * names.  It used to come free from name collation, because the active
+     * file was named for its generation and its name was a strict prefix of
+     * the in-order name covering it -- so it sorted first and "take the last"
+     * picked the in-order file.
+     *
+     * D-1b broke that: `.current` carries no generation, so where it collates
+     * says nothing about which generation it holds, and a plain name sort puts
+     * it after EVERY in-order file.  In the conversion window -- output renamed
+     * in, input not yet removed (D-5) -- that would make "take the last" pick
+     * the superseded active file over the in-order file that just replaced it,
+     * and the snapshot would carry an active file the writer is about to
+     * delete.
+     *
+     * So sort by what the rule actually means: generation ascending, then reach
+     * ascending so the widest is last, then unordered before in-order so the
+     * published form wins a tie.  The scan has filled in every start by now,
+     * which is what makes this possible at all. */
+    qsort(fs->all, fs->nall, sizeof(fs->all[0]), zsi_entry_resolve_order);
+
     uint32_t cur = fs->all[0].start;
     for (size_t i = 1; i < fs->nall; i++)
         if (fs->all[i].start < cur) cur = fs->all[i].start;
@@ -3724,8 +3897,8 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
 
     for (;;) {
         /* The LAST file whose start equals cur.  The array is sorted by name, and
-         * for a shared start that orders unordered-then-narrow-then-widest, so
-         * the last is the one that encloses the others (D-5a). */
+         * for a shared start that orders narrow-then-widest, so the last is the
+         * one that encloses the others (D-5a). */
         ssize_t pick = -1;
         for (size_t i = 0; i < fs->nall; i++)
             if (fs->all[i].start == cur) pick = (ssize_t)i;
@@ -4016,7 +4189,7 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
 {
     for (int attempt = 0; attempt < ZSI_SNAPSHOT_RETRIES; attempt++) {
         struct zsi_fileset fs;
-        int r = zsi_fileset_scan(dir, uuid, &fs);
+        int r = zsi_fileset_scan_csum(dir, uuid, external_csum, &fs);
         if (r != ZS_OK) return r;
 
         r = zsi_fileset_resolve(&fs);
@@ -4524,24 +4697,17 @@ struct zs_db {
     struct zsi_locks     locks;
     struct zsi_snapshot *snap;
 
+    /* C-4i: the active file's identity as of the last refresh, so the probe can
+     * tell an append from a rollover (D-1b).  Kept here rather than derived
+     * from the snapshot because a snapshot holds no inode. */
+    dev_t                act_dev;
+    ino_t                act_ino;
+
     /* Immutable files carried across rebuilds (C-4c).  Per HANDLE, not global:
      * it holds open descriptors and mappings, which belong to the handle's
      * lifetime and must go when it closes. */
     struct zsi_fcache    fcache;      /* current snapshot for zs_db_* calls */
     struct zs_txn       *write_txn;
-
-    /* C-4i freshness baseline: the raw sorted name set of the last probe's
-     * directory scan, NUL-joined.  Taken BEFORE the snapshot it vouches for,
-     * so a file appearing between the two scans makes the NEXT probe fire a
-     * spurious refresh rather than ever missing one -- the safe direction. */
-    char        *probe_names;
-    size_t       probe_names_len;
-
-    /* The probe's directory stream, held for the handle's lifetime and
-     * rewound per probe.  rewinddir makes a readdir pass equivalent to a
-     * fresh opendir's (POSIX), and the probe runs once per operation, where
-     * opendir/closedir was the single largest cost of a cached fetch. */
-    DIR         *probe_dh;
 
     /* The active file's append descriptor, handed back by the last write
      * transaction and reused by the next while the active generation is
@@ -4599,13 +4765,42 @@ static int zsi_create_active(struct zs_db *db, uint32_t gen)
     if (!cs) return ZS_BADUSAGE;
     zsi_header_encode(hdr, &h, cs);
 
-    zsi_name_format(name, db->uuid, gen, 0);
+    zsi_name_current(name, db->uuid);           /* D-1b */
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
 
-    /* O_EXCL: creating a file IS publishing it (D-8), so a collision would mean
-     * another writer allocated the same generation -- which D-9b makes
-     * impossible, and which must therefore fail loudly rather than truncate. */
+    /* O_EXCL: creating a file IS publishing it (D-8), so a collision must fail
+     * loudly rather than truncate.  Under D-1b the name is fixed, so what a
+     * collision means has changed: not another writer allocating the same
+     * generation, but a file already sitting at the one active-file name.
+     *
+     * If that file has no valid header it is D-10's case -- no discoverable
+     * generation, no recoverable record, and invisible to the resolved set, so
+     * nothing upstream had a file object to convert.  It is exactly the state a
+     * crash during this function leaves behind, and removing it is what lets a
+     * writer continue (G-3).  Anything with a VALID header is a different
+     * matter: it holds records and a caller failed to convert it first (D-12b),
+     * so it must not be silently destroyed. */
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        char buf[ZSI_HEADER_LEN];
+        struct zsi_header probe;
+        ssize_t got;
+        int pfd = open(path, O_RDONLY);
+
+        if (pfd < 0) return ZS_IOERROR;
+        got = read(pfd, buf, sizeof(buf));
+        close(pfd);
+
+        if (got == (ssize_t)sizeof(buf)) {
+            zs_csum *pcs = zsi_csum_for_id(zsi_header_engine_id(buf),
+                                           db->external_csum);
+            if (pcs && zsi_header_decode(buf, sizeof(buf), pcs, &probe) == ZS_OK)
+                return ZS_BADFORMAT;    /* holds records; convert it first */
+        }
+
+        if (ZS_UNLINK(path) != 0) return ZS_IOERROR;
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    }
     if (fd < 0) return ZS_IOERROR;
 
     ssize_t n = ZS_WRITE(fd, hdr, sizeof(hdr));
@@ -4658,6 +4853,18 @@ static int zsi_db_refresh(struct zs_db *db)
      * input holds a descriptor and a mapping until somebody lets go. */
     zsi_fcache_sweep(&db->fcache, s);
 
+    /* C-4i's baseline, committed only by a refresh that SUCCEEDED. */
+    {
+        struct zsi_file *na = zsi_snapshot_active(s);
+        struct stat sb;
+        db->act_dev = 0;
+        db->act_ino = 0;
+        if (na && stat(na->fname, &sb) == 0) {
+            db->act_dev = sb.st_dev;
+            db->act_ino = sb.st_ino;
+        }
+    }
+
     if (!db->have_uuid && s->nfiles) {
         memcpy(db->uuid, s->files[0]->hdr.uuid, 16);
         db->have_uuid = true;
@@ -4666,108 +4873,65 @@ static int zsi_db_refresh(struct zs_db *db)
     return ZS_OK;
 }
 
-static int zsi_entry_name_order(const void *va, const void *vb)
-{
-    const struct zsi_entry *a = va, *b = vb;
-    return strcmp(a->name, b->name);
-}
-
 /* C-4i: refresh the handle's snapshot, unless a probe proves nothing has
  * committed since it was taken.
  *
- * If the active file is the same and hasn't changed size, it's always safe --
- * what remains is noticing a NEW active file, and the name set is what does
- * that.  The probe is therefore EXACT, not a heuristic: every commit either
- * appends to the active file -- its size grows past the snapshot's -- or
- * publishes a file by rename (rollover, conversion, repack), which changes
- * the directory's name set.  Timestamps play no part, so filesystem
- * timestamp granularity cannot fake freshness.
- *
- * The baseline name set is the probe's own scan, captured BEFORE the refresh
- * it triggers.  A file that appears between this scan and the refresh's own
- * is in the snapshot but missing from the baseline, so the NEXT probe fires a
- * refresh for nothing -- a spurious refresh, never a missed commit.  That is
- * the safe direction, and it converges the probe after.
- *
  * This is what makes a read on an hours-old handle as current as one on a
- * handle opened for the call, at a few syscalls rather than the snapshot
- * rebuild zsi_db_refresh pays: readers take no lock (C-2), so nothing
- * announces another process's commit -- the only way to see it is to look. */
+ * handle opened for the call, at ONE syscall rather than the snapshot rebuild
+ * zsi_db_refresh pays: readers take no lock (C-2), so nothing announces
+ * another process's commit -- the only way to see it is to look.  Timestamps
+ * play no part, so filesystem timestamp granularity cannot fake freshness. */
 static int zsi_db_freshen(struct zs_db *db)
 {
-    struct zsi_fileset fs;
-    char *names = NULL;
-    size_t len = 0;
+    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    char path[PATH_MAX], name[ZSI_NAME_MAX];
+    struct stat sb;
     bool stale;
-    int r;
 
-    /* One directory stream for the handle's life, rewound per probe
-     * (zsi_fileset_scan_dh), because this runs once per operation and the
-     * opendir/closedir pair was the bulk of a cached fetch's cost. */
-    if (!db->probe_dh) {
-        db->probe_dh = opendir(db->dir);
-        if (!db->probe_dh)
-            return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+    /* C-4i, from ONE file.  D-1b gives the active file a fixed name, and that
+     * is what makes this exact rather than a heuristic:
+     *
+     *   - a commit that APPENDS grows it, so the size changes;
+     *   - a commit that starts a new generation converts it and creates a
+     *     replacement at the same name (D-12b), so the INODE changes;
+     *   - and nothing else makes committed data visible.  Publishing an
+     *     in-order file by rename (C-3, D-21) only republishes records that
+     *     were already readable from what it was built from, so a conversion,
+     *     a repack output or a D-23 removal is invisible here -- and harmless,
+     *     because no record appears or disappears.
+     *
+     * A superseded file vanishing therefore needs no advance detection: in-order
+     * files are immutable, so a later open either finds what we expected or
+     * fails with ENOENT, and C-4b's retry rescans and converges.  Detection is
+     * lazy exactly where laziness is free.
+     *
+     * This replaces a getdents sweep of the whole directory on every operation.
+     * That was equally exact and, on a network or ZFS mount, cost about what
+     * the fdatasyncs beside it cost -- measured against the sqlite extension,
+     * where it was why turning sync off bought nothing. */
+    zsi_name_current(name, db->uuid);
+    snprintf(path, sizeof(path), "%s/%s", db->dir, name);
+
+    if (stat(path, &sb) != 0) {
+        if (errno != ENOENT) return ZS_IOERROR;
+        /* No active file.  Fresh only if we did not think there was one --
+         * otherwise it has been converted away and the set has moved. */
+        stale = (act != NULL);
+    } else if (!act) {
+        stale = true;                   /* one appeared: a peer rolled over */
+    } else {
+        /* Identity first, then extent.  A replacement can be the same size as
+         * what it replaced, so comparing size alone would miss a rollover. */
+        stale = (sb.st_dev != db->act_dev)
+             || (sb.st_ino != db->act_ino)
+             || ((size_t)sb.st_size != act->size);
     }
 
-    r = zsi_fileset_scan_dh(db->probe_dh, db->have_uuid ? &db->uuid : NULL,
-                            &fs);
+    if (!stale) return ZS_OK;
+
+    int r = zsi_db_refresh(db);
     if (r != ZS_OK) return r;
 
-    /* The raw name set, sorted and NUL-joined into one comparable blob.
-     * Raw rather than resolved: after a repack, a superseded input lingers
-     * beside its output until D-23 removes it, and a resolved-set baseline
-     * would read that removal window as "changed" on every probe. */
-    qsort(fs.all, fs.nall, sizeof(*fs.all), zsi_entry_name_order);
-    for (size_t i = 0; i < fs.nall; i++) len += strlen(fs.all[i].name) + 1;
-
-    names = malloc(len ? len : 1);
-    if (!names) { zsi_fileset_fini(&fs); return ZS_INTERNAL; }
-    {
-        size_t off = 0;
-        for (size_t i = 0; i < fs.nall; i++) {
-            size_t n = strlen(fs.all[i].name) + 1;
-            memcpy(names + off, fs.all[i].name, n);
-            off += n;
-        }
-    }
-    zsi_fileset_fini(&fs);
-
-    stale = !db->probe_names
-         || db->probe_names_len != len
-         || memcmp(db->probe_names, names, len) != 0;
-
-    /* Names unchanged: the set is the same, so the only possible commit is an
-     * append to the snapshot's active file.  No active file means the newest
-     * file is in-order and any commit would have had to CREATE one -- which
-     * the name set would have caught -- so there is nothing left to check. */
-    if (!stale) {
-        struct zsi_file *act = zsi_snapshot_active(db->snap);
-        if (act) {
-            struct stat sb;
-            /* fname is already the full path, as zsi_file_open stored it. */
-            if (stat(act->fname, &sb) != 0) stale = true;
-            else if ((size_t)sb.st_size != act->size) stale = true;
-        }
-    }
-
-    if (!stale) { free(names); return ZS_OK; }
-
-    /* The baseline is committed only by a refresh that SUCCEEDED.  The names
-     * were still captured before the refresh's own scan -- that ordering is
-     * what keeps a file appearing in between a spurious refresh rather than
-     * a missed commit -- but committing them before the refresh poisons the
-     * probe behind a transient failure: the next probe's names match, and a
-     * snapshot holding no active file has no size left to disagree, so a
-     * peer's commit into a file this handle never opened reads as fresh,
-     * indefinitely.  That is C-4i broken exactly where it promises
-     * exactness. */
-    r = zsi_db_refresh(db);
-    if (r != ZS_OK) { free(names); return r; }
-
-    free(db->probe_names);
-    db->probe_names = names;
-    db->probe_names_len = len;
     return ZS_OK;
 }
 
@@ -5919,6 +6083,10 @@ static int zsi_convert_pending(struct zs_db *db);
  * lock.  Declared here because the REPACK section is below this one. */
 static bool zsi_should_repack(struct zsi_snapshot *snap);
 static int  zsi_repack(struct zs_db *db);
+
+/* D-12b/D-10: the writer frees the active-file name before reusing it. */
+static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
+static int zsi_remove_file(struct zs_db *db, const char *name);
 static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 
 /* Append bytes to a file descriptor, retrying a short write. */
@@ -6016,10 +6184,38 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 
     if (db->wfd_cache >= 0) { close(db->wfd_cache); db->wfd_cache = -1; }
 
+    /* D-12b: there is one active-file name (D-1b), so the file occupying it has
+     * to go before a replacement can be created.  Converting it is what makes
+     * room -- and it is work that had to happen anyway (D-12), only now its
+     * ordering is forced by the name rather than by policy.
+     *
+     * An unclean file converts like any other: the conversion reads to its
+     * complete point (F-24) and the garbage beyond is simply not carried over,
+     * so no chain is built on an untrustworthy boundary.  Only an invalid
+     * header has nothing to convert, and D-10 says it holds no recoverable
+     * record, so it is removed rather than preserved -- which is not a repair
+     * (R-4), because nothing in it is being salvaged. */
+    int r;
+    struct zsi_file *stale = zsi_snapshot_active(db->snap);
+    if (stale) {
+        if (stale->hdr_valid) {
+            r = zsi_convert_one(db, stale);
+            if (r != ZS_OK) return r;
+        } else {
+            char cname[ZSI_NAME_MAX];
+            zsi_name_current(cname, db->uuid);
+            r = zsi_remove_file(db, cname);
+            if (r != ZS_OK) return r;
+        }
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) return r;
+    }
+
     /* A new generation, one above the highest PRESENT (D-9b), so a superseded
-     * file's generation is never reissued. */
+     * file's generation is never reissued.  Every remaining file is in-order,
+     * since the one that was not has just been dealt with. */
     struct zsi_fileset fs;
-    int r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
+    r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
     if (r != ZS_OK) return r;
 
     uint32_t next;
@@ -6033,7 +6229,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
     r = zsi_db_refresh(db);
     if (r != ZS_OK) return r;
 
-    zsi_name_format(name, db->uuid, next, 0);
+    zsi_name_current(name, db->uuid);           /* D-1b */
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
     int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
     if (fd < 0) return ZS_IOERROR;
@@ -6828,7 +7024,7 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
      * takes the repack lock -- it renames its output in without any lock and holds
      * remove only momentarily, so a writer never waits on a repack. */
     char iname[ZSI_NAME_MAX];
-    zsi_name_format(iname, db->uuid, f->hdr.start, 0);
+    zsi_name_current(iname, db->uuid);           /* D-1b */
     r = zsi_remove_file(db, iname);
 
     /* ZS_AGAIN means the set still needs it, which cannot happen here -- the
@@ -7245,7 +7441,7 @@ static int zsi_repack_run(struct zs_db *db, size_t first, size_t count)
     char (*names)[ZSI_NAME_MAX] = malloc(count * sizeof(*names));
     if (!names) return ZS_INTERNAL;
     for (size_t i = 0; i < count; i++)
-        zsi_name_format(names[i], db->uuid,
+        zsi_name_format(names[i], db->uuid,     /* in-order only (D-16) */
                         db->snap->files[first + i]->hdr.start,
                         db->snap->files[first + i]->hdr.end);
 
@@ -7905,7 +8101,14 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     /* Is there anything here?  A directory that does not exist, or holds no data
      * files, is the empty case D-8a handles. */
     struct zsi_fileset probe;
-    r = zsi_fileset_scan(dir, NULL, &probe);
+    /* The RAW scan: a data file whose header did not survive still proves the
+     * database EXISTS, even though D-1b leaves its generation unknown and D-10
+     * keeps it out of the resolved set.  The filling scan would drop it and the
+     * directory would read as empty -- so a crash during the very first header
+     * write would leave a database that only ZS_CREATE could open, which is
+     * exactly the "any state a crash can produce reopens" that G-3 forbids.
+     * The uuid is still in the name, so discovery (D-4a) works regardless. */
+    r = zsi_fileset_scan_raw(dir, NULL, &probe);
     bool empty = (r == ZS_NOTFOUND) || (r == ZS_OK && probe.nall == 0);
     bool discovered = (r == ZS_OK && probe.nall > 0);
 
@@ -8053,9 +8256,7 @@ int zs_db_close(struct zs_db **dbp)
     zsi_snapshot_release(&db->snap);
     zsi_fcache_fini(&db->fcache);       /* the handle's own references */
     zsi_lock_close(&db->locks);
-    if (db->probe_dh) closedir(db->probe_dh);
     if (db->wfd_cache >= 0) close(db->wfd_cache);
-    free(db->probe_names);
     free(db->retbuf);
     free(db->index_dir);
     free(db->dir);
@@ -8902,6 +9103,15 @@ static int zsi_salvage_order(const void *va, const void *vb)
 {
     const struct zsi_entry *a = va, *b = vb;
 
+    /* D-1b: the active file's generation is not in its name, and salvage reads
+     * the directory RAW (S-1) so it is not filled in either -- start == 0.
+     * That must sort LAST, not first: it is the newest file, and S-10's
+     * "possibly stale" report depends on scanning oldest first so that the
+     * first loss is discovered before anything beyond it is applied.  Sorting
+     * it first would apply the newest records before the older ones that
+     * supersede nothing, and invert every version it reports. */
+    if ((a->start == 0) != (b->start == 0)) return a->start == 0 ? 1 : -1;
+
     if (a->start != b->start) return a->start < b->start ? -1 : 1;
 
     {
@@ -9000,7 +9210,7 @@ int zs_db_salvage(const char *from, const char *to,
      * resolve overlaps or check tiling -- that is zsi_fileset_resolve, which is
      * deliberately not called here.  A gap is something to report and step over,
      * not something to fail on. */
-    r = zsi_fileset_scan(from, NULL, &fs);
+    r = zsi_fileset_scan_raw(from, NULL, &fs);   /* keeps a bad header (S-1) */
     if (r == ZS_NOTFOUND) return ZS_NOTFOUND;
     if (r != ZS_OK) return r;
 
@@ -9025,21 +9235,35 @@ int zs_db_salvage(const char *from, const char *to,
         ctx.fname = fs.all[i].name;
         ctx.gen = fs.all[i].start;
 
-        /* S-2 again: a generation absent from the set is reported, and the walk
-         * simply carries on.  Nothing is reconstructed (S-12). */
-        if (expect_gen && fs.all[i].start > expect_gen)
-            zsi_salvage_emit(&ctx, ZS_SALVAGE_GAP, 0,
-                             fs.all[i].start - expect_gen, NULL, 0);
-        {
-            uint32_t end = fs.all[i].end ? fs.all[i].end : fs.all[i].start;
-            if (end + 1 > expect_gen) expect_gen = end + 1;
-        }
-
+        /* Opened BEFORE the gap check, because D-1b puts the active file's
+         * generation in its header and zsi_fileset_scan_raw deliberately does
+         * not go and read it -- salvage keeps a file whose header may be the
+         * damaged part.  So the generation is whatever the header turns out to
+         * say, and is not known until here. */
         if (zsi_file_open(from, fs.all[i].name, fs.all[i].start,
                           setup->csum, &f) != ZS_OK) {
+            ctx.gen = fs.all[i].start;
             zsi_salvage_emit(&ctx, ZS_SALVAGE_FILE_UNREADABLE, 0, 0, NULL, 0);
             continue;
         }
+
+        {
+            uint32_t gen = fs.all[i].start;
+            uint32_t end;
+
+            if (!gen && f->hdr_valid) gen = f->hdr.start;
+            ctx.gen = gen;
+
+            /* S-2 again: a generation absent from the set is reported, and the
+             * walk simply carries on.  Nothing is reconstructed (S-12). */
+            if (expect_gen && gen > expect_gen)
+                zsi_salvage_emit(&ctx, ZS_SALVAGE_GAP, 0,
+                                 gen - expect_gen, NULL, 0);
+
+            end = fs.all[i].end ? fs.all[i].end : gen;
+            if (end + 1 > expect_gen) expect_gen = end + 1;
+        }
+
 
         if (f->hdr_valid) {
             cs = f->csum;

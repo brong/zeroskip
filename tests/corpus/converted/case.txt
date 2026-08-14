@@ -11,7 +11,7 @@ op convert
 
 expect files
 zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001-00000001
-zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000002
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb.current
 
 expect scan
 61 3031

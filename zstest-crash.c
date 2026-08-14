@@ -786,7 +786,7 @@ static void test_crash_leaves_unaligned_length(void)
     CHECK(db != NULL, "open failed");
     CHECK(zs_db_store(db, "a", 1, "1", 1, 0) == ZS_OK, "store");
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     zs_db_close(&db);
 
     char path[PATH_MAX];
@@ -835,7 +835,7 @@ static void test_crash_after_invalid_terminator(void)
     CHECK(db != NULL, "open failed");
     CHECK(zs_db_store(db, "a", 1, "1", 1, 0) == ZS_OK, "store");
     char name[ZSI_NAME_MAX];
-    zsi_name_format(name, db->uuid, 1, 0);
+    zsi_name_current(name, db->uuid);
     zs_db_close(&db);
 
     /* Append something that LOOKS like a terminator but does not validate. */
@@ -1022,7 +1022,7 @@ static void test_snapshot_gap_retry(void)
 
         if (i < 2) {
             char name[ZSI_NAME_MAX], path[PATH_MAX];
-            zsi_name_format(name, uuid, (uint32_t)(i + 1), 0);
+            zsi_name_current(name, uuid);
             snprintf(path, sizeof(path), "%s/%s", dbdir, name);
             int fd = open(path, O_WRONLY | O_APPEND);
             CHECK(fd >= 0, "append to %s", name);
