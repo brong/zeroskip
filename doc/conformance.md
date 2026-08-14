@@ -119,9 +119,9 @@ a spec label is missing here.
 | `D-3c` | The lock file is empty and its contents are never read. Nothing about | `lock_basic` |
 | `D-4` | A file participates if its name matches `zeroskip-<uuid>-*` for this | `filename_rejections`, `fileset_ignores_foreign` |
 | `D-4a` | On first open the UUID is not yet known, so it is **discovered**: take | `fileset_uuid_discovery`, `open_create`, `open_uuid_mismatch` |
-| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `filename_sort_property`, `filename_rejections`, `snapshot_resolves_overlap` |
-| `D-5a` | One rule handles every overlap that can occur, because the naming | `filename_sort_property`, `fileset_overlap_table` |
-| `D-5b` | The rule requires an unordered file's name to sort before the in-order | `fileset_first_vs_last` |
+| `D-5` | Resolution by scan. An output is renamed into place before its inputs | `fileset_overlap_table`, `filename_rejections`, `snapshot_resolves_overlap` |
+| `D-5a` | The order the sweep takes the files in MUST be, for each file, its | `fileset_overlap_table`, `fileset_mid_conversion_stable` |
+| `D-5b` | The order MUST be derived from each file's range and kind, as D-5a | `fileset_first_vs_last`, `fileset_mid_conversion_stable` |
 | `D-5c` | A **partial** overlap, where neither range contains the other, cannot | `fileset_gaps`, `mp_racing_removers` |
 | `D-6` | Completeness. A set is complete if and only if the scan of D-5 consumes | `convert_steady_state`, `fileset_gaps`, `mp_repack_and_writer_concurrent`, +1 more |
 | `D-7` | `readdir` is not atomic, so a scan may miss an entry and produce a set | `fileset_gaps` |

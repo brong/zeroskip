@@ -704,9 +704,12 @@ filesize-4    4   checksum of the pointer section
   the whole set without opening anything except this one.
 
   It sorts **after** every generation name, because `.` (0x2E) is above `-`
-  (0x2D) at the position where the two diverge. The active file therefore sorts
-  last, which is where its generation puts it — the ordering D-5's sweep wants
-  is preserved without the name carrying a number.
+  (0x2D) at the position where the two diverge, so a name-ordered listing still
+  shows it last, where the newest file belongs. That is a convenience for `ls`
+  and for globs, and nothing more: D-5's resolution MUST NOT be driven by name
+  collation (D-5b), because the one moment the two disagree is the conversion
+  window, where the active file's generation is not above every other file's
+  but equal to the in-order file that has just superseded it.
 
   What this buys is C-4i: a static name means a handle can detect every commit
   by looking at **one file** instead of re-reading the directory. That check is
@@ -765,7 +768,7 @@ without opening a single file.
 - **D-5 Resolution by scan.** An output is renamed into place before its inputs
   are removed, so a scan legitimately sees overlapping files. **An overlap is
   never an error — it is resolved, not rejected**, by a single sweep over the
-  sorted names:
+  files in D-5a's order:
 
   > Start at the lowest generation present. Repeatedly take the **last** file
   > whose `start` equals the current generation, then set the current generation
@@ -779,17 +782,26 @@ without opening a single file.
 
   The files taken are the resolved set; every other file is superseded, and is
   ignored for reading and removable under D-23.
-- **D-5a** One rule handles every overlap that can occur, because the naming
-  scheme arranges for the correct file to sort last in both cases:
+- **D-5a** The order the sweep takes the files in MUST be, for each file, its
+  `start` ascending, then its **reach** (`end`, or `start` for an unordered
+  file) ascending, then **unordered before in-order**. One rule then handles
+  every overlap that can occur, because the correct file is last in each case:
 
   | Situation | Files sharing a `start` | Last, and correct |
   |---|---|---|
-  | repack output `[1-4]` present with inputs `[1-1]`…`[4-4]` | `00000001-00000001`, `00000001-00000004` | `[1-4]` — fixed-width hex makes lexical order numeric, so the widest `end` sorts last |
-  | conversion output present with its input | `00000005`, `00000005-00000005` | the in-order file — the unordered name is a prefix, so it sorts first |
-  | both at once: unordered *N*, `N-N`, and a wider `N-M` | `00000005`, `00000005-00000005`, `00000005-00000009` | `[5-9]`, the widest |
+  | repack output `[1-4]` present with inputs `[1-1]`…`[4-4]` | `[1-1]`, `[1-4]` | `[1-4]` — the widest reach is last |
+  | conversion output present with its input | the active file at generation 5, `[5-5]` | the in-order file — same range, and the published form wins the tie |
+  | both at once: unordered *N*, `N-N`, and a wider `N-M` | the active file at generation 5, `[5-5]`, `[5-9]` | `[5-9]`, the widest |
 
-- **D-5b** The rule requires an unordered file's name to sort before the in-order
-  name for the same generation, which D-1a's naming provides.
+- **D-5b** The order MUST be derived from each file's range and kind, as D-5a
+  states it, and **MUST NOT** be taken from collating the filenames. For the
+  generation-named files the two agree — D-1's fixed-width hex makes lexical
+  order numeric order — but the active file's name carries no generation
+  (D-1b), so where it collates says nothing about which generation it holds. A
+  name sort puts it after *every* in-order file, which in the conversion window
+  is exactly wrong: the output is renamed in before the input is removed, so
+  taking the last would pick the superseded active file over the in-order file
+  that had just replaced it.
 - **D-5c** A **partial** overlap, where neither range contains the other, cannot
   arise from any legal sequence and MUST be reported as corruption rather than
   resolved.
@@ -2286,9 +2298,11 @@ the set is judged complete, and leaving it that way indefinitely — as a writer
 death would — does not make readers retry forever; and all three files
 sharing a `start` at once. Taking the *first* file instead asserted to fail, so
 D-5b's error is caught rather than rediscovered. A partial overlap reported rather
-than worked around (D-5c). And the prefix property D-1a depends on, asserted
-directly on generated names, so adding an extension later breaks a test rather
-than the database (D-5c). Sets
+than worked around (D-5c). D-5a's order asserted where it differs from name
+collation, so D-5b's requirement that it come from ranges and kinds is tested
+rather than assumed. And the naming property of D-1b, asserted directly on
+generated names — the active file's name sorting after every generation name —
+so changing the separator breaks a test rather than a listing. Sets
 that do **not** tile rejected and retried (D-7): a missing middle generation, a
 gap at the bottom, two files claiming overlapping ranges that are not nested.
 Files disagreeing on UUID rejected rather than resolved by majority (D-4a), and
