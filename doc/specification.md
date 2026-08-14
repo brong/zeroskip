@@ -1939,6 +1939,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
 | `ZS_FETCHNEXT` | fetch | return the record with the smallest key ≥ the given key; with `ZS_SKIPROOT`, strictly > (A-12) |
 | `ZS_FETCHPREV` | fetch | return the record with the largest key ≤ the given key; with `ZS_SKIPROOT`, strictly < (A-12) |
+| `ZS_EPHEMERAL` | fetch | returned pointers live only until the next call on the transaction or handle (A-4b); a usage error on a cursor or `foreach` |
 | `ZS_REVERSE` | cursor | iterate toward smaller keys (D-14k); not valid on `foreach` or with `ZS_CURSOR_LIVE` (A-13) |
 | `ZS_SKIPROOT` | foreach, cursor | skip the first record if it matches the start key exactly |
 | `ZS_CURSOR_PREFIX` | foreach, cursor | treat the start key as a prefix and stop when a key leaves it |
@@ -1979,7 +1980,9 @@ different calls, though not every flag is meaningful everywhere:
 - **A-1c** A transaction supports **any number of cursors open at once**, and
   writes through the transaction while they are open. Each cursor observes
   the write by D-14j; every key or value pointer any of them has returned
-  remains valid by A-4 — a store never invalidates another read's result.
+  remains valid by A-4 — a store never invalidates another read's result,
+  unless that result was asked for with `ZS_EPHEMERAL`, which is precisely
+  the promise A-4b gives up.
   Cursors are not thread-safe and this promises nothing across threads (G-5's
   caveats apply); it promises composition within one caller, which is what a
   layered consumer — one query touching several key ranges inside one write
@@ -2028,6 +2031,36 @@ different calls, though not every flag is meaningful everywhere:
   API — nothing the caller did says "the file set moved" — so an implementation
   passes every single-snapshot test and still hands out dangling pointers the
   moment a transaction's first store starts a new generation.
+- **A-4b** `ZS_EPHEMERAL` on a fetch **weakens A-4 for that result**: the key and
+  value pointers it returns remain valid only until the **next call on that
+  transaction** — or, for `zs_db_fetch`, on that `struct zs_db`. A caller MUST
+  copy whatever it needs before then. Without the flag A-4 is unchanged, and the
+  flag applies to one call: it is not a mode, and a result already returned
+  without it keeps the lifetime it was given.
+
+  It is valid on `zs_db_fetch` and `zs_txn_fetch`, including their `ZS_FETCHNEXT`
+  and `ZS_FETCHPREV` forms (A-12). On a cursor or either `foreach` form it is a
+  usage error (`ZS_BADUSAGE`), for A-13's reason: those yield across steps, a
+  caller holding the previous record while it looks at the next one is the
+  ordinary shape, and a rejected flag is cheaper than an untested promise.
+
+  **It is a permission, not a requirement.** A conforming implementation MAY
+  ignore it entirely and return pointers with A-4's full lifetime — the weaker
+  promise is a superset of the stronger one, so a caller written against it is
+  correct either way. Nothing on disk changes and no peer can observe whether it
+  was used, so it is not interoperability surface.
+
+  What it buys is the write-combining an implementation would otherwise have to
+  give up. A read of a record the transaction itself has just stored (A-1a) must
+  see that record's bytes; an implementation that streams records to the active
+  file as they are stored (C-8) and returns pointers into a mapping of it can
+  only point at bytes that have reached the file, so every such read forces out
+  whatever buffer it was accumulating. With the weaker lifetime it may answer
+  from that buffer instead. Measured on the reference implementation, 100 000
+  store-then-fetch-back pairs in one transaction: 100 000 flushes and 0.30s
+  becomes 135 flushes and 0.08s, against 0.07s for the stores alone — the whole
+  cost of reading back what you just wrote, which is the shape a layered
+  consumer doing read-modify-write hits on every row.
 - **A-5** `ZS_SHARED` is read-only and MUST NOT write (R-3).
 - **A-6** A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**;
   it never overrides what an existing file records, since each file's engine comes
@@ -2068,7 +2101,8 @@ different calls, though not every flag is meaningful everywhere:
   The transactional form sees the transaction's own pending writes, like
   every other read (A-1a). `ZS_FETCHNEXT` and `ZS_FETCHPREV` together are a
   usage error (`ZS_BADUSAGE`). A-4's lifetime applies to the result
-  unchanged. (History: bare `ZS_FETCHNEXT` was the strict bound until
+  unchanged, or A-4b's if `ZS_EPHEMERAL` was given. (History: bare
+  `ZS_FETCHNEXT` was the strict bound until
   2026-08-13, when the strictness moved to the modifier for symmetry with
   `ZS_FETCHPREV`; every known consumer was updated with the change.)
 - **A-13** `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor`
