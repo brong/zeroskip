@@ -2237,7 +2237,7 @@ static void test_file_bounds(void)
     ASSERT_EQ((unsigned char)p[0], ZSI_VERSION_READ);
     ASSERT_EQ((unsigned char)p[1], ZSI_VERSION_WRITE);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 }
 
 static void test_file_zero_length(void)
@@ -2263,7 +2263,7 @@ static void test_file_zero_length(void)
     /* Nothing can be read from it, at any offset, including zero bytes at zero. */
     ASSERT_NULL(zsi_file_at(f, 0, 0));
     ASSERT_NULL(zsi_file_at(f, 0, 1));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 }
 
 static void test_file_bad_header(void)
@@ -2284,14 +2284,14 @@ static void test_file_bad_header(void)
     ASSERT_EQU(f->hdr.start, 4u);
     ASSERT_EQU(f->hdr.end, 0u);
     ASSERT(zsi_file_is_unordered(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* All zeroes: no magic, and byte 0 of 0x00 is also an invalid type byte. */
     memset(buf, 0, sizeof(buf));
     ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
     ASSERT(!f->hdr_valid);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* Shorter than a header: valid magic but truncated.  Still not an error at
      * this level -- the caller's position in the file set decides (D-10/D-10a). */
@@ -2305,7 +2305,7 @@ static void test_file_bad_header(void)
         /* Bounds still hold over the short file. */
         ASSERT_NOT_NULL(zsi_file_at(f, 0, len));
         ASSERT_NULL(zsi_file_at(f, 0, len + 1));
-        zsi_file_close(&f);
+        zsi_file_release(&f);
     }
 
     /* A header whose checksum does not match: unverifiable, so invalid. */
@@ -2314,7 +2314,7 @@ static void test_file_bad_header(void)
     ASSERT_EQ(writefile(name, buf, sizeof(buf)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 4, NULL, &f));
     ASSERT(!f->hdr_valid);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 }
 
 static void test_file_engine_from_header(void)
@@ -2335,14 +2335,14 @@ static void test_file_engine_from_header(void)
     ASSERT(f->hdr_valid);
     ASSERT_EQ(f->csum_id, ZSI_CSUM_NONE);
     ASSERT(f->csum == zsi_csum_none);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     make_header(hdr, 1, 0, ZSI_CSUM_XXHASH);
     ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
     ASSERT_EQ(f->csum_id, ZSI_CSUM_XXHASH);
     ASSERT(f->csum == zsi_csum_xxhash);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* Engine 2 with the caller's function supplied: readable, and the engine is
      * reported as external rather than as whatever function happened to match. */
@@ -2352,7 +2352,7 @@ static void test_file_engine_from_header(void)
     ASSERT(f->hdr_valid);
     ASSERT_EQ(f->csum_id, ZSI_CSUM_EXTERNAL);
     ASSERT(f->csum == TEST_EXTERNAL_CSUM);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* The same file with NO function supplied: unverifiable, so the header is not
      * accepted.  A-6 makes this an error at the database level; here it comes back
@@ -2360,14 +2360,14 @@ static void test_file_engine_from_header(void)
      * able to inspect the file. */
     ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
     ASSERT(!f->hdr_valid);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* An unknown engine id, likewise. */
     make_header(hdr, 1, 0, 3);
     ASSERT_EQ(writefile(name, hdr, sizeof(hdr)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
     ASSERT(!f->hdr_valid);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 }
 
 static void test_file_open_failures(void)
@@ -2392,7 +2392,7 @@ static void test_file_open_failures(void)
     ASSERT_NULL(f);
 
     /* Closing a NULL handle is a no-op, so cleanup paths need no guard. */
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     ASSERT_NULL(f);
 }
 
@@ -2421,7 +2421,7 @@ static void test_span_basic(void)
     ASSERT_STR_EQ(c.key[2], "c");
     ASSERT(zsi_unordered_is_clean(f));
     ASSERT_EQU(f->complete, s.len);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Several spans, all committed, replay in order across span boundaries. */
@@ -2436,7 +2436,7 @@ static void test_span_basic(void)
     ASSERT_STR_EQ(c.key[0], "a");
     ASSERT_STR_EQ(c.key[2], "c");
     ASSERT(zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* An empty span -- a terminator with no records -- is legal (F-23 says zero
@@ -2449,7 +2449,7 @@ static void test_span_basic(void)
     ASSERT_EQU(c.n, 1u);
     ASSERT_STR_EQ(c.key[0], "a");
     ASSERT(zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Deletions are presented as records with a NULL value (A-1); the replay does
@@ -2463,7 +2463,7 @@ static void test_span_basic(void)
     ASSERT_EQU(c.n, 2u);
     ASSERT(!c.isdel[0]);
     ASSERT(c.isdel[1]);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -2484,7 +2484,7 @@ static void test_span_rollback(void)
      * the writer may keep appending to it (F-26h). */
     ASSERT(zsi_unordered_is_clean(f));
     ASSERT_EQU(f->complete, s.len);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* F-25 directly: visibility is per span, NOT a watermark.  A rolled-back span
@@ -2503,7 +2503,7 @@ static void test_span_rollback(void)
     ASSERT_STR_EQ(c.key[0], "first");
     ASSERT_STR_EQ(c.key[1], "third");
     ASSERT(zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Every span rolled back: clean, zero records, not an error (F-26h). */
@@ -2515,7 +2515,7 @@ static void test_span_rollback(void)
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
     ASSERT(zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Interleaved, several of each, to catch an implementation that skips one
@@ -2532,7 +2532,7 @@ static void test_span_rollback(void)
     ASSERT_STR_EQ(c.key[0], "k0");
     ASSERT_STR_EQ(c.key[1], "k2");
     ASSERT_STR_EQ(c.key[2], "k4");
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -2550,7 +2550,7 @@ static void test_span_empty_file(void)
     ASSERT_EQU(c.n, 0u);
     ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
     ASSERT(zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -2574,7 +2574,7 @@ static void test_span_torn_tail(void)
     ASSERT_STR_EQ(c.key[0], "a");
     ASSERT_EQU(f->complete, good_end);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* The same file with the terminator present but a data byte flipped.  F-22:
@@ -2593,7 +2593,7 @@ static void test_span_torn_tail(void)
     ASSERT_STR_EQ(c.key[0], "a");
     ASSERT_EQU(f->complete, good_end);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Trailing garbage after a valid span. */
@@ -2606,7 +2606,7 @@ static void test_span_torn_tail(void)
     ASSERT_EQU(c.n, 1u);
     ASSERT_EQU(f->complete, good_end);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* Truncated at every byte offset past the first valid span.  Whatever the
@@ -2631,7 +2631,7 @@ static void test_span_torn_tail(void)
             fprintf(stderr, "\n    FAIL cut at %zu: n=%zu complete=%zu (want 1, %zu)\n",
                     cut, c.n, f->complete, good_end);
             current_test_failed = 1;
-            zsi_file_close(&f);
+            zsi_file_release(&f);
             sb_free(&s);
             return;
         }
@@ -2647,7 +2647,7 @@ static void test_span_torn_tail(void)
         else
             ASSERT(!zsi_unordered_is_clean(f));
 
-        zsi_file_close(&f);
+        zsi_file_release(&f);
     }
     sb_free(&s);
 }
@@ -2681,7 +2681,7 @@ static void test_span_terminator_without_data(void)
     ASSERT_STR_EQ(c.key[0], "a");
     ASSERT_EQU(f->complete, good_end);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     sb_free(&s);
 
@@ -2697,7 +2697,7 @@ static void test_span_terminator_without_data(void)
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);                        /* checksum catches it */
     ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     sb_free(&s);
 }
@@ -2775,7 +2775,7 @@ static void test_span_progress(void)
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
     ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* A file that is entirely 0xFF: no valid type byte anywhere, so the walk stops
@@ -2787,7 +2787,7 @@ static void test_span_progress(void)
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
     ASSERT_EQU(f->complete, (size_t)ZSI_HEADER_LEN);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* A file of zero bytes throughout: 0x00 is an invalid type byte (F-12), which
@@ -2797,7 +2797,7 @@ static void test_span_progress(void)
     sb_raw(&s, junk, sizeof(junk));
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     alarm(0);
@@ -2824,7 +2824,7 @@ static void test_span_bad_header_and_kind(void)
     ASSERT_EQU(c.n, 0u);
     ASSERT_EQU(f->complete, 0u);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* A zero-length file, likewise: complete == size == 0, and yet NOT clean,
      * because D-9 requires a valid header.  This is the case where a
@@ -2836,7 +2836,7 @@ static void test_span_bad_header_and_kind(void)
     ASSERT_EQU(f->complete, 0u);
     ASSERT_EQU(f->size, 0u);
     ASSERT(!zsi_unordered_is_clean(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* Replaying an in-order file is a usage error, not a data condition: it has no
      * spans at all (section 4.9), so there is no answer to invent. */
@@ -2851,7 +2851,7 @@ static void test_span_bad_header_and_kind(void)
     ASSERT_EQ(writefile(name, io, sizeof(io)), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 5, NULL, &f));
     ASSERT_EQ(zsi_unordered_replay(f, ZSI_HEADER_LEN, collect_cb, &c), ZS_BADUSAGE);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 }
 
 static void test_span_pointers_rejected(void)
@@ -2879,7 +2879,7 @@ static void test_span_pointers_rejected(void)
         ASSERT_EQU(c.n, 1u);
         ASSERT_EQU(f->complete, good_end);
         ASSERT(!zsi_unordered_is_clean(f));
-        zsi_file_close(&f);
+        zsi_file_release(&f);
         sb_free(&s);
     }
 }
@@ -2904,7 +2904,7 @@ static void test_span_engine_zero(void)
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 1u);                        /* undetected: engine 0 */
     ASSERT_EQ(f->csum_id, ZSI_CSUM_NONE);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* But a length disagreement is structural and still caught. */
@@ -2913,7 +2913,7 @@ static void test_span_engine_zero(void)
     sb_term_badlen(&s, 999);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -2962,7 +2962,7 @@ static void test_span_long_terminator(void)
     ASSERT(nrecs > 2000);       /* enough records that the span really is large */
 
     (void)c;
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3052,7 +3052,7 @@ static void test_index_committed_only(void)
     char keys[256];
     index_keys(f, keys, sizeof(keys));
     ASSERT_STR_EQ(keys, "live");
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* A key committed, then rewritten in a rolled-back span: the committed
@@ -3071,7 +3071,7 @@ static void test_index_committed_only(void)
                              f->hdr.start, &r));
     ASSERT_EQU(r.vallen, 4u);
     ASSERT_MEM_EQ(r.val, "good", 4);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* A key deleted in a rolled-back span stays present. */
@@ -3085,7 +3085,7 @@ static void test_index_committed_only(void)
     ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
                              f->hdr.start, &r));
     ASSERT_NOT_NULL(r.val);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3125,7 +3125,7 @@ static void test_index_ordered_traversal(void)
 
     /* The comparator's own ordering is used, including the shorter-key-first rule
      * (F-11a), not byte order alone. */
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
@@ -3137,7 +3137,7 @@ static void test_index_ordered_traversal(void)
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
     index_keys(f, keys, sizeof(keys));
     ASSERT_STR_EQ(keys, "a|ab|abc|b");
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3226,7 +3226,7 @@ static void test_index_delta(void)
             if (zsi_compar_default(prev, prevlen, r.key, r.keylen) >= 0) {
                 fprintf(stderr, "\n    FAIL out of order at %zu\n", seen);
                 current_test_failed = 1;
-                zsi_file_close(&f);
+                zsi_file_release(&f);
                 sb_free(&s);
                 return;
             }
@@ -3239,7 +3239,7 @@ static void test_index_delta(void)
     }
     ASSERT_EQU(seen, n);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3344,7 +3344,7 @@ static void test_index_delta_shadows_base(void)
     ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_a));
     ASSERT_EQU(ix->ndelta, 2u);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3478,7 +3478,7 @@ static void test_index_delta_merge_with_duplicates(void)
     }
 
 done:
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
     free(old_off);
     free(new_off);
@@ -3530,7 +3530,7 @@ static void test_index_binary_keys(void)
     ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, k4, 2, &off));
 
     (void)keys;
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -3578,7 +3578,7 @@ static void test_inorder_empty(void)
     ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "", 0, &idx, &exact));
     ASSERT_EQU(idx, 0u);
     ASSERT(!exact);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* Byte-identical every time it is produced. */
     struct ib b2;
@@ -3598,7 +3598,7 @@ static void test_inorder_empty(void)
     ASSERT_EQ(ib_load(&b0, 5, 5, &f), ZS_OK);
     ASSERT_EQU(f->records_csum, 0u);
     ASSERT_OK(zsi_ptrs_verify_records(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     ib_free(&b0);
 
     ib_free(&b);
@@ -3632,7 +3632,7 @@ static void test_inorder_search(void)
         ASSERT(!exact); ASSERT_EQU(idx, 0u);
         ASSERT_OK(zsi_ptrs_search(f, zsi_compar_default, "z", 1, &idx, &exact));
         ASSERT(!exact); ASSERT_EQU(idx, n);
-        zsi_file_close(&f);
+        zsi_file_release(&f);
         ib_free(&b);
     }
 }
@@ -3689,10 +3689,10 @@ static void test_inorder_trailer_negatives(void)
         if (zsi_ptrs_load(f) == ZS_OK) {
             fprintf(stderr, "\n    FAIL back pointer %s accepted\n", bad[i].what);
             current_test_failed = 1;
-            zsi_file_close(&f);
+            zsi_file_release(&f);
             goto done;
         }
-        zsi_file_close(&f);
+        zsi_file_release(&f);
     }
 
     /* A back pointer to a byte that is neither PTRS32 nor PTRS64. */
@@ -3706,14 +3706,14 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* A file shorter than header plus trailer, at every length. */
     for (size_t len = 0; len < ZSI_HEADER_LEN + ZSI_TRAILER_LEN; len += 8) {
         ASSERT_EQ(writefile(name, orig, len), 0);
         ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
         ASSERT(zsi_ptrs_load(f) != ZS_OK);
-        zsi_file_close(&f);
+        zsi_file_release(&f);
     }
 
     /* A corrupted pad byte inside the section is caught by the section checksum
@@ -3724,7 +3724,7 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADCHECKSUM);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* A corrupted count: caught by the section checksum, and if the checksum is
      * recomputed, by the section-length equality. */
@@ -3737,7 +3737,7 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* A pointer outside the records region (F-27), with the checksum fixed up. */
     memcpy(b.buf, orig, full);
@@ -3749,7 +3749,7 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* A pointer that is not 8-aligned (F-27). */
     memcpy(b.buf, orig, full);
@@ -3761,7 +3761,7 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
 done:
     free(orig);
@@ -3803,7 +3803,7 @@ static void test_inorder_records_checksum(void)
 
     /* And the on-demand check reports it. */
     ASSERT_EQ(zsi_ptrs_verify_records(f), ZS_BADCHECKSUM);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
 
     /* Undamaged, the same check passes. */
     ib_free(&b);
@@ -3815,7 +3815,7 @@ static void test_inorder_records_checksum(void)
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_OK(zsi_ptrs_load(f));
     ASSERT_OK(zsi_ptrs_verify_records(f));
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     ib_free(&b);
 }
 
@@ -3852,7 +3852,7 @@ static void test_inorder_widths_and_padding(void)
         ASSERT_EQU(f->nptrs, n);
         ASSERT(!f->ptr_wide);
         ASSERT_OK(zsi_ptrs_verify_records(f));
-        zsi_file_close(&f);
+        zsi_file_release(&f);
         ib_free(&b);
     }
 }
@@ -3913,7 +3913,7 @@ static void test_inorder_ptrs64(void)
     ASSERT(exact);
     ASSERT_EQU(idx, 1u);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     free(buf);
 }
 
@@ -3935,7 +3935,7 @@ static void test_inorder_kind_rules(void)
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT(zsi_file_is_unordered(f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADUSAGE);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 
     /* And a pointers block is present exactly when end != 0 (T-6): an in-order
@@ -3947,7 +3947,7 @@ static void test_inorder_kind_rules(void)
     ASSERT_EQ(ib_load(&b, 3, 3, &f), ZS_OK);
     ASSERT(!zsi_file_is_unordered(f));
     ASSERT_EQU(f->nptrs, 1u);
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     ib_free(&b);
 }
 
@@ -3998,13 +3998,13 @@ static void test_inorder_probe_ends_agrees(void)
                     (unsigned long long)got_idx, (int)got_exact,
                     (unsigned long long)lo, (int)want_exact);
             current_test_failed = 1;
-            zsi_file_close(&f);
+            zsi_file_release(&f);
             ib_free(&b);
             return;
         }
     }
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     ib_free(&b);
 }
 
@@ -4148,8 +4148,8 @@ static void test_fcur_uniform(void)
     }
 
 done:
-    zsi_file_close(&uf);
-    zsi_file_close(&inf);
+    zsi_file_release(&uf);
+    zsi_file_release(&inf);
     sb_free(&s);
     ib_free(&b);
 }
@@ -4213,8 +4213,8 @@ static void test_fcur_empty_sources(void)
     ASSERT_EQ(zsi_fcur_find(&fc, "k", 1, &r), ZS_NOTFOUND);
     ASSERT_EQU(fc.gen, (uint32_t)UINT32_MAX);
 
-    zsi_file_close(&uf);
-    zsi_file_close(&inf);
+    zsi_file_release(&uf);
+    zsi_file_release(&inf);
     sb_free(&s);
     ib_free(&b);
 }
@@ -4258,7 +4258,7 @@ static void test_fcur_no_duplicate_keys(void)
     ASSERT(!fc.exhausted);
     ASSERT_MEM_EQ(fc.cur.val, "v3", 2);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -4298,7 +4298,7 @@ static void test_fcur_deletions_visible(void)
     ASSERT_OK(zsi_fcur_find(&fc, "b", 1, &r));
     ASSERT_NULL(r.val);
 
-    zsi_file_close(&f);
+    zsi_file_release(&f);
     sb_free(&s);
 }
 
@@ -4763,7 +4763,7 @@ static void test_snapshot_basic(void)
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
 
     /* Sorted by start ascending -- reads walk it descending (D-14). */
@@ -4792,7 +4792,7 @@ static void test_snapshot_basic(void)
     put_inorder(5, 5, k2);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -4802,7 +4802,7 @@ static void test_snapshot_basic(void)
     clear_db();
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 0u);
     ASSERT_NULL(zsi_snapshot_active(s));
     zsi_snapshot_release(&s);
@@ -4822,7 +4822,7 @@ static void test_snapshot_resolves_overlap(void)
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[1]->hdr.start, 5u);
     ASSERT_EQU(s->files[1]->hdr.end, 5u);       /* the in-order one won */
@@ -4837,7 +4837,7 @@ static void test_snapshot_resolves_overlap(void)
     put_unordered(3, k);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT_EQU(s->files[0]->hdr.start, 1u);
     ASSERT_EQU(s->files[0]->hdr.end, 2u);
@@ -4860,7 +4860,7 @@ static void test_snapshot_retries_and_bounds(void)
 
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s), ZS_AGAIN);
+                                NULL, NULL, &s), ZS_AGAIN);
     ASSERT_NULL(s);
 
     /* A partial overlap is corruption rather than a stale scan, so it is
@@ -4870,7 +4870,7 @@ static void test_snapshot_retries_and_bounds(void)
     put_inorder(3, 8, k);
     ASSERT_EQ(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s), ZS_BADFORMAT);
+                                NULL, NULL, &s), ZS_BADFORMAT);
 
     alarm(0);
 }
@@ -4895,7 +4895,7 @@ static void test_snapshot_boundary(void)
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &snap));
+                                NULL, NULL, &snap));
     ASSERT_EQU(snap->nfiles, 1u);
     ASSERT_EQU(snap->files[0]->complete, boundary);
     ASSERT(snap->files[0]->size > boundary);
@@ -4935,7 +4935,7 @@ static void test_snapshot_bad_nonactive(void)
     report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                counting_error, &s));
+                                counting_error, NULL, &s));
     ASSERT_EQ(report_count, 0);
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
@@ -4957,7 +4957,7 @@ static void test_snapshot_bad_nonactive(void)
     report_count = 0;
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                counting_error, &s));
+                                counting_error, NULL, &s));
     ASSERT_NOT_NULL(s);
     ASSERT(report_count > 0);       /* not silent */
     zsi_snapshot_release(&s);
@@ -4969,7 +4969,7 @@ static void test_snapshot_bad_nonactive(void)
     ASSERT_EQ(writefile(name, "", 0), 0);
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 2u);
     ASSERT(!s->files[1]->hdr_valid);
     zsi_snapshot_release(&s);
@@ -4990,7 +4990,7 @@ static void test_snapshot_refcount(void)
 
     ASSERT_OK(zsi_snapshot_take(dbdir, &test_uuid, zsi_compar_default,
                                 "memcmp", TEST_EXTERNAL_CSUM, NULL,
-                                NULL, &s));
+                                NULL, NULL, &s));
     ASSERT_EQU(s->nfiles, 1u);
 
     /* Unlink the file out from under the open snapshot. */
@@ -7410,9 +7410,10 @@ static void test_a4_borrow_survives_shared_snapshot_swap(void)
     ASSERT_MEM_EQ(k, "key", 3);
     ASSERT_MEM_EQ(v, big, sizeof(big));
 
-    /* Kept as a reference rather than taken over, precisely because it was
-     * shared -- the distinction the bug turned on. */
-    ASSERT(txn->hold.ns > 0);
+    /* The transaction holds its own references to the files it may have
+     * returned pointers into -- which is the whole point: it no longer matters
+     * who else was looking at the snapshot. */
+    ASSERT(txn->hold.n > 0);
 
     ASSERT_OK(zs_txn_commit(&txn));
     zs_db_close(&db);
@@ -7487,6 +7488,78 @@ static void test_empty_value_is_not_null_on_read(void)
     ASSERT_OK(zs_txn_delete(txn, "b_full", 6, 0));
     ASSERT_EQ(zs_txn_fetch(txn, "b_full", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     ASSERT_OK(zs_txn_commit(&txn));
+
+    zs_db_close(&db);
+}
+
+/* C-4c: a rebuild reuses the file objects it already holds, because everything
+ * except the active file is immutable. Asserted by OBJECT IDENTITY, which is
+ * the only thing that separates "reused" from "re-derived the same answer".
+ *
+ * The active file is the exception and must be re-opened, since its index and
+ * complete boundary belong to the snapshot that built them (G-4). */
+static void test_snapshot_reuses_immutable_files(void)
+{
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+
+    /* Three in-order files plus an active one. */
+    for (int i = 0; i < 3; i++) {
+        char k[32];
+        int n = snprintf(k, sizeof(k), "key%d", i);
+        ASSERT_OK(zs_db_store(db, k, n, "v", 1, 0));
+        ASSERT_OK(zs_db_seal(db));
+    }
+    ASSERT_OK(zs_db_store(db, "live", 4, "v", 1, 0));
+
+    struct zsi_snapshot *before = db->snap;
+    ASSERT(before->nfiles >= 4);
+
+    struct zsi_file *was[16];
+    size_t n = before->nfiles;
+    ASSERT(n <= 16);
+    for (size_t i = 0; i < n; i++) was[i] = before->files[i];
+
+    /* A full rebuild, not the C-4i probe: this is the path a peer's commit or
+     * a repack puts a handle through. */
+    ASSERT_OK(zsi_db_refresh(db));
+    ASSERT(db->snap != before);
+    ASSERT_EQU(db->snap->nfiles, n);
+
+    /* Every immutable file is the SAME object. */
+    for (size_t i = 0; i + 1 < n; i++)
+        ASSERT(db->snap->files[i] == was[i]);
+
+    /* The active file is not, because it is the one that can have changed. */
+    ASSERT(zsi_file_is_unordered(db->snap->files[n - 1]));
+    ASSERT(db->snap->files[n - 1] != was[n - 1]);
+
+    zs_db_close(&db);
+}
+
+/* The cache holds a descriptor and a mapping per file, so a file the set no
+ * longer names has to be let go -- otherwise a long-lived handle accumulates
+ * every input a repack ever superseded. */
+static void test_fcache_sweeps_superseded_files(void)
+{
+    struct zs_db *db = fresh_db();
+    ASSERT_NOT_NULL(db);
+
+    for (int i = 0; i < 6; i++) {
+        char k[32];
+        int n = snprintf(k, sizeof(k), "key%d", i);
+        ASSERT_OK(zs_db_store(db, k, n, "v", 1, 0));
+        ASSERT_OK(zs_db_seal(db));
+    }
+
+    ASSERT(db->fcache.n >= 4);          /* the in-order files are held */
+
+    /* Merge them away; the inputs are superseded and then removed (D-23). */
+    ASSERT_OK(zs_db_compact(db));
+
+    /* The cache must not still be holding the inputs.  Bounded by what the
+     * current set actually names. */
+    ASSERT(db->fcache.n <= db->snap->nfiles);
 
     zs_db_close(&db);
 }
@@ -15108,6 +15181,10 @@ static struct test_entry tests[] = {
                                         test_a4_borrow_survives_shared_snapshot_swap },
     { "test_empty_value_is_not_null_on_read",
                                         test_empty_value_is_not_null_on_read },
+    { "test_snapshot_reuses_immutable_files",
+                                        test_snapshot_reuses_immutable_files },
+    { "test_fcache_sweeps_superseded_files",
+                                        test_fcache_sweeps_superseded_files },
 
     { "test_convert_basic",             test_convert_basic },
     { "test_convert_steady_state",      test_convert_steady_state },

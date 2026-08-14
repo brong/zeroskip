@@ -1306,6 +1306,17 @@ static bool zsi_term_is_canonical(const struct zsi_term *t)
 struct zsi_file {
     char             *fname;      /* full path, owned */
     int               fd;
+
+    /* Who is using this object.  The lifetime that matters is the MAPPING's,
+     * not the snapshot's: a snapshot is just one user, and a transaction or
+     * cursor holding pointers into these bytes is another (A-4a).  Tracking it
+     * on the snapshot instead meant every consumer reasoned about the
+     * snapshot's OTHER holders rather than about the bytes it was using, which
+     * is how two lifetime bugs shipped in one week.
+     *
+     * A file is shared between snapshots when it is immutable (C-4c), so a
+     * rebuild reuses it rather than re-opening, re-mapping and re-indexing it. */
+    int               refcount;
     const char       *base;       /* mmap, or NULL for a zero-length file */
     size_t            maplen;     /* bytes mapped; 0 when base is NULL */
     size_t            size;       /* st_size at map time */
@@ -1368,17 +1379,28 @@ static const char *zsi_file_at(const struct zsi_file *f, size_t off, size_t len)
  * happen: every early-return path in the snapshot protocol would need it. */
 static void zsi_index_free(struct zsi_index **ip);
 
-static void zsi_file_close(struct zsi_file **fp)
+static void zsi_file_ref(struct zsi_file *f)
+{
+    f->refcount++;
+}
+
+/* Drop one user.  The mapping, the descriptor and the index go when the LAST
+ * one does -- which may be a snapshot being rebuilt, a transaction ending, or
+ * a cursor closing, and which of them is last is not knowable at any of those
+ * sites.  That is the whole reason this is a refcount. */
+static void zsi_file_release(struct zsi_file **fp)
 {
     struct zsi_file *f = *fp;
     if (!f) return;
+    *fp = NULL;
+
+    if (--f->refcount > 0) return;
 
     zsi_index_free(&f->index);
     if (f->base) munmap((void *)f->base, f->maplen);
     if (f->fd >= 0) close(f->fd);
     free(f->fname);
     free(f);
-    *fp = NULL;
 }
 
 /* Open and map one data file.
@@ -1402,10 +1424,11 @@ static int zsi_file_open(const char *dir, const char *name,
     if (!f) return ZS_INTERNAL;
 
     f->fd = -1;
+    f->refcount = 1;            /* the caller's, so the error paths below release */
 
     size_t dlen = strlen(dir), nlen = strlen(name);
     f->fname = malloc(dlen + 1 + nlen + 1);
-    if (!f->fname) { zsi_file_close(&f); return ZS_INTERNAL; }
+    if (!f->fname) { zsi_file_release(&f); return ZS_INTERNAL; }
     memcpy(f->fname, dir, dlen);
     f->fname[dlen] = '/';
     memcpy(f->fname + dlen + 1, name, nlen + 1);
@@ -1417,13 +1440,13 @@ static int zsi_file_open(const char *dir, const char *name,
     f->fd = open(f->fname, O_RDONLY);
     if (f->fd < 0) {
         int r = (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
-        zsi_file_close(&f);
+        zsi_file_release(&f);
         return r;
     }
 
     struct stat sb;
-    if (fstat(f->fd, &sb) < 0) { zsi_file_close(&f); return ZS_IOERROR; }
-    if (!S_ISREG(sb.st_mode)) { zsi_file_close(&f); return ZS_BADFORMAT; }
+    if (fstat(f->fd, &sb) < 0) { zsi_file_release(&f); return ZS_IOERROR; }
+    if (!S_ISREG(sb.st_mode)) { zsi_file_release(&f); return ZS_BADFORMAT; }
     f->size = (size_t)sb.st_size;
 
     /* A zero-length file cannot be mapped, and must not be an error: D-10 makes
@@ -1432,7 +1455,7 @@ static int zsi_file_open(const char *dir, const char *name,
      * content rather than a special case anyone has to remember. */
     if (f->size > 0) {
         void *m = mmap(NULL, f->size, PROT_READ, MAP_SHARED, f->fd, 0);
-        if (m == MAP_FAILED) { zsi_file_close(&f); return ZS_IOERROR; }
+        if (m == MAP_FAILED) { zsi_file_release(&f); return ZS_IOERROR; }
         f->base = (const char *)m;
         f->maplen = f->size;
     }
@@ -2063,7 +2086,7 @@ static int zsi_ptrs_build(const uint64_t *offs, size_t n, size_t records_end,
  *
  * The full rationale, and the build and lookup paths, are in the task that
  * implements them.  Only the shape and the destructor live here, because
- * zsi_file_close must be able to free an index without the caller remembering to. */
+ * zsi_file_release must be able to free an index without the caller remembering to. */
 /* Above ZSI_DELTA_MAX entries the delta is merged into the base and cleared.
  *
  * The bound is what makes insertion amortised O(1) rather than O(n): a splice
@@ -3789,10 +3812,84 @@ static void zsi_snapshot_release(struct zsi_snapshot **sp)
     if (--s->refcount > 0) { *sp = NULL; return; }
 
     for (size_t i = 0; i < s->nfiles; i++)
-        zsi_file_close(&s->files[i]);
+        zsi_file_release(&s->files[i]);
     free(s->files);
     free(s);
     *sp = NULL;
+}
+
+/* A handle's cache of IMMUTABLE file objects (C-4c).
+ *
+ * A rebuild otherwise re-opens, re-maps and re-indexes every file in the set,
+ * even though only the active one can have changed -- and replaying an
+ * unordered file is the expensive part (D-13d).  Here a rebuild costs only the
+ * files that are actually new.
+ *
+ * Keyed on the FILENAME, which is sound because a name identifies its content
+ * for the life of the database: generations are never reissued (D-9b, D-9c),
+ * and a conversion or repack output takes a new name rather than rewriting an
+ * old one.  A name that is present again therefore names the bytes we already
+ * hold.
+ *
+ * The ACTIVE file is never cached, and that exclusion is load-bearing: it is
+ * the one file that grows, and its index and `complete` boundary belong to the
+ * SNAPSHOT that built them, not to the file (C-4c, G-4).  Sharing it would let
+ * an older snapshot see records committed after it was taken.  A generation
+ * that has stopped being active is opened fresh once -- by then its extent is
+ * settled -- and cached from there on.
+ */
+struct zsi_fcache {
+    struct zsi_file **f;
+    size_t            n, a;
+};
+
+static struct zsi_file *zsi_fcache_get(struct zsi_fcache *c, const char *path)
+{
+    for (size_t i = 0; i < c->n; i++)
+        if (strcmp(c->f[i]->fname, path) == 0) return c->f[i];
+    return NULL;
+}
+
+static void zsi_fcache_put(struct zsi_fcache *c, struct zsi_file *f)
+{
+    if (c->n == c->a) {
+        size_t want = c->a ? c->a * 2 : 8;
+        struct zsi_file **p = realloc(c->f, want * sizeof(*p));
+        if (!p) return;                 /* caching is only an optimisation */
+        c->f = p;
+        c->a = want;
+    }
+    zsi_file_ref(f);
+    c->f[c->n++] = f;
+}
+
+/* Drop whatever the new set no longer names.  Releasing only decrements, so a
+ * snapshot still using a file keeps it: this hands back the cache's own
+ * reference and nothing else. */
+static void zsi_fcache_sweep(struct zsi_fcache *c, struct zsi_snapshot *s)
+{
+    size_t keep = 0;
+
+    for (size_t i = 0; i < c->n; i++) {
+        bool present = false;
+
+        for (size_t j = 0; j < s->nfiles && !present; j++)
+            if (s->files[j] == c->f[i]) present = true;
+
+        if (present) c->f[keep++] = c->f[i];
+        else         zsi_file_release(&c->f[i]);
+    }
+
+    c->n = keep;
+}
+
+static void zsi_fcache_fini(struct zsi_fcache *c)
+{
+    for (size_t i = 0; i < c->n; i++)
+        zsi_file_release(&c->f[i]);
+    free(c->f);
+    c->f = NULL;
+    c->n = c->a = 0;
 }
 
 /* A-4a: what a snapshot swap must NOT throw away.
@@ -3800,117 +3897,71 @@ static void zsi_snapshot_release(struct zsi_snapshot **sp)
  * A transaction or cursor can move to a newer snapshot while it is alive -- a
  * write transaction resolves its active file at its first store (D-9), a
  * ZS_CURSOR_LIVE cursor follows the handle's file set (D-14j) -- and the
- * snapshot it leaves behind owns the mappings every key and value pointer it
- * already returned points into.  Releasing it there unmaps them under the
+ * snapshot it leaves behind owns the files every key and value pointer it
+ * already returned points into.  Letting it go there unmaps them under the
  * caller, which is a segfault in the caller's code with nothing in the
  * backtrace to say why.
  *
- * So the borrower takes the MAPPINGS over and the snapshot goes: descriptors
- * are closed, indexes freed, file objects freed.  Only the bytes survive, and
- * they cost address space backed by the page cache -- never a descriptor, so a
- * cursor that swaps once per observed commit cannot exhaust the table it
- * shares with the rest of the process.  Retaining whole snapshots would.
- *
- * The same shape as the transaction's own zsi_txnmap list, for the same
- * reason, over the other half of what a read can return.
+ * So the borrower keeps a REFERENCE to each of those files, and the bytes live
+ * until the borrower does.  Because an immutable file is shared between
+ * snapshots (C-4c), a cursor that follows fifty commits ends up holding
+ * references to the same few objects rather than to fifty copies -- which is
+ * why this can be a plain reference and does not need the mapping-stealing
+ * the descriptor cost would otherwise have forced.
  */
-struct zsi_holdmap {
-    void   *base;
-    size_t  len;
-};
-
 struct zsi_hold {
-    struct zsi_holdmap   *m;
-    size_t                n, a;
-
-    /* Snapshots that were still SHARED at the swap, so their mappings could
-     * not be taken over -- the reference is kept instead.  See the note in
-     * zsi_snapshot_retire for why dropping it is not an option. */
-    struct zsi_snapshot **s;
-    size_t                ns, as;
+    struct zsi_file **f;
+    size_t            n, a;
 };
 
 static void zsi_hold_fini(struct zsi_hold *h)
 {
-    for (size_t i = 0; i < h->ns; i++)
-        zsi_snapshot_release(&h->s[i]);
-    free(h->s);
-    h->s = NULL;
-    h->ns = h->as = 0;
-
     for (size_t i = 0; i < h->n; i++)
-        munmap(h->m[i].base, h->m[i].len);
-    free(h->m);
-    h->m = NULL;
+        zsi_file_release(&h->f[i]);
+    free(h->f);
+    h->f = NULL;
     h->n = h->a = 0;
 }
 
-/* Hand `*sp` over to the borrower `h`, which may hold pointers into it.
- *
- * Two cases, and the split is the whole subtlety:
- *
- *   - LAST reference: take the mappings over and let the snapshot go, so the
- *     descriptors and indexes are freed and only the bytes survive.  This is
- *     the common path -- a live cursor's swap and a sole-writer transaction's
- *     first store both land here -- and it costs no descriptor.
- *
- *   - STILL SHARED: keep our reference instead of dropping it, and release it
- *     when the borrower ends.  The mappings cannot be taken over here, because
- *     the other holder would unmap them again.
- *
- * Dropping the reference in the shared case -- which is what this did until
- * 2026-08-14 -- looks safe and is not: it assumes the other holder outlives
- * US, and nothing says it does.  A transaction that fetches, opens a cursor,
- * then stores leaves the outgoing snapshot held only by that cursor, and
- * closing the cursor unmaps bytes the TRANSACTION still has pointers to and
- * was promised for its whole life (A-4).  Reported from the sqlite integration
- * as "database disk image is malformed" out of a savepoint workload, which is
- * where a fetch, a cursor and a store land in that order.
- *
- * Capacity is reserved before anything is touched, so a failure leaves the
- * snapshot exactly as it was and the caller can propagate the error rather
- * than choosing between a leak and a dangle. */
-static int zsi_snapshot_retire(struct zsi_snapshot **sp, struct zsi_hold *h)
+/* Take a reference, for the borrower `h`, to every file in `s`. */
+static int zsi_hold_add_snapshot(struct zsi_hold *h, struct zsi_snapshot *s)
 {
-    struct zsi_snapshot *s = *sp;
+    if (!s || !s->nfiles) return ZS_OK;
 
-    if (!s) return ZS_OK;
-
-    if (s->refcount > 1) {
-        if (h->ns == h->as) {
-            size_t want = h->as ? h->as * 2 : 4;
-            struct zsi_snapshot **p = realloc(h->s, want * sizeof(*p));
-            if (!p) return ZS_INTERNAL;
-            h->s = p;
-            h->as = want;
-        }
-        h->s[h->ns++] = s;      /* our reference, transferred not dropped */
-        *sp = NULL;
-        return ZS_OK;
-    }
-
+    /* Reserved before anything is referenced, so a failure leaves the borrower
+     * exactly as it was and the caller can propagate the error rather than
+     * choosing between a leak and a dangle. */
     if (h->n + s->nfiles > h->a) {
         size_t want = h->a ? h->a : 8;
         while (want < h->n + s->nfiles) want *= 2;
-        struct zsi_holdmap *p = realloc(h->m, want * sizeof(*p));
+        struct zsi_file **p = realloc(h->f, want * sizeof(*p));
         if (!p) return ZS_INTERNAL;
-        h->m = p;
+        h->f = p;
         h->a = want;
     }
 
     for (size_t i = 0; i < s->nfiles; i++) {
-        struct zsi_file *f = s->files[i];
-
-        if (!f || !f->base) continue;
-
-        h->m[h->n].base = (void *)f->base;
-        h->m[h->n].len = f->maplen;
-        h->n++;
-
-        /* Detached, so zsi_file_close does everything EXCEPT the munmap. */
-        f->base = NULL;
-        f->maplen = 0;
+        zsi_file_ref(s->files[i]);
+        h->f[h->n++] = s->files[i];
     }
+
+    return ZS_OK;
+}
+
+/* Leave `*sp`, keeping whatever the borrower may still be reading.
+ *
+ * There is no "am I the last holder" case to get right anymore, and that is
+ * the point: the previous version had one and got it wrong twice.  Taking a
+ * reference per file is correct whoever else is looking, because the
+ * reference is on the object whose lifetime is actually in question. */
+static int zsi_snapshot_retire(struct zsi_snapshot **sp, struct zsi_hold *h)
+{
+    int r;
+
+    if (!*sp) return ZS_OK;
+
+    r = zsi_hold_add_snapshot(h, *sp);
+    if (r != ZS_OK) return r;
 
     zsi_snapshot_release(sp);
     return ZS_OK;
@@ -3960,6 +4011,7 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                              zs_csum *external_csum,
                              const struct zsi_idxcfg *idxcfg,
                              void (*report)(const char *, const char *, ...),
+                             struct zsi_fcache *cache,
                              struct zsi_snapshot **out)
 {
     for (int attempt = 0; attempt < ZSI_SNAPSHOT_RETRIES; attempt++) {
@@ -3990,20 +4042,48 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
         bool retry = false;
         for (size_t i = 0; i < fs.nresolved && !retry; i++) {
             struct zsi_file *f = NULL;
-            r = zsi_file_open(dir, fs.resolved[i].name, fs.resolved[i].start,
-                              external_csum, &f);
+            bool is_last = (i + 1 == fs.nresolved);
+            char fpath[PATH_MAX];
+            bool reused = false;
 
-            /* A file may legitimately be unlinked between steps 2 and 3, by a
-             * packer retiring an input it has already superseded.  That is not an
-             * error, it is a stale scan -- restart. */
-            if (r == ZS_NOTFOUND) { retry = true; break; }
-            if (r != ZS_OK) {
-                zsi_snapshot_release(&s);
-                zsi_fileset_fini(&fs);
-                return r;
+            /* The active file is the last one when it is unordered, and it is
+             * the only file that can still change -- so it is the only one that
+             * must be opened fresh.  Everything else is immutable (C-4c) and
+             * may already be in hand from the previous snapshot. */
+            snprintf(fpath, sizeof(fpath), "%s/%s", dir, fs.resolved[i].name);
+            if (cache) {
+                /* No !is_last guard here on purpose.  The active file is kept
+                 * out of the cache at the PUT below, so it can never be found
+                 * at this one -- and stating the invariant twice would leave
+                 * neither statement testable, since defeating either alone
+                 * changes nothing. */
+                f = zsi_fcache_get(cache, fpath);
+                if (f) {
+                    zsi_file_ref(f);
+                    reused = true;
+                }
+            }
+
+            if (!f) {
+                r = zsi_file_open(dir, fs.resolved[i].name,
+                                  fs.resolved[i].start, external_csum, &f);
+
+                /* A file may legitimately be unlinked between steps 2 and 3, by
+                 * a packer retiring an input it has already superseded.  That is
+                 * not an error, it is a stale scan -- restart. */
+                if (r == ZS_NOTFOUND) { retry = true; break; }
+                if (r != ZS_OK) {
+                    zsi_snapshot_release(&s);
+                    zsi_fileset_fini(&fs);
+                    return r;
+                }
             }
 
             s->files[s->nfiles++] = f;
+
+            /* Already indexed, header already checked, table already published
+             * when it was first opened.  Skipping that IS the saving. */
+            if (reused) continue;
 
             /* D-10a: a NON-ACTIVE file with an invalid header is REPORTED and
              * treated as holding no records.  It is deliberately NOT fatal, and
@@ -4016,7 +4096,6 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
              * invalid header means no record in that file is recoverable either
              * way, while refusing to open costs every other file too.  "Silently"
              * is the hazard, and the report addresses it. */
-            bool is_last = (i + 1 == fs.nresolved);
             if (!f->hdr_valid && !is_last && report)
                 report("non-active file has an invalid header",
                        "file=<%s>", f->fname);
@@ -4052,6 +4131,10 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
                     return r;
                 }
             }
+
+            /* Fully built, so it is worth keeping -- unless it is the active
+             * file, whose extent is this snapshot's and nobody else's. */
+            if (cache && !is_last) zsi_fcache_put(cache, f);
         }
 
         zsi_fileset_fini(&fs);
@@ -4438,7 +4521,12 @@ struct zs_db {
     bool         nonblocking;
 
     struct zsi_locks     locks;
-    struct zsi_snapshot *snap;      /* current snapshot for zs_db_* calls */
+    struct zsi_snapshot *snap;
+
+    /* Immutable files carried across rebuilds (C-4c).  Per HANDLE, not global:
+     * it holds open descriptors and mappings, which belong to the handle's
+     * lifetime and must go when it closes. */
+    struct zsi_fcache    fcache;      /* current snapshot for zs_db_* calls */
     struct zs_txn       *write_txn;
 
     /* C-4i freshness baseline: the raw sorted name set of the last probe's
@@ -4559,11 +4647,15 @@ static int zsi_db_refresh(struct zs_db *db)
                                  db->index_local };
     int r = zsi_snapshot_take(db->dir, db->have_uuid ? &db->uuid : NULL,
                               db->compar, db->compar_name, db->external_csum,
-                              &idxcfg, db->error, &s);
+                              &idxcfg, db->error, &db->fcache, &s);
     if (r != ZS_OK) return r;
 
     zsi_snapshot_release(&db->snap);
     db->snap = s;
+
+    /* Anything the new set no longer names is dead weight -- a repacked-away
+     * input holds a descriptor and a mapping until somebody lets go. */
+    zsi_fcache_sweep(&db->fcache, s);
 
     if (!db->have_uuid && s->nfiles) {
         memcpy(db->uuid, s->files[0]->hdr.uuid, 16);
@@ -4961,6 +5053,14 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
      * transaction is still pointing at. */
     c->snap = snap;
     c->snap->refcount++;
+
+    /* A reference per file this cursor may read from.  Two jobs at once: it is
+     * A-4a's retention for every pointer the cursor yields, and it is what
+     * tells the commit-site fold that somebody is reading the active file, so
+     * the fold leaves it alone and rebuilds instead (D-13b, G-6).  Without it a
+     * commit through the same handle mutates the index and mapping under a
+     * cursor whose view G-4 fixes at open. */
+    if (zsi_hold_add_snapshot(&c->hold, c->snap) != ZS_OK) return ZS_INTERNAL;
     c->flags = flags;
 
     /* Take the transaction's change counter NOW.  Starting from zero makes the
@@ -5231,6 +5331,8 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
              * than a few hundred bytes lost on the way out of an OOM. */
             {
                 int hr = zsi_snapshot_retire(&old, &c->hold);
+                if (hr != ZS_OK) return hr;
+                hr = zsi_hold_add_snapshot(&c->hold, c->snap);
                 if (hr != ZS_OK) return hr;
             }
 
@@ -6136,6 +6238,22 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
     txn->snap = db->snap;
     txn->snap->refcount++;
 
+    /* A READ transaction references the files it may return pointers into, for
+     * the same two reasons a cursor does (A-4a, and blocking the fold from
+     * mutating a view G-4 fixed here).
+     *
+     * A WRITE transaction deliberately does not: it is the one that will do the
+     * folding, so its own reference would be indistinguishable from a reader's
+     * and would disable the incremental path entirely -- which is the quadratic
+     * bulk load D-13b exists to prevent.  Its borrows are safe without it,
+     * because the fold happens during commit and commit is where the
+     * transaction's A-4 lifetime ends. */
+    if (shared && zsi_hold_add_snapshot(&txn->hold, txn->snap) != ZS_OK) {
+        zsi_snapshot_release(&txn->snap);
+        free(txn);
+        return ZS_INTERNAL;
+    }
+
     if (!shared) db->write_txn = txn;
 
     *out = txn;
@@ -6205,14 +6323,18 @@ static int zsi_txn_commit(struct zs_txn *txn)
      * is a full refresh, which builds a NEW snapshot and leaves the old one
      * untouched.
      *
-     * TWO references are this commit's own: db->snap itself, and txn->snap,
-     * re-pointed at the same object above.  Counting "sole holder" as one made
-     * this branch dead code from the first commit -- every commit fell back to
-     * a full refresh, and with no cache directory to seed it that refresh
-     * replays the whole active file, making a bulk load exactly the quadratic
-     * thing this branch exists to prevent.  Found by a mutant that targeted
-     * the branch and could not be caught. */
-    if (act && offs && db->snap->refcount == 2
+     * ONE reference is this commit's own -- the snapshot's.  A cursor takes a
+     * reference per file it may be reading (A-4a), so a sharer shows up here
+     * as a second one and the fallback engages.
+     *
+     * This used to ask db->snap->refcount == 2, using the SNAPSHOT's count as
+     * a proxy for "is anyone reading this file".  The proxy was already subtle
+     * -- two is the commit's own db->snap and txn->snap, and reading it as one
+     * made the branch dead code and every bulk load quadratic -- and it broke
+     * outright once A-4a's retention started perturbing snapshot references
+     * for reasons that had nothing to do with the active file.  Asking about
+     * the file is both simpler and the actual question. */
+    if (act && offs && act->refcount == 1
         && act->hdr.start == gen && act->index) {
         r = zsi_file_remap(act);
         if (r == ZS_OK) {
@@ -7880,6 +8002,7 @@ int zs_db_close(struct zs_db **dbp)
     if (!db) return ZS_OK;
 
     zsi_snapshot_release(&db->snap);
+    zsi_fcache_fini(&db->fcache);       /* the handle's own references */
     zsi_lock_close(&db->locks);
     if (db->probe_dh) closedir(db->probe_dh);
     if (db->wfd_cache >= 0) close(db->wfd_cache);
@@ -8891,7 +9014,7 @@ int zs_db_salvage(const char *from, const char *to,
             if (zsi_salvage_engine(f, setup->csum, &cs, &csum_id) != ZS_OK) {
                 zsi_salvage_emit(&ctx, ZS_SALVAGE_FILE_UNREADABLE, 0, 0,
                                  NULL, 0);
-                zsi_file_close(&f);
+                zsi_file_release(&f);
                 continue;
             }
             zsi_salvage_emit(&ctx, ZS_SALVAGE_ENGINE_GUESSED, csum_id, 0,
@@ -8906,7 +9029,7 @@ int zs_db_salvage(const char *from, const char *to,
         else
             r = zsi_salvage_inorder(&ctx, f, cs, csum_id);
 
-        zsi_file_close(&f);
+        zsi_file_release(&f);
         if (r != ZS_OK) goto out;
     }
 

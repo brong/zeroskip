@@ -1080,7 +1080,7 @@ static void test_snapshot_gap_retry(void)
     struct zsi_snapshot *s = NULL;
     alarm(30);
     int r = zsi_snapshot_take(dbdir, &uuid, zsi_compar_default, "memcmp",
-                              NULL, NULL, NULL, &s);
+                              NULL, NULL, NULL, NULL, &s);
     alarm(0);
     zs_hook_snapshot_gap = NULL;
 

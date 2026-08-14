@@ -547,7 +547,12 @@ mutant "next: advances only base on a tie" catch \
 # over the active file when no cache directory seeds it.  This mutant IS that
 # bug, preserved.
 mutant "commit: incremental fold never taken" catch \
-  's/    if \(act && offs && db->snap->refcount == 2/    if (act \&\& offs \&\& db->snap->refcount == 1/'
+  's/    if \(act && offs && act->refcount == 1/    if (act \&\& offs \&\& act->refcount == 0/'
+
+# ... and the other direction: folding while a READER holds the active file
+# remaps it and mutates its index underneath a view G-4 fixed at open.
+mutant "commit: folds even while a reader holds the file" catch \
+  's/    if \(act && offs && act->refcount == 1/    if (act \&\& offs \&\& act->refcount >= 1/'
 
 # The insert path (D-13b), and the bound that makes it amortised O(1).
 mutant "insert: no replace of an existing key" catch \
@@ -705,7 +710,7 @@ mutant "open: ENOENT reported as IOERROR" catch \
   's/        int r = \(errno == ENOENT\) \? ZS_NOTFOUND : ZS_IOERROR;/        int r = ZS_IOERROR;/'
 
 mutant "open: directory accepted as a file" catch \
-  's/    if \(!S_ISREG\(sb.st_mode\)\) \{ zsi_file_close\(&f\); return ZS_BADFORMAT; \}/    \/* S_ISREG check removed *\//'
+  's/    if \(!S_ISREG\(sb.st_mode\)\) \{ zsi_file_release\(&f\); return ZS_BADFORMAT; \}/    \/* S_ISREG check removed *\//'
 
 echo
 echo "records and terminators (Task 4)"
@@ -1318,21 +1323,52 @@ mutant "txn: retires the snapshot even when it did not move" catch \
 mutant "cursor: live swap releases the borrowed snapshot" catch \
   's/                int hr = zsi_snapshot_retire\(&old, &c->hold\);\n                if \(hr != ZS_OK\) return hr;/                zsi_snapshot_release(\&old);/'
 
-# The retention granularity itself: stealing the mapping but leaving the file
-# object owning it is the same dangle with more code.
-mutant "retire: detaches the mapping but still unmaps it" catch \
-  's/        f->base = NULL;\n        f->maplen = 0;/        \/* left attached *\//'
+# A-4a: leaving a snapshot without referencing what we may still be reading is
+# the whole bug, in its final form -- the two earlier shapes of it (stealing
+# mappings, and dropping a shared reference) no longer exist to mutate.
+mutant "retire: leaves without referencing the files" catch \
+  's/    r = zsi_hold_add_snapshot\(h, \*sp\);\n    if \(r != ZS_OK\) return r;/    \/* not referenced *\//'
 
-# A-4a: the bug the first fix shipped with.  A snapshot that is still SHARED
-# cannot have its mappings taken over, and dropping the reference instead
-# assumes the remaining holder outlives the borrower -- a cursor does not.
-mutant "retire: drops the reference when still shared" catch \
-  's/        h->s\[h->ns\+\+\] = s;      \/\* our reference, transferred not dropped \*\/\n        \*sp = NULL;\n        return ZS_OK;/        zsi_snapshot_release(sp);\n        return ZS_OK;/'
+# ... and the references must come back, or every rebuild strands a descriptor
+# and a mapping.
+mutant "hold: references never released" catch \
+  's/    for \(size_t i = 0; i < h->n; i\+\+\)\n        zsi_file_release\(&h->f\[i\]\);/    \/* leaked *\//'
 
-# ... and the release at the end of the borrow must actually happen, or the
-# shared case leaks a snapshot and every descriptor in it.
-mutant "hold: shared snapshot references never released" catch \
-  's/    for \(size_t i = 0; i < h->ns; i\+\+\)\n        zsi_snapshot_release\(&h->s\[i\]\);/    \/* leaked *\//'
+# A cursor's references do two jobs: A-4a retention, and telling the fold that
+# somebody is reading the active file.  Dropping them breaks BOTH, and the
+# second is a G-4 violation a data test can see.
+mutant "cursor: takes no reference to the files it reads" catch \
+  's/    if \(zsi_hold_add_snapshot\(&c->hold, c->snap\) != ZS_OK\) return ZS_INTERNAL;/    \/* unreferenced *\//'
+
+# The same for a read transaction, which is the other holder of a fixed view.
+mutant "txn: read transaction references no files" catch \
+  's/    if \(shared && zsi_hold_add_snapshot\(&txn->hold, txn->snap\) != ZS_OK\) \{/    if (false \&\& zsi_hold_add_snapshot(\&txn->hold, txn->snap) != ZS_OK) {/'
+
+echo
+echo "shared immutable files (C-4c)"
+
+# C-4c: the ACTIVE file is the one file that changes, and its index and
+# complete boundary belong to the snapshot that built them.  Caching it lets an
+# older snapshot see records committed after it was taken -- G-4 gone.
+mutant "fcache: caches the active file too" catch \
+  's/            if \(cache && !is_last\) zsi_fcache_put\(cache, f\);/            if (cache) zsi_fcache_put(cache, f);/'
+
+# Reuse must actually happen, or the whole thing is overhead.
+mutant "fcache: never reuses anything" catch \
+  's/                f = zsi_fcache_get\(cache, fpath\);/                f = NULL;/'
+
+# A hit that falls through and redoes the work is the same optimisation
+# defeated more subtly.  It cannot be ISOLATED: the file object is still
+# reused, so identity holds and every value read is the same -- only the cost
+# differs, and no assertion can see that.  The sibling above defeats the same
+# optimisation observably, which is what pairs this one.
+mutant "fcache: hit still re-indexes the file" subsumed \
+  's/            if \(reused\) continue;/            if (0) continue;/'
+
+# The sweep is what keeps a repacked-away input from holding its descriptor and
+# mapping for the handle's life.
+mutant "fcache: never sweeps superseded files" catch \
+  's/    zsi_fcache_sweep\(&db->fcache, s\);/    \/* never swept *\//'
 
 echo
 echo "empty value vs deletion on read (A-1)"
