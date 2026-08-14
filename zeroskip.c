@@ -3561,15 +3561,20 @@ static int zsi_entry_cmp(const void *a, const void *b)
  * choice of majority -- silently adopting one would read half a database and
  * call it whole.  A directory with no data files leaves have_uuid false, which is
  * the empty case D-8a handles. */
-static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
-                            struct zsi_fileset *fs)
+/* The scan body, over an already-open directory stream.  rewinddir makes the
+ * stream reflect the directory's CURRENT state -- POSIX specifies it as
+ * equivalent to a fresh opendir -- which is what lets the C-4i probe hold one
+ * stream open for the handle's lifetime instead of paying opendir/closedir
+ * per begin: at one probe per operation, the opendir was the single largest
+ * cost of a small read or write, measured at ~2/3 of a cached fetch. */
+static int zsi_fileset_scan_dh(DIR *d, const zsi_uuid_t *want_uuid,
+                               struct zsi_fileset *fs)
 {
-    DIR *d = opendir(dir);
     struct dirent *de;
     size_t alloc = 0;
 
     memset(fs, 0, sizeof(*fs));
-    if (!d) return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+    rewinddir(d);
 
     if (want_uuid) {
         memcpy(fs->uuid, *want_uuid, 16);
@@ -3591,7 +3596,6 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
              * a UUID this is simply someone else's file and we ignore it; if we
              * are discovering, it is corruption and must be reported. */
             if (want_uuid) continue;
-            closedir(d);
             zsi_fileset_fini(fs);
             return ZS_BADFORMAT;
         }
@@ -3599,7 +3603,7 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
         if (fs->nall == alloc) {
             size_t want = alloc ? alloc * 2 : 16;
             struct zsi_entry *p = realloc(fs->all, want * sizeof(*p));
-            if (!p) { closedir(d); zsi_fileset_fini(fs); return ZS_INTERNAL; }
+            if (!p) { zsi_fileset_fini(fs); return ZS_INTERNAL; }
             fs->all = p;
             alloc = want;
         }
@@ -3624,8 +3628,6 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
         fs->nall++;
     }
 
-    closedir(d);
-
     /* Sort lexically.  D-1's fixed-width uppercase hex makes lexical order
      * numeric order, and D-1a's no-extension rule makes an unordered name a
      * strict prefix of the in-order name for the same generation -- the two
@@ -3635,6 +3637,20 @@ static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
         qsort(fs->all, fs->nall, sizeof(*fs->all), zsi_entry_cmp);
 
     return ZS_OK;
+}
+
+static int zsi_fileset_scan(const char *dir, const zsi_uuid_t *want_uuid,
+                            struct zsi_fileset *fs)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        memset(fs, 0, sizeof(*fs));
+        return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+    }
+
+    int r = zsi_fileset_scan_dh(d, want_uuid, fs);
+    closedir(d);
+    return r;
 }
 
 /* D-5's single sweep over the sorted names:
@@ -4145,6 +4161,24 @@ struct zs_db {
     char        *probe_names;
     size_t       probe_names_len;
 
+    /* The probe's directory stream, held for the handle's lifetime and
+     * rewound per probe.  rewinddir makes a readdir pass equivalent to a
+     * fresh opendir's (POSIX), and the probe runs once per operation, where
+     * opendir/closedir was the single largest cost of a cached fetch. */
+    DIR         *probe_dh;
+
+    /* The active file's append descriptor, handed back by the last write
+     * transaction and reused by the next while the active generation is
+     * unchanged -- the open/fstat/close round trip was the largest single
+     * cost of a small NOSYNC transaction.  -1 when empty.  Reuse is gated on
+     * the SNAPSHOT's active file each time (zsi_writer_active): a rollover,
+     * seal or conversion changes the generation, and the stale descriptor is
+     * closed rather than written through.  Generations are never reissued
+     * (D-9b), so gen equality on an unordered active file identifies the
+     * inode. */
+    int          wfd_cache;
+    uint32_t     wfd_gen;
+
     /* Backing for pointers returned by the non-transactional calls, whose
      * implicit transaction has ended by the time the caller sees them (A-4). */
     char        *retbuf;
@@ -4287,7 +4321,17 @@ static int zsi_db_freshen(struct zs_db *db)
     bool stale;
     int r;
 
-    r = zsi_fileset_scan(db->dir, db->have_uuid ? &db->uuid : NULL, &fs);
+    /* One directory stream for the handle's life, rewound per probe
+     * (zsi_fileset_scan_dh), because this runs once per operation and the
+     * opendir/closedir pair was the bulk of a cached fetch's cost. */
+    if (!db->probe_dh) {
+        db->probe_dh = opendir(db->dir);
+        if (!db->probe_dh)
+            return (errno == ENOENT) ? ZS_NOTFOUND : ZS_IOERROR;
+    }
+
+    r = zsi_fileset_scan_dh(db->probe_dh, db->have_uuid ? &db->uuid : NULL,
+                            &fs);
     if (r != ZS_OK) return r;
 
     /* The raw name set, sorted and NUL-joined into one comparable blob.
@@ -5510,6 +5554,17 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
 
     if (act && zsi_unordered_is_clean(act)
             && act->size < db->rollover_size) {
+        /* The descriptor the last transaction handed back, if it is for THIS
+         * generation.  O_APPEND means every write lands at the true EOF
+         * regardless of which transaction opened the descriptor. */
+        if (db->wfd_cache >= 0 && db->wfd_gen == act->hdr.start) {
+            *fdp = db->wfd_cache;
+            db->wfd_cache = -1;
+            *genp = act->hdr.start;
+            return ZS_OK;
+        }
+        if (db->wfd_cache >= 0) { close(db->wfd_cache); db->wfd_cache = -1; }
+
         snprintf(path, sizeof(path), "%s", act->fname);
         int fd = open(path, O_RDWR | O_APPEND);   /* RDWR: the streaming reads mmap this fd (A-4) */
         if (fd < 0) return ZS_IOERROR;
@@ -5517,6 +5572,8 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
         *genp = act->hdr.start;
         return ZS_OK;
     }
+
+    if (db->wfd_cache >= 0) { close(db->wfd_cache); db->wfd_cache = -1; }
 
     /* A new generation, one above the highest PRESENT (D-9b), so a superseded
      * file's generation is never reissued. */
@@ -5566,26 +5623,28 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
 {
     struct zs_db *db = txn->db;
     size_t spanlen = txn->wsize - txn->span_base;
-
-    int r = zsi_txn_flush(txn);
-    if (r != ZS_OK) return r;
+    int r;
 
     /* The terminator's checksum covers the span's BYTES plus the terminator
-     * (C-4f), the engine is one-shot -- and engine 2 is the caller's, so no
-     * incremental variant is possible -- so the streamed span is re-read
-     * through the mapping: one warm pass, where the buffered writer paid the
-     * same pass over RAM.  A ROLLBACK's checksum matters as much as a
-     * COMMIT's: an invalid rolled-back span completes the file early (F-24)
-     * and costs everything after it. */
-    const char *span = zsi_txn_at(txn, txn->span_base, spanlen);
-    if (!span) return ZS_IOERROR;
-
-    /* Gate 1: the data records, then a sync.  If this fails, no terminator
-     * was written, so the transaction plainly did not happen (C-7a).  C-8: an
-     * abort syncs NEITHER gate -- the next commit's own gate 1 is what orders
-     * the ROLLBACK ahead of the next COMMIT terminator (C-8a). */
-    if (!db->nosync && !rollback) {
-        if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
+     * (C-4f), and the engine is one-shot -- engine 2 is the caller's, so no
+     * incremental variant is possible.  The bytes come from wherever they
+     * still are: a span that fits the chunk buffer entirely -- every small
+     * transaction -- is checksummed there, and only a span already partially
+     * flushed is re-read through a mapping (one warm pass, where the
+     * buffered writer paid the same pass over RAM).  C-4f covers bytes, not
+     * their residence, and the flush writes exactly these bytes.  A
+     * ROLLBACK's checksum matters as much as a COMMIT's: an invalid
+     * rolled-back span completes the file early (F-24) and costs everything
+     * after it. */
+    bool in_chunk = (txn->flushed == txn->span_base);
+    const char *span;
+    if (in_chunk) {
+        span = txn->chunk;                  /* chunklen == spanlen here */
+    } else {
+        r = zsi_txn_flush(txn);
+        if (r != ZS_OK) return r;
+        span = zsi_txn_at(txn, txn->span_base, spanlen);
+        if (!span) return ZS_IOERROR;
     }
 
     char term[ZSI_TERMLEN_LONG];
@@ -5596,10 +5655,35 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
     zsi_term_encode(term, (uint64_t)spanlen, rollback, span,
                     txn->wcs, txn->wcsum_id);
 
-    r = zsi_write_all(txn->wfd, term, termlen);
-    if (r != ZS_OK) return r;
-    txn->flushed += termlen;
-    txn->wsize += termlen;
+    bool gated = !db->nosync && !rollback;
+
+    /* With no gate between them, the span and its terminator may leave in
+     * ONE write: nothing orders them for the ungated cases (C-7c, C-8), and
+     * the terminator checksum already makes any torn interleaving read as
+     * absent (F-22).  Under default durability the merge is FORBIDDEN --
+     * gate 1 exists precisely to order the data before the terminator. */
+    if (!gated && in_chunk && txn->chunklen + termlen <= txn->chunkcap) {
+        memcpy(txn->chunk + txn->chunklen, term, termlen);
+        txn->chunklen += termlen;
+        txn->wsize += termlen;
+        r = zsi_txn_flush(txn);
+        if (r != ZS_OK) return r;
+    } else {
+        r = zsi_txn_flush(txn);
+        if (r != ZS_OK) return r;
+
+        /* Gate 1: the data records, then a sync.  If this fails, no
+         * terminator was written, so the transaction plainly did not happen
+         * (C-7a).  C-8: an abort syncs NEITHER gate -- the next commit's own
+         * gate 1 is what orders the ROLLBACK ahead of the next COMMIT
+         * terminator (C-8a). */
+        if (gated && ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
+
+        r = zsi_write_all(txn->wfd, term, termlen);
+        if (r != ZS_OK) return r;
+        txn->flushed += termlen;
+        txn->wsize += termlen;
+    }
 
     /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may
      * or may not be durable -- and either outcome is correct, so the error is
@@ -5638,7 +5722,21 @@ static void zsi_txn_free(struct zs_txn *txn)
         munmap(txn->maps[i].base, txn->maps[i].len);
     free(txn->maps);
     free(txn->chunk);
-    if (txn->wfd >= 0) close(txn->wfd);
+
+    /* Hand the append descriptor back for the next transaction rather than
+     * closing it -- unless this one's stream broke, in which case nothing
+     * about the descriptor is worth trusting.  A torn or rolled-back tail
+     * does not disqualify it: whether the next transaction may APPEND is
+     * decided by zsi_writer_active against the refreshed snapshot, and a
+     * mismatched or unwanted descriptor is closed there. */
+    if (txn->wfd >= 0) {
+        if (!txn->broken && txn->db->wfd_cache < 0) {
+            txn->db->wfd_cache = txn->wfd;
+            txn->db->wfd_gen = txn->wgen;
+        } else {
+            close(txn->wfd);
+        }
+    }
 
     zsi_snapshot_release(&txn->snap);
     free(txn);
@@ -7210,6 +7308,7 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     if (!db) return ZS_INTERNAL;
 
     db->locks.fd = -1;
+    db->wfd_cache = -1;
     db->flags = setup->flags;
     db->readonly = (setup->flags & ZS_SHARED) != 0;
     db->nocsum = (setup->flags & ZS_NOCSUM) != 0;
@@ -7444,6 +7543,8 @@ int zs_db_close(struct zs_db **dbp)
 
     zsi_snapshot_release(&db->snap);
     zsi_lock_close(&db->locks);
+    if (db->probe_dh) closedir(db->probe_dh);
+    if (db->wfd_cache >= 0) close(db->wfd_cache);
     free(db->probe_names);
     free(db->retbuf);
     free(db->index_dir);

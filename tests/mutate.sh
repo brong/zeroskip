@@ -373,7 +373,7 @@ mutant "D-5c: partial overlap resolved anyway" catch \
 
 # D-4a: disagreeing UUIDs are an error, never a majority vote.
 mutant "D-4a: uuid mismatch ignored" catch \
-  's/            if \(want_uuid\) continue;\n            closedir\(d\);\n            zsi_fileset_fini\(fs\);\n            return ZS_BADFORMAT;/            continue;/'
+  's/            if \(want_uuid\) continue;\n            zsi_fileset_fini\(fs\);\n            return ZS_BADFORMAT;/            continue;/'
 
 # D-9b: the next generation comes from ALL files, not the resolved set -- a
 # superseded file still pins its generation until it is removed.
