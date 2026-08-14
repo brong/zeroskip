@@ -5229,24 +5229,106 @@ static void test_lock_dies_with_process(void)
  *
  * So the asserted behaviour is the honest one: the second take succeeds, and that
  * is documented rather than defended against. */
-static void test_lock_two_handles_one_process(void)
+/* One run of T-14 against whichever C-1j mechanism is currently selected. */
+static void two_handles_are_excluded(void)
 {
     struct zsi_locks a, b;
 
-    ASSERT_EQ(mkdbdir(), 0);
     ASSERT_OK(zsi_lock_open(&a, dbdir));
     ASSERT_OK(zsi_lock_open(&b, dbdir));
 
     ASSERT_OK(zsi_lock_take(&a, ZSI_LOCK_WRITE, 0));
 
-    /* Not excluded -- by design, and stated in G-5 and C-1f.  If this ever starts
-     * returning ZS_LOCKED, either F_OFD_SETLK was adopted (C-1i permits it, and it
-     * WOULD exclude these) or a mutex crept back in.  The first is an improvement
-     * worth documenting; the second is the bug this test guards. */
+    /* The second handle is refused, exactly as a second process would be. */
+    ASSERT_EQ(zsi_lock_take(&b, ZSI_LOCK_WRITE, ZS_NONBLOCKING), ZS_LOCKED);
+
+    /* And it is a lock, not a permanent refusal: releasing hands it over.  A
+     * mechanism that never released would pass the assertion above. */
+    ASSERT_OK(zsi_lock_release(&a, ZSI_LOCK_WRITE));
+    ASSERT_OK(zsi_lock_take(&b, ZSI_LOCK_WRITE, ZS_NONBLOCKING));
+
+    /* The other two locks are tracked separately, not as one flag. */
+    ASSERT_OK(zsi_lock_take(&a, ZSI_LOCK_REPACK, ZS_NONBLOCKING));
+
+    zsi_lock_close(&a);
+    zsi_lock_close(&b);
+}
+
+/* T-14, C-1j: two handles on one database within one process exclude each
+ * other.  This asserted the OPPOSITE until 2026-08-14 -- fcntl locks are
+ * per-process, so neither excluded the other and every caller that cared built
+ * the exclusion itself (the sqlite integration did, with a dev/ino registry,
+ * which is the mechanism C-1f described and declined to require).
+ *
+ * Run against BOTH mechanisms.  F_OFD_SETLK exists on every platform anyone
+ * develops on, so the registry is dead code here and would rot unexercised
+ * until the one platform that needs it found out. */
+static void test_lock_two_handles_one_process(void)
+{
+    bool saved = zsi_lock_registry;
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+#if ZSI_HAVE_OFD_LOCKS
+    zsi_lock_registry = false;          /* mechanism 1: the kernel does it */
+    two_handles_are_excluded();
+#endif
+
+    zsi_lock_registry = true;           /* mechanism 2: the registry does it */
+    two_handles_are_excluded();
+
+    zsi_lock_registry = saved;
+}
+
+/* C-1j: the registry keys on the lock file's inode, not its path, so two
+ * handles that reached one database by different paths still exclude each
+ * other.  A path-keyed registry passes every test that opens `dbdir` twice. */
+static void test_lock_registry_keys_on_inode(void)
+{
+    struct zsi_locks a, b;
+    bool saved = zsi_lock_registry;
+    char viadot[PATH_MAX];
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_lock_registry = true;
+
+    snprintf(viadot, sizeof(viadot), "%s/.", dbdir);
+
+    ASSERT_OK(zsi_lock_open(&a, dbdir));
+    ASSERT_OK(zsi_lock_open(&b, viadot));
+
+    ASSERT_OK(zsi_lock_take(&a, ZSI_LOCK_WRITE, 0));
+    ASSERT_EQ(zsi_lock_take(&b, ZSI_LOCK_WRITE, ZS_NONBLOCKING), ZS_LOCKED);
+
+    zsi_lock_close(&a);
+    zsi_lock_close(&b);
+    zsi_lock_registry = saved;
+}
+
+/* C-1j: the registry is per DATABASE.  Keying it on anything coarser -- a
+ * single process-wide flag, say -- would make one database's writer exclude
+ * another's, which is a deadlock in any caller holding two open (C-1h). */
+static void test_lock_registry_is_per_database(void)
+{
+    struct zsi_locks a, b;
+    bool saved = zsi_lock_registry;
+    char other[PATH_MAX];
+
+    ASSERT_EQ(mkdbdir(), 0);
+    zsi_lock_registry = true;
+
+    snprintf(other, sizeof(other), "%s/other", basedir);
+    ASSERT_EQ(mkdir(other, 0700), 0);
+
+    ASSERT_OK(zsi_lock_open(&a, dbdir));
+    ASSERT_OK(zsi_lock_open(&b, other));
+
+    ASSERT_OK(zsi_lock_take(&a, ZSI_LOCK_WRITE, 0));
     ASSERT_OK(zsi_lock_take(&b, ZSI_LOCK_WRITE, ZS_NONBLOCKING));
 
     zsi_lock_close(&a);
     zsi_lock_close(&b);
+    zsi_lock_registry = saved;
 }
 
 /* And the corollary: the library holds no thread machinery at all, so nobody can
@@ -6491,7 +6573,13 @@ static void test_cursor_live_sees_other_handle_commit(void)
     other = open_db(0);
     ASSERT_NOT_NULL(other);
 
-    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_CURSOR_LIVE));
+    /* ZS_SHARED matters here and is not decoration: a cursor from a handle
+     * takes an implicit WRITE transaction unless told otherwise, and that
+     * holds the write lock for the cursor's whole life -- so `other` could
+     * never commit underneath it.  This test passed before C-1j only because
+     * two handles in one process excluded each other by nothing; against a
+     * second PROCESS it would always have deadlocked. */
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_CURSOR_LIVE | ZS_SHARED));
     ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
     ASSERT_MEM_EQ(k, "a", 1);
 
@@ -6504,7 +6592,7 @@ static void test_cursor_live_sees_other_handle_commit(void)
     zs_cursor_fini(&c);
 
     /* Without the flag, the traversal's view stays put. */
-    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, 0));
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED));
     ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
     ASSERT_MEM_EQ(k, "a", 1);
     ASSERT_OK(zs_db_store(other, "aa", 2, "x", 1, 0));
@@ -14818,6 +14906,8 @@ static struct test_entry tests[] = {
     { "test_lock_excludes_other_process", test_lock_excludes_other_process },
     { "test_lock_dies_with_process",    test_lock_dies_with_process },
     { "test_lock_two_handles_one_process", test_lock_two_handles_one_process },
+    { "test_lock_registry_keys_on_inode", test_lock_registry_keys_on_inode },
+    { "test_lock_registry_is_per_database", test_lock_registry_is_per_database },
     { "test_lock_no_thread_machinery",  test_lock_no_thread_machinery },
     { "test_lock_never_uses_flock",     test_lock_never_uses_flock },
 

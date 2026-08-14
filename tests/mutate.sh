@@ -1262,6 +1262,41 @@ mutant "write begin: rebuilds the snapshot unconditionally" catch \
   's/         \* snapped back at rollover\. \*\/\n        r = zsi_db_freshen\(db\);/         * snapped back at rollover. *\/\n        r = zsi_db_refresh(db);/'
 
 echo
+echo "same-process exclusion (C-1j)"
+
+# C-1j: the registry must not be dropped -- on a platform without OFD locks
+# that is the whole of the guarantee, and on one with them this is what T-14's
+# second run exercises.
+mutant "lock: registry not consulted on take" catch \
+  's/    int r = zsi_lockreg_acquire\(lk, which, block\);\n    if \(r != ZS_OK\) return r;\n\n    r = zsi_lock_fcntl/    int r = zsi_lock_fcntl/'
+
+# ... and must be released, or the first writer in a process is the only one
+# that ever writes.
+mutant "lock: registry not dropped on release" catch \
+  's/    lk->held &= ~\(1u << which\);\n    zsi_lockreg_drop\(lk, which\);/    lk->held \&= ~(1u << which);/'
+
+# C-1j's key is st_dev AND st_ino.  Dropping the device leaves inode numbers,
+# which are unique only WITHIN a filesystem -- so two databases on different
+# filesystems whose lock files happen to share an inode number would exclude
+# each other, and a writer on one would block on the other.  Isolating that
+# needs two filesystems with a colliding inode, which no portable test can
+# construct; the combined mutant below removes the whole comparison and IS
+# caught, so the key is demonstrated to be load-bearing even though this half
+# of it cannot be isolated.
+mutant "lock: registry ignores the device number" subsumed \
+  's/        while \(e && !\(e->dev == sb.st_dev && e->ino == sb.st_ino\)\) e = e->next;/        while (e \&\& !(e->ino == sb.st_ino)) e = e->next;\n        if (0) { }/'
+
+# The entry is per database.  One process-wide word would deadlock any caller
+# holding two databases open (C-1h).
+mutant "lock: registry entry shared by all databases" catch \
+  's/        while \(e && !\(e->dev == sb.st_dev && e->ino == sb.st_ino\)\) e = e->next;/        \/* first entry, whatever it is *\//'
+
+# OFD selection: falling back to F_SETLK while the registry is off leaves
+# nothing excluding two handles at all.
+mutant "lock: OFD commands replaced by POSIX ones" catch \
+  's/    int wait_cmd = F_OFD_SETLKW, try_cmd = F_OFD_SETLK;/    int wait_cmd = F_SETLKW, try_cmd = F_SETLK;/'
+
+echo
 echo "A-4a borrow lifetime across a snapshot swap"
 
 # A-4a: the bug as it shipped.  A transaction that reads before its first write

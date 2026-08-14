@@ -17,9 +17,9 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 263 |
-| With an enforcing test | 254 |
-| Gaps, each with a reason | 9 |
+| Requirements | 264 |
+| With an enforcing test | 256 |
+| Gaps, each with a reason | 8 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -205,7 +205,8 @@ a spec label is missing here.
 | `C-1f` | `fcntl` locks are per-process, not per-thread: two threads of one | `lock_byte_offsets`, `lock_dies_with_process`, `lock_two_handles_one_process`, +1 more |
 | `C-1g` | `fcntl` locks are released by closing **any** descriptor for the file | `one_lock_descriptor` |
 | `C-1h` | Locks across databases. C-1d orders the locks within one database. | **none** |
-| `C-1i` | An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only | **none** |
+| `C-1i` | An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only | `lock_two_handles_one_process` |
+| `C-1j` | **Same-process exclusion.** An implementation SHOULD exclude two handles | `lock_two_handles_one_process`, `lock_registry_keys_on_inode`, `lock_registry_is_per_database` |
 | `C-2` | Readers take **no lock**. | `mp_two_writers`, `mp_writer_and_readers` |
 | `C-3` | A file is published by writing it under a staging name, then | `convert_basic, mp_reader_across_repack` |
 | `C-4` | Taking a snapshot. The protocol is: | `crash/crash_after_invalid_terminator`, `file_open_failures`, `fileset_gaps`, +1 more |
@@ -345,24 +346,20 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`F-30`** — Not yet attributed.
 - **`D-14g`** — Not yet attributed.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
-- **`C-1i`** — Not implemented. F_OFD_SETLK is permitted but only after verifying platform behaviour, and this implementation uses F_SETLK.
 - **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
 - **`T-13`** — Needs a second implementation. zstool provides hold-write for it.
 
 ## What this implementation does not claim
 
-- **`C-1i`** `F_OFD_SETLK` is not used. The spec permits it, but only after
-  verifying on the target platform that it conflicts with `F_SETLK`.
 - **Engine 2** is outside the shared corpus (F-5d): a file written under a
   caller-supplied checksum is readable only by a caller supplying the same
   function, so it cannot be validated by anyone else.
 - **Thread-safe handles.** Removed from the spec in `6282469` after measurement
   showed the in-process mutex did not deliver what G-5 appeared to promise.
-  Concurrent writers must be separate processes.
-- **A ROLLBACK span is never written**, only read. This writer buffers a
-  transaction and writes at commit, so an abort has nothing on disk to void.
-  Both writers are conforming; the trade is that a transaction must fit in
-  memory.
+  Two threads sharing ONE handle remain the caller's problem. Two separate
+  handles on one database are a different question and are excluded (C-1j),
+  by `F_OFD_SETLK` where the platform has it and by a registry keyed on the
+  lock file's inode otherwise.
 - **The cross-implementation tests** (`T-12`, `T-13`) need a second
   implementation. Everything they depend on — the language-neutral corpus and
   the driver contract — is in place.
