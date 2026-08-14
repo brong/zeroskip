@@ -1,4 +1,11 @@
 /* Round 2: can exact extension avoid the dirty-page truncate penalty? */
+/* Platform defines: see the note in ftbench.c. */
+#if defined(__linux__)
+#define _GNU_SOURCE
+#elif defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

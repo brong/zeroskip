@@ -8,6 +8,16 @@
  *   E  memcpy into a pre-sized file through the window (faults only)
  *   F  chunked ftruncate-up + memcpy, NO down-truncate, 1GB window
  */
+/* These files are compiled by hand (see README), so they carry the platform
+ * defines the Makefile supplies for the library: -std=c99 alone hides
+ * ftruncate/pwrite/fdatasync on glibc, and an implicit declaration returns
+ * int, which truncates nothing and mismeasures everything. */
+#if defined(__linux__)
+#define _GNU_SOURCE
+#elif defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -7,6 +7,13 @@
  *                           pwrite z; memcpy term; fdatasync
  *   M: J without the down-truncate (slop persists; measures the truncate)
  */
+/* Platform defines: see the note in ftbench.c. */
+#if defined(__linux__)
+#define _GNU_SOURCE
+#elif defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
