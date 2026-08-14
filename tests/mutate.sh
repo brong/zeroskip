@@ -1411,9 +1411,15 @@ mutant "autorepack: trigger removed" catch \
 # genuinely there -- and it is not: a transaction that merely appends cannot
 # have created work, but work left over from EARLIER activity is still
 # outstanding, so the broadened trigger merges at moments the narrow one
-# leaves alone.  zstest-crash catches it on the resulting file layout.  Kept
-# as a reminder that "more eager" is a behaviour change here, not a tuning
-# knob.
+# leaves alone.  Kept as a reminder that "more eager" is a behaviour change
+# here, not a tuning knob.
+#
+# Caught by test_autorepack_only_at_a_new_generation, which had to build a
+# state the other two D-16e tests never reach: work pending AND a clean active
+# file with room.  Store-seal-repeat leaves no active file, so every begin
+# starts a generation and the two rules agree on the whole workload -- which is
+# why this reported NOT CAUGHT from the day it was written until 2026-08-14.
+# The comment here used to claim zstest-crash covered it; it did not.
 mutant "autorepack: probes on every begin, not just new generations" catch \
   's/            bool new_gen = !\(act && zsi_unordered_is_clean\(act\)\n                             && !zsi_active_full\(db, act\)\);/            bool new_gen = true;/'
 

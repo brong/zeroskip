@@ -7786,6 +7786,90 @@ static void test_autorepack_bounds_the_file_count(void)
     zs_db_close(&db);
 }
 
+/* D-16e's TRIGGER, not just its effect: the cascade runs at a begin that is
+ * about to start a new generation, and at no other begin.
+ *
+ * The two tests either side of this one cannot see the difference.  Both use
+ * store-seal-repeat, and after a seal there is no active file at all, so every
+ * begin starts a generation and the narrow trigger and "every begin" agree on
+ * the whole workload.  Broadening it merges at moments the narrow rule leaves
+ * alone, which is a real behaviour change (D-16b puts an unbounded operation on
+ * the write path) and went untested for exactly that reason.
+ *
+ * So this builds the state they never do: repack work pending AND a clean
+ * active file with room in it, where the narrow trigger is false.
+ *
+ * Deliberately does NOT set ZS_NOAUTOREPACK, though its subject is a file
+ * layout and the house rule says otherwise.  Here the armed cascade is the
+ * subject -- what is asserted is that it declines to fire -- so suppressing it
+ * would assert nothing. */
+static void test_autorepack_only_at_a_new_generation(void)
+{
+    struct zs_db *db = fresh_db_noautorepack();
+    char val[512];
+    const int n = 40;
+    size_t before;
+
+    ASSERT_NOT_NULL(db);
+    memset(val, 'v', sizeof(val));
+
+    /* Files to merge, with the cascade disarmed so they survive to be merged. */
+    for (int i = 0; i < n; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, val, sizeof(val), 0));
+        ASSERT_OK(zs_db_seal(db));
+    }
+    /* One more store WITHOUT a seal, so the database is left with a clean
+     * active file rather than none -- the whole point of the fixture. */
+    ASSERT_OK(zs_db_store(db, "tail", 4, val, sizeof(val), 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Reopen with the cascade ARMED.  Opening does not repack (D-16e is a
+     * write-begin rule), so the work is still here to be declined. */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT(zs_db_should_repack(db));
+
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT(zsi_unordered_is_clean(act));
+        ASSERT(act->size < db->rollover_size);      /* D-9a: room to append */
+        ASSERT(act->nspans < db->rollover_txns);    /* D-9d: and spans spare */
+    }
+    before = db->snap->nfiles;
+    ASSERT(before >= (size_t)n);
+
+    /* A begin that APPENDS to that active file. D-9a's condition is false, so
+     * no generation is starting and the cascade must not run -- this
+     * transaction created no repack work and must not pay for anyone else's. */
+    ASSERT_OK(zs_db_store(db, "appended", 8, val, sizeof(val), 0));
+    ASSERT_EQU(db->snap->nfiles, before);
+    ASSERT(zs_db_should_repack(db));       /* still pending, still declined */
+
+    /* The positive control, and not optional: without it this test also passes
+     * on a build where the cascade never runs at all, which is the opposite
+     * bug.  Seal leaves no active file, so the next begin IS starting a
+     * generation, and there the same pending work must be taken. */
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT_OK(zs_db_store(db, "newgen", 6, val, sizeof(val), 0));
+    ASSERT(db->snap->nfiles < before);
+
+    /* And nothing was lost to the merge that did happen. */
+    for (int i = 0; i < n; i++) {
+        char k[32];
+        const char *v;
+        size_t vl;
+        int kl = snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_OK(zs_db_fetch(db, k, kl, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, sizeof(val));
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-14: and the caller can turn it off, which is what makes the latency of an
  * unbounded cascade (D-16b) something they can schedule rather than something
  * that happens to them. The same workload, one flag apart. */
@@ -15776,6 +15860,8 @@ static struct test_entry tests[] = {
                                         test_fcache_sweeps_superseded_files },
     { "test_autorepack_bounds_the_file_count",
                                         test_autorepack_bounds_the_file_count },
+    { "test_autorepack_only_at_a_new_generation",
+                                        test_autorepack_only_at_a_new_generation },
     { "test_noautorepack_leaves_the_files",
                                         test_noautorepack_leaves_the_files },
 
