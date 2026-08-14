@@ -5315,7 +5315,7 @@ static void test_lock_registry_keys_on_inode(void)
     ASSERT_EQ(mkdbdir(), 0);
     zsi_lock_registry = true;
 
-    snprintf(viadot, sizeof(viadot), "%s/.", dbdir);
+    XSNPRINTF(viadot, "%s/.", dbdir);
 
     ASSERT_OK(zsi_lock_open(&a, dbdir));
     ASSERT_OK(zsi_lock_open(&b, viadot));
@@ -5340,7 +5340,7 @@ static void test_lock_registry_is_per_database(void)
     ASSERT_EQ(mkdbdir(), 0);
     zsi_lock_registry = true;
 
-    snprintf(other, sizeof(other), "%s/other", basedir);
+    XSNPRINTF(other, "%s/other", basedir);
     ASSERT_EQ(mkdir(other, 0700), 0);
 
     ASSERT_OK(zsi_lock_open(&a, dbdir));
