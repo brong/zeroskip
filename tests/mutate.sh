@@ -1160,8 +1160,21 @@ mutant "salvage: uses the header-filling scan" catch \
   's/    r = zsi_fileset_scan_raw\(from, NULL, &fs\);   \/\* keeps a bad header \(S-1\) \*\//    r = zsi_fileset_scan(from, NULL, \&fs);/'
 
 # S-3.  Newest first makes an OLDER value win, silently, with no error anywhere.
+#
+# ANCHORED on the D-1b guard above it, and that is not decoration: an identical
+# comparison line exists in zsi_entry_resolve_order EARLIER in the file, and
+# perl's s/// without /g takes the first match.  Anchored loosely, this mutant
+# silently retargeted onto the resolution comparator and reported NOT CAUGHT --
+# which reads as a test gap and is really a mis-aimed mutant.  --rot-only cannot
+# catch that, because the pattern still matches something.
 mutant "salvage: processes newest first" catch \
-  's/    if \(a->start != b->start\) return a->start < b->start \? -1 : 1;/    if (a->start != b->start) return a->start < b->start ? 1 : -1;/'
+  's/    if \(\(a->start == 0\) != \(b->start == 0\)\) return a->start == 0 \? 1 : -1;\n\n    if \(a->start != b->start\) return a->start < b->start \? -1 : 1;/    if ((a->start == 0) != (b->start == 0)) return a->start == 0 ? 1 : -1;\n\n    if (a->start != b->start) return a->start < b->start ? 1 : -1;/'
+
+# And the guard itself: with D-1b the active file's generation is unknown to
+# salvage's raw scan (start == 0), so it must be forced LAST.  Sorting it first
+# inverts S-3 for the newest file in the database.
+mutant "salvage: active file sorts first, not last" catch \
+  's/    if \(\(a->start == 0\) != \(b->start == 0\)\) return a->start == 0 \? 1 : -1;/    if ((a->start == 0) != (b->start == 0)) return a->start == 0 ? -1 : 1;/'
 
 # S-10.  The report is the mitigation for emitting a possibly stale value, so
 # dropping it leaves the value emitted and the risk unnamed.

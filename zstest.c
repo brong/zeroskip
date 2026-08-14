@@ -13766,6 +13766,15 @@ static void test_salvage_newest_version_wins(void)
     }
     ASSERT_OK(zs_db_store(db, "gone", 4, "x", 1, 0));
     ASSERT_OK(zs_db_delete(db, "gone", 4, 0));
+
+    /* Seal, so the NEWEST version of "same" lives in an in-order file rather
+     * than in the active one.  Without this the active file carries it, and
+     * since a start-0 entry sorts last regardless (D-1b leaves its generation
+     * unknown to salvage's raw scan), the ordering among the generation-named
+     * files could be reversed without changing any answer -- the fixture would
+     * assert S-3 while being unable to see it broken. */
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
     ASSERT(db->snap->nfiles > 1);
     ASSERT_OK(zs_db_close(&db));
 
@@ -13826,6 +13835,44 @@ static void test_salvage_invalid_header(void)
 
 /* S-6: a pointer section that will not load makes a file unreadable under
  * section 7 while its records may be perfect. */
+/* S-3's other half, which the sealed fixture above structurally cannot see:
+ * the newest version living in the ACTIVE file.  D-1b leaves its generation
+ * out of the name, and salvage reads the directory raw (S-1), so it arrives
+ * with start == 0 and has to be forced last -- a naive sort puts it first and
+ * makes the newest file in the database the first one applied. */
+static void test_salvage_active_file_is_newest(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char val[64];
+
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_size = 256;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    for (int i = 0; i < 30; i++) {
+        char v[32];
+        snprintf(v, sizeof(v), "v%02d", i);
+        ASSERT_OK(zs_db_store(db, "same", 4, v, strlen(v), 0));
+        ASSERT_OK(zs_db_store(db, "filler", 6, "0123456789012345678901234567890",
+                              31, 0));
+    }
+
+    /* Deliberately NOT sealed: the newest version is in the active file. */
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT(db->snap->nfiles > 1);
+    ASSERT_OK(zs_db_close(&db));
+
+    salv_reset_out();
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    ASSERT_OK(salv_fetch("same", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v29");
+}
+
 static void test_salvage_ignores_pointer_section(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -15593,6 +15640,8 @@ static struct test_entry tests[] = {
                                         test_salvage_across_a_missing_generation },
     { "test_salvage_newest_version_wins",
                                         test_salvage_newest_version_wins },
+    { "test_salvage_active_file_is_newest",
+                                        test_salvage_active_file_is_newest },
     { "test_salvage_invalid_header",    test_salvage_invalid_header },
     { "test_salvage_ignores_pointer_section",
                                         test_salvage_ignores_pointer_section },
