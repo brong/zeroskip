@@ -1507,21 +1507,32 @@ unreadable one.
   loaded — reaches an implementation-defined threshold. Readers and writers
   apply the same rule: whoever builds the pointers publishes them.
 
-  The threshold is required rather than advisory, and **both ends of it cost**.
+  The threshold is required rather than advisory, and **both ends of it
+  cost** — paid by different parties.
 
-  Too high is the expensive end. A write transaction refreshes its snapshot at
-  begin (C-4), and that refresh replays from the last published `valid_upto` —
-  so a threshold that publishes rarely leaves that replay unbounded, and a
-  one-store-per-transaction load becomes quadratic in the active file. Too low
-  costs an O(records) merge and a whole-table rewrite per commit, which is real
-  but cheaper, because a table is never synced (P-14).
+  The replay from the last published `valid_upto` is paid per snapshot
+  **rebuild**: at open, and at any begin whose C-4i inspection detected
+  another process's commit. A sole writer's steady state rebuilds nothing —
+  its begins reuse the snapshot (C-4i) and its commits fold incrementally
+  (D-13b) — but writers alternating one-store transactions across processes
+  rebuild at every begin, and a threshold that publishes rarely leaves each
+  of those replays unbounded, making that load quadratic in the active file.
+  Too low costs whoever publishes an O(records) merge and a whole-table
+  rewrite per commit, which is real but bounded, because a table is never
+  synced (P-14).
 
-  Measured on 16000 single-store transactions over a 2 MB active file: no cache
-  26.8 s, threshold 1 byte 6.5 s, 4 KB 2.7 s, 32 KB 2.8 s, 256 KB 6.5 s, 1 MB
-  18.6 s. An implementation SHOULD choose its default from a measurement like
-  that one, and the figure is an absolute byte count rather than a fraction of
-  `rollover_size`: the knee is set by how much data a replay walks, which has
-  nothing to do with how large a caller lets a generation grow.
+  Measured on 16000 single-store transactions over a 2 MB active file, with a
+  rebuild forced at every begin — the alternating shape: no cache 13.2 s,
+  threshold 1 byte 5.7 s, 4 KB 2.0 s, 32 KB 2.0 s, 256 KB 3.5 s, 1 MB 8.8 s.
+  The same load as a sole writer whose begins reuse: no cache 1.2 s, 1 byte
+  5.0 s, 4 KB 1.4 s, 32 KB 1.3 s, 256 KB 1.2 s, 1 MB 1.3 s. The low end
+  keeps its cost in both shapes; the high end costs only whoever rebuilds —
+  and the knee a default must sit in is the rebuilding shape's, because that
+  is the shape a threshold exists to bound. An implementation SHOULD choose
+  its default from measurements like these, and the figure is an absolute
+  byte count rather than a fraction of `rollover_size`: the knee is set by
+  how much data a replay walks, which has nothing to do with how large a
+  caller lets a generation grow.
 - **P-14** A table MUST NOT be `fsync`ed before publication. It is rebuildable,
   and a torn or zero-filled file after a crash is rejected by P-11. Syncing it
   would add a sync to the commit path, which C-7 defines as exactly two.
