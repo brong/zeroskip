@@ -3341,6 +3341,8 @@ struct zsi_fcur {
  * source; the alternative is a special case in the merge, which D-14g exists to
  * avoid. */
 static int zsi_txn_cur_load(struct zsi_fcur *fc);
+static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
+                                 size_t *klp);
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
 static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
                                  size_t keylen, bool inclusive);
@@ -3589,17 +3591,32 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
          * position key -- so the copy owns one too, and it has to be released on
          * every exit from here.  A struct that was trivially copyable and then
          * grows an owned pointer is exactly where this goes wrong; `make leaks`
-         * is what caught it. */
+         * is what caught it.
+         *
+         * The match is tested against the PENDING ARRAY's own key, and the
+         * record is decoded only once it is going to be returned.  Loading
+         * first and comparing the decoded key -- which is what this did until
+         * 2026-08-14 -- makes a MISS cost a write(2): the seek lands on the
+         * neighbouring pending record, materialising it flushes the writer's
+         * chunk (zsi_txn_at), and the record is then discarded as not equal.
+         * A caller probing for keys it is about to insert misses every time,
+         * which is how a bulk load in ONE transaction came to issue 300k
+         * write() against 10 fdatasync.  ZS_EPHEMERAL (A-4b) covers the other
+         * half, where the read HITS and the bytes really are wanted. */
         struct zsi_fcur scratch = *fc;
-        int r = zsi_fcur_seek(&scratch, key, keylen);
+        const char *pk;
+        size_t pkl;
+        int r = ZS_NOTFOUND;
 
-        if (r == ZS_OK) {
-            if (scratch.exhausted
-                || fc->compar(scratch.cur.key, scratch.cur.keylen,
-                              key, keylen) != 0)
-                r = ZS_NOTFOUND;
-            else
-                *out = scratch.cur;
+        zsi_txn_cur_seek(&scratch, key, keylen);
+
+        if (zsi_txn_cur_peek_key(&scratch, &pk, &pkl)
+            && fc->compar(pk, pkl, key, keylen) == 0) {
+            r = zsi_fcur_load(&scratch);
+            if (r == ZS_OK) {
+                if (scratch.exhausted) r = ZS_NOTFOUND;
+                else *out = scratch.cur;
+            }
         }
 
         zsi_fcur_fini(&scratch);
@@ -6072,22 +6089,54 @@ static bool zsi_txn_cur_index_rev(struct zsi_fcur *fc, size_t *ti)
     return true;
 }
 
+/* The pending entry this cursor is positioned on, without touching a byte of
+ * the record.  Both the load below and the exact-match test in zsi_fcur_find
+ * go through here so they cannot disagree about WHERE the cursor is -- which
+ * matters more than it looks, since the two would then answer for different
+ * records and a lookup would return the wrong value. */
+static bool zsi_txn_cur_at(struct zsi_fcur *fc, size_t *tip)
+{
+    struct zs_txn *txn = fc->txn;
+    size_t ti;
+
+    if (!txn) return false;
+
+    if (fc->reverse) {
+        if (!zsi_txn_cur_index_rev(fc, &ti)) return false;
+    } else {
+        ti = zsi_txn_cur_index(fc);
+    }
+    if (ti >= txn->npend) return false;
+
+    *tip = ti;
+    return true;
+}
+
+/* The key at the cursor's position, straight from the pending array.
+ *
+ * zsi_pend_set records the key alongside the offset, so an exact-match test
+ * needs no record at all -- which is the whole point: materialising it would
+ * call zsi_txn_at, and a record still in the writer's chunk buffer is flushed
+ * to the file just to be looked at.  A lookup that MISSES would pay a write(2)
+ * for a record it then discards, and a bulk load probing for keys it is about
+ * to insert misses on nearly every one.  Reported from the sqlite integration
+ * as 300k write() against 10 fdatasync over 100k rows in ONE transaction. */
+static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
+                                 size_t *klp)
+{
+    size_t ti;
+    if (!zsi_txn_cur_at(fc, &ti)) return false;
+    *kp  = fc->txn->pend[ti].key;
+    *klp = fc->txn->pend[ti].keylen;
+    return true;
+}
+
 static int zsi_txn_cur_load(struct zsi_fcur *fc)
 {
     struct zs_txn *txn = fc->txn;
     size_t ti;
 
-    if (!txn) { fc->exhausted = true; return ZS_OK; }
-
-    if (fc->reverse) {
-        if (!zsi_txn_cur_index_rev(fc, &ti)) {
-            fc->exhausted = true;
-            return ZS_OK;
-        }
-    } else {
-        ti = zsi_txn_cur_index(fc);
-    }
-    if (ti >= txn->npend) { fc->exhausted = true; return ZS_OK; }
+    if (!zsi_txn_cur_at(fc, &ti)) { fc->exhausted = true; return ZS_OK; }
 
     /* The record was streamed to the active file when it was stored (C-8);
      * decode it back through the transaction's accumulated mappings, whose

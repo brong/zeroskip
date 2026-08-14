@@ -343,11 +343,17 @@ static void bench_batched_store(void)
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
 
-    for (int per = 10; per <= 1000; per *= 10) {
+    /* nrecs means "all of them in one transaction", which is the shape twom's
+     * fillseq uses.  Without it the closest zsbench figure commits every 1000,
+     * so a side-by-side bulk-load row compared batching policy rather than the
+     * two libraries -- 20 commits and 40 fdatasyncs against one and two. */
+    for (int per = 10; per <= nrecs * 10; per *= 10) {
         char label[64], slug[64];
         struct reptimes rt = { {0}, 0 };
-        snprintf(label, sizeof(label), "store, %d per txn", per);
-        if (!selected(label)) continue;
+        if (per > nrecs) per = nrecs;
+        snprintf(label, sizeof(label), per == nrecs ? "store, all in one txn"
+                                                    : "store, %d per txn", per);
+        if (!selected(label)) { if (per == nrecs) break; else continue; }
 
         for (int r = 0; r < reps; r++) {
             snprintf(dir, sizeof(dir), "%s/batch", workdir);
@@ -371,8 +377,93 @@ static void bench_batched_store(void)
             cleanup(dir);
         }
 
-        snprintf(slug, sizeof(slug), "store_%d_per_txn", per);
+        if (per == nrecs) snprintf(slug, sizeof(slug), "store_all_per_txn");
+        else              snprintf(slug, sizeof(slug), "store_%d_per_txn", per);
         record(slug, label, (size_t)nrecs, &rt, "");
+        if (per == nrecs) break;    /* the sweep ends at "all" */
+    }
+    free(val);
+}
+
+/* Read-after-write inside one transaction: store a record, then read it back,
+ * for every record.  This is what a layered consumer does -- SQLite's btree
+ * reads before nearly every insert, for rowid allocation, uniqueness and the
+ * overwrite probe -- and it is NOT what a store-only loop measures.
+ *
+ * The difference is the whole of A-4b.  A read of a record this transaction
+ * just stored has to see bytes that are still in the writer's chunk buffer, so
+ * without ZS_EPHEMERAL it forces a write(2) and the buffering is defeated: one
+ * write per record instead of one per 64KB.  With the flag it is answered out
+ * of the buffer and costs nothing.
+ *
+ * It exists because its absence produced a wrong answer.  Asked in August 2026
+ * whether the library wrote through per record on a bulk load, this tool could
+ * only say "no" -- every store workload here writes without ever reading, so
+ * none of them can see the flush.  The consumer's profile showed 300k write()
+ * against 10 fdatasync over 100k rows in ONE transaction, which is this effect
+ * exactly, and no zsbench figure would have predicted it. */
+static void bench_read_after_write(void)
+{
+    char dir[1200];
+    char *val = malloc(valsize);
+    memset(val, 'v', valsize);
+
+    static const struct {
+        const char *slug, *label;
+        int flags, probe_first;
+    } passes[] = {
+        /* Read back what was just stored: the read HITS a pending record, so
+         * the bytes really are wanted and only A-4b's shorter lifetime can
+         * avoid writing them out first. */
+        { "read_after_write",           "store+read back, durable",   0, 0 },
+        { "read_after_write_ephemeral", "store+read back, ephemeral",
+          ZS_EPHEMERAL, 0 },
+        /* Probe THEN store, which is what a btree layer does before an insert.
+         * The read misses every time, and a miss is settled against the
+         * pending array's key without materialising anything -- so this needs
+         * no flag and should track the store-only rate. */
+        { "probe_then_store",           "probe (miss)+store",         0, 1 },
+    };
+
+    for (unsigned pass = 0; pass < sizeof(passes)/sizeof(passes[0]); pass++) {
+        struct reptimes rt = { {0}, 0 };
+
+        if (!selected(passes[pass].label)) continue;
+
+        for (int r = 0; r < reps; r++) {
+            snprintf(dir, sizeof(dir), "%s/raw", workdir);
+            cleanup(dir);
+            struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+            struct zs_txn *txn = NULL;
+            if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+
+            double t0 = now();
+            for (int i = 0; i < nrecs; i++) {
+                char k[64];
+                const char *v;
+                size_t vl;
+                makekey(k, sizeof(k), i);
+                if (passes[pass].probe_first) {
+                    zs_txn_fetch(txn, k, strlen(k), NULL, NULL, &v, &vl,
+                                 passes[pass].flags);
+                    zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+                } else {
+                    zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+                    zs_txn_fetch(txn, k, strlen(k), NULL, NULL, &v, &vl,
+                                 passes[pass].flags);
+                }
+            }
+            /* Committed inside the timed region, because the store rows above
+             * are: aborting instead excluded C-7's two gates and made this
+             * workload look FASTER than the plain store it contains. */
+            zs_txn_commit(&txn);
+            rep_add(&rt, now() - t0);
+
+            zs_db_close(&db);
+            cleanup(dir);
+        }
+
+        record(passes[pass].slug, passes[pass].label, (size_t)nrecs, &rt, "");
     }
     free(val);
 }
@@ -572,7 +663,13 @@ static void bench_repack_cascade(void)
     for (int r = 0; r < reps; r++) {
         snprintf(dir, sizeof(dir), "%s/cascade", workdir);
         cleanup(dir);
-        struct zs_db *db = open_at(dir, ZS_CREATE, 32 * 1024);
+        /* ZS_NOAUTOREPACK, or this benchmark measures NOTHING.  Since D-16e a
+         * writer runs the cascade itself at a begin that starts a generation,
+         * so by the time the loop below asks, the stores have already merged
+         * the files away: it reported "4 -> 4 files, 0 rounds" and a rate of
+         * zero, which reads as a fast cascade rather than an absent one.  Same
+         * rule as any test whose subject is a file layout (A-14). */
+        struct zs_db *db = open_at(dir, ZS_CREATE | ZS_NOAUTOREPACK, 32 * 1024);
 
         for (int i = 0; i < nrecs; i++) {
             char k[64];
@@ -598,10 +695,14 @@ static void bench_repack_cascade(void)
         cleanup(dir);
     }
 
-    /* ops is FILES MERGED AWAY, not records: the cascade's unit of work is a
-     * file, and a per-record rate here would invite comparison with the store
-     * workloads, which measure something else entirely. */
-    record("repack", "repack cascade", merged, &rt, note);
+    /* ops is RECORDS, matching what twombench's repack reports (*ops = n), so
+     * the two are joinable: both operations rewrite the whole dataset, and
+     * records-rewritten-per-second is the unit they share.  Counting files
+     * merged away instead -- which this did first -- put records/sec beside
+     * files/sec in the comparison and produced a ratio 900x out.  The file
+     * counts stay in the note, where they describe rather than divide. */
+    (void)merged;
+    record("repack", "repack cascade", (size_t)nrecs, &rt, note);
     free(val);
 }
 
@@ -1085,6 +1186,7 @@ int main(int argc, char **argv)
                nrecs, keysize, valsize, reps);
         bench_sequential_store();
         bench_batched_store();
+        bench_read_after_write();
         bench_fetch();
         bench_scan();
         bench_rollover_and_convert();

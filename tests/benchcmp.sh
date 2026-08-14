@@ -64,14 +64,13 @@ trap 'rm -rf "$tmp"' EXIT
 
 # The MAPPING.  Each line is "label|twom_slug|zeroskip_slug".
 #
-# Only fillsync/store_1_per_txn is a like-for-like pair: both commit one
-# transaction per record, so both pay their durability cost per record.  The
-# others are the nearest equivalent and are labelled as such -- in particular
-# twom's fillseq puts every record in ONE transaction, while zeroskip's closest
-# batched figure commits every 1000, so that row compares batching policies as
-# much as it compares libraries.
+# fillsync/store_1_per_txn and fillseq/store_all_per_txn are like-for-like:
+# one transaction per record, and one transaction for the whole load.  The rest
+# are the nearest equivalent.  store_all_per_txn exists BECAUSE of this table:
+# the bulk-load row used to pair fillseq's single transaction against zeroskip
+# committing every 1000, which compared batching policy rather than libraries.
 MAP='one txn per record (synced)|fillsync|store_1_per_txn
-bulk load, batched|fillseq|store_1000_per_txn
+bulk load, one txn|fillseq|store_all_per_txn
 random point lookup|readrandom|fetch
 full scan|readseq|scan
 repack / merge|repack|repack'

@@ -15495,6 +15495,59 @@ static void test_ephemeral_avoids_the_flush(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* A lookup that MISSES inside a write transaction must not flush the writer's
+ * chunk.  The match is decided against the pending array's own key, so no
+ * record is materialised unless it is going to be returned.
+ *
+ * This is the read-before-insert shape: a caller probing for a key it is about
+ * to store misses every time, and until 2026-08-14 each miss cost a write(2) --
+ * the seek landed on a neighbouring pending record, decoding it flushed the
+ * chunk, and the record was then discarded as not equal.  Reported from the
+ * sqlite integration as 300k write() against 10 fdatasync over 100k rows in
+ * ONE transaction, which no store-only benchmark could see.
+ *
+ * Deliberately WITHOUT ZS_EPHEMERAL: the flag covers reads that hit, and this
+ * half must hold for a caller that never asked for the weaker lifetime. */
+static void test_txn_miss_does_not_flush(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    ASSERT_OK(zs_txn_store(txn, "key00000", 8, "value", 5, 0));
+    size_t base = txn->flushed;
+
+    /* Probe-then-insert, exactly as a btree layer does. */
+    for (int i = 1; i < 200; i++) {
+        char k[16];
+        size_t kl = (size_t)snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_EQ(zs_txn_fetch(txn, k, kl, NULL, NULL, &v, &vl, 0),
+                  ZS_NOTFOUND);
+        ASSERT_OK(zs_txn_store(txn, k, kl, "value", 5, 0));
+    }
+    ASSERT_EQU(txn->flushed - base, 0u);
+
+    /* A miss below every pending key, and one above them all: the seek lands
+     * off each end of the array, which must also touch nothing. */
+    ASSERT_EQ(zs_txn_fetch(txn, "aaa", 3, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQ(zs_txn_fetch(txn, "zzz", 3, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQU(txn->flushed - base, 0u);
+
+    /* And a HIT still returns the right bytes -- the load has to happen when
+     * the record is actually wanted.  Without ZS_EPHEMERAL that one does
+     * flush, which is A-4's promise being kept, not a regression. */
+    ASSERT_OK(zs_txn_fetch(txn, "key00007", 8, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "value", 5);
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* A-4b: the weaker lifetime is the ONLY difference.  An ephemeral fetch has to
  * answer exactly what a durable one would, including for the cases where the
  * record is not sitting conveniently in the chunk: one already flushed out of
@@ -16053,6 +16106,7 @@ static struct test_entry tests[] = {
       test_rollover_txns_seals_on_span_count },
     { "test_rollover_txns_counts_the_replay_window",
       test_rollover_txns_counts_the_replay_window },
+    { "test_txn_miss_does_not_flush",   test_txn_miss_does_not_flush },
     { "test_ephemeral_avoids_the_flush", test_ephemeral_avoids_the_flush },
     { "test_ephemeral_matches_durable", test_ephemeral_matches_durable },
     { "test_ephemeral_rejected_on_cursor", test_ephemeral_rejected_on_cursor },

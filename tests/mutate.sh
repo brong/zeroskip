@@ -1535,6 +1535,16 @@ mutant "cursor: txn_seq not taken at open" subsumed \
 mutant "fetch: ephemeral still flushes" catch \
   's/    if \(ephemeral && off >= txn->flushed\n        && need <= txn->flushed \+ txn->chunklen\)\n        return txn->chunk \+ \(off - txn->flushed\);/    \/* served from the file as ever *\//'
 
+# A transaction lookup that materialises the record BEFORE deciding whether it
+# is the one asked for -- the pre-2026-08-14 behaviour.  Every answer stays
+# correct, which is why only a flush assertion can catch it: the seek lands on
+# a neighbouring pending record, decoding it drags the writer's chunk out to
+# the file, and the record is then discarded as not equal.  A caller probing
+# for keys it is about to insert misses every time, which is how a bulk load in
+# ONE transaction issued 300k write() against 10 fdatasync.
+mutant "txn lookup materialises before comparing" catch \
+  's/        zsi_txn_cur_seek\(&scratch, key, keylen\);\n\n        if \(zsi_txn_cur_peek_key\(&scratch, &pk, &pkl\)\n            && fc->compar\(pk, pkl, key, keylen\) == 0\) \{\n            r = zsi_fcur_load\(&scratch\);\n            if \(r == ZS_OK\) \{\n                if \(scratch.exhausted\) r = ZS_NOTFOUND;\n                else \*out = scratch.cur;\n            \}\n        \}/        zsi_txn_cur_seek(\&scratch, key, keylen);\n        (void)pk; (void)pkl;\n        r = zsi_fcur_load(\&scratch);\n        if (r == ZS_OK) {\n            if (scratch.exhausted\n                || fc->compar(scratch.cur.key, scratch.cur.keylen,\n                              key, keylen) != 0)\n                r = ZS_NOTFOUND;\n            else *out = scratch.cur;\n        }/'
+
 # A-4b: the conditional-store probe made durable again.  ZS_IFNOTEXIST and
 # ZS_IFEXIST look up a record only to decide, and never let it escape, so a
 # durable probe flushes the chunk on every conditional store for bytes it
