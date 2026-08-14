@@ -162,6 +162,7 @@ a spec label is missing here.
 | `D-16a` | The two jobs divide by whether a file has an `end`, which is what | `mp_repack_and_writer_concurrent` |
 | `D-16b` | A cascade writes one output for the whole selected set, not one per | `repack_selection`, `zsbench` |
 | `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_backlog_oldest_first` |
+| `D-16e` | **Who runs it.** A writer SHOULD run the cascade itself, at the start of | `autorepack_bounds_the_file_count`, `noautorepack_leaves_the_files` |
 | `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
 | `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
 | `D-17a` | Ancestors are copied verbatim; nothing is renumbered and no | `repack_v1_ancestor_v3_value` |
@@ -305,6 +306,7 @@ a spec label is missing here.
 | `A-11` | `zs_db_compact` performs D-26, returning `ZS_OK` only when the | `compact_to_one_file`, `compact_reports_and_fails_on_bad_file` |
 | `A-12` | The point-lookup forms on `zs_db_fetch` and `zs_txn_fetch`: | `fetchprev_basic`, `fetchprev_sees_txn_writes`, `fetchnext_inclusive`, `fetchnext_inclusive_sees_txn_writes`, `reverse_rejected_compositions` |
 | `A-13` | `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor` | `cursor_reverse_seek_and_skiproot`, `reverse_a4_lifetime`, `reverse_rejected_compositions` |
+| `A-14` | `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only | `noautorepack_leaves_the_files` |
 
 ## Conformance suite (`T-n`)
 

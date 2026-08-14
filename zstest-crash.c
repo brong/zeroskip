@@ -1038,8 +1038,12 @@ static void test_snapshot_gap_retry(void)
     }
     zs_db_close(&db);
 
-    /* Convert, so generations 1 and 2 are in-order files and both are RESOLVED. */
-    db = open_db(0);
+    /* Convert, so generations 1 and 2 are in-order files and both are RESOLVED.
+     *
+     * ZS_NOAUTOREPACK because this test's subject is the layout BEFORE a
+     * repack -- it builds the [1-2] output by hand below.  D-16e would merge
+     * the two the moment this begin ran, leaving nothing to merge (A-14). */
+    db = open_db(ZS_NOAUTOREPACK);
     CHECK(db != NULL, "reopen for convert");
     {
         struct zs_txn *t = NULL;

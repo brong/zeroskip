@@ -174,12 +174,15 @@ check "check after convert" "OK" "$($TOOL "$DB2" check)"
 # --- repack ------------------------------------------------------------------
 DB3="$WORK/db3"
 $TOOL "$DB3" create --uuid "$UUID"
+# --noautorepack: the point of this case is that `repack` reduces the count, so
+# the layout has to survive being built.  D-16e merges it away otherwise, and
+# the case would pass for the wrong reason -- nothing left to merge (A-14).
 for i in 1 2 3 4 5 6 7 8; do
-    $TOOL "$DB3" store "3$i" "763$i" --hex
+    $TOOL "$DB3" store "3$i" "763$i" --hex --noautorepack
     printf '\336\255\276\357\336\255\276\357' \
         >> "$DB3/$(ls "$DB3" | grep '^zeroskip-' | sort | tail -1)"
 done
-$TOOL "$DB3" convert
+$TOOL "$DB3" convert --noautorepack
 before=$(ls "$DB3" | grep -c '^zeroskip-')
 $TOOL "$DB3" repack
 after=$(ls "$DB3" | grep -c '^zeroskip-')

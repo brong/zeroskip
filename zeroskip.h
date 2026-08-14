@@ -63,6 +63,17 @@ enum zs_flagspec {
                                   gate for callers pacing durability
                                   themselves. */
     ZS_NONBLOCKING   = 1<<4,   /* open,txn: ZS_LOCKED rather than wait for a lock */
+    ZS_NOAUTOREPACK  = 1<<5,   /* open:    do not run the repack cascade from a
+                                  write transaction (D-16e, A-14).  D-16e puts
+                                  an UNBOUNDED merge on the write path, paid by
+                                  whichever writer starts a new generation and
+                                  finds work; this is for a caller that would
+                                  rather schedule it from idle time through
+                                  zs_db_repack.  zs_db_should_repack still
+                                  reports the work.  Setting it and then never
+                                  repacking gives a read path that degrades
+                                  linearly in the file count -- every read
+                                  merges across every file. */
 
     ZS_IFNOTEXIST    = 1<<11,  /* store:   only if absent, else ZS_EXISTS */
     ZS_IFEXIST       = 1<<12,  /* store:   only if present, else ZS_NOTFOUND */

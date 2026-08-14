@@ -1345,6 +1345,30 @@ mutant "txn: read transaction references no files" catch \
   's/    if \(shared && zsi_hold_add_snapshot\(&txn->hold, txn->snap\) != ZS_OK\) \{/    if (false \&\& zsi_hold_add_snapshot(\&txn->hold, txn->snap) != ZS_OK) {/'
 
 echo
+echo "the writer runs the cascade (D-16e)"
+
+# D-16e: without the trigger nothing merges unless the caller remembers, which
+# is the field failure -- 103 files, none merged, reads 17.5x slower.
+mutant "autorepack: trigger removed" catch \
+  's/            if \(new_gen && zsi_should_repack\(db->snap\)\)\n                \(void\)zsi_repack\(db\);/            \/* no cascade *\//'
+
+# The trigger is the NEW-GENERATION condition (D-9a).  This looks like it
+# should be equivalent -- probing more often can only find work that is
+# genuinely there -- and it is not: a transaction that merely appends cannot
+# have created work, but work left over from EARLIER activity is still
+# outstanding, so the broadened trigger merges at moments the narrow one
+# leaves alone.  zstest-crash catches it on the resulting file layout.  Kept
+# as a reminder that "more eager" is a behaviour change here, not a tuning
+# knob.
+mutant "autorepack: probes on every begin, not just new generations" catch \
+  's/            bool new_gen = !\(act && zsi_unordered_is_clean\(act\)\n                             && act->size < db->rollover_size\);/            bool new_gen = true;/'
+
+# A-14 must actually suppress it, or a caller who asked to schedule the
+# cascade themselves gets it on the write path anyway.
+mutant "autorepack: ZS_NOAUTOREPACK ignored" catch \
+  's/        if \(!db->no_auto_repack\) \{/        if (1) {/'
+
+echo
 echo "shared immutable files (C-4c)"
 
 # C-4c: the ACTIVE file is the one file that changes, and its index and

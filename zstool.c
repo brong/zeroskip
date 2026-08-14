@@ -182,6 +182,10 @@ static int usage(void)
         "                         prints " NOTFOUND_MARKER " for an absent key.  The\n"
         "                         interop runner's mode: embedded NULs and\n"
         "                         newlines survive a comparison as text (T-12)\n"
+        "  --noautorepack         do not run the repack cascade from a write\n"
+        "                         transaction (D-16e).  For building a file\n"
+        "                         layout deliberately, which the cascade would\n"
+        "                         otherwise merge away as fast as it is made\n"
         "  --index-dir PATH       enable the pointer table cache for this run;\n"
         "                         MUST NOT be the database directory (P-2)\n"
         "\n"
@@ -199,6 +203,7 @@ int main(int argc, char **argv)
     struct zs_db *db = NULL;
     const char *dir, *cmd;
     const char *uuid = NULL, *prefix = NULL, *index_dir = NULL;
+    int noautorepack = 0;
     int detail = 0, nochecksum = 0;
     long hold_ms = 0;
     int r;
@@ -239,6 +244,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--for") && i + 1 < argc)    hold_ms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--nochecksum"))             nochecksum = 1;
         else if (!strcmp(argv[i], "--hex"))                    hexmode = 1;
+        else if (!strcmp(argv[i], "--noautorepack"))          noautorepack = 1;
         else if (!strcmp(argv[i], "--index-dir") && i + 1 < argc) index_dir = argv[++i];
     }
 
@@ -249,6 +255,7 @@ int main(int argc, char **argv)
      * way to test that the format is really shared rather than merely written.
      * A threshold of one byte, because a corpus case is far smaller than any
      * sensible default and would otherwise never publish anything. */
+    if (noautorepack) setup.flags |= ZS_NOAUTOREPACK;
     setup.index_dir = index_dir;
     if (index_dir) setup.index_threshold = 1;
 

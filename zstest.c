@@ -6360,6 +6360,19 @@ static struct zs_db *fresh_db(void)
     return db;
 }
 
+/* For tests that need to BUILD a particular file layout.  D-16e merges one
+ * away as fast as store+seal can make it, which is the point of D-16e and the
+ * ruin of any test whose subject is the layout itself (A-14). */
+static struct zs_db *fresh_db_noautorepack(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
 /* Collect a whole database through the PUBLIC scan, so these tests exercise the
  * same path a caller would. */
 static int api_collect_cb(void *rock, const char *key, size_t keylen,
@@ -7500,7 +7513,7 @@ static void test_empty_value_is_not_null_on_read(void)
  * complete boundary belong to the snapshot that built them (G-4). */
 static void test_snapshot_reuses_immutable_files(void)
 {
-    struct zs_db *db = fresh_db();
+    struct zs_db *db = fresh_db_noautorepack();
     ASSERT_NOT_NULL(db);
 
     /* Three in-order files plus an active one. */
@@ -7542,7 +7555,7 @@ static void test_snapshot_reuses_immutable_files(void)
  * every input a repack ever superseded. */
 static void test_fcache_sweeps_superseded_files(void)
 {
-    struct zs_db *db = fresh_db();
+    struct zs_db *db = fresh_db_noautorepack();
     ASSERT_NOT_NULL(db);
 
     for (int i = 0; i < 6; i++) {
@@ -7560,6 +7573,77 @@ static void test_fcache_sweeps_superseded_files(void)
     /* The cache must not still be holding the inputs.  Bounded by what the
      * current set actually names. */
     ASSERT(db->fcache.n <= db->snap->nfiles);
+
+    zs_db_close(&db);
+}
+
+/* D-16e: the writer runs the cascade itself, so a caller that never calls
+ * zs_db_repack does not accumulate files without bound.
+ *
+ * The workload is the one that produced this in the field: store, seal, repeat,
+ * which leaves one single-generation in-order file per transaction. Without
+ * D-16e that is a file per iteration forever; with it the count stays near
+ * log(n), and every read stops merging across the whole set. */
+static void test_autorepack_bounds_the_file_count(void)
+{
+    struct zs_db *db = fresh_db();
+    char val[512];
+    const int n = 40;
+
+    ASSERT_NOT_NULL(db);
+    memset(val, 'v', sizeof(val));
+
+    for (int i = 0; i < n; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, val, sizeof(val), 0));
+        ASSERT_OK(zs_db_seal(db));
+    }
+
+    /* Geometric, not linear.  The bound is generous on purpose -- what is
+     * being asserted is that it does not track n, not an exact shape. */
+    ASSERT(db->snap->nfiles < 12);
+
+    /* And every record is still there, which is the part a merge can break. */
+    for (int i = 0; i < n; i++) {
+        char k[32];
+        const char *v;
+        size_t vl;
+        int kl = snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_OK(zs_db_fetch(db, k, kl, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, sizeof(val));
+    }
+
+    zs_db_close(&db);
+}
+
+/* A-14: and the caller can turn it off, which is what makes the latency of an
+ * unbounded cascade (D-16b) something they can schedule rather than something
+ * that happens to them. The same workload, one flag apart. */
+static void test_noautorepack_leaves_the_files(void)
+{
+    struct zs_db *db = fresh_db_noautorepack();
+    char val[512];
+    const int n = 40;
+
+    ASSERT_NOT_NULL(db);
+    memset(val, 'v', sizeof(val));
+
+    for (int i = 0; i < n; i++) {
+        char k[32];
+        int kl = snprintf(k, sizeof(k), "key%05d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, val, sizeof(val), 0));
+        ASSERT_OK(zs_db_seal(db));
+    }
+
+    /* Nothing merged: one file per transaction, as before D-16e. */
+    ASSERT(db->snap->nfiles >= (size_t)n);
+
+    /* The work is still REPORTED -- the flag suppresses the doing, not the
+     * telling, so a caller scheduling its own cascade can still find it. */
+    ASSERT(zs_db_should_repack(db));
+    ASSERT_OK(zs_db_repack(db));
+    ASSERT(db->snap->nfiles < 12);
 
     zs_db_close(&db);
 }
@@ -15185,6 +15269,10 @@ static struct test_entry tests[] = {
                                         test_snapshot_reuses_immutable_files },
     { "test_fcache_sweeps_superseded_files",
                                         test_fcache_sweeps_superseded_files },
+    { "test_autorepack_bounds_the_file_count",
+                                        test_autorepack_bounds_the_file_count },
+    { "test_noautorepack_leaves_the_files",
+                                        test_noautorepack_leaves_the_files },
 
     { "test_convert_basic",             test_convert_basic },
     { "test_convert_steady_state",      test_convert_steady_state },

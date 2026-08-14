@@ -4516,6 +4516,7 @@ struct zs_db {
     bool         idx_publish_warned; /* P-15: report the first failure only */
 
     bool         readonly;          /* ZS_SHARED (A-5) */
+    bool         no_auto_repack;    /* ZS_NOAUTOREPACK (A-14, D-16e) */
     bool         nocsum;            /* ZS_NOCSUM (F-5e) */
     bool         nosync;            /* ZS_NOSYNC (C-7c) */
     bool         nonblocking;
@@ -5913,6 +5914,11 @@ static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
  * means this one forward declaration, since conversion needs the write path's file
  * writer in turn. */
 static int zsi_convert_pending(struct zs_db *db);
+
+/* D-16e: a write transaction runs the repack cascade before it takes the write
+ * lock.  Declared here because the REPACK section is below this one. */
+static bool zsi_should_repack(struct zsi_snapshot *snap);
+static int  zsi_repack(struct zs_db *db);
 static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 
 /* Append bytes to a file descriptor, retrying a short write. */
@@ -6189,6 +6195,48 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
         r = zsi_check_writable(db);
         if (r != ZS_OK) return r;
         if (db->write_txn) return ZS_BADUSAGE;      /* one at a time */
+
+        /* D-16e.  Here rather than at the end of the commit that created the
+         * work, because C-1d orders repack BEFORE write: a commit holds the
+         * write lock and so structurally cannot take the repack lock.  This
+         * transaction holds nothing yet, so the chain is available in order.
+         *
+         * Only when this transaction is about to START A NEW GENERATION --
+         * the same condition zsi_writer_active applies (D-9a): no clean active
+         * file, or one already past rollover_size.  That is the only way the
+         * file count grows, so it is the only moment new repack work can
+         * appear; a transaction appending to an existing active file cannot
+         * have created any, and probing on every begin would pay for an
+         * answer that cannot have changed.
+         *
+         * The cost lands on the transaction that finds the work, which is the
+         * amortisation D-12 already uses for conversion.  A cascade is
+         * UNBOUNDED (D-16b), so this is a latency spike on whichever writer
+         * trips it; what it buys is that no caller has to remember, and
+         * forgetting is expensive and invisible -- every read merges across
+         * every file, so the read path degrades linearly in the file count
+         * while the database merely looks slow.
+         *
+         * Both tests are against a possibly-stale snapshot, deliberately.
+         * Neither decides anything except whether the repack lock is worth
+         * taking: zsi_repack refreshes and re-selects underneath that lock and
+         * returns having done nothing if the work is gone, so losing the race
+         * to another process costs one lock acquisition and a rescan rather
+         * than a wrong decision.
+         *
+         * Never fatal.  A failed or refused repack leaves a database that is
+         * merely unmerged, and failing the caller's transaction over it would
+         * report an error they cannot act on; the next writer tries again.
+         * ZS_NONBLOCKING is honoured inside zsi_repack, so a caller who asked
+         * not to wait does not wait here either. */
+        if (!db->no_auto_repack) {
+            struct zsi_file *act = zsi_snapshot_active(db->snap);
+            bool new_gen = !(act && zsi_unordered_is_clean(act)
+                             && act->size < db->rollover_size);
+
+            if (new_gen && zsi_should_repack(db->snap))
+                (void)zsi_repack(db);
+        }
     }
 
     txn = zsi_zmalloc(sizeof(*txn));
@@ -7771,6 +7819,7 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     db->wfd_cache = -1;
     db->flags = setup->flags;
     db->readonly = (setup->flags & ZS_SHARED) != 0;
+    db->no_auto_repack = (setup->flags & ZS_NOAUTOREPACK) != 0;
     db->nocsum = (setup->flags & ZS_NOCSUM) != 0;
     db->nosync = (setup->flags & ZS_NOSYNC) != 0;
     db->nonblocking = (setup->flags & ZS_NONBLOCKING) != 0;
