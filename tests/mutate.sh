@@ -1305,7 +1305,15 @@ echo "A-4a borrow lifetime across a snapshot swap"
 # and releasing the outgoing snapshot there unmaps the caller's bytes.  Both
 # mutants restore the plain release.
 mutant "txn: first-store swap releases the borrowed snapshot" catch \
-  's/    int hr = zsi_snapshot_retire\(&txn->snap, &txn->hold\);\n    if \(hr != ZS_OK\) \{ close\(fd\); return hr; \}/    zsi_snapshot_release(\&txn->snap);/'
+  's/        int hr = zsi_snapshot_retire\(&txn->snap, &txn->hold\);\n        if \(hr != ZS_OK\) \{ close\(fd\); return hr; \}/        zsi_snapshot_release(\&txn->snap);/'
+
+# D-13b/G-6: retiring a snapshot the transaction is ALREADY on hands our own
+# reference to the hold list and takes a fresh one, so the snapshot carries an
+# extra reference for the rest of the transaction -- and the commit-site fold
+# reads refcount == 2 as "nobody else is looking", so every commit silently
+# demotes to a full rebuild.  Costs no data, which is why it needs a mutant.
+mutant "txn: retires the snapshot even when it did not move" catch \
+  's/    if \(db->snap != txn->snap\) \{\n        int hr = zsi_snapshot_retire/    if (1) {\n        int hr = zsi_snapshot_retire/'
 
 mutant "cursor: live swap releases the borrowed snapshot" catch \
   's/                int hr = zsi_snapshot_retire\(&old, &c->hold\);\n                if \(hr != ZS_OK\) return hr;/                zsi_snapshot_release(\&old);/'
@@ -1314,6 +1322,26 @@ mutant "cursor: live swap releases the borrowed snapshot" catch \
 # object owning it is the same dangle with more code.
 mutant "retire: detaches the mapping but still unmaps it" catch \
   's/        f->base = NULL;\n        f->maplen = 0;/        \/* left attached *\//'
+
+# A-4a: the bug the first fix shipped with.  A snapshot that is still SHARED
+# cannot have its mappings taken over, and dropping the reference instead
+# assumes the remaining holder outlives the borrower -- a cursor does not.
+mutant "retire: drops the reference when still shared" catch \
+  's/        h->s\[h->ns\+\+\] = s;      \/\* our reference, transferred not dropped \*\/\n        \*sp = NULL;\n        return ZS_OK;/        zsi_snapshot_release(sp);\n        return ZS_OK;/'
+
+# ... and the release at the end of the borrow must actually happen, or the
+# shared case leaks a snapshot and every descriptor in it.
+mutant "hold: shared snapshot references never released" catch \
+  's/    for \(size_t i = 0; i < h->ns; i\+\+\)\n        zsi_snapshot_release\(&h->s\[i\]\);/    \/* leaked *\//'
+
+echo
+echo "empty value vs deletion on read (A-1)"
+
+# A-1: an empty value must not collapse into the deletion case on read.  The
+# db-level path copies into retbuf and is the one that can silently start
+# returning NULL for a zero-length value.
+mutant "retain: empty value returns NULL like a deletion" catch \
+  's/    if \(valp\) \*valp = db->retbuf \+ r->keylen \+ 1;/    if (valp) *valp = r->vallen ? db->retbuf + r->keylen + 1 : NULL;/'
 
 echo
 echo "reverse iteration (D-14k, D-14l, A-12, A-13)"

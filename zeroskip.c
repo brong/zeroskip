@@ -3820,12 +3820,24 @@ struct zsi_holdmap {
 };
 
 struct zsi_hold {
-    struct zsi_holdmap *m;
-    size_t              n, a;
+    struct zsi_holdmap   *m;
+    size_t                n, a;
+
+    /* Snapshots that were still SHARED at the swap, so their mappings could
+     * not be taken over -- the reference is kept instead.  See the note in
+     * zsi_snapshot_retire for why dropping it is not an option. */
+    struct zsi_snapshot **s;
+    size_t                ns, as;
 };
 
 static void zsi_hold_fini(struct zsi_hold *h)
 {
+    for (size_t i = 0; i < h->ns; i++)
+        zsi_snapshot_release(&h->s[i]);
+    free(h->s);
+    h->s = NULL;
+    h->ns = h->as = 0;
+
     for (size_t i = 0; i < h->n; i++)
         munmap(h->m[i].base, h->m[i].len);
     free(h->m);
@@ -3833,12 +3845,31 @@ static void zsi_hold_fini(struct zsi_hold *h)
     h->n = h->a = 0;
 }
 
-/* Release a reference the borrower `h` may hold pointers into.
+/* Hand `*sp` over to the borrower `h`, which may hold pointers into it.
  *
- * Ordinary release while others still reference it; on the LAST reference,
- * the mappings move to `h` first.  Capacity is reserved before anything is
- * touched, so a failure leaves the snapshot exactly as it was and the caller
- * can propagate the error rather than choosing between a leak and a dangle. */
+ * Two cases, and the split is the whole subtlety:
+ *
+ *   - LAST reference: take the mappings over and let the snapshot go, so the
+ *     descriptors and indexes are freed and only the bytes survive.  This is
+ *     the common path -- a live cursor's swap and a sole-writer transaction's
+ *     first store both land here -- and it costs no descriptor.
+ *
+ *   - STILL SHARED: keep our reference instead of dropping it, and release it
+ *     when the borrower ends.  The mappings cannot be taken over here, because
+ *     the other holder would unmap them again.
+ *
+ * Dropping the reference in the shared case -- which is what this did until
+ * 2026-08-14 -- looks safe and is not: it assumes the other holder outlives
+ * US, and nothing says it does.  A transaction that fetches, opens a cursor,
+ * then stores leaves the outgoing snapshot held only by that cursor, and
+ * closing the cursor unmaps bytes the TRANSACTION still has pointers to and
+ * was promised for its whole life (A-4).  Reported from the sqlite integration
+ * as "database disk image is malformed" out of a savepoint workload, which is
+ * where a fetch, a cursor and a store land in that order.
+ *
+ * Capacity is reserved before anything is touched, so a failure leaves the
+ * snapshot exactly as it was and the caller can propagate the error rather
+ * than choosing between a leak and a dangle. */
 static int zsi_snapshot_retire(struct zsi_snapshot **sp, struct zsi_hold *h)
 {
     struct zsi_snapshot *s = *sp;
@@ -3846,7 +3877,15 @@ static int zsi_snapshot_retire(struct zsi_snapshot **sp, struct zsi_hold *h)
     if (!s) return ZS_OK;
 
     if (s->refcount > 1) {
-        zsi_snapshot_release(sp);
+        if (h->ns == h->as) {
+            size_t want = h->as ? h->as * 2 : 4;
+            struct zsi_snapshot **p = realloc(h->s, want * sizeof(*p));
+            if (!p) return ZS_INTERNAL;
+            h->s = p;
+            h->as = want;
+        }
+        h->s[h->ns++] = s;      /* our reference, transferred not dropped */
+        *sp = NULL;
         return ZS_OK;
     }
 
@@ -5503,10 +5542,19 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
      * file at all, so the very next transaction takes that path.  Reported
      * from the sqlite integration as crashes with the library nowhere in the
      * backtrace. */
-    int hr = zsi_snapshot_retire(&txn->snap, &txn->hold);
-    if (hr != ZS_OK) { close(fd); return hr; }
-    txn->snap = db->snap;
-    txn->snap->refcount++;
+    /* Only when it actually MOVED.  zsi_writer_active refreshes just on the
+     * new-generation path, so the ordinary append leaves db->snap exactly where
+     * this transaction already is -- and retiring that would hand our own
+     * reference to the hold list and take a fresh one, leaving the snapshot
+     * with an extra reference for the rest of the transaction.  The commit-site
+     * fold reads refcount == 2 as "nobody else is looking" (D-13b, G-6), so the
+     * inflated count silently demotes every commit to a full rebuild. */
+    if (db->snap != txn->snap) {
+        int hr = zsi_snapshot_retire(&txn->snap, &txn->hold);
+        if (hr != ZS_OK) { close(fd); return hr; }
+        txn->snap = db->snap;
+        txn->snap->refcount++;
+    }
 
     struct zsi_file *act = zsi_snapshot_active(db->snap);
     zs_csum *cs = act && act->hdr_valid

@@ -7363,6 +7363,134 @@ static void test_a4_borrow_survives_cursor_swap(void)
     zs_db_close(&db);
 }
 
+/* A-4a, the case the first fix missed: the outgoing snapshot is still SHARED.
+ *
+ * Taking the mappings over is only available to the last holder, so with a
+ * cursor also referencing it the swap could only keep a reference -- and the
+ * first version dropped one instead, on the assumption that the remaining
+ * holder outlives us. It does not: the cursor closes, the snapshot hits zero,
+ * and the TRANSACTION's borrow is unmapped underneath it.
+ *
+ * Reported from the sqlite integration as "database disk image is malformed"
+ * out of a savepoint workload, which is where fetch, cursor and store land in
+ * exactly this order. */
+static void test_a4_borrow_survives_shared_snapshot_swap(void)
+{
+    struct zs_db *db = fresh_db();
+    struct zs_cursor *c = NULL;
+    char big[8192];
+    const char *k, *v, *ck, *cv;
+    size_t kl, vl, ckl, cvl;
+
+    ASSERT_NOT_NULL(db);
+    memset(big, 'v', sizeof(big));
+    ASSERT_OK(zs_db_store(db, "key", 3, big, sizeof(big), 0));
+    ASSERT_OK(zs_db_seal(db));
+
+    struct zs_txn *txn = NULL;
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    /* The borrow, promised for the transaction's lifetime. */
+    ASSERT_OK(zs_txn_fetch(txn, "key", 3, &k, &kl, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(big));
+
+    /* A third reference on the transaction's snapshot. */
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, 0));
+    ASSERT_OK(zs_cursor_next(c, &ck, &ckl, &cv, &cvl));
+
+    /* The swap, with the snapshot shared. */
+    struct zsi_snapshot *before = txn->snap;
+    ASSERT_OK(zs_txn_store(txn, "other", 5, "x", 1, 0));
+    ASSERT(txn->snap != before);
+
+    /* Now the cursor lets go.  Before the fix this unmapped `v`, so the reads
+     * below come FIRST: a regression here should fail as the use-after-unmap
+     * it is, not as a bookkeeping assertion that merely correlates with one. */
+    zs_cursor_fini(&c);
+    ASSERT_MEM_EQ(k, "key", 3);
+    ASSERT_MEM_EQ(v, big, sizeof(big));
+
+    /* Kept as a reference rather than taken over, precisely because it was
+     * shared -- the distinction the bug turned on. */
+    ASSERT(txn->hold.ns > 0);
+
+    ASSERT_OK(zs_txn_commit(&txn));
+    zs_db_close(&db);
+}
+
+/* A-1 on the read side: an empty value is a non-NULL pointer of length 0 on
+ * EVERY path, and absent is ZS_NOTFOUND. Returning NULL would collapse it into
+ * the deletion case that store is careful to keep distinct, leaving a caller
+ * to track "present but empty" itself. */
+static int empty_cb(void *rock, const char *key, size_t keylen,
+                    const char *val, size_t vallen)
+{
+    int *seen = rock;
+
+    if (keylen == 7 && memcmp(key, "a_empty", 7) == 0) {
+        CB_ASSERT(val != NULL);
+        CB_ASSERT_EQ(vallen, 0);
+        (*seen)++;
+    }
+    return 0;
+}
+
+static void test_empty_value_is_not_null_on_read(void)
+{
+    struct zs_db *db = fresh_db();
+    struct zs_cursor *c = NULL;
+    struct zs_txn *txn = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "a_empty", 7, "", 0, 0));
+    ASSERT_OK(zs_db_store(db, "b_full", 6, "x", 1, 0));
+
+    /* 1. zs_db_fetch */
+    ASSERT_OK(zs_db_fetch(db, "a_empty", 7, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQU(vl, 0u);
+
+    /* ... and absent is a different answer, not the same one. */
+    ASSERT_EQ(zs_db_fetch(db, "nope", 4, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* 2. zs_txn_fetch over committed data */
+    ASSERT_OK(zs_db_begin_txn(db, 1, &txn));
+    ASSERT_OK(zs_txn_fetch(txn, "a_empty", 7, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQU(vl, 0u);
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* 3. a cursor yield */
+    ASSERT_OK(zs_db_begin_cursor(db, "a_", 2, &c, ZS_SHARED | ZS_CURSOR_PREFIX));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "a_empty", 7);
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQU(vl, 0u);
+    zs_cursor_fini(&c);
+
+    /* 4. a foreach callback */
+    int seen = 0;
+    ASSERT_OK(zs_db_foreach(db, NULL, 0, NULL, empty_cb, &seen, 0));
+    ASSERT_EQ(seen, 1);
+
+    /* 5. the transaction's OWN uncommitted write, which reads back through
+     *    the pending array rather than a file mapping. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "c_pend", 6, "", 0, 0));
+    ASSERT_OK(zs_txn_fetch(txn, "c_pend", 6, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQU(vl, 0u);
+
+    /* And a deletion in the same transaction stays absent, not empty. */
+    ASSERT_OK(zs_txn_delete(txn, "b_full", 6, 0));
+    ASSERT_EQ(zs_txn_fetch(txn, "b_full", 6, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    zs_db_close(&db);
+}
+
 /*
  * ============================================================
  * Conversion (D-12, T-10a)
@@ -14976,6 +15104,10 @@ static struct test_entry tests[] = {
                                         test_a4_borrow_survives_new_generation },
     { "test_a4_borrow_survives_cursor_swap",
                                         test_a4_borrow_survives_cursor_swap },
+    { "test_a4_borrow_survives_shared_snapshot_swap",
+                                        test_a4_borrow_survives_shared_snapshot_swap },
+    { "test_empty_value_is_not_null_on_read",
+                                        test_empty_value_is_not_null_on_read },
 
     { "test_convert_basic",             test_convert_basic },
     { "test_convert_steady_state",      test_convert_steady_state },

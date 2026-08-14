@@ -286,14 +286,14 @@ a spec label is missing here.
 | Req | Requirement | Enforced by |
 |---|---|---|
 | `A-0` | Every read and write entry point exists in three forms — on the | `api_three_forms` |
-| `A-1` | `store` with `val == NULL` writes a deletion; with a non-NULL | `record_byte_layout`, `span_basic`, `tool.sh`, +1 more |
+| `A-1` | `store` with `val == NULL` writes a deletion; with a non-NULL | `record_byte_layout`, `span_basic`, `tool.sh`, +1 more, `empty_value_is_not_null_on_read` |
 | `A-1a` | A write inside a transaction is visible to subsequent reads on that | `tool.sh`, `write_txn_isolation` |
 | `A-1b` | The `*_delete` forms are **macros** over `store` and | `api_cursor_replace`, `api_three_forms`, `write_basic` |
 | `A-1c` | A transaction supports **any number of cursors open at once**, and | `txn_many_cursors`, `txn_insert_select_self` |
 | `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
 | `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime`, `txn_fetch_survives_overwrite`, `reverse_a4_lifetime` |
-| `A-4a` | A-4 binds across a **snapshot swap**. A transaction or cursor may | `a4_borrow_survives_new_generation`, `a4_borrow_survives_cursor_swap` |
+| `A-4a` | A-4 binds across a **snapshot swap**. A transaction or cursor may | `a4_borrow_survives_new_generation`, `a4_borrow_survives_cursor_swap`, `a4_borrow_survives_shared_snapshot_swap` |
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
 | `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |
