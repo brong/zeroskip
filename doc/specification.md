@@ -1822,6 +1822,14 @@ different calls, though not every flag is meaningful everywhere:
 - **A-1** `store` with `val == NULL` writes a deletion; with a non-NULL
   zero-length value it stores an empty value. These are distinct states. This
   matches the convention of the other Cyrus database backends.
+
+  **On the read side the distinction MUST survive**, and on every path: a
+  fetch, a cursor yield and a `foreach` callback all report an empty value as a
+  **non-NULL pointer with length 0**, while an absent or deleted key is
+  `ZS_NOTFOUND` from a fetch and is simply not yielded by a traversal. A caller
+  therefore never has to track "present but empty" itself. Returning NULL for
+  an empty value would collapse it into the deletion case that `store` is
+  careful to keep separate, so an implementation MUST NOT.
 - **A-1b** The `*_delete` forms are **macros** over `store` and
   `cursor_replace`, not separate entry points, so there is exactly one write
   path to implement and test. `ZS_IFEXIST` composes with them naturally to mean
@@ -1863,6 +1871,16 @@ different calls, though not every flag is meaningful everywhere:
   process's descriptor table. An implementation SHOULD retain only the
   **mappings**, closing descriptors and freeing indexes at the swap as usual:
   the bytes are page-cache-backed and cost address space alone.
+
+  **A snapshot that is still shared at the swap is not thereby safe.** Taking
+  the mappings over is only available to the *last* holder; while others remain,
+  an implementation MUST keep its own reference rather than drop it. Dropping it
+  assumes the remaining holder outlives the borrower, and nothing establishes
+  that: a transaction that fetches, opens a cursor and then stores leaves the
+  outgoing snapshot held by that cursor alone, and closing the cursor unmaps
+  bytes the *transaction* was promised for its whole life. The reference is what
+  bounds the lifetime; the refcount says who may take the mappings, not who may
+  forget about them.
 
   This is not a fresh guarantee, only the reading of A-4 that a caller depends
   on. It is called out because both of the swaps above are invisible from the
