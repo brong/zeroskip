@@ -4433,7 +4433,7 @@ static void test_fileset_overlap_table(void)
     char got[128];
 
     /* A repack output [1-4] present with its inputs [1-1]..[4-4].  The widest
-     * wins, because fixed-width hex makes lexical order numeric. */
+     * reach wins, and D-5a orders by reach so it is last. */
     {
         const char *names[] = { dn(1,1), dn(2,2), dn(3,3), dn(4,4), dn(1,4),
                                 dn(5,0), NULL };
@@ -4456,8 +4456,10 @@ static void test_fileset_overlap_table(void)
         zsi_fileset_fini(&fs);
     }
 
-    /* A conversion output present with its input: the IN-ORDER file wins, because
-     * the unordered name is a strict prefix and so sorts first (D-1a). */
+    /* A conversion output present with its input: the IN-ORDER file wins.  Both
+     * cover generation 5, and D-5a breaks that tie by kind -- unordered first,
+     * so the published form is last.  NOT by name: `.current` collates after
+     * every in-order name and would win the sweep (D-5b). */
     {
         const char *names[] = { dn(5,0), dn(5,5), dn(1,4), NULL };
         seed_names_cur(names, 5);

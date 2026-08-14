@@ -3602,12 +3602,6 @@ static void zsi_fileset_fini(struct zsi_fileset *fs)
     memset(fs, 0, sizeof(*fs));
 }
 
-static int zsi_entry_cmp(const void *a, const void *b)
-{
-    return strcmp(((const struct zsi_entry *)a)->name,
-                  ((const struct zsi_entry *)b)->name);
-}
-
 /* readdir the directory, keeping the data files of one database (D-4).
  *
  * If want_uuid is NULL the UUID is DISCOVERED: parse it from each zeroskip-*
@@ -3682,14 +3676,14 @@ static int zsi_fileset_scan_dh(DIR *d, const zsi_uuid_t *want_uuid,
         fs->nall++;
     }
 
-    /* Sort lexically.  D-1's fixed-width uppercase hex makes lexical order
-     * numeric order, and D-1a's no-extension rule makes an unordered name a
-     * strict prefix of the in-order name for the same generation -- the two
-     * properties D-5's "take the last" rule rests on, both under test in
-     * test_filename_prefix_property and test_filename_lexical_order. */
-    if (fs->nall)
-        qsort(fs->all, fs->nall, sizeof(*fs->all), zsi_entry_cmp);
-
+    /* Deliberately left in readdir order.  Every consumer that needs an order
+     * imposes its own, on the entries rather than on the names -- D-5a's
+     * zsi_entry_resolve_order for resolution, S-3's zsi_salvage_order for
+     * salvage -- because since D-1b a name no longer determines where a file
+     * belongs: the active file's carries no generation.  A lexical sort here
+     * would produce an order that LOOKS meaningful and is wrong in the
+     * conversion window (D-5b), which is exactly the reasoning to avoid
+     * re-introducing. */
     return ZS_OK;
 }
 
@@ -3823,11 +3817,10 @@ static int zsi_fileset_scan_raw(const char *dir, const zsi_uuid_t *want_uuid,
  * renamed into place before its inputs are removed, so a scan legitimately sees
  * a repack output alongside the files it encloses.
  *
- * Taking the LAST is the whole rule, and it is correct only because of the sort:
- * fixed-width hex makes the widest end sort last among files sharing a start, and
- * the prefix property makes an unordered name sort before the in-order name for
- * the same generation.  T-9 asserts that taking the FIRST fails, so D-5b's
- * requirement is tested rather than assumed.
+ * Taking the LAST is the whole rule, and it is correct only because of the sort
+ * below: among files sharing a start the widest reach comes last, and for a
+ * shared range the in-order file comes last.  T-9 asserts that taking the FIRST
+ * fails, so D-5b's requirement is tested rather than assumed.
  *
  * Returns ZS_OK when the resolved set tiles (D-6), ZS_AGAIN when it leaves a gap
  * (D-7 -- a torn readdir, retry), or ZS_BADFORMAT for a partial overlap (D-5c). */
@@ -3858,13 +3851,6 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
     fs->resolved = malloc(fs->nall * sizeof(*fs->resolved));
     if (!fs->resolved) return ZS_INTERNAL;
 
-    /* D-1b: the active file carries no generation in its name, so it takes no
-     * part in the sweep.  It is held aside here and appended last, at the
-     * generation D-9b says it must have -- one above the highest present.
-     * zsi_snapshot_take checks that against its header when it opens the file,
-     * which is where a disagreement becomes D-10's problem rather than a
-     * silently mis-tiled set.  zsi_name_parse marks it by start == 0, which
-     * F-9 makes unambiguous. */
     /* D-5a's order, imposed on the ENTRIES rather than inherited from the
      * names.  It used to come free from name collation, because the active
      * file was named for its generation and its name was a strict prefix of
@@ -3881,8 +3867,10 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
      *
      * So sort by what the rule actually means: generation ascending, then reach
      * ascending so the widest is last, then unordered before in-order so the
-     * published form wins a tie.  The scan has filled in every start by now,
-     * which is what makes this possible at all. */
+     * published form wins a tie.  The scan has filled in every start by now --
+     * the active file's from its header (D-1b) -- which is what makes this
+     * possible at all, and is why the raw scan's entries must never reach here:
+     * an unfilled start of 0 would sort the active file below everything. */
     qsort(fs->all, fs->nall, sizeof(fs->all[0]), zsi_entry_resolve_order);
 
     uint32_t cur = fs->all[0].start;
@@ -3896,9 +3884,9 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
     }
 
     for (;;) {
-        /* The LAST file whose start equals cur.  The array is sorted by name, and
-         * for a shared start that orders narrow-then-widest, so the last is the
-         * one that encloses the others (D-5a). */
+        /* The LAST file whose start equals cur.  The array is in D-5a's order,
+         * and for a shared start that orders narrow-then-widest, so the last is
+         * the one that encloses the others. */
         ssize_t pick = -1;
         for (size_t i = 0; i < fs->nall; i++)
             if (fs->all[i].start == cur) pick = (ssize_t)i;

@@ -372,11 +372,20 @@ mutant "D-5: advances by start not end" catch \
   's/        uint32_t last = e->end \? e->end : e->start;/        uint32_t last = e->start;/'
 
 # The sort is what makes "last" mean "widest".  Without it, readdir order decides.
-mutant "sort: names not sorted" catch \
-  's/    if \(fs->nall\)\n        qsort\(fs->all, fs->nall, sizeof\(\*fs->all\), zsi_entry_cmp\);/    \/* sort removed *\//'
+#
+# These two replace a pair aimed at a lexical sort of the NAMES in the scan.
+# D-1b made that sort dead -- resolution and salvage each impose their own order
+# on the entries -- so both mutants had quietly become NOT CAUGHT, which reads as
+# a test gap and was really a mutant aimed at code nothing depended on any more.
+mutant "D-5a: entries not sorted" catch \
+  's/    qsort\(fs->all, fs->nall, sizeof\(fs->all\[0\]\), zsi_entry_resolve_order\);/    \/* sort removed *\//'
 
-mutant "sort: descending" catch \
-  's/    return strcmp\(\(\(const struct zsi_entry \*\)a\)->name,\n                  \(\(const struct zsi_entry \*\)b\)->name\);/    return strcmp(((const struct zsi_entry *)b)->name,\n                  ((const struct zsi_entry *)a)->name);/'
+# D-5b: for a shared range the tie is broken by KIND, and the published in-order
+# file must be last.  Flipping it is what a sort by NAME would do, since
+# ".current" collates above every generation name -- so in the conversion window
+# the sweep takes the superseded active file over the output that replaced it.
+mutant "D-5a: unordered sorts after in-order" catch \
+  's/    if \(\(a->end == 0\) != \(b->end == 0\)\) return a->end == 0 \? -1 : 1;/    if ((a->end == 0) != (b->end == 0)) return a->end == 0 ? 1 : -1;/'
 
 # D-6: tiling IS the completeness test.  Without it a gap reads as a complete set
 # and committed data goes missing silently.
