@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 261 |
-| With an enforcing test | 252 |
+| Requirements | 263 |
+| With an enforcing test | 254 |
 | Gaps, each with a reason | 9 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -292,6 +292,7 @@ a spec label is missing here.
 | `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
 | `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime`, `txn_fetch_survives_overwrite`, `reverse_a4_lifetime` |
+| `A-4a` | A-4 binds across a **snapshot swap**. A transaction or cursor may | `a4_borrow_survives_new_generation`, `a4_borrow_survives_cursor_swap` |
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |
 | `A-6` | A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**; | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `interop_constants_csum`, +1 more |
 | `A-7` | `zs_compar` returns negative, zero or positive like `memcmp`, but MUST | `interop_constants_compar` |

@@ -3795,6 +3795,88 @@ static void zsi_snapshot_release(struct zsi_snapshot **sp)
     *sp = NULL;
 }
 
+/* A-4a: what a snapshot swap must NOT throw away.
+ *
+ * A transaction or cursor can move to a newer snapshot while it is alive -- a
+ * write transaction resolves its active file at its first store (D-9), a
+ * ZS_CURSOR_LIVE cursor follows the handle's file set (D-14j) -- and the
+ * snapshot it leaves behind owns the mappings every key and value pointer it
+ * already returned points into.  Releasing it there unmaps them under the
+ * caller, which is a segfault in the caller's code with nothing in the
+ * backtrace to say why.
+ *
+ * So the borrower takes the MAPPINGS over and the snapshot goes: descriptors
+ * are closed, indexes freed, file objects freed.  Only the bytes survive, and
+ * they cost address space backed by the page cache -- never a descriptor, so a
+ * cursor that swaps once per observed commit cannot exhaust the table it
+ * shares with the rest of the process.  Retaining whole snapshots would.
+ *
+ * The same shape as the transaction's own zsi_txnmap list, for the same
+ * reason, over the other half of what a read can return.
+ */
+struct zsi_holdmap {
+    void   *base;
+    size_t  len;
+};
+
+struct zsi_hold {
+    struct zsi_holdmap *m;
+    size_t              n, a;
+};
+
+static void zsi_hold_fini(struct zsi_hold *h)
+{
+    for (size_t i = 0; i < h->n; i++)
+        munmap(h->m[i].base, h->m[i].len);
+    free(h->m);
+    h->m = NULL;
+    h->n = h->a = 0;
+}
+
+/* Release a reference the borrower `h` may hold pointers into.
+ *
+ * Ordinary release while others still reference it; on the LAST reference,
+ * the mappings move to `h` first.  Capacity is reserved before anything is
+ * touched, so a failure leaves the snapshot exactly as it was and the caller
+ * can propagate the error rather than choosing between a leak and a dangle. */
+static int zsi_snapshot_retire(struct zsi_snapshot **sp, struct zsi_hold *h)
+{
+    struct zsi_snapshot *s = *sp;
+
+    if (!s) return ZS_OK;
+
+    if (s->refcount > 1) {
+        zsi_snapshot_release(sp);
+        return ZS_OK;
+    }
+
+    if (h->n + s->nfiles > h->a) {
+        size_t want = h->a ? h->a : 8;
+        while (want < h->n + s->nfiles) want *= 2;
+        struct zsi_holdmap *p = realloc(h->m, want * sizeof(*p));
+        if (!p) return ZS_INTERNAL;
+        h->m = p;
+        h->a = want;
+    }
+
+    for (size_t i = 0; i < s->nfiles; i++) {
+        struct zsi_file *f = s->files[i];
+
+        if (!f || !f->base) continue;
+
+        h->m[h->n].base = (void *)f->base;
+        h->m[h->n].len = f->maplen;
+        h->n++;
+
+        /* Detached, so zsi_file_close does everything EXCEPT the munmap. */
+        f->base = NULL;
+        f->maplen = 0;
+    }
+
+    zsi_snapshot_release(sp);
+    return ZS_OK;
+}
+
 /* The active file: the highest-generation UNORDERED file, or NULL if the newest
  * file is in-order.  The only file a writer appends to. */
 static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
@@ -4479,6 +4561,10 @@ struct zs_cursor {
     struct zsi_snapshot *snap;
     bool              owns_txn;
 
+    /* A-4a: mappings from snapshots this cursor has swapped away from, kept
+     * until it ends because pointers it yielded still point into them. */
+    struct zsi_hold   hold;
+
     struct zsi_fcur  *cur;
     size_t            ncur;
 
@@ -4605,6 +4691,11 @@ static void zsi_cursor_free(struct zs_cursor *c)
     if (!c) return;
     for (size_t i = 0; i < c->ncur; i++) zsi_fcur_fini(&c->cur[i]);
     zsi_snapshot_release(&c->snap);
+
+    /* A-4a: the end of the cursor is the first moment a mapping it yielded
+     * pointers out of may go. */
+    zsi_hold_fini(&c->hold);
+
     free(c->start_key);
     free(c->last_key);
     free(c->rev_succ);
@@ -4926,7 +5017,20 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
             c->db->snap->refcount++;
             c->snap = c->db->snap;
             if (c->txn) zsi_txn_set_snapshot(c->txn, c->snap);
-            zsi_snapshot_release(&old);
+
+            /* A-4a: NOT a release.  Every pointer this cursor has already
+             * yielded points into `old`'s mappings, and they are promised for
+             * the cursor's lifetime -- the arms below are rebuilt precisely
+             * because they point there too.
+             *
+             * A failure here can only be the hold list's realloc, and it
+             * LEAKS `old` rather than releasing it: releasing would unmap
+             * bytes the caller still holds pointers to, and a dangle is worse
+             * than a few hundred bytes lost on the way out of an OOM. */
+            {
+                int hr = zsi_snapshot_retire(&old, &c->hold);
+                if (hr != ZS_OK) return hr;
+            }
 
             /* The file arms point into the old snapshot's files, so they must be
              * rebuilt rather than re-seeked. */
@@ -5084,6 +5188,11 @@ struct zs_txn {
     size_t               chunklen, chunkcap;
     struct zsi_txnmap   *maps;
     size_t               nmaps, amaps;
+
+    /* A-4a: mappings from the snapshot this transaction swapped away from at
+     * its first store, kept until it ends.  The other half of the same
+     * promise `maps` keeps for the transaction's own streamed records. */
+    struct zsi_hold      hold;
 };
 
 static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
@@ -5221,8 +5330,18 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
 
     /* The snapshot may have been replaced by a rollover, and both the
      * ancestor search and this transaction's own reads must see the file set
-     * as it is now. */
-    zsi_snapshot_release(&txn->snap);
+     * as it is now.
+     *
+     * A-4a: the outgoing snapshot is RETIRED, not released.  A caller that
+     * read before its first write -- read-modify-write, the ordinary shape --
+     * holds pointers into its mappings, and A-4 promised them for the whole
+     * transaction.  Releasing here unmapped them, and it fired whenever the
+     * first store started a new generation: after a seal there is no active
+     * file at all, so the very next transaction takes that path.  Reported
+     * from the sqlite integration as crashes with the library nowhere in the
+     * backtrace. */
+    int hr = zsi_snapshot_retire(&txn->snap, &txn->hold);
+    if (hr != ZS_OK) { close(fd); return hr; }
     txn->snap = db->snap;
     txn->snap->refcount++;
 
@@ -5725,6 +5844,9 @@ static void zsi_txn_free(struct zs_txn *txn)
         munmap(txn->maps[i].base, txn->maps[i].len);
     free(txn->maps);
     free(txn->chunk);
+
+    /* A-4a: and the same for what a snapshot swap left behind. */
+    zsi_hold_fini(&txn->hold);
 
     /* Hand the append descriptor back for the next transaction rather than
      * closing it -- unless this one's stream broke, in which case nothing

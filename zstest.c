@@ -7164,6 +7164,96 @@ static void test_api_pointer_lifetime(void)
     zs_db_close(&db);
 }
 
+/* A-4a: a read before the transaction's first write, where that write starts a
+ * NEW generation.
+ *
+ * The first store resolves the active file (D-9), and after a seal there is no
+ * active file at all, so it creates one -- which refreshes the handle and
+ * replaces the snapshot the earlier fetch returned a pointer into.  Releasing
+ * that snapshot there unmaps the value under the caller.  Read-modify-write is
+ * the ordinary shape of a transaction, so this fired constantly; it was
+ * reported from the sqlite integration as crashes with no library frame in the
+ * backtrace.
+ *
+ * The value is deliberately larger than a page, so the mapping it lives in is
+ * one the kernel really does tear down. */
+static void test_a4_borrow_survives_new_generation(void)
+{
+    struct zs_db *db = fresh_db();
+    char big[8192];
+    const char *k, *v;
+    size_t kl, vl;
+
+    ASSERT_NOT_NULL(db);
+    memset(big, 'v', sizeof(big));
+    ASSERT_OK(zs_db_store(db, "key", 3, big, sizeof(big), 0));
+
+    /* Every file in-order, so the next transaction's first store must create a
+     * generation rather than append to one. */
+    ASSERT_OK(zs_db_seal(db));
+
+    struct zs_txn *txn = NULL;
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_fetch(txn, "key", 3, &k, &kl, &v, &vl, 0));
+    ASSERT_EQU(vl, sizeof(big));
+
+    struct zsi_snapshot *before = txn->snap;
+    ASSERT_OK(zs_txn_store(txn, "other", 5, "x", 1, 0));
+
+    /* The swap really happened -- otherwise this test would pass for the wrong
+     * reason on any change that stopped rolling over here. */
+    ASSERT(txn->snap != before);
+    ASSERT(txn->hold.n > 0);
+
+    /* A-4: both pointers are still the caller's to read. */
+    ASSERT_MEM_EQ(k, "key", 3);
+    ASSERT_MEM_EQ(v, big, sizeof(big));
+
+    ASSERT_OK(zs_txn_commit(&txn));
+    zs_db_close(&db);
+}
+
+/* A-4a, the cursor half: a handle-live cursor follows the handle's file set
+ * (D-14j), and the snapshot it leaves behind owns the bytes of every record it
+ * has already yielded.  A shared cursor takes no write lock, so a commit
+ * through the same handle moves the set underneath it. */
+static void test_a4_borrow_survives_cursor_swap(void)
+{
+    struct zs_db *db = fresh_db();
+    struct zs_cursor *c = NULL;
+    char big[8192];
+    const char *k, *v;
+    size_t kl, vl;
+
+    ASSERT_NOT_NULL(db);
+    memset(big, 'v', sizeof(big));
+    ASSERT_OK(zs_db_store(db, "a", 1, big, sizeof(big), 0));
+    ASSERT_OK(zs_db_store(db, "b", 1, big, sizeof(big), 0));
+    ASSERT_OK(zs_db_seal(db));
+
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_MEM_EQ(k, "a", 1);
+    ASSERT_EQU(vl, sizeof(big));
+
+    const char *held_k = k, *held_v = v;
+    struct zsi_snapshot *before = c->snap;
+
+    /* A commit on the same handle: db->snap moves, and the next step brings
+     * the cursor onto it. */
+    ASSERT_OK(zs_db_store(db, "c", 1, "z", 1, 0));
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT(c->snap != before);
+    ASSERT(c->hold.n > 0);
+
+    /* The record yielded BEFORE the swap is still readable. */
+    ASSERT_MEM_EQ(held_k, "a", 1);
+    ASSERT_MEM_EQ(held_v, big, sizeof(big));
+
+    zs_cursor_fini(&c);
+    zs_db_close(&db);
+}
+
 /*
  * ============================================================
  * Conversion (D-12, T-10a)
@@ -14772,6 +14862,10 @@ static struct test_entry tests[] = {
     { "test_api_cursor_replace",        test_api_cursor_replace },
     { "test_api_readonly",              test_api_readonly },
     { "test_api_pointer_lifetime",      test_api_pointer_lifetime },
+    { "test_a4_borrow_survives_new_generation",
+                                        test_a4_borrow_survives_new_generation },
+    { "test_a4_borrow_survives_cursor_swap",
+                                        test_a4_borrow_survives_cursor_swap },
 
     { "test_convert_basic",             test_convert_basic },
     { "test_convert_steady_state",      test_convert_steady_state },

@@ -1262,6 +1262,25 @@ mutant "write begin: rebuilds the snapshot unconditionally" catch \
   's/         \* snapped back at rollover\. \*\/\n        r = zsi_db_freshen\(db\);/         * snapped back at rollover. *\/\n        r = zsi_db_refresh(db);/'
 
 echo
+echo "A-4a borrow lifetime across a snapshot swap"
+
+# A-4a: the bug as it shipped.  A transaction that reads before its first write
+# holds pointers into the snapshot it began on; the first store resolves the
+# active file and, when that starts a new generation, refreshes the handle --
+# and releasing the outgoing snapshot there unmaps the caller's bytes.  Both
+# mutants restore the plain release.
+mutant "txn: first-store swap releases the borrowed snapshot" catch \
+  's/    int hr = zsi_snapshot_retire\(&txn->snap, &txn->hold\);\n    if \(hr != ZS_OK\) \{ close\(fd\); return hr; \}/    zsi_snapshot_release(\&txn->snap);/'
+
+mutant "cursor: live swap releases the borrowed snapshot" catch \
+  's/                int hr = zsi_snapshot_retire\(&old, &c->hold\);\n                if \(hr != ZS_OK\) return hr;/                zsi_snapshot_release(\&old);/'
+
+# The retention granularity itself: stealing the mapping but leaving the file
+# object owning it is the same dangle with more code.
+mutant "retire: detaches the mapping but still unmaps it" catch \
+  's/        f->base = NULL;\n        f->maplen = 0;/        \/* left attached *\//'
+
+echo
 echo "reverse iteration (D-14k, D-14l, A-12, A-13)"
 
 # D-14k: reverse flips the KEY order only.  Flipping the generation tie-break
