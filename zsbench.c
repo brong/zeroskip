@@ -468,6 +468,111 @@ static void bench_read_after_write(void)
     free(val);
 }
 
+/* Store into a database that ALREADY HOLDS FILES.
+ *
+ * Every other store workload here begins in an empty directory, where a store
+ * touches nothing but the active file.  With files present it costs more, and
+ * not for the reason a reader would guess: before appending anything, a store
+ * must decide the record's ancestor (F-16, F-17), and zsi_ancestor_for resolves
+ * that by searching the file set newest to oldest for the key.  So every store
+ * carries a point lookup, whether or not the caller ever reads.
+ *
+ * The two lines bound it.  An UPDATE stops at the first file holding the key,
+ * so it pays a partial search but materialises a record when it lands.  A
+ * CREATE is absent everywhere, so it searches every file to the bottom with no
+ * early exit and materialises nothing -- and that is the shape that matters,
+ * because loading new keys into a database that already holds data is what a
+ * bulk load IS.
+ *
+ * Read against `store, all in one txn`, which is this same loop over an empty
+ * directory: same -n, same single transaction, no files to search.  The gap
+ * between them is what the ancestor costs.
+ *
+ * Rebuilt per repetition rather than reused, because storing mutates what it
+ * measures -- the second repetition would find the keys already present and
+ * turn every create into an update.  ZS_NOAUTOREPACK for the usual reason: the
+ * file count IS the independent variable here, and the cascade would merge it
+ * away at the begin (D-16e). */
+static void bench_store_into_files(void)
+{
+    char dir[1200];
+    char *val = malloc(valsize);
+    memset(val, 'v', valsize);
+
+    for (int pass = 0; pass < 2; pass++) {
+        char label[64], slug[64], note[96];
+        struct reptimes rt = { {0}, 0 };
+        int files = 0;
+
+        for (int r = 0; r < reps; r++) {
+            snprintf(dir, sizeof(dir), "%s/storefiles", workdir);
+            cleanup(dir);
+
+            /* EVEN keys only, and per-record commits -- which is what produces
+             * several files.  Even/odd so that the create pass can insert keys
+             * that are absent but INTERLEAVED with these.  Appending above the
+             * existing range instead would measure the wrong thing entirely:
+             * D-14d's end probe rejects an out-of-range key in two comparisons,
+             * so a miss above the top is the cheapest lookup the format has,
+             * while the miss a bulk load actually pays is a full binary search
+             * of every file.  Measured that way round, `create` came out
+             * FASTER than `update`, which is how the mistake surfaced. */
+            struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+            for (int i = 0; i < nrecs; i++) {
+                char k[64];
+                makekey(k, sizeof(k), (long)i * 2);
+                zs_db_store(db, k, strlen(k), val, valsize, 0);
+            }
+            zs_db_close(&db);
+
+            db = open_at(dir, ZS_NOAUTOREPACK, 0);
+            files = count_files(dir);
+
+            /* The label carries the file count, so the filter cannot be applied
+             * until a database exists to count -- the same order bench_fetch
+             * uses, and the same accepted cost: one build before a filtered-out
+             * workload discovers it was filtered out. */
+            if (r == 0) {
+                snprintf(label, sizeof(label), "store into %d files (%s)",
+                         files, pass ? "create" : "update");
+                snprintf(slug, sizeof(slug), "store_into_files_%s",
+                         pass ? "create" : "update");
+                if (!selected(label)) {
+                    zs_db_close(&db);
+                    cleanup(dir);
+                    break;
+                }
+            }
+
+            struct zs_txn *txn = NULL;
+            if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+
+            double t0 = now();
+            for (int i = 0; i < nrecs; i++) {
+                char k[64];
+                /* update: the even keys, all present.  create: the odd ones,
+                 * all absent and interleaved among them. */
+                makekey(k, sizeof(k), (long)i * 2 + (pass ? 1 : 0));
+                zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+            }
+            /* Committed inside the timed region for the same reason
+             * bench_read_after_write gives: aborting would drop C-7's two gates
+             * and make this look faster than the plain store it contains. */
+            zs_txn_commit(&txn);
+            rep_add(&rt, now() - t0);
+
+            zs_db_close(&db);
+            cleanup(dir);
+        }
+
+        if (!rt.n) continue;                    /* filtered out above */
+        snprintf(note, sizeof(note), "%d files searched", files);
+        record(slug, label, (size_t)nrecs, &rt, note);
+    }
+
+    free(val);
+}
+
 static void bench_fetch(void)
 {
     char dir[1200];
@@ -1293,6 +1398,7 @@ int main(int argc, char **argv)
         bench_sequential_store();
         bench_batched_store();
         bench_read_after_write();
+        bench_store_into_files();
         bench_fetch();
         bench_scan();
         bench_txn_scan();
