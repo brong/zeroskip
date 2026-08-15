@@ -17,9 +17,9 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 270 |
-| With an enforcing test | 259 |
-| Gaps, each with a reason | 8 |
+| Requirements | 266 |
+| With an enforcing test | 256 |
+| Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -66,17 +66,12 @@ a spec label is missing here.
 | `F-11b` | The default comparator's recorded name is the ASCII string | `corpus`, `header_roundtrip`, `interop_constants_compar`, +2 more |
 | `F-12` | The table above is normative: any byte not in it is invalid, | `span_progress`, `type_byte_validity` |
 | `F-12a` | Each bit is meaningful in isolation: `type & IsBig` selects the wide | `type_byte_validity` |
-| `F-12b` | Each data shape has exactly two forms, one storing an ancestor and | `record_roundtrip` |
-| `F-12c` | A 32-bit ancestor fits inside the padding the big forms already | `record_byte_layout_big` |
+| `F-12b` | Each data shape has exactly one form. Nothing distinguishes a | `record_roundtrip` |
+| `F-12c` | Bit `0x08` was `HasAncestor`, and each data shape had a second form | `type_byte_validity` |
 | `F-13` | Lengths are authoritative; keys and values MAY contain NUL bytes, | `corpus`, `index_binary_keys`, `interop_constants_compar`, +4 more |
 | `F-14` | A key MUST be at least 1 byte. An empty value is legal and distinct | `malformed_never_hangs`, `record_bounds`, `record_byte_layout`, +2 more |
 | `F-15` | Encoding is canonical: an implementation MUST use the short form | `corpus`, `dump_shows_rollback`, `header_roundtrip`, +5 more |
-| `F-16` | Every record that casts a shadow MUST know the generation at which | `write_ancestors, repack_v1_ancestor_v3_value` |
-| `F-16a` | The stored value is the **`start` of the range of the file holding | `write_ancestors` |
-| `F-16b` | There is **no guarantee the ancestor is numerically close**: a key | `repack_d18_table` |
-| `F-16c` | The ancestor is absolute precisely so it never needs | `repack_v1_ancestor_v3_value` |
-| `F-17` | The ancestor is **omitted exactly when it equals the containing | `check_noncanonical`, `record_canonical`, `record_roundtrip`, +1 more |
-| `F-17a` | The two conditions "this is a later occurrence in the file" and | `write_ancestors` |
+| `F-18` | A record MUST NOT carry any reference to another record. In | `record_roundtrip`, `record_byte_layout`, `type_byte_validity` |
 | `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
 | `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
@@ -167,11 +162,12 @@ a spec label is missing here.
 | `D-16e` | **Who runs it.** A writer SHOULD run the cascade itself, at the start of | `autorepack_bounds_the_file_count`, `autorepack_only_at_a_new_generation`, `noautorepack_leaves_the_files` |
 | `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
 | `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
-| `D-17a` | Ancestors are copied verbatim; nothing is renumbered and no | `repack_v1_ancestor_v3_value` |
 | `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_v1_ancestor_v3_value` |
-| `D-18` | Per key: | `repack_d18_table`, `repack_v1_ancestor_v3_value` |
-| `D-19` | A key is removed entirely if and only if its latest version is a | `repack_d18_table` |
+| `D-18` | Per key, where **below** means "in a file whose range lies entirely | `repack_d18_table` |
+| `D-19` | A tombstone is retained **if and only if the newest record for its | `repack_d18_table`, `repack_d19a_resurrection` |
 | `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_resurrection` |
+| `D-19b` | D-19 states a **predicate, not an algorithm**. An implementation MAY | **none** |
+| `D-19c` | The test MAY err toward **retention**, never toward dropping. A | **none** |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
 | `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
 | `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs`, `repack_verifies_inputs_nocsum`, `seal_verifies_spans_nocsum` |
@@ -352,6 +348,8 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`F-26b`** — Not yet attributed.
 - **`F-30`** — Not yet attributed.
 - **`D-14g`** — Not yet attributed.
+- **`D-19b`** — Permissive: it states what an implementation MAY do (any means of evaluating D-19's predicate), so there is nothing to enforce. What *is* enforced is the predicate itself, by `repack_d18_table`.
+- **`D-19c`** — Permissive in the same way, and the direction it permits is the safe one. A test could show that repacking two ranges in either order leaves a conforming result, but it would be asserting the absence of a constraint.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
 - **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
 - **`T-13`** — Needs a second implementation. zstool provides hold-write for it.

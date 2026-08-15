@@ -73,7 +73,6 @@ tolerate compaction happening out of band.
 | terminator | a commit or rollback record, ending a span |
 | complete at *n* | the logical end of an unordered file: the offset after its last valid span, which may be short of the file's physical end |
 | clean | an unordered file whose complete point *is* its physical end — nothing follows the last valid span |
-| ancestor | the absolute generation at which the shadow cast by a record hits the previous record for that key |
 | shadowed | a record superseded by a later record for the same key, anywhere |
 | tombstone | a deletion record — data that hides every older version of its key (D-14), not mere absence |
 | file set | the data files present in the directory, derived from their names alone (D-2) |
@@ -301,14 +300,13 @@ Each part earns its place, following the reasoning behind the PNG signature:
 
 ### 4.4 Record types
 
-The type byte is a bitfield of six independent properties:
+The type byte is a bitfield of five independent properties:
 
 | Bit | Name | Meaning |
 |---|---|---|
 | `0x01` | `HasKey` | a data record: carries a key |
 | `0x02` | `IsDelete` | negation — of a key, or of a span |
 | `0x04` | `IsBig` | wide length fields |
-| `0x08` | `HasAncestor` | an ancestor generation is stored |
 | `0x10` | `SpanTerminator` | ends a span |
 | `0x20` | `Pointers` | begins a pointer section |
 
@@ -317,13 +315,9 @@ Every legal combination, and no others:
 | Value | Type | Header | Bits |
 |---|---|---|---|
 | `0x01` | `KEYVALUE` | 4 | `HasKey` |
-| `0x09` | `KEYVALUE_ANC` | 8 | `HasKey HasAncestor` |
 | `0x05` | `BIGKEYVALUE` | 24 | `HasKey IsBig` |
-| `0x0D` | `BIGKEYVALUE_ANC` | 24 | `HasKey IsBig HasAncestor` |
 | `0x03` | `DELETION` | 4 | `HasKey IsDelete` |
-| `0x0B` | `DELETION_ANC` | 8 | `HasKey IsDelete HasAncestor` |
 | `0x07` | `BIGDELETION` | 16 | `HasKey IsDelete IsBig` |
-| `0x0F` | `BIGDELETION_ANC` | 16 | `HasKey IsDelete IsBig HasAncestor` |
 | `0x10` | `COMMIT` | 8 | `SpanTerminator` |
 | `0x14` | `COMMIT_LONG` | 24 | `SpanTerminator IsBig` |
 | `0x12` | `ROLLBACK` | 8 | `SpanTerminator IsDelete` |
@@ -334,19 +328,21 @@ Every legal combination, and no others:
 - **F-12** The table above is normative: any byte not in it is invalid,
   including `0x00`. It is structured rather than arbitrary — exactly one of
   `HasKey`, `SpanTerminator` and `Pointers` is set, since they select the
-  family; `HasAncestor` appears only with `HasKey`; `IsDelete` appears with
-  `HasKey` or `SpanTerminator` but never with `Pointers`; `IsBig` may appear
-  with any family; and bits `0x40` and `0x80` are reserved and always zero.
+  family; `IsDelete` appears with `HasKey` or `SpanTerminator` but never with
+  `Pointers`; `IsBig` may appear with any family; and bits `0x08`, `0x40` and
+  `0x80` are reserved and always zero.
 - **F-12a** Each bit is meaningful in isolation: `type & IsBig` selects the wide
-  layout in all three families, `type & HasAncestor` says whether the ancestor
-  field is present, and `type & IsDelete` means negation, whether of a key or of a
-  span. A decoder reads a record's shape from the bits.
-- **F-12b** Each data shape has exactly two forms, one storing an ancestor and
-  one omitting it. Nothing distinguishes a "create" at the record level, because
-  nothing needs to (F-17).
-- **F-12c** A 32-bit ancestor fits inside the padding the big forms already
-  carry, so `HasAncestor` costs **nothing** there; in the short forms it adds 4
-  bytes.
+  layout in all three families, and `type & IsDelete` means negation, whether of
+  a key or of a span. A decoder reads a record's shape from the bits.
+- **F-12b** Each data shape has exactly one form. Nothing distinguishes a
+  "create" at the record level, and nothing records where a key's previous
+  version lives: a record describes only itself. What used to need that —
+  deciding whether a repack may drop a tombstone — is derived at repack time
+  instead (D-19).
+- **F-12c** Bit `0x08` was `HasAncestor`, and each data shape had a second form
+  carrying a 32-bit ancestor generation. It is reserved rather than reused so
+  that the surviving values keep their meanings; a record carrying it MUST be
+  rejected like any other invalid type.
 
 ### 4.5 Data records
 
@@ -359,9 +355,8 @@ in place as C strings.
 - **F-14** A key MUST be at least 1 byte. An empty value is legal and distinct
   from an absent key.
 
-The ancestor is an **absolute 32-bit generation**, never relative to the
-containing file, and is stored only when it differs from the containing file's
-`start` (F-17).
+A record describes only itself. It carries no reference to any other record,
+and in particular nothing about where the key's previous version lives.
 
 ```
 KEYVALUE (0x01)
@@ -372,15 +367,6 @@ KEYVALUE (0x01)
   +len-4  4  csum      covers [0, len-4)
   len = roundup8(4 + keylen + 1 + vallen + 1 + 4)
 
-KEYVALUE_ANC (0x09)
-  +0      1  type
-  +1      1  keylen
-  +2      2  vallen
-  +4      4  ancestor generation
-  +8      .  key NUL value NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(8 + keylen + 1 + vallen + 1 + 4)
-
 DELETION (0x03)
   +0      1  type
   +1      1  keylen
@@ -389,28 +375,9 @@ DELETION (0x03)
   +len-4  4  csum      covers [0, len-4)
   len = roundup8(4 + keylen + 1 + 4)
 
-DELETION_ANC (0x0B)
-  +0      1  type
-  +1      1  keylen
-  +2      2  pad
-  +4      4  ancestor generation
-  +8      .  key NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(8 + keylen + 1 + 4)
-
 BIGKEYVALUE (0x05)
   +0      1  type
   +1      7  pad
-  +8      8  keylen
-  +16     8  vallen
-  +24     .  key NUL value NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(24 + keylen + 1 + vallen + 1 + 4)
-
-BIGKEYVALUE_ANC (0x0D)
-  +0      1  type
-  +1      3  pad
-  +4      4  ancestor generation
   +8      8  keylen
   +16     8  vallen
   +24     .  key NUL value NUL pad->8
@@ -424,64 +391,51 @@ BIGDELETION (0x07)
   +16     .  key NUL pad->8
   +len-4  4  csum      covers [0, len-4)
   len = roundup8(16 + keylen + 1 + 4)
-
-BIGDELETION_ANC (0x0F)
-  +0      1  type
-  +1      3  pad
-  +4      4  ancestor generation
-  +8      8  keylen
-  +16     .  key NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(16 + keylen + 1 + 4)
 ```
 
 - **F-15** Encoding is canonical: an implementation MUST use the short form
   whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
-  whenever the span is `<= 0xFFFFFF` bytes; and MUST select between the
-  ancestor-storing and ancestor-omitting forms exactly as F-17 requires; and MUST
-  choose the pointer width by F-26c; and the stored checksum (F-32) MUST be
-  correct under the containing file's engine — a checksum that does not match
-  is corruption, never an alternative encoding of the same record. Output
-  bytes are therefore determined by the logical contents together with what
-  the file already holds. The big form is chosen by key or value length only,
-  never by the ancestor, which is 4 bytes whenever it is present.
+  whenever the span is `<= 0xFFFFFF` bytes; MUST choose the pointer width by
+  F-26c; and the stored checksum (F-32) MUST be correct under the containing
+  file's engine — a checksum that does not match is corruption, never an
+  alternative encoding of the same record. Output bytes are therefore
+  determined by the logical contents together with what the file already holds.
+  The big form is chosen by key or value length, and by nothing else.
 
-### 4.6 Ancestors
+### 4.6 Why records carry no back-reference
 
-- **F-16** Every record that casts a shadow MUST know the generation at which
-  that shadow hits the previous record for its key — either its own generation
-  or an earlier one. An update or deletion stores it; a create stores nothing,
-  its ancestor being implicitly its own generation.
-- **F-16a** The stored value is the **`start` of the range of the file holding
-  the superseded record** when the shadow was cast — not its `end`. Since
-  `start <= end`, D-19's containment test then errs toward retaining a tombstone
-  rather than dropping one, so an imprecise ancestor costs disk space and not
-  correctness.
-- **F-16b** There is **no guarantee the ancestor is numerically close**: a key
-  untouched for a long time and then updated casts its shadow far back. A
-  record in generation 20 may legitimately reference generation 5.
-- **F-16c** The ancestor is absolute precisely so it never needs
-  recalculating. A repack copies ancestors through verbatim, and the generation
-  named may since have been absorbed into a file covering a range — harmless,
-  because D-19 compares the absolute ancestor against a generation range.
-- **F-17** The ancestor is **omitted exactly when it equals the containing
-  file's `start` generation**, and a record with no stored ancestor is read as
-  having that value. This one rule covers every case:
+Earlier revisions of this format gave every record an **ancestor**: the
+generation at which the shadow it casts hits the previous record for its key.
+It existed for exactly one consumer — a repack deciding whether it may drop a
+tombstone — and six requirements in this section specified it. They are gone,
+and the reasoning is recorded here because "store the answer" is the obvious
+design and it is the wrong one. (The retired labels are not repeated here: a
+label named anywhere in this document is a label the conformance map must carry
+a row for, so naming a dead requirement would resurrect it.)
 
-  | Situation | Ancestor | Encoding |
-  |---|---|---|
-  | new key written into the active file | its own generation = the file's `start` | omitted |
-  | key updated again later in the same file | the file holding what it superseded is this one | omitted |
-  | key last written in an older file | that file's `start`, which is lower | stored |
-  | repack output, chain begins inside the output range | the output's `start` | omitted |
-  | repack output, chain begins earlier | V1's ancestor, which is lower | stored |
+- **F-18** A record MUST NOT carry any reference to another record. In
+  particular, whether a tombstone may be dropped MUST be **derived** when the
+  question is asked (D-19), never read from the record.
 
-- **F-17a** The two conditions "this is a later occurrence in the file" and
-  "the ancestor equals this file's `start`" coincide, because a later
-  occurrence by definition supersedes a record in this same file. Decoding
-  therefore never needs to establish whether a record is the first occurrence
-  of its key. A repeated update within one file costs a 4-byte header rather
-  than 8.
+The trade the ancestor made was a bad one in both directions:
+
+- **It was written far more often than it was read.** Computing a record's
+  ancestor means finding where the key currently lives, which is a point lookup
+  across the whole file set — paid on **every** store, including creates, which
+  miss in every file and so have no early exit. It was then consulted only
+  during a repack. Measured on the reference implementation at the moment it was
+  removed, that search cost about 0.09µs per file in the set per store: nearly a
+  doubling of store cost at 4 files, and roughly 9µs per store at the 103 files
+  this has been seen at in the field.
+- **The information was not scarce.** A repack can establish the same fact by
+  looking, and it looks once per surviving tombstone rather than once per store.
+
+The general principle, which applies beyond this field: a derived fact should
+be stored only when deriving it is expensive **at the moment it is needed**.
+Here it was cheap then and expensive when recorded, because the two moments
+have wildly different frequencies. Storing it also made the fact
+interoperability surface — every implementation had to agree on it byte for
+byte — where deriving it leaves each implementation free to choose how (D-19b).
 
 ### 4.7 Terminators
 
@@ -639,7 +593,7 @@ filesize-4    4   checksum of the pointer section
   demand (F-26f).
 - **F-32** Every data record ends in a 4-byte checksum: the last 4 bytes of
   the padded record, computed by the containing file's engine (F-5a) over
-  `[0, len-4)` — type, lengths, ancestor, key, value, and padding. This is
+  `[0, len-4)` — type, lengths, key, value, and padding. This is
   the format's one checksum convention, stated once: **every checksum is the
   last field of the thing it covers, and covers everything before it**
   (header F-4, terminator F-19, trailer F-26b, records F-32).
@@ -991,8 +945,9 @@ Every read draws on the same set of **sources**, ordered newest to oldest:
   binary search over a zero-length array, and an index for a file with no
   committed records, are both ordinary cases (F-26g, F-26h).
 
-- **D-14c** Ancestors are **not** consulted by any read. They exist solely for
-  repacking (F-16), so a lookup never follows a chain.
+- **D-14c** A read never follows a chain, because there is no chain to follow:
+  a record refers to no other record (F-18). A lookup resolves a key purely by
+  the source priority order below.
 
 **Point lookup (D-14d).** Walk the sources in priority order; in each, search
 for the key by D-14b; stop at the first source that has it. That record decides
@@ -1169,9 +1124,7 @@ The per-file cursors are held in an array kept sorted by:
 - **D-17** The output holds **exactly one record per key**, built from the live
   records of all inputs, skipping rolled-back spans. Where the inputs hold
   versions V1, V2, V3 of a key from oldest to newest, the emitted record
-  carries **V3's value** — possibly a deletion — and **V1's ancestor**.
-- **D-17a** Ancestors are copied verbatim; nothing is renumbered and no
-  ancestor is recalculated (F-16c).
+  carries **V3's value** — possibly a deletion.
 - **D-17b** A repack MUST consider the versions of a key in a **total order**,
   oldest to newest:
 
@@ -1180,26 +1133,49 @@ The per-file cursors are held in an array kept sorted by:
   2. within one unordered file, by increasing offset among committed spans;
   3. an in-order file holds one record per key, so there is nothing to order.
 
-  V1 is the first version in that order and V3 the last. The emitted record
-  takes **V3's value** and **V1's ancestor** — from those records specifically,
-  and by no other route.
-- **D-18** Per key:
+  V3 is the last version in that order, and the emitted record takes its value
+  from that record specifically and by no other route.
+- **D-18** Per key, where **below** means "in a file whose range lies entirely
+  below the output's `start`":
 
-  | V1's ancestor | V3's value | emit |
+  | V3's value | newest record below | emit |
   |---|---|---|
-  | `>= output start` | a deletion | **nothing** — drop the key |
-  | `>= output start` | a value | the **ancestor-omitting** form |
-  | `< output start` | either | the **ancestor-storing** form, ancestor = V1's |
+  | a value | — | the record, carrying V3's value |
+  | a deletion | a value | the tombstone |
+  | a deletion | a deletion | **nothing** — drop the key |
+  | a deletion | none | **nothing** — drop the key |
 
-- **D-19** A key is removed entirely if and only if its latest version is a
-  deletion **and** V1's ancestor lies inside the output range — its
-  whole lifespan from create through update to delete is contained. Otherwise
-  the tombstone MUST be retained, because an older file may still hold the key
-  and dropping it would resurrect the value.
+- **D-19** A tombstone is retained **if and only if the newest record for its
+  key below the output range is a value**. Otherwise the key is removed
+  entirely.
+
+  Retaining it when a value is below is required: that value is still live, and
+  dropping the tombstone would resurrect it. Dropping it when a *deletion* is
+  below is safe because that deletion already hides everything beneath it, so
+  ours adds nothing. Dropping it when nothing is below is safe because the key's
+  whole lifespan is contained in the inputs.
+
+  Files **above** the output range do not enter the test, and cannot. A newer
+  record shadows everything below it, so a newer file can only ever make a
+  retained tombstone redundant — never make a dropped one unsafe. Retention
+  therefore depends solely on what lies below, which is what allows the test to
+  look in one direction only.
 - **D-19a** The emitted record MUST be written even when a newer file already
   shadows the key: being shadowed does not permit dropping a record. Only D-19
-  does. The retained record carries the chain's reach, which no other file
-  records. T-7 constructs the resurrection that follows from dropping it.
+  does. This is now a cost argument rather than a correctness one — establishing
+  that a newer file shadows a key would take a lookup **per key**, where D-19's
+  test costs a lookup only per surviving tombstone — but the rule is unchanged.
+- **D-19b** D-19 states a **predicate, not an algorithm**. An implementation MAY
+  evaluate it by a point lookup per surviving tombstone, by a single merged pass
+  over the files below the range, or by any other means giving the same answer.
+  Nothing about the choice is visible on disk, so unlike the ancestor it
+  replaced (§4.6) it is not interoperability surface and implementations need
+  not agree on it.
+- **D-19c** The test MAY err toward **retention**, never toward dropping. A
+  retained-but-unnecessary tombstone costs space and is collected by a later
+  repack or by compaction; a wrongly dropped one resurrects a deleted value and
+  is unrecoverable. Repacking ranges in different orders can therefore leave
+  different tombstones behind, and both results are conforming.
 - **D-20** Inputs are iterated in key order: from the pointer section where present,
   otherwise from the same private index any reader of a pointerless file builds.
   There is nothing repack-specific about this.
@@ -1295,10 +1271,11 @@ The per-file cursors are held in an array kept sorted by:
   is second in the set — which is precisely the damaged database where D-28's
   "everything mergeable" has to mean something.
 - **D-27** Because a compaction output spans the whole generation interval,
-  D-19's containment test succeeds for every key, so every tombstone whose
-  lifespan it contains is dropped. This is the **only** merge that can reclaim
-  them: a partial repack MUST retain a tombstone, because a file outside its
-  input set may still hold the key (D-19a).
+  there is no file below its range, so D-19 drops **every** tombstone. This
+  needs no special case: it is what the rule already says when the set of files
+  below is empty. Compaction is the merge that reclaims them all, but not the
+  only one that reclaims any — a partial repack drops a tombstone whenever
+  nothing below its range holds the key.
 - **D-28** Compaction is **best effort in action and strict in reporting**: it
   merges everything mergeable (D-26b) and reports what it could not, and reports
   failure only if the result is not a single file. A non-active file with an
@@ -2249,9 +2226,9 @@ gets wrong — and the empty-versus-one-byte case (F-11a); the exact bytes of th
 and generation range, character for character (D-0, D-1).
 
 **T-2b Type byte validity.** All 256 byte values fed as a record type, asserting
-exactly the 14 in F-12's table are accepted and the other 242 rejected. A
+exactly the 10 in F-12's table are accepted and the other 246 rejected. A
 bitfield admits far more values than it defines, so the near-misses matter most:
-two family bits set at once, `HasAncestor` without `HasKey`, `IsDelete` with
+two family bits set at once, the reserved `0x08` set, `IsDelete` with
 `Pointers`, and either reserved bit set. Each is a plausible result of a single
 flipped bit in a valid type, and each MUST be rejected rather than
 half-interpreted.
@@ -2313,28 +2290,38 @@ writing 4GB of real data, and that a file whose offsets all fit is written as
 in-order file round-trips as exactly 96 bytes, is written as `PTRS32`, and
 carries the engine's empty-input checksum for its records region (F-26g); that a
 database consisting only of such a file reads as empty and iterates to zero
-records; and that every row of F-17's table round-trips — in particular that
-repeated writes to one key in a file store the ancestor at most once, and that a
-record with no stored ancestor decodes to its file's `start`. Negatively, a
-hand-built file storing an ancestor equal to its own `start` (which F-15 forbids
-as non-canonical) is reported by `zs_db_check_consistency`.
+records; and that a record's encoded bytes are a function of its own key and
+value alone (F-18), unchanged by what else the file holds — the same key and
+value written as a create, as an update within one file, and as an update across
+files MUST produce identical bytes. Negatively, a hand-built record carrying the
+reserved `0x08` bit is rejected as an invalid type rather than read as a record
+with something extra.
 
-**T-7 Ancestors and repacking.** For every arrangement of create, update and
-delete spread across generations: chains stay unbroken (F-16), D-17 preserves
-V1's ancestor with V3's value, exactly one record per key is emitted, D-18's
-table is followed, and D-19 drops a key only when its whole lifespan is inside
-the output. Version ordering (D-17b) is tested directly, since getting it wrong
-silently emits the wrong value or the wrong ancestor: several versions of one
-key at increasing offsets within an unordered file, several across files with
-different `start` generations, and both at once — asserting the emitted value
-comes from V3 and the emitted ancestor from V1 under that total order, not from
-whichever record the merge's internal iteration happened to touch first or last.
-Then D-19a's resurrection is constructed directly, asserting both that the key
-stays absent and that dropping the retained record *does* produce the bug.
-Coverage continues with
-the output. The D-19a resurrection is constructed directly, asserting both that
-the key stays absent and that dropping the retained record *does* produce the
-bug — so the test fails if the rule is ever removed as an optimisation. Also
+**T-7 Tombstone retention across repacks.** For every arrangement of create,
+update and delete spread across generations: exactly one record per key is
+emitted, D-18's table is followed, and D-19 retains a tombstone exactly when the
+newest record for its key below the output range is a value. All four rows are
+constructed directly, and the two that drop are as important as the two that
+keep — a rule that never drops is trivially safe and collects nothing.
+
+Version ordering (D-17b) is tested directly, since getting it wrong silently
+emits the wrong value: several versions of one key at increasing offsets within
+an unordered file, several across files with different `start` generations, and
+both at once — asserting the emitted value comes from V3 under that total order,
+not from whichever record the merge's internal iteration happened to touch first
+or last.
+
+The resurrection D-19 exists to prevent is constructed directly: a value in an
+older file, a tombstone in the repacked range, nothing newer, asserting both
+that the key stays absent afterwards and that dropping the tombstone *does*
+produce the bug. Its counterpart is constructed too — the same shape with a
+newer file re-creating the key — asserting that dropping is correct there and
+that the read returns the newer value, since D-19 deliberately does not look
+up.
+
+D-19a is constructed directly too — a key shadowed by a newer file, asserting
+that the repack still emits it — so the test fails if the rule is ever removed
+as an optimisation. Coverage continues with
 that D-16 selects inputs correctly — several unordered files collapsing into
 only in-order files as inputs (D-16), and the cascade reaching the
 geometric size relation after many rollovers — and that an empty output is
@@ -2437,8 +2424,8 @@ and keys containing NUL bytes.
 sequence, every implementation MUST produce **identical files**, since encoding
 is canonical (F-15, F-26c) and no timestamps or nondeterminism enter the format.
 The runner diffs the directories. This is a much sharper test than reading each
-other's output, because it catches divergence in padding, in ancestor omission,
-in the choice of short versus big form, and in checksum seeding — before that
+other's output, because it catches divergence in padding, in the choice of
+short versus big form, and in checksum seeding — before that
 divergence has a chance to become a compatibility rule nobody meant to make.
 
 **T-13 Cross-implementation concurrency.** The tests most likely to find real
