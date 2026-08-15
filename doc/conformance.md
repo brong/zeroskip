@@ -144,7 +144,7 @@ a spec label is missing here.
 | `D-14` | Within a file the newest version of a key wins — the highest offset | `fcur_no_duplicate_keys`, `read_d14f_duplicate_across_three_files`, `read_model` |
 | `D-14a` | Point lookups, cursors and range scans MUST all resolve visibility | `fcur_uniform` |
 | `D-14b` | Searching one file for a key: | `fcur_empty_sources`, `inorder_empty`, `read_arrangements` |
-| `D-14c` | Ancestors are **not** consulted by any read. They exist solely for | `reads_never_consult_ancestors` |
+| `D-14c` | A read never follows a chain, because there is no chain to follow: | `reads_never_consult_ancestors` |
 | `D-14d` | Point lookup Walk the sources in priority order; in each, search | `inorder_probe_ends_agrees`, `zsbench` |
 | `D-14e` | Iteration A cursor holds one **per-file cursor** per source, each | `fcur_deletions_visible`, `fcur_empty_sources`, `open_uuid_mismatch`, +2 more |
 | `D-14f` | Because the tie-break is part of the sort, cursors on the emitted key | `read_d14f_duplicate_across_three_files`, `read_prefix_across_files` |
@@ -327,7 +327,7 @@ a spec label is missing here.
 | `T-5a` | Read paths under every file arrangement. The same assertions driven | `inorder_probe_ends_agrees`, `open_uuid_mismatch`, `read_arrangements` |
 | `T-5b` | Cursor mechanics. The sorted-array invariant of D-14e asserted after | `open_uuid_mismatch`, `read_cursor_invariant`, `read_d14f_duplicate_across_three_files` |
 | `T-6` | File states and encoding. That `end == 0` and `end != 0` files are | `check_noncanonical`, `inorder_kind_rules`, `inorder_ptrs64`, +3 more |
-| `T-7` | Ancestors and repacking. For every arrangement of create, update and | `convert_readonly_does_nothing` |
+| `T-7` | Tombstone retention across repacks. For every arrangement of create, | `repack_d18_table`, `repack_version_order`, `repack_d19a_resurrection`, +2 more |
 | `T-8` | Crash injection. A test build interposes `write`, `fdatasync`, `rename` | `crash/crash_after_invalid_terminator`, `crash/crash_leaves_unaligned_length`, `crash/sync_failure_every_point` |
 | `T-8a` | Sync failure. The case C-7a exists for, which no crash test reaches: | `crash/dirsync_justifies_c6` |
 | `T-9` | File set discovery. That the set and every range are derived from | `fcur_deletions_visible`, `filename_sort_property`, `fileset_first_vs_last`, +3 more |

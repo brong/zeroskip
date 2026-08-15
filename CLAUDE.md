@@ -193,7 +193,7 @@ The perl patterns are tied to exact source text and will rot when the code is re
 
 Changing any of these breaks other implementations, so they need a spec change first:
 
-- the 16 magic bytes, the 72-byte header layout, the 14 type bytes, the record and terminator layouts, the pointer section and its 16-byte trailer
+- the 16 magic bytes, the 72-byte header layout, the 10 type bytes, the record and terminator layouts, the pointer section and its 16-byte trailer
 - XXH3-64 with seed 0, truncated to the low 32 bits, little-endian
 - the default comparator's total order and the exact bytes of the `memcmp` name field
 - filename format: lowercase hyphenated UUID, uppercase 8-digit hex generations, **no extension** (D-1a — the unordered name must sort before the in-order name for the same generation)

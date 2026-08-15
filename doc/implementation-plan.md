@@ -13,6 +13,13 @@
 >   name. Tasks 5 and 11 have been corrected in place, because the naming
 >   rationale they carried was not merely old but *false*; anything else here
 >   that reasons from an unordered file being named for its generation is v1.
+> - It predates the **removal of ancestors** (F-18, 2026-08-15): every record
+>   carried the generation of the key's previous version, and Task 8's type
+>   table, `struct zsi_rec`, `zsi_rec_encode`/`zsi_rec_decode` signatures and
+>   ancestor-resolution text are all from before. There are ten type bytes and
+>   four data shapes now, not fourteen and eight, and a repack derives tombstone
+>   retention by looking below its own range (D-19) instead of reading it off
+>   the record.
 > - Whole features arrived with no task in this plan: salvage (S-1…S-12),
 >   sealing and compaction (D-25…D-29), same-process exclusion (C-1j), the
 >   repack cascade at write begin (D-16e), and the streaming writer (C-8) —

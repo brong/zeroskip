@@ -197,7 +197,12 @@ goal is only to stop readers replaying the active file.
 
 The `store, rollover Nk` figures are not monotonic, and that is expected rather
 than noise. A smaller rollover means more frequent conversions, each individually
-cheaper (D-12d), but also more files — so lookups during the run get slower, and the
-ancestor search a write performs (F-17) walks more sources. The interesting
-question is not which row is fastest but whether any row *collapses*, which would
-mean a writer's inline cost is not bounded after all.
+cheaper (D-12d), but also more files — so lookups during the run get slower. The
+interesting question is not which row is fastest but whether any row *collapses*,
+which would mean a writer's inline cost is not bounded after all.
+
+Writes themselves no longer scale with the file count at all. They used to: a
+store had to resolve its record's ancestor first, which searched every source
+for the key (F-17, retired 2026-08-15). `store into N files` measures what that
+cost — about 0.09µs per file in the set, per store — and it is now zero, with
+stores into a populated database running at the empty-database rate.
