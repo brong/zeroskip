@@ -14599,6 +14599,89 @@ static void test_txn_cursor_store_behind_not_yielded(void)
     ASSERT_OK(zs_db_close(&live_db));
 }
 
+/* A-4a with D-14j-b: the resume point is BORROWED from the record the cursor
+ * yielded, not copied, so the bytes it points into must outlive the refresh
+ * that reads them.  A-4a is exactly that promise -- the cursor references every
+ * file in its snapshot, and a snapshot swap RETIRES the outgoing one into the
+ * cursor's hold rather than releasing it -- but the other D-14j tests cannot
+ * tell a sound borrow from a lucky one, because their databases are small
+ * enough that the swap never retires anything: the same file object carries
+ * over and nothing is ever unmapped.
+ *
+ * The lever is C-4c: an immutable file is SHARED across snapshots, so a swap
+ * hands the same object back and nothing is retired -- but the ACTIVE file is
+ * deliberately excluded from that cache, because its index and complete
+ * boundary belong to the snapshot that built them.  So every handle-live swap
+ * over a live active file retires that object, and the cursor's resume key
+ * points straight into it.  Drop the hold and the re-seek below reads unmapped
+ * memory; the mutant "hold: takes no references at all" is that bug. */
+static void test_cursor_resume_key_survives_retirement(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_cursor *c = NULL;
+    struct zsi_file *old_act;
+    const char *k, *v;
+    size_t kl, vl;
+    char seen[256] = "";
+
+    /* A layout test, so the cascade must not merge the layout away. */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &live_db));
+
+    /* One live unordered file holding everything when the cursor opens. */
+    for (const char *p = "abcd"; *p; p++)
+        ASSERT_OK(zs_db_store(live_db, p, 1, "v", 1, 0));
+
+    /* ZS_SHARED: no write lock, so this handle can commit underneath its own
+     * cursor, which is the handle-live swap (D-14j). */
+    ASSERT_OK(zs_db_begin_cursor(live_db, NULL, 0, &c, ZS_SHARED));
+
+    /* One yield, so last_key now points into the active file's mapping. */
+    ASSERT_OK(zs_cursor_next(c, &k, &kl, &v, &vl));
+    ASSERT_EQU(kl, 1u);
+    ASSERT_MEM_EQ(k, "a", 1);
+
+    ASSERT_EQU(live_db->snap->nfiles, 1u);
+    old_act = live_db->snap->files[0];
+    ASSERT(zsi_file_is_unordered(old_act));
+    ASSERT(old_act->base != NULL);
+
+    /* A commit through the same handle, so the cursor's next step swaps. */
+    ASSERT_OK(zs_db_store(live_db, "z", 1, "9", 1, 0));
+
+    /* The retirement really happened: the rebuilt set holds a DIFFERENT object
+     * for the active file, because C-4c carries only immutable files across.
+     * (Same file on disk, so identity here is the object, not the inode or the
+     * name -- D-1b keeps the generation in the header, so the name is `.current`
+     * either way.)
+     *
+     * This is also where the bug lands, which is why it is an equality and not
+     * a comment: without the hold the old object is FREED during the store
+     * above, and its address is then recycled for the replacement -- so the two
+     * pointers come back equal. */
+    ASSERT_EQU(live_db->snap->nfiles, 1u);
+    ASSERT(live_db->snap->files[0] != old_act);
+
+    /* So the cursor's own A-4a hold is now the only thing keeping it mapped. */
+    ASSERT(old_act->refcount > 0);
+    ASSERT(old_act->base != NULL);
+
+    /* This step refreshes, and re-seeks every rebuilt arm from last_key, which
+     * points into old_act.  Without the hold that is a use-after-unmap; with a
+     * stale or lost resume point the order below breaks instead. */
+    strncat(seen, "|", sizeof(seen) - strlen(seen) - 1);
+    strncat(seen, k, kl);
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        strncat(seen, "|", sizeof(seen) - strlen(seen) - 1);
+        strncat(seen, k, kl);
+    }
+    ASSERT_STR_EQ(seen, "|a|b|c|d|z");
+    ASSERT_OK(zs_cursor_abort(&c));
+
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
 /*
  * ============================================================
  * Reverse iteration (D-14k, D-14l, A-12, A-13, A-1c)
@@ -16113,6 +16196,8 @@ static struct test_entry tests[] = {
 
     { "test_txn_cursor_store_behind_not_yielded",
                                         test_txn_cursor_store_behind_not_yielded },
+    { "test_cursor_resume_key_survives_retirement",
+                                        test_cursor_resume_key_survives_retirement },
 
     { NULL, NULL }
 };

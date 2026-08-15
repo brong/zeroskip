@@ -1374,8 +1374,34 @@ mutant "txn: first-store swap releases the borrowed snapshot" catch \
 mutant "txn: retires the snapshot even when it did not move" catch \
   's/    if \(db->snap != txn->snap\) \{\n        int hr = zsi_snapshot_retire/    if (1) {\n        int hr = zsi_snapshot_retire/'
 
-mutant "cursor: live swap releases the borrowed snapshot" catch \
-  's/                int hr = zsi_snapshot_retire\(&old, &c->hold\);\n                if \(hr != ZS_OK\) return hr;/                zsi_snapshot_release(\&old);/'
+# EQUIVALENT for the cursor, unlike its transaction twin above, and the asymmetry
+# is the reason: zsi_hold_add_snapshot does not dedup, and a cursor calls it on
+# EVERY snapshot that becomes c->snap -- at open, and again at the end of each
+# swap.  So by the time the retire runs, the outgoing snapshot's files are
+# already in the hold and its own add is a second reference to them; dropping
+# back to a plain release still leaves the bytes mapped.  A write transaction
+# holds only when SHARED, so there the retire is the only reference and the
+# mutant bites.
+#
+# Listed rather than deleted because the redundancy is not obvious from the call
+# site, and someone removing one of the two holds needs to find this note.  It
+# was classified `catch` while its pattern was rotted, so it had never actually
+# run; the classification is corrected here, not the code.
+#
+# The `int hr` declaration has to stay either way: the hold_add_snapshot call
+# below it uses the same variable, so deleting the declaration is a build
+# failure rather than a mutation.
+mutant "cursor: live swap releases the borrowed snapshot" equivalent \
+  's/                int hr = zsi_snapshot_retire\(&old, &c->hold\);\n                if \(hr != ZS_OK\) return hr;/                int hr;\n                zsi_snapshot_release(\&old);/'
+
+# ... so the hold itself is what has to be attacked to reach A-4a through a
+# cursor: with both of its call sites neutered at once, a borrowed pointer dies
+# at the first swap that actually retires a file.  D-25d's in-place seal is such
+# a swap -- the active file the cursor was reading is converted and removed --
+# and the cursor's own resume key (D-14j-b) points into it, so this lands even
+# with no caller holding a pointer at all.
+mutant "hold: takes no references at all" catch \
+  's/    if \(!s \|\| !s->nfiles\) return ZS_OK;/    if (1) return ZS_OK;/'
 
 # A-4a: leaving a snapshot without referencing what we may still be reading is
 # the whole bug, in its final form -- the two earlier shapes of it (stealing

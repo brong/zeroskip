@@ -5112,11 +5112,27 @@ struct zs_cursor {
      *     handle's current one -- also free, because a commit through the same
      *     handle already replaces it.
      *
-     * last_key is an owned copy of the key most recently yielded, because after
-     * a refresh the record it came from may have been unmapped.  It is what
-     * D-14j-b's "resume strictly after" is measured from. */
+     * last_key is the key most recently yielded, BORROWED rather than copied.
+     * It is what D-14j-b's "resume strictly after" is measured from, and it is
+     * needed only until the next step -- a strictly shorter window than the one
+     * A-4 already promises the CALLER for the very same pointer.  So a copy here
+     * would be redundant with A-4a, and if it were not redundant the record the
+     * caller is holding would be dangling too.  It is exactly the borrow
+     * `emitted` (just above) has always taken, which zs_cursor_replace
+     * dereferences arbitrarily later.
+     *
+     * What makes A-4a hold through a refresh: the cursor references every file
+     * in its snapshot, a snapshot swap RETIRES the outgoing one into c->hold
+     * instead of releasing it, and that same reference is what stops the D-13b
+     * fold remapping the active file underneath a reader (G-6).
+     *
+     * ZS_EPHEMERAL is the one place A-4 is weakened (A-4b), and it cannot reach
+     * here: the public cursor and foreach forms reject it, so the only source
+     * that ever sets it belongs to the throwaway ZS_FETCHNEXT/ZS_FETCHPREV
+     * cursor, which takes a single step and is freed inside the call -- it
+     * never reaches a second step, which is the only thing that reads this. */
     unsigned long     txn_seq;
-    char             *last_key;
+    const char       *last_key;
     size_t            last_keylen;
 
     /* The key this cursor was opened at, kept for the whole of its life.
@@ -5216,7 +5232,8 @@ static void zsi_cursor_free(struct zs_cursor *c)
     zsi_hold_fini(&c->hold);
 
     free(c->start_key);
-    free(c->last_key);
+    /* last_key is borrowed (see its declaration), so there is nothing to free --
+     * and the bytes it points at only become free-able at zsi_hold_fini above. */
     free(c->rev_succ);
     free(c->cur);
     free(c->prefix);
@@ -5628,16 +5645,13 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
             c->emitted = *out;
             c->have_emitted = true;
 
-            /* Owned, because a refresh before the next step may unmap the
-             * record this key points into (D-14j-b). */
-            {
-                char *k = out->keylen ? malloc(out->keylen) : NULL;
-                if (out->keylen && !k) return ZS_INTERNAL;
-                if (k) memcpy(k, out->key, out->keylen);
-                free(c->last_key);
-                c->last_key = k;
-                c->last_keylen = out->keylen;
-            }
+            /* Borrowed, not copied: A-4 already promises these bytes for the
+             * whole cursor, and D-14j-b needs them only until the next step.
+             * See the last_key comment on struct zs_cursor.  A copy here was
+             * two allocator round-trips per record -- about a fifth of the time
+             * in a scan profile -- to duplicate a guarantee we already keep. */
+            c->last_key = out->keylen ? out->key : NULL;
+            c->last_keylen = out->keylen;
             return ZS_OK;
         }
         c->started = true;
