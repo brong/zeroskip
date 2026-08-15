@@ -71,7 +71,7 @@ a spec label is missing here.
 | `F-13` | Lengths are authoritative; keys and values MAY contain NUL bytes, | `corpus`, `index_binary_keys`, `interop_constants_compar`, +4 more |
 | `F-14` | A key MUST be at least 1 byte. An empty value is legal and distinct | `malformed_never_hangs`, `record_bounds`, `record_byte_layout`, +2 more |
 | `F-15` | Encoding is canonical: an implementation MUST use the short form | `corpus`, `dump_shows_rollback`, `header_roundtrip`, +5 more |
-| `F-18` | A record MUST NOT carry any reference to another record. In | `record_roundtrip`, `record_byte_layout`, `type_byte_validity` |
+| `F-18` | A record MUST NOT carry any reference to another record. In | `write_record_is_self_contained`, `record_canonical`, `type_byte_validity` |
 | `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
 | `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
@@ -162,10 +162,10 @@ a spec label is missing here.
 | `D-16e` | **Who runs it.** A writer SHOULD run the cascade itself, at the start of | `autorepack_bounds_the_file_count`, `autorepack_only_at_a_new_generation`, `noautorepack_leaves_the_files` |
 | `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
 | `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
-| `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_v1_ancestor_v3_value` |
+| `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_version_order` |
 | `D-18` | Per key, where **below** means "in a file whose range lies entirely | `repack_d18_table` |
-| `D-19` | A tombstone is retained **if and only if the newest record for its | `repack_d18_table`, `repack_d19a_resurrection` |
-| `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_resurrection` |
+| `D-19` | A tombstone is retained **if and only if the newest record for its | `repack_d18_table`, `repack_d19a_resurrection`, `repack_d19_newer_file_recreates` |
+| `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_shadowed` |
 | `D-19b` | D-19 states a **predicate, not an algorithm**. An implementation MAY | **none** |
 | `D-19c` | The test MAY err toward **retention**, never toward dropping. A | **none** |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |

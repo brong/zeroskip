@@ -458,7 +458,7 @@ mutant "find: inexact hit returned" catch \
 # A cursor that hid tombstones would let an older file's value resurface, since
 # the merge is what turns a deletion into "absent" (D-14e step 4).
 mutant "find: deletions hidden by the cursor" catch \
-  's/        const char \*b = zsi_file_at\(fc->file, off, 1\);\n        if \(!b\) return ZS_BADFORMAT;\n        return zsi_rec_decode\(b, fc->file->size - off, fc->file->hdr.start, out\);/        const char *b = zsi_file_at(fc->file, off, 1);\n        if (!b) return ZS_BADFORMAT;\n        { int rr = zsi_rec_decode(b, fc->file->size - off, fc->file->hdr.start, out);\n          if (rr == ZS_OK \&\& !out->val) return ZS_NOTFOUND;\n          return rr; }/'
+  's/        const char \*b = zsi_file_at\(fc->file, off, 1\);\n        if \(!b\) return ZS_BADFORMAT;\n        return zsi_rec_decode\(b, fc->file->size - off, out\);/        const char *b = zsi_file_at(fc->file, off, 1);\n        if (!b) return ZS_BADFORMAT;\n        { int rr = zsi_rec_decode(b, fc->file->size - off, out);\n          if (rr == ZS_OK \&\& !out->val) return ZS_NOTFOUND;\n          return rr; }/'
 
 echo
 echo "pointer section (Task 9)"
@@ -753,7 +753,7 @@ mutant "keylen boundary: 256 stays short" catch \
   's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        hdr = big \? ZSI_HDRLEN_BIGDELETION/bool big = keylen > 256\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);\n\n    if (isdelete) {\n        hdr = big ? ZSI_HDRLEN_BIGDELETION/'
 
 mutant "vallen boundary: 65536 stays short" catch \
-  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        if \(big\) return store_ancestor/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > 65536);\n\n    if (isdelete) {\n        if (big) return store_ancestor/'
+  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) return big/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > 65536);\n\n    if (isdelete) return big/'
 
 # Changes BOTH zsi_rec_type_for and zsi_rec_encoded_len, so the two stay
 # consistent with each other and the mutant is a plausible bug rather than an
@@ -771,9 +771,6 @@ mutant "vallen stored at +3 not +2" catch \
 
 mutant "big keylen at +16, vallen at +8" catch \
   's/            zsi_put64\(buf \+ 8, \(uint64_t\)keylen\);\n            zsi_put64\(buf \+ 16, \(uint64_t\)vallen\);/            zsi_put64(buf + 16, (uint64_t)keylen);\n            zsi_put64(buf + 8, (uint64_t)vallen);/'
-
-mutant "short ancestor at +2 not +4" catch \
-  's/            if \(store_ancestor\) \{\n                zsi_put32\(buf \+ 4, ancestor\);\n                body = ZSI_HDRLEN_KEYVALUE_ANC;/            if (store_ancestor) {\n                zsi_put32(buf + 2, ancestor);\n                body = ZSI_HDRLEN_KEYVALUE_ANC;/'
 
 mutant "encoder: no memset (dirty record padding)" catch \
   's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/'
@@ -794,9 +791,6 @@ mutant "no NUL after key" equivalent \
 # NUL writes gone, the trailing NULs really are absent and a test must object.
 mutant "no memset and no NULs" catch \
   's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/; s/buf\[body \+ keylen \+ 1 \+ vallen\] = /(void)0; \/\/ /; s/    buf\[body \+ keylen\] = /    (void)0; \/\/ /'
-
-mutant "omitted ancestor resolves to 0" catch \
-  's/    ancestor = hasanc \? zsi_get32\(buf \+ 4\) : file_start;/    ancestor = hasanc ? zsi_get32(buf + 4) : 0;/'
 
 mutant "F-14: zero keylen allowed" catch \
   's/    if \(keylen < 1\) return ZS_BADFORMAT;             \/\* F-14 \*\//    \/* F-14 check removed *\//'
@@ -829,10 +823,7 @@ mutant "terminator: long csum at +16 not +20" catch \
 # non-canonical record.  Combined with F-24 that discards every committed record
 # after it, which G-3 forbids.  The mutant restores the bug; a test must object.
 mutant "decode: reject non-canonical (data loss)" catch \
-  's/    \/\* The ancestor: stored when HasAncestor, otherwise the containing file.s/    if (big \&\& keylen <= ZSI_SHORT_KEYLEN_MAX\n            \&\& (isdelete || vallen <= ZSI_SHORT_VALLEN_MAX))\n        return ZS_BADFORMAT;\n\n    \/* The ancestor: stored when HasAncestor, otherwise the containing file'"'"'s/'
-
-mutant "canonical: ancestor==start not flagged" catch \
-  's/    if \(anc_stored && r->ancestor == file_start\) return false;/    \/* F-17 check removed *\//'
+  's/    \/\* Total size, every term overflow-checked/    if (big \&\& keylen <= ZSI_SHORT_KEYLEN_MAX\n            \&\& (isdelete || vallen <= ZSI_SHORT_VALLEN_MAX))\n        return ZS_BADFORMAT;\n\n    \/* Total size, every term overflow-checked/'
 
 echo
 echo "pointer table cache (spec section 8)"
@@ -1052,6 +1043,42 @@ mutant "compact: reports success regardless" catch \
 # checksum, which nothing on the read path checks.  Skipping the verification
 # launders a corrupt body: the output is written under a FRESH checksum computed
 # over the corrupt copy, and D-23 then removes the input -- the only evidence.
+echo
+echo "repack: what is emitted and what is dropped (D-17b, D-18, D-19)"
+
+# D-17b.  The emitted value comes from V3 under the total order -- oldest to
+# newest by start generation.  Taking the FIRST version instead emits a value
+# the database stopped holding generations ago, silently.
+mutant "repack: emits V1's value, not V3's" catch \
+  's/            mk.have = true;\n            mk.v3 = fc\[i\].cur;/            if (!mk.have) mk.v3 = fc[i].cur;\n            mk.have = true;/'
+
+# D-19, the direction that LOSES DATA: dropping a tombstone whose key still has
+# a live value below the output range resurrects that value.  This is the whole
+# reason the test exists, and it is what the retired ancestor used to answer.
+mutant "repack: drops every tombstone" catch \
+  's/    for \(size_t i = first; i-- > 0; \) \{/    return false;\n    for (size_t i = first; i-- > 0; ) {/'
+
+# ... and the direction that merely LEAKS: retaining every tombstone is safe,
+# so nothing about a read can see it.  It needs a mutant precisely because it
+# is invisible to correctness tests -- a rule that never drops would otherwise
+# read as passing while reclaiming nothing.
+mutant "repack: retains every tombstone" catch \
+  's/    for \(size_t i = first; i-- > 0; \) \{/    return true;\n    for (size_t i = first; i-- > 0; ) {/'
+
+# D-19 looks BELOW the output range.  Searching the whole set instead finds
+# newer files too, so a key re-created above the range keeps a tombstone that
+# should have gone -- and, worse, makes the answer depend on files the range
+# has no business consulting.
+mutant "repack: searches above the range too" catch \
+  's/    for \(size_t i = first; i-- > 0; \) \{/    for (size_t i = snap->nfiles; i-- > 0; ) {/'
+
+# The refinement that is free: the search stops at the first file holding the
+# key, so it already knows whether that record is a value or a deletion.
+# Treating a deletion below as "present" retains a tombstone that is redundant
+# with it.  Safe, and so invisible without a mutant.
+mutant "repack: a deletion below counts as a value" catch \
+  's/            bool isval = found && !zsi_rec_is_delete\(&r\);/            bool isval = found;/'
+
 mutant "repack: inputs not verified before merge" catch \
   's/        r = zsi_ptrs_verify_records\(snap->files\[first \+ i\]\);/        r = ZS_OK;/'
 
@@ -1078,7 +1105,7 @@ mutant "record: csum covers its own field" catch \
 # flipped value byte into the silent loss of every record after it -- caught by
 # the no-truncate test, which is the G-3 half of the requirement.
 mutant "record: verified during replay" catch \
-  's/            struct zsi_rec r;\n            if \(zsi_rec_decode\(b, avail, f->hdr\.start, &r\) != ZS_OK\) break;/            struct zsi_rec r;\n            if (zsi_rec_decode(b, avail, f->hdr.start, \&r) != ZS_OK) break;\n            if (zsi_rec_verify(f->csum, \&r) != ZS_OK) break;/'
+  's/            struct zsi_rec r;\n            if \(zsi_rec_decode\(b, avail, &r\) != ZS_OK\) break;/            struct zsi_rec r;\n            if (zsi_rec_decode(b, avail, \&r) != ZS_OK) break;\n            if (zsi_rec_verify(f->csum, \&r) != ZS_OK) break;/'
 
 # F-32.  The write-side gap: a checksum never computed reads as engine 0's
 # everywhere, so every engine-1 read fails -- unmissable, which is the point:

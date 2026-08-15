@@ -1295,9 +1295,9 @@ static void test_header_bounds_and_ranges(void)
 static void test_type_byte_validity(void)
 {
     /* T-2b: all 256 byte values fed as a record type, asserting exactly the
-     * fourteen in F-12's table are accepted and the other 242 rejected. */
+     * ten in F-12's table are accepted and the other 246 rejected. */
     static const uint8_t legal[] = {
-        0x01, 0x03, 0x05, 0x07, 0x09, 0x0B, 0x0D, 0x0F,
+        0x01, 0x03, 0x05, 0x07,
         0x10, 0x12, 0x14, 0x16, 0x20, 0x24
     };
     bool is_legal[256];
@@ -1316,7 +1316,7 @@ static void test_type_byte_validity(void)
             return;
         }
     }
-    ASSERT_EQ(naccepted, 14);
+    ASSERT_EQ(naccepted, 10);
 
     /* A bitfield admits far more values than it defines, so the near-misses
      * matter most: each of these is a plausible single flipped bit away from a
@@ -1328,10 +1328,17 @@ static void test_type_byte_validity(void)
     ASSERT(!zsi_type_valid(ZSI_SPANTERM | ZSI_POINTERS));     /* 0x30 */
     ASSERT(!zsi_type_valid(0x31));
 
-    /* HasAncestor without HasKey */
-    ASSERT(!zsi_type_valid(ZSI_HASANCESTOR));                 /* 0x08 */
-    ASSERT(!zsi_type_valid(ZSI_HASANCESTOR | ZSI_SPANTERM));  /* 0x18 */
-    ASSERT(!zsi_type_valid(ZSI_HASANCESTOR | ZSI_POINTERS));  /* 0x28 */
+    /* The retired 0x08 (was HasAncestor), alone and on top of each shape that
+     * used to pair with it.  F-12c reserves the bit rather than reusing it, so
+     * a peer still writing the old ancestor forms is rejected record by record
+     * rather than silently misread -- every one of these was a legal type. */
+    ASSERT(!zsi_type_valid(0x08));
+    ASSERT(!zsi_type_valid(0x09));                            /* KEYVALUE_ANC */
+    ASSERT(!zsi_type_valid(0x0B));                            /* DELETION_ANC */
+    ASSERT(!zsi_type_valid(0x0D));                         /* BIGKEYVALUE_ANC */
+    ASSERT(!zsi_type_valid(0x0F));                         /* BIGDELETION_ANC */
+    ASSERT(!zsi_type_valid(0x18));
+    ASSERT(!zsi_type_valid(0x28));
 
     /* IsDelete with Pointers */
     ASSERT(!zsi_type_valid(ZSI_POINTERS | ZSI_ISDELETE));     /* 0x22 */
@@ -1348,7 +1355,6 @@ static void test_type_byte_validity(void)
 
     /* The bits mean what F-12a says in isolation, checked against the table
      * rather than assumed. */
-    ASSERT(ZSI_KEYVALUE_ANC == (ZSI_KEYVALUE | ZSI_HASANCESTOR));
     ASSERT(ZSI_DELETION == (ZSI_KEYVALUE | ZSI_ISDELETE));
     ASSERT(ZSI_BIGKEYVALUE == (ZSI_KEYVALUE | ZSI_ISBIG));
     ASSERT(ZSI_ROLLBACK == (ZSI_COMMIT | ZSI_ISDELETE));
@@ -1372,7 +1378,7 @@ static void test_record_byte_layout(void)
      * is what pins a real, nonzero engine's checksum against a literal. */
     zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
 
-    /* KEYVALUE (0x01): key "ab", value "xy", ancestor omitted.
+    /* KEYVALUE (0x01): key "ab", value "xy".
      *   +0 type, +1 keylen, +2 vallen(LE16), +4 key NUL value NUL,
      *   pad, last 4 bytes checksum (F-32)
      *   len = roundup8(4 + 2 + 1 + 2 + 1 + 4) = roundup8(14) = 16 */
@@ -1380,25 +1386,10 @@ static void test_record_byte_layout(void)
         0x01, 0x02, 0x02, 0x00, 'a', 'b', 0x00, 'x',
         'y',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false, false), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, false, 0);
+    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2);
     ASSERT_MEM_EQ(buf, kv, 16);
-
-    /* KEYVALUE_ANC (0x09): the same with ancestor 5 stored.
-     *   +4 ancestor, +8 key NUL value NUL, then padding, then checksum
-     *   len = roundup8(8 + 2 + 1 + 2 + 1 + 4) = roundup8(18) = 24 -- the
-     *   checksum no longer fits in the ancestor form's leftover padding, so
-     *   this shape grows a whole roundup8 step over the pre-F-32 layout. */
-    static const unsigned char kva[24] = {
-        0x09, 0x02, 0x02, 0x00, 0x05, 0x00, 0x00, 0x00,
-        'a',  'b',  0x00, 'x',  'y',  0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false, true), 24u);
-    memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, true, 5);
-    ASSERT_MEM_EQ(buf, kva, 24);
 
     /* DELETION (0x03): key "ab", no value field at all.
      *   +0 type, +1 keylen, +2 pad(2), +4 key NUL, then padding, then checksum
@@ -1407,23 +1398,10 @@ static void test_record_byte_layout(void)
         0x03, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true, false), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, false, 0);
+    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0);
     ASSERT_MEM_EQ(buf, del, 16);
-
-    /* DELETION_ANC (0x0B): +4 ancestor, +8 key NUL
-     *   len = roundup8(8 + 2 + 1 + 4) = roundup8(15) = 16 -- unchanged from the
-     *   pre-F-32 layout, because the checksum fits the same leftover padding
-     *   that used to be zero anyway. */
-    static const unsigned char dela[16] = {
-        0x0B, 0x02, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-        'a',  'b',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true, true), 16u);
-    memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, true, 5);
-    ASSERT_MEM_EQ(buf, dela, 16);
 
     /* An empty value is legal and distinct from an absent key (F-14, A-1).
      *   len = roundup8(4 + 2 + 1 + 0 + 1 + 4) = roundup8(12) = 16 */
@@ -1431,9 +1409,9 @@ static void test_record_byte_layout(void)
         0x01, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false, false), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false), 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, "", 0, false, 0);
+    zsi_rec_encode(buf, cs, "ab", 2, "", 0);
     ASSERT_MEM_EQ(buf, kv_empty, 16);
 
     /* Note this is byte-distinct from DELETION above at exactly one place -- the
@@ -1464,11 +1442,11 @@ static void test_record_byte_layout_big(void)
      *                     +24 key NUL value NUL, then checksum (F-32)
      *   len = roundup8(24 + 256 + 1 + 2 + 1 + 4) = roundup8(288) = 288 */
     size_t want = 288;
-    ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false, false), want);
+    ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false), want);
     char *buf = malloc(want + 16);
     ASSERT_NOT_NULL(buf);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, "xy", 2, false, 0);
+    zsi_rec_encode(buf, cs, key, keylen, "xy", 2);
 
     static const unsigned char bkv_hdr[24] = {
         0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1481,39 +1459,17 @@ static void test_record_byte_layout_big(void)
     ASSERT_MEM_EQ(buf + 24 + keylen + 1, "xy", 2);
     ASSERT_EQ(buf[24 + keylen + 1 + 2], 0);
 
-    /* BIGKEYVALUE_ANC (0x0D): the ancestor lands in padding the shape already
-     * carries, so the header stays 24 bytes and the total is unchanged (F-12c). */
-    ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false, true), want);
-    memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, "xy", 2, true, 5);
-    static const unsigned char bkva_hdr[24] = {
-        0x0D, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,   /* +4 ancestor = 5 */
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    ASSERT_MEM_EQ(buf, bkva_hdr, 24);
-
     /* BIGDELETION (0x07): +0 type, +1 pad(7), +8 keylen, +16 key NUL, checksum
      *   len = roundup8(16 + 256 + 1 + 4) = roundup8(277) = 280 */
-    ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true, false), 280u);
+    ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true), 280u);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, NULL, 0, false, 0);
+    zsi_rec_encode(buf, cs, key, keylen, NULL, 0);
     static const unsigned char bdel_hdr[16] = {
         0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
     ASSERT_MEM_EQ(buf, bdel_hdr, 16);
     ASSERT_MEM_EQ(buf + 16, key, keylen);
-
-    /* BIGDELETION_ANC (0x0F): +1 pad(3), +4 ancestor, +8 keylen, +16 key NUL */
-    ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true, true), 280u);
-    memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, NULL, 0, true, 5);
-    static const unsigned char bdela_hdr[16] = {
-        0x0F, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    ASSERT_MEM_EQ(buf, bdela_hdr, 16);
 
     free(buf);
     free(key);
@@ -1531,8 +1487,8 @@ static void test_record_byte_layout_v2(void)
     zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
     /* KEYVALUE "ab" -> "xy": fixed 4 + 2+1+2+1 + csum 4 = 14 -> len 16. */
-    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2, false, 0);
-    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 2, false, false), 16u);
+    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2);
+    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 2, false), 16u);
     ASSERT_EQ(buf[0], 0x01);
     ASSERT_EQ(buf[1], 2);                       /* keylen */
     ASSERT_EQU(zsi_get16(buf + 2), 2u);         /* vallen */
@@ -1540,36 +1496,34 @@ static void test_record_byte_layout_v2(void)
     ASSERT_EQ(buf[10], 0); ASSERT_EQ(buf[11], 0);   /* pad, covered */
     ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));   /* trailing csum */
 
-    /* DELETION_ANC "ab", anc 5: fixed 8 + 2+1 + 4 = 15 -> len 16. */
-    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0, true, 5);
-    ASSERT_EQ(buf[0], 0x0B);
-    ASSERT_EQU(zsi_get32(buf + 4), 5u);         /* ancestor stays at +4 */
+    /* DELETION "ab": fixed 4 + 2+1 + csum 4 = 11 -> len 16.  The bytes between
+     * the key's NUL and the checksum are padding and are covered by it. */
+    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0);
+    ASSERT_EQ(buf[0], 0x03);
+    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 0, true), 16u);
+    ASSERT_MEM_EQ(buf + 4, "ab\0", 3);
     ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));
 
     /* Engine 0 writes a ZERO field. */
     zs_csum *cs0 = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
-    zsi_rec_encode(buf, cs0, "ab", 2, "xy", 2, false, 0);
+    zsi_rec_encode(buf, cs0, "ab", 2, "xy", 2);
     ASSERT_EQU(zsi_get32(buf + 12), 0u);
 }
 
 static void test_record_roundtrip(void)
 {
-    /* Every one of the eight data shapes encodes and decodes back unchanged, with
+    /* Every one of the four data shapes encodes and decodes back unchanged, with
      * a total length that is a multiple of 8 and all padding zero (F-2). */
     struct {
         const char *what;
         size_t keylen, vallen;
-        bool isdelete, anc;
+        bool isdelete;
         uint8_t type;
     } shapes[] = {
-        { "KEYVALUE",        2,   2, false, false, ZSI_KEYVALUE        },
-        { "KEYVALUE_ANC",    2,   2, false, true,  ZSI_KEYVALUE_ANC    },
-        { "DELETION",        2,   0, true,  false, ZSI_DELETION        },
-        { "DELETION_ANC",    2,   0, true,  true,  ZSI_DELETION_ANC    },
-        { "BIGKEYVALUE",   300,   2, false, false, ZSI_BIGKEYVALUE     },
-        { "BIGKEYVALUE_ANC", 300, 2, false, true,  ZSI_BIGKEYVALUE_ANC },
-        { "BIGDELETION",   300,   0, true,  false, ZSI_BIGDELETION     },
-        { "BIGDELETION_ANC", 300, 0, true,  true,  ZSI_BIGDELETION_ANC }
+        { "KEYVALUE",      2,   2, false, ZSI_KEYVALUE    },
+        { "DELETION",      2,   0, true,  ZSI_DELETION    },
+        { "BIGKEYVALUE", 300,   2, false, ZSI_BIGKEYVALUE },
+        { "BIGDELETION", 300,   0, true,  ZSI_BIGDELETION }
     };
 
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
@@ -1580,8 +1534,7 @@ static void test_record_roundtrip(void)
         for (size_t j = 0; j < kl; j++) key[j] = (char)(1 + (j % 255));
         for (size_t j = 0; j < vl; j++) val[j] = (char)(255 - (j % 255));
 
-        size_t len = zsi_rec_encoded_len(kl, vl, shapes[i].isdelete,
-                                         shapes[i].anc);
+        size_t len = zsi_rec_encoded_len(kl, vl, shapes[i].isdelete);
         ASSERT(len > 0);
         ASSERT_EQU(len % 8, 0u);
 
@@ -1589,12 +1542,12 @@ static void test_record_roundtrip(void)
         ASSERT_NOT_NULL(buf);
         memset(buf, 0xAA, len);
         zsi_rec_encode(buf, zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL), key, kl,
-                       shapes[i].isdelete ? NULL : val, vl, shapes[i].anc, 7);
+                       shapes[i].isdelete ? NULL : val, vl);
 
         ASSERT_EQ((unsigned char)buf[0], shapes[i].type);
 
         struct zsi_rec r;
-        int rc = zsi_rec_decode(buf, len, 99, &r);
+        int rc = zsi_rec_decode(buf, len, &r);
         if (rc != ZS_OK) {
             fprintf(stderr, "\n    FAIL %s: decode returned %d\n",
                     shapes[i].what, rc);
@@ -1617,10 +1570,6 @@ static void test_record_roundtrip(void)
             ASSERT_MEM_EQ(r.val, val, vl);
         }
 
-        /* F-17: a stored ancestor is read back; an omitted one resolves to the
-         * containing file's start generation, which the caller supplies. */
-        ASSERT_EQU(r.ancestor, shapes[i].anc ? 7u : 99u);
-
         /* Key and value are usable in place as C strings, since a NUL follows
          * each -- while the lengths remain authoritative (F-13). */
         ASSERT_EQ(r.key[r.keylen], 0);
@@ -1640,30 +1589,25 @@ static void test_record_canonical(void)
     /* F-15: the short form is mandatory whenever the lengths fit.  Asserting the
      * exact type byte at each boundary means a wrong threshold fails here rather
      * than surfacing much later as a cross-implementation byte diff. */
-    ASSERT_EQ(zsi_rec_type_for(255, 0, false, false), ZSI_KEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(256, 0, false, false), ZSI_BIGKEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(1, 65535, false, false), ZSI_KEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(1, 65536, false, false), ZSI_BIGKEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(255, 0, true, false), ZSI_DELETION);
-    ASSERT_EQ(zsi_rec_type_for(256, 0, true, false), ZSI_BIGDELETION);
+    ASSERT_EQ(zsi_rec_type_for(255, 0, false), ZSI_KEYVALUE);
+    ASSERT_EQ(zsi_rec_type_for(256, 0, false), ZSI_BIGKEYVALUE);
+    ASSERT_EQ(zsi_rec_type_for(1, 65535, false), ZSI_KEYVALUE);
+    ASSERT_EQ(zsi_rec_type_for(1, 65536, false), ZSI_BIGKEYVALUE);
+    ASSERT_EQ(zsi_rec_type_for(255, 0, true), ZSI_DELETION);
+    ASSERT_EQ(zsi_rec_type_for(256, 0, true), ZSI_BIGDELETION);
 
     /* A deletion has no value field, so a value length cannot promote it. */
-    ASSERT_EQ(zsi_rec_type_for(1, 70000, true, false), ZSI_DELETION);
-
-    /* The ancestor never promotes a record to the big form: it is 4 bytes
-     * whenever present (F-15). */
-    ASSERT_EQ(zsi_rec_type_for(255, 65535, false, true), ZSI_KEYVALUE_ANC);
-    ASSERT_EQ(zsi_rec_type_for(255, 0, true, true), ZSI_DELETION_ANC);
+    ASSERT_EQ(zsi_rec_type_for(1, 70000, true), ZSI_DELETION);
 
     /* Encoding at each boundary produces the type the table says. */
     zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
     memset(buf, 0, sizeof(buf));
-    zsi_rec_encode(buf, cs, key, 255, "", 0, false, 0);
+    zsi_rec_encode(buf, cs, key, 255, "", 0);
     ASSERT_EQ((unsigned char)buf[0], ZSI_KEYVALUE);
 
-    char *big = malloc(zsi_rec_encoded_len(256, 0, false, false));
+    char *big = malloc(zsi_rec_encoded_len(256, 0, false));
     ASSERT_NOT_NULL(big);
-    zsi_rec_encode(big, cs, key, 256, "", 0, false, 0);
+    zsi_rec_encode(big, cs, key, 256, "", 0);
     ASSERT_EQ((unsigned char)big[0], ZSI_BIGKEYVALUE);
     free(big);
 
@@ -1682,21 +1626,21 @@ static void test_record_canonical(void)
     zsi_put64(buf + 8, 2);              /* keylen 2: fits the short form */
     zsi_put64(buf + 16, 2);             /* vallen 2: fits too */
     memcpy(buf + 24, "ab\0xy", 5);
-    ASSERT_OK(zsi_rec_decode(buf, 64, 1, &r));
+    ASSERT_OK(zsi_rec_decode(buf, 64, &r));
     ASSERT_EQU(r.keylen, 2u);
     ASSERT_MEM_EQ(r.key, "ab", 2);      /* the data survives, which is the point */
     ASSERT_EQU(r.vallen, 2u);
     ASSERT_MEM_EQ(r.val, "xy", 2);
-    ASSERT(!zsi_rec_is_canonical(&r, 1));
+    ASSERT(!zsi_rec_is_canonical(&r));
 
     /* A big record that genuinely needs the big form decodes and is canonical. */
-    size_t n = zsi_rec_encoded_len(300, 2, false, false);
+    size_t n = zsi_rec_encoded_len(300, 2, false);
     char *ok = malloc(n);
     ASSERT_NOT_NULL(ok);
-    zsi_rec_encode(ok, cs, key, 300, "xy", 2, false, 0);
-    ASSERT_OK(zsi_rec_decode(ok, n, 1, &r));
+    zsi_rec_encode(ok, cs, key, 300, "xy", 2);
+    ASSERT_OK(zsi_rec_decode(ok, n, &r));
     ASSERT_EQU(r.keylen, 300u);
-    ASSERT(zsi_rec_is_canonical(&r, 1));
+    ASSERT(zsi_rec_is_canonical(&r));
     free(ok);
 
     /* And the same for a big deletion, where only keylen can justify the form. */
@@ -1704,28 +1648,24 @@ static void test_record_canonical(void)
     buf[0] = (char)ZSI_BIGDELETION;
     zsi_put64(buf + 8, 2);
     memcpy(buf + 16, "ab", 2);
-    ASSERT_OK(zsi_rec_decode(buf, 64, 1, &r));
+    ASSERT_OK(zsi_rec_decode(buf, 64, &r));
     ASSERT_MEM_EQ(r.key, "ab", 2);
-    ASSERT(!zsi_rec_is_canonical(&r, 1));
+    ASSERT(!zsi_rec_is_canonical(&r));
 
-    /* Everything this implementation writes is canonical, across all eight
+    /* Everything this implementation writes is canonical, across all four
      * shapes -- which is the writer-side half of F-15. */
-    struct { size_t kl, vl; bool del, anc; } shapes[] = {
-        { 2, 2, false, false }, { 2, 2, false, true },
-        { 2, 0, true,  false }, { 2, 0, true,  true },
-        { 300, 2, false, false }, { 300, 2, false, true },
-        { 300, 0, true, false },  { 300, 0, true, true }
+    struct { size_t kl, vl; bool del; } shapes[] = {
+        { 2, 2, false }, { 2, 0, true }, { 300, 2, false }, { 300, 0, true }
     };
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
         size_t len = zsi_rec_encoded_len(shapes[i].kl, shapes[i].vl,
-                                         shapes[i].del, shapes[i].anc);
+                                         shapes[i].del);
         char *b = malloc(len);
         ASSERT_NOT_NULL(b);
         zsi_rec_encode(b, cs, key, shapes[i].kl,
-                       shapes[i].del ? NULL : val, shapes[i].vl,
-                       shapes[i].anc, 7);
-        ASSERT_OK(zsi_rec_decode(b, len, 1, &r));
-        if (!zsi_rec_is_canonical(&r, 1)) {
+                       shapes[i].del ? NULL : val, shapes[i].vl);
+        ASSERT_OK(zsi_rec_decode(b, len, &r));
+        if (!zsi_rec_is_canonical(&r)) {
             fprintf(stderr, "\n    FAIL shape %zu encoded non-canonically\n", i);
             current_test_failed = 1;
             free(b);
@@ -1734,21 +1674,24 @@ static void test_record_canonical(void)
         free(b);
     }
 
-    /* F-17: storing an ancestor equal to the file's own start is non-canonical,
-     * because the rule is to omit it exactly then.  This is the case T-6 names
-     * explicitly, and it decodes to the same value either way -- which is why
-     * only a canonicality check can see it. */
-    size_t l2 = zsi_rec_encoded_len(2, 2, false, true);
-    char *b2 = malloc(l2);
+    /* F-18: a record's bytes are a function of its own key and value, and of
+     * nothing else -- so canonicality is a property of the record alone and
+     * needs no containing file to judge it against.  The same key and value
+     * encode identically however the database around them got there, which is
+     * what makes T-12a's byte-for-byte agreement checkable at all. */
+    size_t l2 = zsi_rec_encoded_len(2, 2, false);
+    char *b2 = malloc(l2), *b3 = malloc(l2);
     ASSERT_NOT_NULL(b2);
-    zsi_rec_encode(b2, cs, "ab", 2, "xy", 2, true, 5);
-    ASSERT_OK(zsi_rec_decode(b2, l2, 5, &r));
-    ASSERT_EQU(r.ancestor, 5u);
-    ASSERT(!zsi_rec_is_canonical(&r, 5));   /* stored, but equals file start */
-    ASSERT_OK(zsi_rec_decode(b2, l2, 9, &r));
-    ASSERT_EQU(r.ancestor, 5u);
-    ASSERT(zsi_rec_is_canonical(&r, 9));    /* stored, and differs: correct */
+    ASSERT_NOT_NULL(b3);
+    memset(b2, 0xAA, l2);
+    memset(b3, 0x55, l2);
+    zsi_rec_encode(b2, cs, "ab", 2, "xy", 2);
+    zsi_rec_encode(b3, cs, "ab", 2, "xy", 2);
+    ASSERT_MEM_EQ(b2, b3, l2);
+    ASSERT_OK(zsi_rec_decode(b2, l2, &r));
+    ASSERT(zsi_rec_is_canonical(&r));
     free(b2);
+    free(b3);
 }
 
 static void test_record_embedded_nul(void)
@@ -1762,13 +1705,13 @@ static void test_record_embedded_nul(void)
     const char val[] = { '\0', 'x', '\0' };
     zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
-    size_t len = zsi_rec_encoded_len(3, 3, false, false);
+    size_t len = zsi_rec_encoded_len(3, 3, false);
     /* roundup8(4 + 3 + 1 + 3 + 1 + 4) = roundup8(16) = 16 -- the checksum's
      * +4 does not push this over another roundup8 step. */
     ASSERT_EQU(len, 16u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, key, 3, val, 3, false, 0);
-    ASSERT_OK(zsi_rec_decode(buf, len, 1, &r));
+    zsi_rec_encode(buf, cs, key, 3, val, 3);
+    ASSERT_OK(zsi_rec_decode(buf, len, &r));
     ASSERT_EQU(r.keylen, 3u);
     ASSERT_MEM_EQ(r.key, key, 3);
     ASSERT_EQU(r.vallen, 3u);
@@ -1780,10 +1723,10 @@ static void test_record_embedded_nul(void)
 
     /* A key that is entirely NULs. */
     const char nuls[] = { '\0', '\0', '\0', '\0' };
-    len = zsi_rec_encoded_len(4, 0, false, false);
+    len = zsi_rec_encoded_len(4, 0, false);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, nuls, 4, "", 0, false, 0);
-    ASSERT_OK(zsi_rec_decode(buf, len, 1, &r));
+    zsi_rec_encode(buf, cs, nuls, 4, "", 0);
+    ASSERT_OK(zsi_rec_decode(buf, len, &r));
     ASSERT_EQU(r.keylen, 4u);
     ASSERT_MEM_EQ(r.key, nuls, 4);
     ASSERT_EQU(r.vallen, 0u);
@@ -1806,20 +1749,19 @@ static void test_record_bounds(void)
 
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
         size_t len = zsi_rec_encoded_len(shapes[i].kl, shapes[i].vl,
-                                         shapes[i].del, shapes[i].anc);
+                                         shapes[i].del);
         char *b = malloc(len);
         ASSERT_NOT_NULL(b);
         char *k = malloc(shapes[i].kl);
         ASSERT_NOT_NULL(k);
         memset(k, 'k', shapes[i].kl);
         zsi_rec_encode(b, cs, k, shapes[i].kl,
-                       shapes[i].del ? NULL : "xy", shapes[i].vl,
-                       shapes[i].anc, 3);
+                       shapes[i].del ? NULL : "xy", shapes[i].vl);
 
-        ASSERT_OK(zsi_rec_decode(b, len, 1, &r));
+        ASSERT_OK(zsi_rec_decode(b, len, &r));
         /* every length below the true one fails */
         for (size_t l = 0; l < len; l++) {
-            if (zsi_rec_decode(b, l, 1, &r) == ZS_OK) {
+            if (zsi_rec_decode(b, l, &r) == ZS_OK) {
                 fprintf(stderr, "\n    FAIL shape %zu accepted at len %zu of %zu\n",
                         i, l, len);
                 current_test_failed = 1;
@@ -1837,25 +1779,25 @@ static void test_record_bounds(void)
     buf[0] = (char)ZSI_BIGKEYVALUE;
     zsi_put64(buf + 8, 0xFFFFFFFFFFFFFFFFull);
     zsi_put64(buf + 16, 0xFFFFFFFFFFFFFFFFull);
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     memset(buf, 0, sizeof(buf));
     buf[0] = (char)ZSI_BIGKEYVALUE;
     zsi_put64(buf + 8, (uint64_t)SIZE_MAX - 1);
     zsi_put64(buf + 16, 4);
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     /* F-14: a key must be at least 1 byte, in every shape. */
     memset(buf, 0, sizeof(buf));
     buf[0] = (char)ZSI_KEYVALUE;
     buf[1] = 0;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     memset(buf, 0, sizeof(buf));
     buf[0] = (char)ZSI_BIGKEYVALUE;
     zsi_put64(buf + 8, 0);
     zsi_put64(buf + 16, 70000);
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     /* An invalid type byte, and a valid non-data type, are both refused by the
      * data-record decoder.
@@ -1871,19 +1813,19 @@ static void test_record_bounds(void)
     memcpy(buf + 4, "ab\0xy", 5);
 
     buf[0] = 0x11;                       /* HasKey|SpanTerminator: not legal */
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = (char)ZSI_COMMIT;           /* a terminator is not a data record */
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = (char)ZSI_ROLLBACK;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = (char)ZSI_COMMIT_LONG;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = (char)ZSI_PTRS32;           /* nor is a pointer section */
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = (char)ZSI_PTRS64;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
     buf[0] = 0x00;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     /* Symmetrically, a data type is not a terminator -- with a plausible
      * terminator body present, for the same reason. */
@@ -1898,7 +1840,7 @@ static void test_record_bounds(void)
     ASSERT_EQ(zsi_term_decode(buf, sizeof(buf), &t), ZS_BADFORMAT);
 
     /* Zero-length buffer. */
-    ASSERT_EQ(zsi_rec_decode(buf, 0, 1, &r), ZS_BADFORMAT);
+    ASSERT_EQ(zsi_rec_decode(buf, 0, &r), ZS_BADFORMAT);
 }
 
 static void test_terminator(void)
@@ -2049,15 +1991,13 @@ static void sb_reserve(struct sb *s, size_t extra)
 
 /* Append a data record to the current span. */
 static void sb_rec(struct sb *s, const char *key, size_t keylen,
-                   const char *val, size_t vallen,
-                   bool store_anc, uint32_t anc)
+                   const char *val, size_t vallen)
 {
-    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, store_anc);
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL);
     assert(n > 0);
     sb_reserve(s, n);
     zs_csum *cs = zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM);
-    zsi_rec_encode(s->buf + s->len, cs, key, keylen, val, vallen, store_anc,
-                   anc);
+    zsi_rec_encode(s->buf + s->len, cs, key, keylen, val, vallen);
     s->len += n;
 }
 
@@ -2133,9 +2073,9 @@ static void ib_init(struct ib *b, uint32_t start, uint32_t end, unsigned engine)
 static void ib_free(struct ib *b) { free(b->buf); b->buf = NULL; }
 
 static void ib_rec(struct ib *b, const char *key, size_t keylen,
-                   const char *val, size_t vallen, bool anc, uint32_t ancgen)
+                   const char *val, size_t vallen)
 {
-    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, anc);
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL);
     assert(n > 0);
     while (b->len + n > b->alloc) {
         b->alloc *= 2;
@@ -2145,7 +2085,7 @@ static void ib_rec(struct ib *b, const char *key, size_t keylen,
     assert(b->n < 256);
     b->offs[b->n++] = b->len;
     zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
-    zsi_rec_encode(b->buf + b->len, cs, key, keylen, val, vallen, anc, ancgen);
+    zsi_rec_encode(b->buf + b->len, cs, key, keylen, val, vallen);
     b->len += n;
 }
 
@@ -2444,9 +2384,9 @@ static void test_span_basic(void)
 
     /* One commit span of three records replays all three, in file order. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
-    sb_rec(&s, "c", 1, "3", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "b", 1, "2", 1);
+    sb_rec(&s, "c", 1, "3", 1);
     sb_term(&s, false);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 3u);
@@ -2460,10 +2400,10 @@ static void test_span_basic(void)
 
     /* Several spans, all committed, replay in order across span boundaries. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
-    sb_rec(&s, "c", 1, "3", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1);
+    sb_rec(&s, "c", 1, "3", 1);
     sb_term(&s, false);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 3u);
@@ -2477,7 +2417,7 @@ static void test_span_basic(void)
      * or more), and contributes nothing. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     sb_term(&s, false);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 1u);
@@ -2490,8 +2430,8 @@ static void test_span_basic(void)
      * not filter them, because resolving a deletion into "absent" is the read
      * path's job, and an index must know the tombstone exists. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
-    sb_rec(&s, "a", 1, NULL, 0, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "a", 1, NULL, 0);
     sb_term(&s, false);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 2u);
@@ -2509,8 +2449,8 @@ static void test_span_rollback(void)
 
     /* A rolled-back span replays nothing (F-21, F-25). */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "b", 1, "2", 1);
     sb_term(&s, true);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
@@ -2526,11 +2466,11 @@ static void test_span_rollback(void)
      * high-water-mark implementation would lose the third span or keep the
      * second. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "first", 5, "1", 1, false, 0);
+    sb_rec(&s, "first", 5, "1", 1);
     sb_term(&s, false);
-    sb_rec(&s, "aborted", 7, "x", 1, false, 0);
+    sb_rec(&s, "aborted", 7, "x", 1);
     sb_term(&s, true);
-    sb_rec(&s, "third", 5, "3", 1, false, 0);
+    sb_rec(&s, "third", 5, "3", 1);
     sb_term(&s, false);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 2u);
@@ -2542,9 +2482,9 @@ static void test_span_rollback(void)
 
     /* Every span rolled back: clean, zero records, not an error (F-26h). */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, true);
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1);
     sb_term(&s, true);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
@@ -2558,7 +2498,7 @@ static void test_span_rollback(void)
     for (int i = 0; i < 6; i++) {
         char k[8];
         snprintf(k, sizeof(k), "k%d", i);
-        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+        sb_rec(&s, k, strlen(k), "v", 1);
         sb_term(&s, (i % 2) == 1);       /* odd spans rolled back */
     }
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
@@ -2599,10 +2539,10 @@ static void test_span_torn_tail(void)
      * complete point is before the unterminated span, and the file is NOT clean --
      * so a writer moves to a new generation rather than appending (D-9, R-4). */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     good_end = s.len;
-    sb_rec(&s, "b", 1, "2", 1, false, 0);       /* no terminator */
+    sb_rec(&s, "b", 1, "2", 1);       /* no terminator */
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 1u);
     ASSERT_STR_EQ(c.key[0], "a");
@@ -2615,11 +2555,11 @@ static void test_span_torn_tail(void)
      * because the checksum covers the span AND the terminator, the outcome is
      * identical -- the span reads as absent. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     good_end = s.len;
     size_t victim = s.len;
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
+    sb_rec(&s, "b", 1, "2", 1);
     sb_term(&s, false);
     s.buf[victim + 5] ^= 0x01;                  /* damage the span's data */
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
@@ -2632,7 +2572,7 @@ static void test_span_torn_tail(void)
 
     /* Trailing garbage after a valid span. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     good_end = s.len;
     sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);
@@ -2646,10 +2586,10 @@ static void test_span_torn_tail(void)
     /* Truncated at every byte offset past the first valid span.  Whatever the
      * truncation point, the answer is the committed prefix and never a crash. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     good_end = s.len;
-    sb_rec(&s, "bb", 2, "22", 2, false, 0);
+    sb_rec(&s, "bb", 2, "22", 2);
     sb_term(&s, false);
     size_t full = s.len;
 
@@ -2700,12 +2640,12 @@ static void test_span_terminator_without_data(void)
      * the writes would leave behind.  The terminator is structurally perfect and
      * its length field matches; only the checksum can tell. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     size_t good_end = s.len;
 
     size_t data_at = s.len;
-    sb_rec(&s, "ghost", 5, "value", 5, false, 0);
+    sb_rec(&s, "ghost", 5, "value", 5);
     size_t data_len = s.len - data_at;
     sb_term(&s, false);
     memset(s.buf + data_at, 0, data_len);       /* data never landed */
@@ -2724,7 +2664,7 @@ static void test_span_terminator_without_data(void)
      * returned as though committed. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     size_t at = s.len;
-    sb_rec(&s, "key", 3, "aaa", 3, false, 0);
+    sb_rec(&s, "key", 3, "aaa", 3);
     sb_term(&s, false);
     s.buf[at + 4 + 3 + 1] = 'b';                /* first value byte: aaa -> baa */
 
@@ -2755,10 +2695,10 @@ static void test_nocsum_still_rejects_bad_span(void)
      * altered after its terminator was computed -- only the checksum can
      * tell. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     size_t at = s.len;
-    sb_rec(&s, "key", 3, "aaa", 3, false, 0);
+    sb_rec(&s, "key", 3, "aaa", 3);
     sb_term(&s, false);
     s.buf[at + 4 + 3 + 1] = 'b';                /* first value byte: aaa -> baa */
 
@@ -2900,7 +2840,7 @@ static void test_span_pointers_rejected(void)
 
     for (int wide = 0; wide < 2; wide++) {
         sb_init(&s, 1, ZSI_CSUM_XXHASH);
-        sb_rec(&s, "a", 1, "1", 1, false, 0);
+        sb_rec(&s, "a", 1, "1", 1);
         sb_term(&s, false);
         size_t good_end = s.len;
 
@@ -2932,7 +2872,7 @@ static void test_span_engine_zero(void)
 
     sb_init(&s, 1, ZSI_CSUM_NONE);
     size_t at = s.len;
-    sb_rec(&s, "key", 3, "aaa", 3, false, 0);
+    sb_rec(&s, "key", 3, "aaa", 3);
     sb_term(&s, false);
     s.buf[at + 4 + 3 + 1] = 'b';
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
@@ -2943,7 +2883,7 @@ static void test_span_engine_zero(void)
 
     /* But a length disagreement is structural and still caught. */
     sb_init(&s, 1, ZSI_CSUM_NONE);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term_badlen(&s, 999);
     ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
     ASSERT_EQU(c.n, 0u);
@@ -2969,7 +2909,7 @@ static void test_span_long_terminator(void)
     while (s.len - s.span_start <= ZSI_SHORT_SPANLEN_MAX) {
         char k[32];
         snprintf(k, sizeof(k), "key%08zu", n++);
-        sb_rec(&s, k, strlen(k), val, sizeof(val), false, 0);
+        sb_rec(&s, k, strlen(k), val, sizeof(val));
     }
     ASSERT(s.len - s.span_start > ZSI_SHORT_SPANLEN_MAX);
     size_t nrecs = n;
@@ -3073,9 +3013,9 @@ static void test_index_committed_only(void)
      * shortcut -- which is a tempting simplification, and which resurrects aborted
      * writes. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "live", 4, "1", 1, false, 0);
+    sb_rec(&s, "live", 4, "1", 1);
     sb_term(&s, false);
-    sb_rec(&s, "aborted", 7, "x", 1, false, 0);
+    sb_rec(&s, "aborted", 7, "x", 1);
     sb_term(&s, true);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
 
@@ -3093,16 +3033,16 @@ static void test_index_committed_only(void)
      * version survives and the aborted rewrite is invisible.  An implementation
      * that walked every record would return the aborted value. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "k", 1, "good", 4, false, 0);
+    sb_rec(&s, "k", 1, "good", 4);
     sb_term(&s, false);
-    sb_rec(&s, "k", 1, "bad", 3, false, 0);
+    sb_rec(&s, "k", 1, "bad", 3);
     sb_term(&s, true);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
 
     ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
     struct zsi_rec r;
     ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
+                             &r));
     ASSERT_EQU(r.vallen, 4u);
     ASSERT_MEM_EQ(r.val, "good", 4);
     zsi_file_release(&f);
@@ -3110,14 +3050,14 @@ static void test_index_committed_only(void)
 
     /* A key deleted in a rolled-back span stays present. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "k", 1, "v", 1, false, 0);
+    sb_rec(&s, "k", 1, "v", 1);
     sb_term(&s, false);
-    sb_rec(&s, "k", 1, NULL, 0, false, 0);
+    sb_rec(&s, "k", 1, NULL, 0);
     sb_term(&s, true);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
     ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
     ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
+                             &r));
     ASSERT_NOT_NULL(r.val);
     zsi_file_release(&f);
     sb_free(&s);
@@ -3133,7 +3073,7 @@ static void test_index_ordered_traversal(void)
     static const char *ins[] = { "m", "d", "z", "a", "q", "b", "y", "c" };
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     for (size_t i = 0; i < sizeof(ins) / sizeof(ins[0]); i++)
-        sb_rec(&s, ins[i], strlen(ins[i]), "v", 1, false, 0);
+        sb_rec(&s, ins[i], strlen(ins[i]), "v", 1);
     sb_term(&s, false);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
 
@@ -3163,10 +3103,10 @@ static void test_index_ordered_traversal(void)
     sb_free(&s);
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "abc", 3, "v", 1, false, 0);
-    sb_rec(&s, "ab", 2, "v", 1, false, 0);
-    sb_rec(&s, "a", 1, "v", 1, false, 0);
-    sb_rec(&s, "b", 1, "v", 1, false, 0);
+    sb_rec(&s, "abc", 3, "v", 1);
+    sb_rec(&s, "ab", 2, "v", 1);
+    sb_rec(&s, "a", 1, "v", 1);
+    sb_rec(&s, "b", 1, "v", 1);
     sb_term(&s, false);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
     index_keys(f, keys, sizeof(keys));
@@ -3190,8 +3130,8 @@ static void test_index_delta(void)
      * of them arrives incrementally, which is what a writer folding in its own
      * commits looks like (D-13b). */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "base0", 5, "b", 1, false, 0);
-    sb_rec(&s, "base1", 5, "b", 1, false, 0);
+    sb_rec(&s, "base0", 5, "b", 1);
+    sb_rec(&s, "base1", 5, "b", 1);
     sb_term(&s, false);
 
     /* Record the offsets of everything appended after the base span. */
@@ -3201,7 +3141,7 @@ static void test_index_delta(void)
         char k[32];
         snprintf(k, sizeof(k), "d%06zu", n);
         offs[n] = s.len;
-        sb_rec(&s, k, strlen(k), "v", 1, false, 0);
+        sb_rec(&s, k, strlen(k), "v", 1);
     }
     sb_term(&s, false);
 
@@ -3293,14 +3233,14 @@ static void test_index_delta_shadows_base(void)
      * cursor never yields the same key twice (D-14h), one level below where that
      * rule is stated. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "old", 3, false, 0);
-    sb_rec(&s, "b", 1, "bee", 3, false, 0);
-    sb_rec(&s, "c", 1, "see", 3, false, 0);
+    sb_rec(&s, "a", 1, "old", 3);
+    sb_rec(&s, "b", 1, "bee", 3);
+    sb_rec(&s, "c", 1, "see", 3);
     sb_term(&s, false);
     size_t newer_a = s.len;
-    sb_rec(&s, "a", 1, "new", 3, false, 0);
+    sb_rec(&s, "a", 1, "new", 3);
     size_t newer_c = s.len;
-    sb_rec(&s, "c", 1, "cee", 3, false, 0);
+    sb_rec(&s, "c", 1, "cee", 3);
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
@@ -3321,8 +3261,8 @@ static void test_index_delta_shadows_base(void)
     ix->base = malloc(3 * sizeof(size_t));
     ASSERT_NOT_NULL(ix->base);
     ix->base[0] = ZSI_HEADER_LEN;                                   /* a */
-    ix->base[1] = ZSI_HEADER_LEN + zsi_rec_encoded_len(1, 3, false, false);
-    ix->base[2] = ix->base[1] + zsi_rec_encoded_len(1, 3, false, false);
+    ix->base[1] = ZSI_HEADER_LEN + zsi_rec_encoded_len(1, 3, false);
+    ix->base[2] = ix->base[1] + zsi_rec_encoded_len(1, 3, false);
     ix->nbase = 3;
     ix->ndelta = 0;
 
@@ -3337,7 +3277,7 @@ static void test_index_delta_shadows_base(void)
     ASSERT_OK(zsi_index_find(ix, zsi_compar_default, "a", 1, &off));
     ASSERT_EQU(off, newer_a);
     ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
+                             &r));
     ASSERT_MEM_EQ(r.val, "new", 3);
 
     ASSERT_OK(zsi_index_find(ix, zsi_compar_default, "c", 1, &off));
@@ -3411,7 +3351,7 @@ static void test_index_delta_merge_with_duplicates(void)
         char k[32];
         snprintf(k, sizeof(k), "k%06zu", i);
         old_off[i] = s.len;
-        sb_rec(&s, k, strlen(k), "old", 3, false, 0);
+        sb_rec(&s, k, strlen(k), "old", 3);
     }
     sb_term(&s, false);
 
@@ -3420,7 +3360,7 @@ static void test_index_delta_merge_with_duplicates(void)
         char k[32];
         snprintf(k, sizeof(k), "k%06zu", i);
         new_off[i] = s.len;
-        sb_rec(&s, k, strlen(k), "new", 3, false, 0);
+        sb_rec(&s, k, strlen(k), "new", 3);
     }
     sb_term(&s, false);
 
@@ -3534,10 +3474,10 @@ static void test_index_binary_keys(void)
     const char k4[] = { 'a', '\0' };
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, k2, 3, "v2", 2, false, 0);
-    sb_rec(&s, k1, 3, "v1", 2, false, 0);
-    sb_rec(&s, k4, 2, "v4", 2, false, 0);
-    sb_rec(&s, k3, 1, "v3", 2, false, 0);
+    sb_rec(&s, k2, 3, "v2", 2);
+    sb_rec(&s, k1, 3, "v1", 2);
+    sb_rec(&s, k4, 2, "v4", 2);
+    sb_rec(&s, k3, 1, "v3", 2);
     sb_term(&s, false);
     ASSERT_EQ(index_file(&s, 1, &f), ZS_OK);
 
@@ -3655,7 +3595,7 @@ static void test_inorder_search(void)
     for (size_t n = 1; n <= 2; n++) {
         ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
         for (size_t i = 0; i < n; i++)
-            ib_rec(&b, keys[i * 2], 1, "v", 1, false, 0);
+            ib_rec(&b, keys[i * 2], 1, "v", 1);
         ib_finish(&b);
         ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
         ASSERT_EQU(f->nptrs, n);
@@ -3686,8 +3626,8 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_EQ(mkdbdir(), 0);
 
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "1", 1, false, 0);
-    ib_rec(&b, "b", 1, "2", 1, false, 0);
+    ib_rec(&b, "a", 1, "1", 1);
+    ib_rec(&b, "b", 1, "2", 1);
     ib_finish(&b);
 
     size_t full = b.len;
@@ -3816,8 +3756,8 @@ static void test_inorder_records_checksum(void)
     ASSERT_EQ(mkdbdir(), 0);
 
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     ib_finish(&b);
 
     /* Damage a value byte, leaving every length and pointer intact. */
@@ -3842,8 +3782,8 @@ static void test_inorder_records_checksum(void)
     /* Undamaged, the same check passes. */
     ib_free(&b);
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     ib_finish(&b);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -3866,7 +3806,7 @@ static void test_inorder_widths_and_padding(void)
         for (size_t i = 0; i < n; i++) {
             char k[8];
             snprintf(k, sizeof(k), "k%zu", i);
-            ib_rec(&b, k, strlen(k), "v", 1, false, 0);
+            ib_rec(&b, k, strlen(k), "v", 1);
         }
         size_t records_end = b.len;
         ib_finish(&b);
@@ -3904,7 +3844,7 @@ static void test_inorder_ptrs64(void)
     zsi_name_format(name, test_uuid, 1, 1);
 
     /* Two records, then a wide section by hand. */
-    size_t reclen = zsi_rec_encoded_len(1, 1, false, false);
+    size_t reclen = zsi_rec_encoded_len(1, 1, false);
     size_t records_end = ZSI_HEADER_LEN + 2 * reclen;
     size_t seclen = 16 + 2 * 8;
     size_t total = records_end + seclen + ZSI_TRAILER_LEN;
@@ -3912,10 +3852,9 @@ static void test_inorder_ptrs64(void)
     char *buf = calloc(1, total);
     ASSERT_NOT_NULL(buf);
     make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
-    zsi_rec_encode(buf + ZSI_HEADER_LEN, zsi_csum_xxhash, "a", 1, "1", 1,
-                   false, 0);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN, zsi_csum_xxhash, "a", 1, "1", 1);
     zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, zsi_csum_xxhash, "b", 1,
-                   "2", 1, false, 0);
+                   "2", 1);
 
     buf[records_end] = (char)ZSI_PTRS64;
     zsi_put64(buf + records_end + 8, 2);
@@ -3959,7 +3898,7 @@ static void test_inorder_kind_rules(void)
     struct zsi_file *f = NULL;
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
@@ -3976,7 +3915,7 @@ static void test_inorder_kind_rules(void)
      * file loads one, an unordered file has none. */
     struct ib b;
     ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "1", 1, false, 0);
+    ib_rec(&b, "a", 1, "1", 1);
     ib_finish(&b);
     ASSERT_EQ(ib_load(&b, 3, 3, &f), ZS_OK);
     ASSERT(!zsi_file_is_unordered(f));
@@ -3998,7 +3937,7 @@ static void test_inorder_probe_ends_agrees(void)
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
     static const char *keys[] = { "c", "e", "g", "i", "k", "m" };
     for (size_t i = 0; i < 6; i++)
-        ib_rec(&b, keys[i], 1, "v", 1, false, 0);
+        ib_rec(&b, keys[i], 1, "v", 1);
     ib_finish(&b);
     ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
 
@@ -4078,7 +4017,7 @@ static void build_both_kinds(struct sb *s, struct ib *b,
 
     sb_init(s, 1, ZSI_CSUM_XXHASH);
     for (size_t i = 0; i < n; i++)
-        sb_rec(s, keys[i], strlen(keys[i]), "v", 1, false, 0);
+        sb_rec(s, keys[i], strlen(keys[i]), "v", 1);
     sb_term(s, false);
 
     char name[ZSI_NAME_MAX];
@@ -4103,7 +4042,7 @@ static void build_both_kinds(struct sb *s, struct ib *b,
 
     ib_init(b, 2, 2, ZSI_CSUM_XXHASH);
     for (size_t i = 0; i < n; i++)
-        ib_rec(b, sorted[i], strlen(sorted[i]), "v", 1, false, 0);
+        ib_rec(b, sorted[i], strlen(sorted[i]), "v", 1);
     ib_finish(b);
     zsi_name_format(name, test_uuid, 2, 2);
     ASSERT_EQ(writefile(name, b->buf, b->len), 0);
@@ -4269,11 +4208,11 @@ static void test_fcur_no_duplicate_keys(void)
 
     /* A key written three times in one file, plus neighbours either side. */
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
-    sb_rec(&s, "k", 1, "v1", 2, false, 0);
-    sb_rec(&s, "k", 1, "v2", 2, false, 0);
-    sb_rec(&s, "z", 1, "9", 1, false, 0);
-    sb_rec(&s, "k", 1, "v3", 2, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "k", 1, "v1", 2);
+    sb_rec(&s, "k", 1, "v2", 2);
+    sb_rec(&s, "z", 1, "9", 1);
+    sb_rec(&s, "k", 1, "v3", 2);
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
@@ -4308,9 +4247,9 @@ static void test_fcur_deletions_visible(void)
     char keys[256];
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
-    sb_rec(&s, "b", 1, "2", 1, false, 0);
-    sb_rec(&s, "b", 1, NULL, 0, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "b", 1, "2", 1);
+    sb_rec(&s, "b", 1, NULL, 0);
     sb_term(&s, false);
 
     char name[ZSI_NAME_MAX];
@@ -4776,7 +4715,7 @@ static void put_unordered(uint32_t gen, const char *const *keys)
 
     sb_init(&s, gen, ZSI_CSUM_XXHASH);
     for (size_t i = 0; keys && keys[i]; i++)
-        sb_rec(&s, keys[i], strlen(keys[i]), "v", 1, false, 0);
+        sb_rec(&s, keys[i], strlen(keys[i]), "v", 1);
     sb_term(&s, false);
     zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
@@ -4802,7 +4741,7 @@ static void put_inorder(uint32_t start, uint32_t end, const char *const *keys)
 
     ib_init(&b, start, end, ZSI_CSUM_XXHASH);
     for (size_t i = 0; i < n; i++)
-        ib_rec(&b, sorted[i], strlen(sorted[i]), "v", 1, false, 0);
+        ib_rec(&b, sorted[i], strlen(sorted[i]), "v", 1);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, start, end);
     ASSERT_EQ(mkdbdir(), 0);
@@ -4951,10 +4890,10 @@ static void test_snapshot_boundary(void)
 
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "visible", 7, "1", 1, false, 0);
+    sb_rec(&s, "visible", 7, "1", 1);
     sb_term(&s, false);
     size_t boundary = s.len;
-    sb_rec(&s, "invisible", 9, "2", 1, false, 0);   /* no terminator */
+    sb_rec(&s, "invisible", 9, "2", 1);   /* no terminator */
     zsi_name_current(name, test_uuid);
     ASSERT_EQ(sb_write(&s, name), 0);
 
@@ -5869,7 +5808,7 @@ static void put_unordered_kv(uint32_t gen, const struct kv *kvs)
     sb_init(&s, gen, ZSI_CSUM_XXHASH);
     for (size_t i = 0; kvs[i].k; i++)
         sb_rec(&s, kvs[i].k, strlen(kvs[i].k),
-               kvs[i].v, kvs[i].v ? strlen(kvs[i].v) : 0, false, 0);
+               kvs[i].v, kvs[i].v ? strlen(kvs[i].v) : 0);
     sb_term(&s, false);
     zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
@@ -5906,7 +5845,7 @@ static void put_inorder_kv(uint32_t start, uint32_t end, const struct kv *kvs)
     ib_init(&b, start, end, ZSI_CSUM_XXHASH);
     for (size_t i = 0; i < n; i++)
         ib_rec(&b, sorted[i].k, strlen(sorted[i].k),
-               sorted[i].v, sorted[i].v ? strlen(sorted[i].v) : 0, false, 0);
+               sorted[i].v, sorted[i].v ? strlen(sorted[i].v) : 0);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, start, end);
     ASSERT_EQ(mkdbdir(), 0);
@@ -7148,67 +7087,93 @@ static void test_write_unclean_rollover(void)
     zs_db_close(&db);
 }
 
-static void test_write_ancestors(void)
+/* F-18: what a record encodes to depends on its key and value, and on nothing
+ * else -- not on the file it lands in, and not on what the key held before.
+ *
+ * This replaces test_write_ancestors, which pinned every row of the retired
+ * F-17 table.  The property that matters now is the absence of those rows: the
+ * same store into three databases with completely different histories must
+ * produce identical bytes, which is what makes T-12a's byte-for-byte agreement
+ * checkable and what removed the point lookup from the write path.
+ *
+ * Asserted on the bytes rather than through a round-trip, for the same reason
+ * the old test was: a symmetric encode/decode bug survives a round-trip. */
+static void test_write_record_is_self_contained(void)
 {
-    /* Every row of F-17's table, checked in the bytes rather than through a
-     * round-trip, because the omission rule is what a peer implementation has to
-     * match exactly. */
-    struct zs_db *db = fresh_db();
     struct zsi_rec r;
-    ASSERT_NOT_NULL(db);
-
-    /* Row 1: a new key written into the active file -- ancestor is its own
-     * generation, so OMITTED. */
-    ASSERT_OK(zs_db_store(db, "k", 1, "v1", 2, 0));
-    struct zsi_file *f = db->snap->files[0];
     size_t off;
-    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
-    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
-    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* no ancestor stored */
-    ASSERT_EQU(r.ancestor, 1u);                     /* resolves to file start */
+    char first[512], again[512], older[512];
+    size_t firstlen, againlen, olderlen;
 
-    /* Row 2: the same key updated again in the SAME file -- the file holding what
-     * it supersedes is this one, so still OMITTED, and the record costs 4 bytes
-     * of header rather than 8 (F-17a). */
-    ASSERT_OK(zs_db_store(db, "k", 1, "v2", 2, 0));
-    f = db->snap->files[0];
-    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
-    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
-    ASSERT_EQ(r.type, ZSI_KEYVALUE);
-    ASSERT_MEM_EQ(r.val, "v2", 2);
-    zs_db_close(&db);
+    /* (a) a create, into an empty database. */
+    {
+        struct zs_db *db = fresh_db_noautorepack();
+        ASSERT_NOT_NULL(db);
+        ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+        struct zsi_file *f = db->snap->files[0];
+        ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+        ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
+        ASSERT_EQ(r.type, ZSI_KEYVALUE);
+        ASSERT(r.len <= sizeof(first));
+        firstlen = r.len;
+        memcpy(first, r.base, r.len);
+        zs_db_close(&db);
+    }
 
-    /* Row 3: a key last written in an OLDER file -- that file's start, which is
-     * lower, so STORED. */
-    clear_db();
-    { static const struct kv p[] = {{"k","old"},{NULL,NULL}};
-      put_inorder_kv(1, 1, p); }
-    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
-    db = open_db(0);
-    ASSERT_NOT_NULL(db);
-    ASSERT_OK(zs_db_store(db, "k", 1, "new", 3, 0));
+    /* (b) an UPDATE of that key, later in the same file.  Under the old rule
+     * this was the row that "coincides" with a create; now there is no rule to
+     * coincide with. */
+    {
+        struct zs_db *db;
+        clear_db();
+        db = open_db(ZS_CREATE | ZS_NOAUTOREPACK);
+        ASSERT_NOT_NULL(db);
+        ASSERT_OK(zs_db_store(db, "k", 1, "other", 5, 0));
+        ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+        struct zsi_file *f = db->snap->files[0];
+        ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+        ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
+        ASSERT(r.len <= sizeof(again));
+        againlen = r.len;
+        memcpy(again, r.base, r.len);
+        zs_db_close(&db);
+    }
 
-    f = db->snap->files[db->snap->nfiles - 1];
-    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
-    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
-    ASSERT_EQ(r.type, ZSI_KEYVALUE_ANC);            /* stored */
-    ASSERT_EQU(r.ancestor, 1u);                     /* the older file's START */
+    /* (c) an update of a key whose previous version is in an OLDER FILE -- the
+     * row that used to store a 4-byte ancestor and so encode differently. */
+    {
+        struct zs_db *db;
+        clear_db();
+        { static const struct kv p[] = {{"k","old"},{NULL,NULL}};
+          put_inorder_kv(1, 1, p); }
+        put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+        db = open_db(ZS_NOAUTOREPACK);
+        ASSERT_NOT_NULL(db);
+        ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+        struct zsi_file *f = db->snap->files[db->snap->nfiles - 1];
+        ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+        ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
+        ASSERT_EQ(r.type, ZSI_KEYVALUE);        /* NOT a distinct "update" form */
+        ASSERT(r.len <= sizeof(older));
+        olderlen = r.len;
+        memcpy(older, r.base, r.len);
 
-    /* A deletion of a key from an older file stores its ancestor too. */
-    ASSERT_OK(zs_db_delete(db, "k", 1, 0));
-    f = db->snap->files[db->snap->nfiles - 1];
-    ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
-    ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off,
-                             f->hdr.start, &r));
-    /* the newest version is now in this same file, so the ancestor is this
-     * file's start and is omitted again */
-    ASSERT_EQ(r.type, ZSI_DELETION);
-    ASSERT_NULL(r.val);
+        /* And a deletion of that same key is likewise just a DELETION. */
+        ASSERT_OK(zs_db_delete(db, "k", 1, 0));
+        f = db->snap->files[db->snap->nfiles - 1];
+        ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
+        ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
+        ASSERT_EQ(r.type, ZSI_DELETION);
+        ASSERT_NULL(r.val);
+        zs_db_close(&db);
+    }
 
-    zs_db_close(&db);
+    /* All three are the same bytes.  Under the old format (c) differed from
+     * (a) and (b) in its type byte, its header length and its total length. */
+    ASSERT_EQU(againlen, firstlen);
+    ASSERT_EQU(olderlen, firstlen);
+    ASSERT_MEM_EQ(again, first, firstlen);
+    ASSERT_MEM_EQ(older, first, firstlen);
 }
 
 static void test_write_encoding_boundaries(void)
@@ -8080,7 +8045,7 @@ static void test_convert_only_one_unordered_file(void)
         char k[16];
         sb_init(&s2, gen, ZSI_CSUM_XXHASH);
         snprintf(k, sizeof(k), "g%u", gen);
-        sb_rec(&s2, k, strlen(k), "v", 1, false, 0);
+        sb_rec(&s2, k, strlen(k), "v", 1);
         sb_term(&s2, false);
         sb_raw(&s2, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);   /* torn tail */
         zsi_name_current(name, test_uuid);
@@ -8369,36 +8334,39 @@ static void test_repack_one_record_per_key(void)
     zs_db_close(&db);
 }
 
-static void test_repack_v1_ancestor_v3_value(void)
+/* D-17b: the emitted record takes V3's value under the total order -- across
+ * files by increasing start generation.  Getting the order wrong silently emits
+ * the value from whichever record the merge's iteration happened to touch
+ * first or last, which no amount of "one record per key" checking would see. */
+static void test_repack_version_order(void)
 {
-    /* D-17b tested DIRECTLY: the emitted record must take V3's VALUE and V1's
-     * ANCESTOR, from those records specifically.  Getting it wrong silently emits
-     * the wrong value or the wrong ancestor, so this asserts the bytes rather than
-     * a round-trip.
-     *
-     * The chain begins in generation 2 with an ancestor pointing back to 1, so V1's
-     * ancestor is BELOW the output range and must be carried through. */
     struct zs_db *db;
     struct ib b;
     char name[ZSI_NAME_MAX];
+    struct zsi_rec r;
 
     clear_db();
-
-    /* Generation 1: nothing for "k" -- it is only referenced by the ancestor. */
-    put_inorder_kv(1, 1, (const struct kv[]){ {"filler","f"}, {NULL,NULL} });
-
-    /* Generation 2: "k" with a STORED ancestor of 1, so its chain reaches below. */
-    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v2", 2, true, 1);
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 2, 2);
     ASSERT_EQ(mkdbdir(), 0);
+
+    /* Three generations, each holding a different version of "k".  The values
+     * are deliberately NOT in an order that any accidental iteration would
+     * produce by luck: the newest sorts lowest as a byte string. */
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "zzz", 3);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
 
-    /* Generation 3: "k" again, ancestor 2 (the file that held the previous one). */
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "mmm", 3);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
     ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v3", 2, true, 2);
+    ib_rec(&b, "k", 1, "aaa", 3);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 3, 3);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
@@ -8406,138 +8374,171 @@ static void test_repack_v1_ancestor_v3_value(void)
 
     put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
 
-    db = open_db(0);
+    db = open_db(ZS_NOAUTOREPACK);
     ASSERT_NOT_NULL(db);
-
-    /* Merge generations 2 and 3 only, so the output range is [2,3] and V1's
-     * ancestor (1) lies BELOW it. */
-    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 3));
     ASSERT_OK(zsi_db_refresh(db));
 
-    struct zsi_file *out = file_with_range(db, 2, 3);
+    struct zsi_file *out = file_with_range(db, 1, 3);
     ASSERT_NOT_NULL(out);
-
-    struct zsi_rec r;
+    ASSERT_EQU(out->nptrs, 1u);                     /* D-17: one record per key */
     ASSERT(rec_at_key(out, "k", 1, &r));
-    ASSERT_MEM_EQ(r.val, "v3", 2);                  /* V3's value */
-    ASSERT_EQ(r.type, ZSI_KEYVALUE_ANC);            /* ancestor STORED (D-18) */
-    ASSERT_EQU(r.ancestor, 1u);                     /* V1's ancestor, not V3's */
-
+    ASSERT_MEM_EQ(r.val, "aaa", 3);                 /* V3's value, generation 3 */
+    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* the only value form now */
     zs_db_close(&db);
 }
 
+/* Every row of D-18, which is D-19's retention test written out.
+ *
+ * The two rows that DROP matter as much as the two that keep: a rule that never
+ * drops is trivially safe and reclaims nothing, so a mutation that made
+ * retention unconditional would pass a keep-only test. */
 static void test_repack_d18_table(void)
 {
-    /* Each row of D-18, with the encoding form asserted. */
     struct zs_db *db;
     struct ib b;
     char name[ZSI_NAME_MAX];
     struct zsi_rec r;
+    struct zsi_file *out;
 
-    /* Row 2: V1's ancestor inside the output range, V3 a value -> the
-     * ancestor-OMITTING form. */
+    /* Row 1: V3 is a value -> emitted, whatever lies below. */
     clear_db();
-    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v1", 2, false, 0);          /* ancestor omitted == 1 */
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-
+    put_inorder_kv(1, 1, (const struct kv[]){ {"k","below"}, {NULL,NULL} });
     ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v2", 2, true, 1);
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 2, 2);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
-
-    db = open_db(0);
-    ASSERT_NOT_NULL(db);
-    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
-    ASSERT_OK(zsi_db_refresh(db));
-
-    struct zsi_file *out = file_with_range(db, 1, 2);
-    ASSERT_NOT_NULL(out);
-    ASSERT(rec_at_key(out, "k", 1, &r));
-    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* omitted: chain contained */
-    ASSERT_MEM_EQ(r.val, "v2", 2);
-    ASSERT_EQU(r.ancestor, 1u);                     /* resolves to output start */
-    zs_db_close(&db);
-
-    /* Row 1: V1's ancestor inside the range, V3 a deletion -> EMIT NOTHING. */
-    clear_db();
-    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v1", 2, false, 0);
-    ib_rec(&b, "other", 5, "o", 1, false, 0);
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 1, 1);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-
-    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, NULL, 0, true, 1);           /* delete, chain from 1 */
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 2, 2);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
-
-    db = open_db(0);
-    ASSERT_NOT_NULL(db);
-    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
-    ASSERT_OK(zsi_db_refresh(db));
-    out = file_with_range(db, 1, 2);
-    ASSERT_NOT_NULL(out);
-    ASSERT_EQU(out->nptrs, 1u);                     /* only "other": k dropped */
-    ASSERT(!rec_at_key(out, "k", 1, &r));
-    ASSERT(rec_at_key(out, "other", 5, &r));
-    zs_db_close(&db);
-
-    /* Row 3: V1's ancestor BELOW the range, V3 a deletion -> the tombstone is
-     * RETAINED in the ancestor-storing form.  This is D-19's "otherwise". */
-    clear_db();
-    put_inorder_kv(1, 1, (const struct kv[]){ {"k","ancient"}, {NULL,NULL} });
-    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v2", 2, true, 1);
+    ib_rec(&b, "k", 1, "v2", 2);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 2, 2);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
     ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, NULL, 0, true, 2);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 3, 3);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
     put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
 
-    db = open_db(0);
+    db = open_db(ZS_NOAUTOREPACK);
     ASSERT_NOT_NULL(db);
-    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));    /* merge [2,3] only */
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));       /* merge [2,3] */
+    ASSERT_OK(zsi_db_refresh(db));
+    out = file_with_range(db, 2, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_MEM_EQ(r.val, "v2", 2);
+    ASSERT_EQ(r.type, ZSI_KEYVALUE);
+    zs_db_close(&db);
+
+    /* Row 2: V3 is a deletion and a VALUE lies below -> the tombstone is kept.
+     * This is the load-bearing row; the others only reclaim space. */
+    clear_db();
+    ASSERT_EQ(mkdbdir(), 0);
+    put_inorder_kv(1, 1, (const struct kv[]){ {"k","below"}, {NULL,NULL} });
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
     ASSERT_OK(zsi_db_refresh(db));
     out = file_with_range(db, 2, 3);
     ASSERT_NOT_NULL(out);
     ASSERT_EQU(out->nptrs, 1u);
     ASSERT(rec_at_key(out, "k", 1, &r));
     ASSERT_NULL(r.val);                             /* the tombstone survives */
-    ASSERT_EQ(r.type, ZSI_DELETION_ANC);            /* ancestor stored */
-    ASSERT_EQU(r.ancestor, 1u);
+    ASSERT_EQ(r.type, ZSI_DELETION);
+    zs_db_close(&db);
+
+    /* Row 3: V3 is a deletion and a DELETION lies below -> dropped.  That
+     * deletion already hides everything under it, so ours adds nothing.  This
+     * row is free precision: the search stops at the first file holding the key
+     * either way, so it costs nothing to look at what it found. */
+    clear_db();
+    ASSERT_EQ(mkdbdir(), 0);
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_rec(&b, "other", 5, "o", 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+    out = file_with_range(db, 2, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 0u);                     /* dropped */
+    ASSERT(!rec_at_key(out, "k", 1, &r));
+    zs_db_close(&db);
+
+    /* Row 4: V3 is a deletion and NOTHING lies below -> dropped, because the
+     * key's whole lifespan is inside the inputs. */
+    clear_db();
+    ASSERT_EQ(mkdbdir(), 0);
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "v1", 2);
+    ib_rec(&b, "other", 5, "o", 1);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));       /* merge [1,2] */
+    ASSERT_OK(zsi_db_refresh(db));
+    out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 1u);                     /* only "other" */
+    ASSERT(!rec_at_key(out, "k", 1, &r));
+    ASSERT(rec_at_key(out, "other", 5, &r));
     zs_db_close(&db);
 }
 
 static void test_repack_d19a_resurrection(void)
 {
-    /* D-19a, constructed directly.
+    /* The resurrection D-19 exists to prevent, constructed directly.
      *
-     * The retained tombstone carries the chain's reach, which no other file
-     * records.  Dropping it -- which looks like a safe optimisation, since a newer
-     * file already shadows the key -- lets generation 1's value RESURRECT.
+     * A value in an older file, a tombstone in the range being repacked,
+     * nothing newer.  Dropping the tombstone -- which under the retired
+     * ancestor scheme looked like a safe optimisation, and under this one looks
+     * like one too if the search below is skipped -- lets generation 1's value
+     * come back.
      *
-     * This test asserts both halves: that the key stays absent with the tombstone,
-     * AND that removing it does produce the bug.  The second half is what stops the
-     * rule being deleted as dead weight later. */
+     * Both halves are asserted: that the key stays absent with the tombstone,
+     * AND that removing it does produce the bug.  The second half is what stops
+     * the rule being deleted as dead weight later. */
     struct zs_db *db;
     struct ib b;
     char name[ZSI_NAME_MAX];
@@ -8547,9 +8548,8 @@ static void test_repack_d19a_resurrection(void)
     clear_db();
     put_inorder_kv(1, 1, (const struct kv[]){ {"k","RESURRECTED"}, {NULL,NULL} });
 
-    /* Generation 2 deletes it, with the chain reaching back to 1. */
     ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, NULL, 0, true, 1);
+    ib_rec(&b, "k", 1, NULL, 0);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 2, 2);
     ASSERT_EQ(mkdbdir(), 0);
@@ -8564,12 +8564,12 @@ static void test_repack_d19a_resurrection(void)
     ib_free(&b);
     put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
 
-    db = open_db(0);
+    db = open_db(ZS_NOAUTOREPACK);
     ASSERT_NOT_NULL(db);
     ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
 
-    /* Repack [2,3].  V1's ancestor is 1, which is BELOW the output start, so the
-     * tombstone must be retained. */
+    /* Repack [2,3].  Generation 1 is below the output range and holds a VALUE
+     * for "k", so the tombstone must be retained. */
     ASSERT_OK(zsi_repack_merge(db, db->snap, 1, 2));
     ASSERT_OK(zsi_db_refresh(db));
 
@@ -8590,10 +8590,129 @@ static void test_repack_d19a_resurrection(void)
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
 
-    db = open_db(0);
+    db = open_db(ZS_NOAUTOREPACK);
     ASSERT_NOT_NULL(db);
     ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "RESURRECTED", 11);            /* the bug, demonstrated */
+    zs_db_close(&db);
+}
+
+/* D-19's counterpart, and the reason it looks only DOWNWARD.
+ *
+ * Same shape as the resurrection above except that a newer file re-creates the
+ * key: created in the range being repacked, deleted there, re-created above it.
+ * Nothing lies below, so the tombstone is dropped -- and that is correct, both
+ * because the key's lifespan is contained and because the newer record would
+ * shadow it anyway.
+ *
+ * A newer file can only ever make a retained tombstone REDUNDANT; it can never
+ * make a dropped one unsafe.  That asymmetry is what lets the test consult one
+ * direction only, and this is the case that would expose it if the reasoning
+ * were backwards. */
+static void test_repack_d19_newer_file_recreates(void)
+{
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    const char *v;
+    size_t vl;
+    struct zsi_rec r;
+
+    clear_db();
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* [1,2] is the range to repack: "k" created then deleted inside it. */
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "gone", 4);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    /* Generation 3, ABOVE the range, re-creates it. */
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "NEW", 3);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "NEW", 3);
+
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));       /* merge [1,2] */
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 0u);                     /* dropped: nothing below */
+    ASSERT(!rec_at_key(out, "k", 1, &r));
+
+    /* And the read is unchanged, which is the point. */
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "NEW", 3);
+    zs_db_close(&db);
+}
+
+/* D-19a: a record is emitted even when a NEWER file already shadows the key.
+ *
+ * Being shadowed does not permit dropping it -- only D-19 does, and D-19 asks
+ * about what lies BELOW.  The rule survives the ancestor's removal, but its
+ * justification changed: it used to be correctness (the retained record carried
+ * the chain's reach) and is now cost, since proving a newer file shadows a key
+ * would take a lookup per KEY rather than per surviving tombstone. */
+static void test_repack_d19a_shadowed(void)
+{
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    struct zsi_rec r;
+
+    clear_db();
+    ASSERT_EQ(mkdbdir(), 0);
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "old", 3);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 2, 2);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    /* Newer, and holding a value for the same key. */
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, "newer", 5);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(4, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));       /* merge [1,2] */
+    ASSERT_OK(zsi_db_refresh(db));
+
+    struct zsi_file *out = file_with_range(db, 1, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQU(out->nptrs, 1u);                 /* written, though shadowed */
+    ASSERT(rec_at_key(out, "k", 1, &r));
+    ASSERT_MEM_EQ(r.val, "old", 3);
     zs_db_close(&db);
 }
 
@@ -8609,7 +8728,7 @@ static void test_repack_empty_output(void)
 
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "only", 4, "v", 1, false, 0);
+    ib_rec(&b, "only", 4, "v", 1);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
@@ -8617,7 +8736,7 @@ static void test_repack_empty_output(void)
     ib_free(&b);
 
     ib_init(&b, 2, 2, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "only", 4, NULL, 0, true, 1);        /* chain begins in 1 */
+    ib_rec(&b, "only", 4, NULL, 0);        /* chain begins in 1 */
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 2, 2);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
@@ -8662,7 +8781,7 @@ static void test_repack_verifies_inputs(void)
     clear_db();
 
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
     ib_finish(&b);
     /* Damage a value byte, leaving every length and pointer intact -- the
      * corruption reads fine and only the records checksum knows. */
@@ -8708,7 +8827,7 @@ static void test_repack_verifies_inputs_nocsum(void)
     clear_db();
 
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
     ib_finish(&b);
     b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     zsi_name_format(name, test_uuid, 1, 1);
@@ -8753,7 +8872,7 @@ static void test_seal_verifies_spans_nocsum(void)
     clear_db();
 
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "k", 1, "value", 5, false, 0);
+    sb_rec(&s, "k", 1, "value", 5);
     sb_term(&s, false);
     for (size_t i = ZSI_HEADER_LEN; i + 5 <= s.len; i++)
         if (memcmp(s.buf + i, "value", 5) == 0) { voff = i; break; }
@@ -8818,8 +8937,8 @@ static void test_read_verifies_record_csum(void)
 
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
@@ -8855,8 +8974,8 @@ static void test_read_verifies_record_csum_unordered(void)
 
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "value", 5, false, 0);
-    sb_rec(&s, "b", 1, "other", 5, false, 0);
+    sb_rec(&s, "a", 1, "value", 5);
+    sb_rec(&s, "b", 1, "other", 5);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
     sb_term(&s, false);
     zsi_name_current(name, test_uuid);
@@ -8887,8 +9006,8 @@ static void test_record_csum_replay_no_truncate(void)
 
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "value", 5, false, 0);
-    sb_rec(&s, "b", 1, "other", 5, false, 0);
+    sb_rec(&s, "a", 1, "value", 5);
+    sb_rec(&s, "b", 1, "other", 5);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     sb_term(&s, false);
     zsi_name_current(name, test_uuid);
@@ -9070,8 +9189,8 @@ static void test_check_out_of_order_pointers(void)
     /* ib_rec appends in the order given, so this builds a deliberately misordered
      * file -- which put_inorder_kv would have sorted. */
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "z", 1, "1", 1, false, 0);
-    ib_rec(&b, "a", 1, "2", 1, false, 0);
+    ib_rec(&b, "z", 1, "1", 1);
+    ib_rec(&b, "a", 1, "2", 1);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
@@ -9089,8 +9208,8 @@ static void test_check_out_of_order_pointers(void)
      * (D-17).  Sorted, so only the equality test can catch it. */
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "dup", 3, "1", 1, false, 0);
-    ib_rec(&b, "dup", 3, "2", 1, false, 0);
+    ib_rec(&b, "dup", 3, "1", 1);
+    ib_rec(&b, "dup", 3, "2", 1);
     ib_finish(&b);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
@@ -9113,8 +9232,8 @@ static void test_check_records_checksum(void)
 
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     ib_finish(&b);
     b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';        /* flip a value byte */
     zsi_name_format(name, test_uuid, 1, 1);
@@ -9141,32 +9260,57 @@ static void test_check_records_checksum(void)
 
 static void test_check_noncanonical(void)
 {
-    /* T-6's negative: a hand-built file storing an ancestor equal to its own start
-     * is non-canonical (F-17 says omit it exactly then) and is REPORTED, while
-     * still reading correctly -- because rejecting it would discard committed data
-     * (F-24 plus G-3). */
+    /* T-6's negative: a hand-built file whose records use the wrong ENCODING
+     * for their contents is REPORTED, while still reading correctly -- because
+     * rejecting it would discard committed data (F-24 plus G-3).
+     *
+     * The space of non-canonical records is smaller than it was.  It used to
+     * include a record storing an ancestor equal to its own file's start, which
+     * decoded identically either way and so could only ever be caught by a
+     * canonicality check.  With F-18 a record's bytes are a function of its own
+     * key and value, so the only remaining divergence is using a wider form
+     * than the lengths require -- checked here for both data shapes, since a
+     * deletion and a key/value pair pick their form by different rules. */
     struct zs_db *db;
-    struct ib b;
     char name[ZSI_NAME_MAX];
     const char *v;
     size_t vl;
 
+    /* A BIGDELETION whose keylen fits the short form. */
     clear_db();
-    ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "k", 1, "v", 1, true, 5);            /* ancestor == start: wrong */
-    ib_finish(&b);
-    zsi_name_format(name, test_uuid, 5, 5);
-    ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
+    {
+        char buf[512];
+        size_t reclen;
+        memset(buf, 0, sizeof(buf));
+        make_header(buf, 5, 5, ZSI_CSUM_XXHASH);
+        buf[ZSI_HEADER_LEN] = (char)ZSI_BIGDELETION;
+        zsi_put64(buf + ZSI_HEADER_LEN + 8, 1);          /* keylen 1: fits */
+        buf[ZSI_HEADER_LEN + 16] = 'k';
+        buf[ZSI_HEADER_LEN + 17] = '\0';
+        reclen = 24;                        /* roundup8(16 + 1 + 1 + 4) */
+        zsi_put32(buf + ZSI_HEADER_LEN + reclen - 4,
+                  zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen - 4));
+
+        uint64_t ptr = ZSI_HEADER_LEN;
+        char *sec = NULL;
+        size_t seclen = 0;
+        uint32_t rc = zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen);
+        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, rc,
+                                 zsi_csum_xxhash, &sec, &seclen));
+        memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
+        free(sec);
+
+        zsi_name_format(name, test_uuid, 5, 5);
+        ASSERT_EQ(mkdbdir(), 0);
+        ASSERT_EQ(writefile(name, buf, ZSI_HEADER_LEN + reclen + seclen), 0);
+    }
     put_unordered_kv(6, (const struct kv[]){ {NULL,NULL} });
 
     db = open_db_reporting(0);
     ASSERT_NOT_NULL(db);
 
-    /* It reads: the data is not lost. */
-    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
-    ASSERT_MEM_EQ(v, "v", 1);
+    /* It reads as a deletion: the record is not discarded. */
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
 
     /* And the divergence is reported. */
     ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);
@@ -9231,7 +9375,7 @@ static void test_check_unclean_reported(void)
 
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1, false, 0);
+    sb_rec(&s, "a", 1, "1", 1);
     sb_term(&s, false);
     sb_raw(&s, "\xde\xad\xbe\xef\xde\xad\xbe\xef", 8);
     zsi_name_current(name, test_uuid);
@@ -9318,9 +9462,9 @@ static void test_dump_shows_rollback(void)
 
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "live", 4, "1", 1, false, 0);
+    sb_rec(&s, "live", 4, "1", 1);
     sb_term(&s, false);
-    sb_rec(&s, "dead", 4, "2", 1, false, 0);
+    sb_rec(&s, "dead", 4, "2", 1);
     sb_term(&s, true);                          /* a rolled-back span */
     zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
@@ -10861,7 +11005,7 @@ static void test_mp_reader_sees_torn_span(void)
     /* Append a span's records with NO terminator, exactly as a writer killed
      * between the two durability gates would leave (C-7). */
     {
-        size_t n = zsi_rec_encoded_len(7, 3, false, false);
+        size_t n = zsi_rec_encoded_len(7, 3, false);
         char *rec = malloc(n);
         ASSERT_NOT_NULL(rec);
         /* fresh_db() defaults to ENGINE 1 (zsi_csum_id_for_flags maps no
@@ -10870,7 +11014,7 @@ static void test_mp_reader_sees_torn_span(void)
          * never read as valid data, but salvage walks it, and a wrong-engine
          * checksum here would read as record corruption rather than the
          * missing terminator this test is about. */
-        zsi_rec_encode(rec, zsi_csum_xxhash, "partial", 7, "no!", 3, false, 0);
+        zsi_rec_encode(rec, zsi_csum_xxhash, "partial", 7, "no!", 3);
         int fd = open(dbpath(name), O_WRONLY | O_APPEND);
         ASSERT(fd >= 0);
         ASSERT_EQ(write(fd, rec, n), (ssize_t)n);
@@ -11045,8 +11189,8 @@ static void test_reads_never_consult_ancestors(void)
     /* Generation 5 with ancestors naming generations 1 and 99 -- one below the
      * file, one far above anything present. */
     ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "A", 1, true, 1);
-    ib_rec(&b, "b", 1, "B", 1, true, 99);
+    ib_rec(&b, "a", 1, "A", 1);
+    ib_rec(&b, "b", 1, "B", 1);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 5, 5);
     ASSERT_EQ(mkdbdir(), 0);
@@ -11081,7 +11225,7 @@ static void test_reads_never_consult_ancestors(void)
     ASSERT_EQ(unlink(dbpath(name)), 0);
 
     ib_init(&b, 7, 7, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, NULL, 0, true, 12345);
+    ib_rec(&b, "a", 1, NULL, 0);
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 7, 7);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
@@ -11203,7 +11347,7 @@ static void test_open_is_o1_in_records(void)
     for (int i = 0; i < 50; i++) {
         char k[16];
         snprintf(k, sizeof(k), "k%03d", i);
-        ib_rec(&b, k, strlen(k), "value", 5, false, 0);
+        ib_rec(&b, k, strlen(k), "value", 5);
     }
     ib_finish(&b);
 
@@ -13652,8 +13796,8 @@ static void test_check_reports_record_csum(void)
 
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
@@ -13662,7 +13806,7 @@ static void test_check_reports_record_csum(void)
     ib_free(&b);
 
     sb_init(&s, 2, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "c", 1, "third", 5, false, 0);
+    sb_rec(&s, "c", 1, "third", 5);
     s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'T';
     sb_term(&s, false);
     zsi_name_current(name, test_uuid);
@@ -13697,8 +13841,8 @@ static void test_salvage_verifies_records_inorder(void)
 
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5, false, 0);
-    ib_rec(&b, "b", 1, "other", 5, false, 0);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_rec(&b, "b", 1, "other", 5);
     b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
@@ -13750,9 +13894,9 @@ static void test_salvage_never_recovers_rollback(void)
 
     clear_db();
     sb_init(&b, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&b, "live", 4, "1", 1, false, 0);
+    sb_rec(&b, "live", 4, "1", 1);
     sb_term(&b, false);
-    sb_rec(&b, "dead", 4, "2", 1, false, 0);
+    sb_rec(&b, "dead", 4, "2", 1);
     sb_term(&b, true);                          /* rolled back */
     zsi_name_current(name, test_uuid);
     ASSERT_EQ(mkdbdir(), 0);
@@ -13946,7 +14090,18 @@ static void test_salvage_active_file_is_newest(void)
                               31, 0));
     }
 
-    /* Deliberately NOT sealed: the newest version is in the active file. */
+    /* Deliberately NOT sealed: the newest version must be in the ACTIVE file,
+     * which is what this test is about.
+     *
+     * Reached by storing until one exists rather than by trusting the loop
+     * above to end that way.  A commit that crosses rollover_size seals in
+     * place (D-25d), so whether the last iteration leaves a clean active file
+     * is a function of the exact encoded record size -- which made this test
+     * fail the moment records got 4 bytes shorter, for a reason that had
+     * nothing to do with salvage.  Re-storing the SAME newest value keeps the
+     * expectation below unchanged. */
+    for (int i = 0; i < 8 && !zsi_snapshot_active(db->snap); i++)
+        ASSERT_OK(zs_db_store(db, "same", 4, "v29", 3, 0));
     ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
     ASSERT(db->snap->nfiles > 1);
     ASSERT_OK(zs_db_close(&db));
@@ -16087,7 +16242,8 @@ static struct test_entry tests[] = {
                                         test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
-    { "test_write_ancestors",           test_write_ancestors },
+    { "test_write_record_is_self_contained",
+                                    test_write_record_is_self_contained },
     { "test_write_encoding_boundaries", test_write_encoding_boundaries },
     { "test_api_three_forms",           test_api_three_forms },
     { "test_api_cursor_replace",        test_api_cursor_replace },
@@ -16123,7 +16279,10 @@ static struct test_entry tests[] = {
 
     { "test_repack_selection",          test_repack_selection },
     { "test_repack_one_record_per_key", test_repack_one_record_per_key },
-    { "test_repack_v1_ancestor_v3_value", test_repack_v1_ancestor_v3_value },
+    { "test_repack_version_order",       test_repack_version_order },
+    { "test_repack_d19_newer_file_recreates",
+                                    test_repack_d19_newer_file_recreates },
+    { "test_repack_d19a_shadowed",      test_repack_d19a_shadowed },
     { "test_repack_d18_table",          test_repack_d18_table },
     { "test_repack_d19a_resurrection",  test_repack_d19a_resurrection },
     { "test_repack_empty_output",       test_repack_empty_output },

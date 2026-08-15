@@ -320,4 +320,40 @@ if [ "$SKIP" -eq 0 ]; then
     finish_case
 fi
 
+# ---------------------------------------------------------------------------
+# 13. cross-generation-update: a key updated and deleted ACROSS generations
+# (F-18).
+#
+# This is the case the format used to encode differently.  A record whose key
+# was last written in an OLDER file carried a 4-byte ancestor and a distinct
+# type byte -- KEYVALUE_ANC or DELETION_ANC -- so the same store produced
+# different bytes depending on the database's history.  It no longer does: a
+# record is a function of its own key and value, so every record here is a
+# plain KEYVALUE or DELETION and is byte-identical to the same store into an
+# empty database.
+#
+# It is worth a case precisely because the corpus never had one.  Every
+# existing case writes into the generation it created, so none of them ever
+# exercised the ancestor forms -- which is why removing those forms changed no
+# golden byte, and why nothing here would have caught an implementation that
+# kept writing them.
+# ---------------------------------------------------------------------------
+begin_case cross-generation-update
+if [ "$SKIP" -eq 0 ]; then
+    hdr "A key updated and deleted across generations: no back-reference (F-18)." 1
+    TOOL "$DB" create --uuid "$UUID"
+    TOOL "$DB" store 61 3031; emit "op store 61 3031"
+    TOOL "$DB" store 62 3032; emit "op store 62 3032"
+    # An unclean active file forces a new generation, so the stores below land
+    # in generation 2 while the keys they supersede stay in generation 1 --
+    # which is the whole point of the case.  A plain `convert` here would be a
+    # no-op: only a NON-ACTIVE unordered file is convertible (D-12b).
+    printf '\336\255\276\357\336\255\276\357' >> "$DB/$(newest_file "$DB")"
+    emit "op garbage deadbeefdeadbeef"
+    TOOL "$DB" store 61 3039; emit "op store 61 3039"
+    TOOL "$DB" delete 62;     emit "op delete 62"
+    TOOL "$DB" convert;       emit "op convert"
+    finish_case
+fi
+
 echo "done"

@@ -1,0 +1,20 @@
+# A key updated and deleted across generations: no back-reference (F-18).
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op store 61 3031
+op store 62 3032
+op garbage deadbeefdeadbeef
+op store 61 3039
+op delete 62
+op convert
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001-00000001
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb.current
+
+expect scan
+61 3039
+
+expect check OK

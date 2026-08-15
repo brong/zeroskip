@@ -840,20 +840,17 @@ static unsigned zsi_header_engine_id(const char *buf)
 #define ZSI_HASKEY      0x01    /* a data record: carries a key */
 #define ZSI_ISDELETE    0x02    /* negation -- of a key, or of a span */
 #define ZSI_ISBIG       0x04    /* wide length fields */
-#define ZSI_HASANCESTOR 0x08    /* an ancestor generation is stored */
 #define ZSI_SPANTERM    0x10    /* ends a span */
 #define ZSI_POINTERS    0x20    /* begins a pointer section */
 
-/* The fourteen legal type bytes (F-12), and no others.  Bits 0x40 and 0x80 are
- * reserved and always zero. */
+/* The ten legal type bytes (F-12), and no others.  Bits 0x08, 0x40 and 0x80 are
+ * reserved and always zero.  0x08 was HasAncestor, and each data shape had a
+ * second form carrying a 32-bit ancestor generation; it is RESERVED rather than
+ * reused, so the surviving values keep their meanings (F-12c). */
 #define ZSI_KEYVALUE         0x01   /* HasKey                               */
 #define ZSI_DELETION         0x03   /* HasKey IsDelete                      */
 #define ZSI_BIGKEYVALUE      0x05   /* HasKey IsBig                         */
 #define ZSI_BIGDELETION      0x07   /* HasKey IsDelete IsBig                */
-#define ZSI_KEYVALUE_ANC     0x09   /* HasKey HasAncestor                   */
-#define ZSI_DELETION_ANC     0x0B   /* HasKey IsDelete HasAncestor          */
-#define ZSI_BIGKEYVALUE_ANC  0x0D   /* HasKey IsBig HasAncestor             */
-#define ZSI_BIGDELETION_ANC  0x0F   /* HasKey IsDelete IsBig HasAncestor    */
 #define ZSI_COMMIT           0x10   /* SpanTerminator                       */
 #define ZSI_ROLLBACK         0x12   /* SpanTerminator IsDelete              */
 #define ZSI_COMMIT_LONG      0x14   /* SpanTerminator IsBig                 */
@@ -861,13 +858,13 @@ static unsigned zsi_header_engine_id(const char *buf)
 #define ZSI_PTRS32           0x20   /* Pointers                             */
 #define ZSI_PTRS64           0x24   /* Pointers IsBig                       */
 
-/* True for exactly the fourteen types above and nothing else, including 0x00.
+/* True for exactly the ten types above and nothing else, including 0x00.
  *
  * Written as an explicit switch rather than as a bit-property computation.  The
  * table in F-12 is normative, and a computed predicate would be a second
  * specification that can drift from it -- a bitfield admits far more values than
  * it defines, and the near-misses are what matter: two family bits set at once,
- * HasAncestor without HasKey, IsDelete with Pointers, either reserved bit set.
+ * the retired 0x08 set, IsDelete with Pointers, either reserved bit set.
  * Each is a plausible result of a single flipped bit in a valid type, and each
  * must be rejected rather than half-interpreted (T-2b). */
 static bool zsi_type_valid(uint8_t type)
@@ -877,10 +874,6 @@ static bool zsi_type_valid(uint8_t type)
     case ZSI_DELETION:
     case ZSI_BIGKEYVALUE:
     case ZSI_BIGDELETION:
-    case ZSI_KEYVALUE_ANC:
-    case ZSI_DELETION_ANC:
-    case ZSI_BIGKEYVALUE_ANC:
-    case ZSI_BIGDELETION_ANC:
     case ZSI_COMMIT:
     case ZSI_ROLLBACK:
     case ZSI_COMMIT_LONG:
@@ -901,9 +894,7 @@ static bool zsi_type_valid(uint8_t type)
 
 /* Fixed header sizes per shape, from section 4.5's diagrams. */
 #define ZSI_HDRLEN_KEYVALUE        4
-#define ZSI_HDRLEN_KEYVALUE_ANC    8
 #define ZSI_HDRLEN_DELETION        4
-#define ZSI_HDRLEN_DELETION_ANC    8
 #define ZSI_HDRLEN_BIGKEYVALUE    24
 #define ZSI_HDRLEN_BIGDELETION    16
 #define ZSI_TERMLEN_SHORT          8
@@ -913,7 +904,6 @@ struct zsi_rec {
     uint8_t     type;
     const char *key;    size_t keylen;
     const char *val;    size_t vallen;   /* val == NULL for a deletion */
-    uint32_t    ancestor;                /* always resolved, never raw (F-17) */
     size_t      len;                     /* total on-disk bytes, multiple of 8 */
     const char *base;   /* record start; csum covers [base, base+len-4) */
     uint32_t    csum;    /* the stored trailing checksum (F-32) */
@@ -933,16 +923,12 @@ static bool zsi_rec_is_delete(const struct zsi_rec *r)
 
 /* Bytes a data record will occupy, or 0 if the inputs cannot be encoded.
  *
- * The big form is chosen by key or value length only, never by the ancestor:
- * the ancestor is 4 bytes whenever it is present, and in the big forms it fits
- * inside padding the shape already carries, so HasAncestor costs nothing there
- * (F-12c).  In the short forms it adds 4 bytes.
+ * The big form is chosen by key or value length, and by nothing else (F-15).
  *
  * The body also carries the record's own trailing 4-byte checksum (F-32),
  * inside the roundup: it is the last 4 bytes of the padded record, not an
  * addition on top of it. */
-static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
-                                  bool store_ancestor)
+static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete)
 {
     size_t hdr, body;
 
@@ -952,15 +938,11 @@ static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
             || (!isdelete && vallen > ZSI_SHORT_VALLEN_MAX);
 
     if (isdelete) {
-        hdr = big ? ZSI_HDRLEN_BIGDELETION
-                  : (store_ancestor ? ZSI_HDRLEN_DELETION_ANC
-                                    : ZSI_HDRLEN_DELETION);
+        hdr = big ? ZSI_HDRLEN_BIGDELETION : ZSI_HDRLEN_DELETION;
         /* key NUL, no value at all, F-32's trailing checksum */
         if (!zsi_add_sz(keylen, 1 + 4, &body)) return 0;
     } else {
-        hdr = big ? ZSI_HDRLEN_BIGKEYVALUE
-                  : (store_ancestor ? ZSI_HDRLEN_KEYVALUE_ANC
-                                    : ZSI_HDRLEN_KEYVALUE);
+        hdr = big ? ZSI_HDRLEN_BIGKEYVALUE : ZSI_HDRLEN_KEYVALUE;
         /* key NUL value NUL (F-13: stored lengths exclude the terminators),
          * F-32's trailing checksum */
         if (!zsi_add3_sz(keylen, vallen, 2 + 4, &body)) return 0;
@@ -971,29 +953,23 @@ static size_t zsi_rec_encoded_len(size_t keylen, size_t vallen, bool isdelete,
     return zsi_roundup8(total);
 }
 
-/* Which of the eight data types the given shape encodes as (F-15).  Split out so
+/* Which of the four data types the given shape encodes as (F-15).  Split out so
  * the encoder and the tests agree on it by construction. */
-static uint8_t zsi_rec_type_for(size_t keylen, size_t vallen, bool isdelete,
-                                bool store_ancestor)
+static uint8_t zsi_rec_type_for(size_t keylen, size_t vallen, bool isdelete)
 {
     bool big = keylen > ZSI_SHORT_KEYLEN_MAX
             || (!isdelete && vallen > ZSI_SHORT_VALLEN_MAX);
 
-    if (isdelete) {
-        if (big) return store_ancestor ? ZSI_BIGDELETION_ANC : ZSI_BIGDELETION;
-        return store_ancestor ? ZSI_DELETION_ANC : ZSI_DELETION;
-    }
-
-    if (big) return store_ancestor ? ZSI_BIGKEYVALUE_ANC : ZSI_BIGKEYVALUE;
-    return store_ancestor ? ZSI_KEYVALUE_ANC : ZSI_KEYVALUE;
+    if (isdelete) return big ? ZSI_BIGDELETION : ZSI_DELETION;
+    return big ? ZSI_BIGKEYVALUE : ZSI_KEYVALUE;
 }
 
 /* Encode a data record into buf, which must hold zsi_rec_encoded_len bytes.
  *
  * val == NULL encodes a deletion (A-1); a non-NULL zero-length value encodes an
- * empty value, which is a distinct state.  store_ancestor is decided by the
- * caller per F-17 -- omit exactly when the ancestor equals the containing file's
- * start generation.
+ * empty value, which is a distinct state.  The bytes are a function of the key
+ * and value alone (F-18): nothing about the containing file, and nothing about
+ * what the key held before, reaches the encoding.
  *
  * Every pad byte is zeroed, not just the tail padding.  Canonical encoding means
  * byte-for-byte reproducibility across implementations (T-12a), and an
@@ -1003,14 +979,13 @@ static uint8_t zsi_rec_type_for(size_t keylen, size_t vallen, bool isdelete,
  * csum is the CONTAINING FILE's engine function (A-6/F-5a), not the handle's --
  * the writer path already holds the right one for span checksums. */
 static void zsi_rec_encode(char *buf, zs_csum *csum, const char *key,
-                           size_t keylen, const char *val, size_t vallen,
-                           bool store_ancestor, uint32_t ancestor)
+                           size_t keylen, const char *val, size_t vallen)
 {
     bool isdelete = (val == NULL);
     if (isdelete) vallen = 0;
 
-    uint8_t type = zsi_rec_type_for(keylen, vallen, isdelete, store_ancestor);
-    size_t total = zsi_rec_encoded_len(keylen, vallen, isdelete, store_ancestor);
+    uint8_t type = zsi_rec_type_for(keylen, vallen, isdelete);
+    size_t total = zsi_rec_encoded_len(keylen, vallen, isdelete);
     size_t body;
 
     memset(buf, 0, total);
@@ -1018,18 +993,12 @@ static void zsi_rec_encode(char *buf, zs_csum *csum, const char *key,
 
     if (type & ZSI_ISBIG) {
         if (isdelete) {
-            /* BIGDELETION      +0 type, +1 pad(7),  +8 keylen, +16 key NUL
-             * BIGDELETION_ANC  +0 type, +1 pad(3),  +4 ancestor, +8 keylen,
-             *                  +16 key NUL */
-            if (store_ancestor) zsi_put32(buf + 4, ancestor);
+            /* BIGDELETION  +0 type, +1 pad(7), +8 keylen, +16 key NUL */
             zsi_put64(buf + 8, (uint64_t)keylen);
             body = ZSI_HDRLEN_BIGDELETION;
         } else {
-            /* BIGKEYVALUE      +0 type, +1 pad(7), +8 keylen, +16 vallen,
-             *                  +24 key NUL value NUL
-             * BIGKEYVALUE_ANC  +0 type, +1 pad(3), +4 ancestor, +8 keylen,
-             *                  +16 vallen, +24 key NUL value NUL */
-            if (store_ancestor) zsi_put32(buf + 4, ancestor);
+            /* BIGKEYVALUE  +0 type, +1 pad(7), +8 keylen, +16 vallen,
+             *              +24 key NUL value NUL */
             zsi_put64(buf + 8, (uint64_t)keylen);
             zsi_put64(buf + 16, (uint64_t)vallen);
             body = ZSI_HDRLEN_BIGKEYVALUE;
@@ -1037,26 +1006,12 @@ static void zsi_rec_encode(char *buf, zs_csum *csum, const char *key,
     } else {
         buf[1] = (char)(unsigned char)keylen;
         if (isdelete) {
-            /* DELETION      +0 type, +1 keylen, +2 pad(2), +4 key NUL
-             * DELETION_ANC  +0 type, +1 keylen, +2 pad(2), +4 ancestor,
-             *               +8 key NUL */
-            if (store_ancestor) {
-                zsi_put32(buf + 4, ancestor);
-                body = ZSI_HDRLEN_DELETION_ANC;
-            } else {
-                body = ZSI_HDRLEN_DELETION;
-            }
+            /* DELETION  +0 type, +1 keylen, +2 pad(2), +4 key NUL */
+            body = ZSI_HDRLEN_DELETION;
         } else {
-            /* KEYVALUE      +0 type, +1 keylen, +2 vallen, +4 key NUL value NUL
-             * KEYVALUE_ANC  +0 type, +1 keylen, +2 vallen, +4 ancestor,
-             *               +8 key NUL value NUL */
+            /* KEYVALUE  +0 type, +1 keylen, +2 vallen, +4 key NUL value NUL */
             zsi_put16(buf + 2, (uint16_t)vallen);
-            if (store_ancestor) {
-                zsi_put32(buf + 4, ancestor);
-                body = ZSI_HDRLEN_KEYVALUE_ANC;
-            } else {
-                body = ZSI_HDRLEN_KEYVALUE;
-            }
+            body = ZSI_HDRLEN_KEYVALUE;
         }
     }
 
@@ -1094,8 +1049,7 @@ static void zsi_rec_encode(char *buf, zs_csum *csum, const char *key,
  * Returns ZS_BADFORMAT for anything that does not decode.  On success out->len is
  * the record's total on-disk size, which the caller uses to advance -- and which
  * F-29 requires it verify is strictly greater than zero before doing so. */
-static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
-                          struct zsi_rec *out)
+static int zsi_rec_decode(const char *buf, size_t len, struct zsi_rec *out)
 {
     if (len < 1) return ZS_BADFORMAT;
 
@@ -1105,10 +1059,8 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
 
     bool isdelete = (type & ZSI_ISDELETE) != 0;
     bool big      = (type & ZSI_ISBIG) != 0;
-    bool hasanc   = (type & ZSI_HASANCESTOR) != 0;
 
     size_t hdr, keylen = 0, vallen = 0;
-    uint32_t ancestor;
 
     /* Read the fixed header only after confirming it is present.  Every read
      * below is inside a bound already checked. */
@@ -1128,8 +1080,7 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
             vallen = (size_t)v;
         }
     } else {
-        hdr = isdelete ? (hasanc ? ZSI_HDRLEN_DELETION_ANC : ZSI_HDRLEN_DELETION)
-                       : (hasanc ? ZSI_HDRLEN_KEYVALUE_ANC : ZSI_HDRLEN_KEYVALUE);
+        hdr = isdelete ? ZSI_HDRLEN_DELETION : ZSI_HDRLEN_KEYVALUE;
         if (len < hdr) return ZS_BADFORMAT;
 
         keylen = (size_t)(unsigned char)buf[1];
@@ -1149,15 +1100,9 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
      * canonicalisation bug would therefore cost us every record it wrote after
      * the first non-canonical one, silently.
      *
-     * The spec puts this in check_consistency instead (T-6 says exactly that for
-     * the analogous non-canonical ancestor), which reports the divergence while
-     * still reading the data.  zsi_rec_is_canonical below is what that uses. */
-
-    /* The ancestor: stored when HasAncestor, otherwise the containing file's
-     * start.  The caller never sees "not stored" -- that is the whole point of
-     * F-17's rule, and it is why decoding never needs to establish whether a
-     * record is the first occurrence of its key (F-17a). */
-    ancestor = hasanc ? zsi_get32(buf + 4) : file_start;
+     * The spec puts this in check_consistency instead, which reports the
+     * divergence while still reading the data (T-6).  zsi_rec_is_canonical below
+     * is what that uses. */
 
     /* Total size, every term overflow-checked (G-0b).  keylen + vallen + 2 is
      * exactly the expression that turns a bounds check into a bypass when it
@@ -1177,7 +1122,6 @@ static int zsi_rec_decode(const char *buf, size_t len, uint32_t file_start,
     out->type     = type;
     out->keylen   = keylen;
     out->key      = buf + hdr;
-    out->ancestor = ancestor;
     out->len      = total;
     out->base     = buf;
     out->csum     = zsi_get32(buf + total - 4);
@@ -1303,27 +1247,24 @@ static bool zsi_term_is_rollback(const struct zsi_term *t)
  * so a peer with a canonicalisation bug would silently cost us everything it
  * wrote after its first non-canonical record.
  *
- * zs_db_check_consistency consults it instead, which reports the divergence while
- * still reading the data.  T-6 sets that precedent explicitly for the ancestor
- * case below.
+ * zs_db_check_consistency consults it instead, which reports the divergence
+ * while still reading the data (T-6).
  *
- * file_start is the containing file's start generation: F-17 requires the
- * ancestor be omitted exactly when it equals that value, so a record storing an
- * ancestor equal to it is non-canonical even though it decodes identically. */
-static bool zsi_rec_is_canonical(const struct zsi_rec *r, uint32_t file_start)
+ * What remains checkable is narrower than it was, and that is the point of
+ * F-18: a record's bytes are a function of its own key and value, so the only
+ * way to be non-canonical is to have used the wrong shape for those lengths.
+ * There is no longer any per-file question to ask, which is why this no longer
+ * takes the containing file's start generation. */
+static bool zsi_rec_is_canonical(const struct zsi_rec *r)
 {
     bool isdelete = zsi_rec_is_delete(r);
-    bool anc_stored = (r->type & ZSI_HASANCESTOR) != 0;
 
     /* the shape F-15 requires for these lengths */
-    if (r->type != zsi_rec_type_for(r->keylen, r->vallen, isdelete, anc_stored))
+    if (r->type != zsi_rec_type_for(r->keylen, r->vallen, isdelete))
         return false;
 
-    /* F-17: stored exactly when it differs from the file's start */
-    if (anc_stored && r->ancestor == file_start) return false;
-
     /* and the total must be the canonical rounded length */
-    if (r->len != zsi_rec_encoded_len(r->keylen, r->vallen, isdelete, anc_stored))
+    if (r->len != zsi_rec_encoded_len(r->keylen, r->vallen, isdelete))
         return false;
 
     return true;
@@ -1708,7 +1649,7 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
             if (!(type & ZSI_HASKEY)) break;
 
             struct zsi_rec r;
-            if (zsi_rec_decode(b, avail, f->hdr.start, &r) != ZS_OK) break;
+            if (zsi_rec_decode(b, avail, &r) != ZS_OK) break;
 
             /* F-29's progress rule: the next offset comes from this record's own
              * length fields, and must be strictly greater and within bounds.
@@ -1781,7 +1722,7 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
                 const char *rb = zsi_file_at(f, q, 1);
                 struct zsi_rec r;
                 if (!rb) break;
-                if (zsi_rec_decode(rb, f->size - q, f->hdr.start, &r) != ZS_OK)
+                if (zsi_rec_decode(rb, f->size - q, &r) != ZS_OK)
                     break;
                 if (r.len == 0) break;
                 if (cb(rock, &r, q) != 0) return ZS_OK;   /* caller stopped */
@@ -2013,7 +1954,7 @@ static int zsi_ptrs_rec(struct zsi_file *f, uint64_t i, struct zsi_rec *out)
     const char *b = zsi_file_at(f, (size_t)off, 1);
 
     if (!b) return ZS_BADFORMAT;
-    return zsi_rec_decode(b, f->ptr_off - (size_t)off, f->hdr.start, out);
+    return zsi_rec_decode(b, f->ptr_off - (size_t)off, out);
 }
 
 /* An implementation MAY probe the first and last pointers before the rest, which
@@ -2196,7 +2137,7 @@ static bool zsi_index_key_at(struct zsi_file *f, size_t off,
     const char *b = zsi_file_at(f, off, 1);
     struct zsi_rec r;
 
-    if (!b || zsi_rec_decode(b, f->size - off, f->hdr.start, &r) != ZS_OK) {
+    if (!b || zsi_rec_decode(b, f->size - off, &r) != ZS_OK) {
         *kp = "";
         *klp = 0;
         return false;
@@ -2479,7 +2420,7 @@ static int zsi_index_cur_get(struct zsi_index *ix, zs_compar *compar,
 
     const char *b = zsi_file_at(ix->file, chosen, 1);
     if (!b) return ZS_DONE;
-    if (zsi_rec_decode(b, ix->file->size - chosen, ix->file->hdr.start, out)
+    if (zsi_rec_decode(b, ix->file->size - chosen, out)
         != ZS_OK)
         return ZS_DONE;
 
@@ -2574,7 +2515,7 @@ static int zsi_index_cur_get_rev(struct zsi_index *ix, zs_compar *compar,
 
     const char *b = zsi_file_at(ix->file, chosen, 1);
     if (!b) return ZS_DONE;
-    if (zsi_rec_decode(b, ix->file->size - chosen, ix->file->hdr.start, out)
+    if (zsi_rec_decode(b, ix->file->size - chosen, out)
         != ZS_OK)
         return ZS_DONE;
 
@@ -3601,7 +3542,7 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
         if (r != ZS_OK) return r;
         const char *b = zsi_file_at(fc->file, off, 1);
         if (!b) return ZS_BADFORMAT;
-        return zsi_rec_decode(b, fc->file->size - off, fc->file->hdr.start, out);
+        return zsi_rec_decode(b, fc->file->size - off, out);
     }
 
     case ZSI_SRC_TXN: {
@@ -5684,9 +5625,6 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 /* Defined further down this section; the streaming store needs them first. */
 static int zsi_write_all(int fd, const char *buf, size_t len);
 static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
-static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
-                                 uint32_t active_start,
-                                 const char *key, size_t keylen);
 
 /* A transaction's own uncommitted records: a sorted KEY -> OFFSET index over
  * records already streamed into the active file (C-8's shape).  The key is an
@@ -5972,13 +5910,11 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
  * empty value, and the two are distinct states (A-1, F-14).
  *
  * The record is encoded and STREAMED here (C-8); only the key and the record's
- * offset are kept.  The ancestor is computed now, against the transaction's
- * snapshot: repack can change the file SET mid-transaction, but never which
- * generation range holds a key's previous version -- an output covers its
- * inputs' ranges (D-5a) and ancestors resolve by range (F-16c).  An intra-
- * transaction overwrite needs no special case: the previous version is in the
- * active file, so the ancestor is the active generation and F-17 omits it --
- * the same answer zsi_ancestor_for gives for a create. */
+ * offset are kept.  Encoding consults nothing outside its arguments (F-18):
+ * this used to resolve the record's ancestor first, which meant a point lookup
+ * across the whole file set on EVERY store -- creates included, and those miss
+ * in every file so they had no early exit at all.  What that answered is now
+ * derived at repack time instead (D-19). */
 static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
                         const char *val, size_t vallen)
 {
@@ -5993,18 +5929,14 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
     int r = zsi_txn_stream_begin(txn);
     if (r != ZS_OK) return r;
 
-    uint32_t anc = zsi_ancestor_for(txn->db, txn->snap, txn->wgen,
-                                    key, keylen);
-    bool store_anc = (anc != txn->wgen);            /* F-17 */
-
-    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL, store_anc);
+    size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL);
     if (!n) return ZS_BADUSAGE;
 
     /* One record's transient encode buffer -- the only per-store allocation
      * proportional to the VALUE, gone before this returns. */
     char *rec = malloc(n);
     if (!rec) return ZS_INTERNAL;
-    zsi_rec_encode(rec, txn->wcs, key, keylen, val, vallen, store_anc, anc);
+    zsi_rec_encode(rec, txn->wcs, key, keylen, val, vallen);
 
     /* EVERYTHING fallible happens before the stream: a streamed record MUST
      * be indexed, or this handle's fold at commit would disagree with every
@@ -6186,7 +6118,7 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
     struct zsi_pending *p = &txn->pend[ti];
     const char *b = zsi_txn_at(txn, p->off, p->len, fc->ephemeral);
     if (!b
-        || zsi_rec_decode(b, p->len, txn->wgen, &fc->cur) != ZS_OK) {
+        || zsi_rec_decode(b, p->len, &fc->cur) != ZS_OK) {
         fc->exhausted = true;
         fc->tloadedkey = NULL;
         fc->tloadedkeylen = 0;
@@ -6271,43 +6203,6 @@ static int zsi_write_all(int fd, const char *buf, size_t len)
     }
 
     return ZS_OK;
-}
-
-/* Decide the ancestor for a record about to be written (F-16, F-17).
- *
- * The ancestor is the START of the range of the file holding the superseded
- * record (F-16a) -- not its end.  Since start <= end, D-19's containment test then
- * errs toward RETAINING a tombstone rather than dropping one, so an imprecise
- * ancestor costs disk space and not correctness.
- *
- * F-17: it is omitted exactly when it equals the containing file's start.  That
- * single rule covers every row of the table -- a new key, a key rewritten in the
- * same file, and a key last written in an older file -- and F-17a notes why the
- * decoder never needs to know which case applied.
- *
- * Returns the ancestor generation.  The caller omits it when it equals active. */
-static uint32_t zsi_ancestor_for(struct zs_db *db, struct zsi_snapshot *snap,
-                                 uint32_t active_start,
-                                 const char *key, size_t keylen)
-{
-    /* Search newest to oldest for the file that currently holds this key.  The
-     * active file included: a key rewritten within it takes the active start,
-     * which F-17 then omits. */
-    for (size_t i = snap->nfiles; i-- > 0; ) {
-        struct zsi_fcur fc;
-        struct zsi_rec r;
-
-        zsi_fcur_init_file(&fc, snap->files[i], db->compar);
-        {
-            int found = (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK);
-            zsi_fcur_fini(&fc);
-            if (found) return snap->files[i]->hdr.start;
-        }
-    }
-
-    /* A key nobody holds is a create: its ancestor is its own generation, which
-     * is the active file's start, and so is omitted. */
-    return active_start;
 }
 
 /* Choose the file a write transaction will append to (D-9).
@@ -7039,29 +6934,30 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * by an engine-1 handle, say -- the copied checksum validates for
      * nobody, so every record is re-encoded under the output engine instead.
      * D-20b verified the source before this ran.  Re-encoding canonicalises
-     * the form (F-15) but copies the ancestor DECISION verbatim (F-17,
-     * D-17a): stored stays stored with its stored value, omitted stays
-     * omitted, nothing is renumbered. */
+     * the form (F-15), and since a record's bytes are a function of its key and
+     * value alone (F-18) that is all it can change. */
     bool reencode = (src->csum_id != db->create_csum_id);
 
     /* Lay the records out contiguously, recording each one's offset in the
-     * output.  A record is copied byte for byte from the source, which is what
-     * makes ancestors verbatim rather than recomputed. */
+     * output.
+     *
+     * A conversion keeps EVERY record it is given, tombstones included, and
+     * must: its output covers its input's range (D-5a), so there is nothing
+     * below it that it is entitled to reason about.  D-19's retention test
+     * belongs to repack, which merges a range and can look under it. */
     for (size_t i = 0; i < n; i++) {
         const char *b = zsi_file_at(src, offs[i], 1);
         struct zsi_rec rec;
         size_t outlen;
 
         if (!b) { r = ZS_BADFORMAT; goto fail; }
-        if (zsi_rec_decode(b, src->size - offs[i], src->hdr.start, &rec)
+        if (zsi_rec_decode(b, src->size - offs[i], &rec)
             != ZS_OK) { r = ZS_BADFORMAT; goto fail; }
-
-        bool store_anc = (rec.type & ZSI_HASANCESTOR) != 0;
 
         outlen = rec.len;
         if (reencode) {
             outlen = zsi_rec_encoded_len(rec.keylen, rec.vallen,
-                                         rec.val == NULL, store_anc);
+                                         rec.val == NULL);
             if (!outlen) { r = ZS_BADFORMAT; goto fail; }
         }
 
@@ -7077,7 +6973,7 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         ptrs[i] = (uint64_t)(ZSI_HEADER_LEN + recslen);
         if (reencode)
             zsi_rec_encode(recs + recslen, cs, rec.key, rec.keylen,
-                           rec.val, rec.vallen, store_anc, rec.ancestor);
+                           rec.val, rec.vallen);
         else
             memcpy(recs + recslen, b, rec.len);
         recslen += outlen;
@@ -7402,8 +7298,12 @@ static bool zsi_should_repack(struct zsi_snapshot *snap)
  * V3's VALUE and V1's ANCESTOR -- from those records specifically, and by no other
  * route.  Getting this wrong silently emits the wrong value or the wrong ancestor,
  * which is why T-7 tests the ordering directly rather than only its consequences. */
+/* The newest version of one key across the inputs, under D-17b's total order.
+ *
+ * V1 -- the oldest version -- used to be carried here too, because D-17 emitted
+ * V1's ancestor alongside V3's value.  With F-18 there is no ancestor, so only
+ * the newest version is ever needed and the oldest is not tracked at all. */
 struct zsi_merge_key {
-    struct zsi_rec v1;          /* oldest version: its ancestor is emitted */
     struct zsi_rec v3;          /* newest version: its value is emitted */
     bool           have;
 };
@@ -7415,6 +7315,51 @@ struct zsi_merge_key {
  * record per key, "within one file" ordering never arises -- but the code walks
  * the inputs in increasing start generation regardless, because that is what makes
  * the order total and what a future pairwise merge would still need. */
+/* D-19: is the newest record for this key BELOW the output range a value?
+ *
+ * This is the whole of the tombstone retention test, and it replaces the
+ * ancestor a record used to carry (section 4.6).  The search is the one the
+ * write path used to run on every store; here it runs once per surviving
+ * tombstone, which is why the trade is worth making.
+ *
+ * `first` indexes the lowest input in a snapshot sorted by start ascending
+ * (D-6 tiles, so ranges never overlap), which makes files [0, first) exactly
+ * those below the output range.  They are in-order files, because D-12b keeps
+ * in-order as a contiguous prefix and the inputs to a repack are in-order --
+ * so each probe is a pointer-section binary search, never a replay.  Nothing
+ * requires that here, though: zsi_fcur_find handles either kind.
+ *
+ * Newest to oldest, stopping at the first file that holds the key, because
+ * that record is the one a reader would resolve to and everything under it is
+ * already hidden.  So a DELETION found here answers false: our tombstone would
+ * be redundant with it, and dropping ours is safe.  That exactness is free --
+ * the search has to stop there either way.
+ *
+ * Files ABOVE the range are deliberately not consulted, and cannot be: a newer
+ * record shadows everything below it, so a newer file can only ever make a
+ * retained tombstone redundant, never make a dropped one unsafe.  Looking up
+ * would also cost a lookup per KEY rather than per tombstone, which is D-19a's
+ * argument for writing a shadowed record rather than proving it is shadowed. */
+static bool zsi_repack_value_below(struct zs_db *db, struct zsi_snapshot *snap,
+                                   size_t first, const char *key, size_t keylen)
+{
+    for (size_t i = first; i-- > 0; ) {
+        struct zsi_fcur fc;
+        struct zsi_rec r;
+
+        zsi_fcur_init_file(&fc, snap->files[i], db->compar);
+        {
+            bool found = (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK);
+            bool isval = found && !zsi_rec_is_delete(&r);
+            zsi_fcur_fini(&fc);
+            if (found) return isval;
+        }
+    }
+
+    /* Nothing below holds the key, so its whole lifespan is in the inputs. */
+    return false;
+}
+
 static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
                             size_t first, size_t count)
 {
@@ -7485,8 +7430,8 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
             if (db->compar(fc[i].cur.key, fc[i].cur.keylen, bestk, bestkl) != 0)
                 continue;
 
-            if (!mk.have) { mk.v1 = fc[i].cur; mk.have = true; }
-            mk.v3 = fc[i].cur;
+            mk.have = true;
+            mk.v3 = fc[i].cur;      /* D-17b: last writer in the order wins */
 
             r = zsi_fcur_next(&fc[i]);
             if (r != ZS_OK) goto out;
@@ -7494,33 +7439,25 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
 
         if (!mk.have) break;
 
-        /* D-19: a key is removed entirely IF AND ONLY IF its latest version is a
-         * deletion AND V1's ancestor lies inside the output range -- its whole
-         * lifespan from create through update to delete is contained.
+        /* D-18/D-19: a tombstone is kept if and only if the newest record for
+         * its key below the output range is a value.  Otherwise the key goes
+         * entirely -- either its whole lifespan is inside the inputs, or a
+         * deletion below already hides everything under it.
          *
-         * Otherwise the tombstone MUST be retained, because an older file may
-         * still hold the key and dropping it would resurrect the value.
-         *
-         * D-19a: the record is written even when a NEWER file already shadows the
-         * key.  Being shadowed does not permit dropping it; only D-19 does.  The
-         * retained record carries the chain's reach, which no other file records.
-         * This looks like a missed optimisation and is not -- T-7 constructs the
-         * resurrection that follows from removing it. */
-        bool v3_delete = zsi_rec_is_delete(&mk.v3);
-        bool contained = (mk.v1.ancestor >= out_start);
-
-        if (v3_delete && contained) continue;   /* drop the key */
-
-        /* D-18's table: the ancestor-omitting form when the chain begins inside
-         * the output range, the ancestor-storing form otherwise, carrying V1's
-         * ancestor -- copied verbatim, never renumbered (D-17a). */
-        bool store_anc = !contained;
-        uint32_t anc = mk.v1.ancestor;
+         * D-19a: a record is written even when a NEWER file already shadows the
+         * key.  Being shadowed does not permit dropping it; only D-19 does.
+         * That is a cost argument now rather than a correctness one -- proving a
+         * newer file shadows a key needs a lookup per KEY, where the test below
+         * needs one per surviving tombstone -- but the rule is unchanged, and
+         * T-7 constructs the resurrection that follows from removing it. */
+        if (zsi_rec_is_delete(&mk.v3)
+            && !zsi_repack_value_below(db, snap, first,
+                                       mk.v3.key, mk.v3.keylen))
+            continue;                           /* drop the key */
 
         const char *val = mk.v3.val;
         size_t vallen = mk.v3.vallen;
-        size_t n = zsi_rec_encoded_len(mk.v3.keylen, vallen, val == NULL,
-                                       store_anc);
+        size_t n = zsi_rec_encoded_len(mk.v3.keylen, vallen, val == NULL);
         if (!n) { r = ZS_INTERNAL; goto out; }
 
         if (recslen + n > alloc) {
@@ -7541,7 +7478,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
 
         ptrs[nptrs++] = (uint64_t)(ZSI_HEADER_LEN + recslen);
         zsi_rec_encode(recs + recslen, cs, mk.v3.key, mk.v3.keylen, val,
-                       vallen, store_anc, anc);
+                       vallen);
         recslen += n;
     }
 
@@ -7836,8 +7773,8 @@ static int zsi_check_inorder(struct zs_db *db, struct zsi_file *f)
             }
         }
 
-        /* F-15/F-17 non-canonical encodings, reported not rejected. */
-        if (!zsi_rec_is_canonical(&cur, f->hdr.start)) {
+        /* F-15 non-canonical encodings, reported not rejected. */
+        if (!zsi_rec_is_canonical(&cur)) {
             zsi_report(db, "non-canonical record encoding", f->fname, i);
             r = ZS_BADFORMAT;
         }
@@ -7872,7 +7809,7 @@ static int zsi_check_rec_cb(void *rock, const struct zsi_rec *rec, size_t off)
 {
     struct zsi_check_unordered *c = rock;
 
-    if (!zsi_rec_is_canonical(rec, c->f->hdr.start)) {
+    if (!zsi_rec_is_canonical(rec)) {
         zsi_report(c->db, "non-canonical record encoding", c->f->fname, off);
         c->result = ZS_BADFORMAT;
     }
@@ -7933,7 +7870,7 @@ static int zsi_check_unordered_file(struct zs_db *db, struct zsi_file *f)
         }
 
         struct zsi_rec rec;
-        if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &rec) != ZS_OK) break;
+        if (zsi_rec_decode(b, f->size - pos, &rec) != ZS_OK) break;
         if (rec.len == 0) break;
         pos += rec.len;
     }
@@ -7992,7 +7929,7 @@ static void zsi_dump_rec(const struct zsi_rec *r, size_t off, int detail)
     printf("REC  %zu type=0x%02X keylen=%zu ", off, r->type, r->keylen);
     if (r->val) printf("vallen=%zu ", r->vallen);
     else        printf("vallen=- ");
-    printf("anc=%u key=", r->ancestor);
+    printf("key=");
     zsi_dump_hex(r->key, r->keylen);
     if (detail > 1 && r->val) {
         printf(" val=");
@@ -8050,7 +7987,7 @@ int zs_db_dump(struct zs_db *db, int detail)
                     }
 
                     struct zsi_rec rec;
-                    if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &rec)
+                    if (zsi_rec_decode(b, f->size - pos, &rec)
                         != ZS_OK) break;
                     if (rec.len == 0) break;
                     if (detail > 0) zsi_dump_rec(&rec, pos, detail);
@@ -9040,7 +8977,7 @@ static int zsi_salvage_engine(struct zsi_file *f, zs_csum *external,
             }
 
             if (!((uint8_t)b[0] & ZSI_HASKEY)) break;
-            if (zsi_rec_decode(b, f->size - p, f->hdr.start, &r) != ZS_OK) break;
+            if (zsi_rec_decode(b, f->size - p, &r) != ZS_OK) break;
             if (r.len == 0) break;
             if (!zsi_add_sz(p, r.len, &p)) break;
             if (p > f->size) break;
@@ -9188,7 +9125,7 @@ static int zsi_salvage_span(struct zsi_salvage_ctx *ctx, struct zsi_file *f,
         int rc;
 
         if (!b) break;
-        if (zsi_rec_decode(b, f->size - q, f->hdr.start, &r) != ZS_OK) break;
+        if (zsi_rec_decode(b, f->size - q, &r) != ZS_OK) break;
         if (r.len == 0) break;
 
         rc = zsi_salvage_apply(ctx, &r, verified);
@@ -9288,7 +9225,7 @@ static int zsi_salvage_inorder(struct zsi_salvage_ctx *ctx, struct zsi_file *f,
         if (!zsi_type_valid((uint8_t)b[0])) break;
         if (!((uint8_t)b[0] & ZSI_HASKEY)) break;
 
-        if (zsi_rec_decode(b, f->size - pos, f->hdr.start, &r) != ZS_OK) {
+        if (zsi_rec_decode(b, f->size - pos, &r) != ZS_OK) {
             zsi_salvage_loss(ctx, pos, f->size - pos);
             break;
         }
