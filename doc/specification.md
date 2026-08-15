@@ -1947,6 +1947,7 @@ different calls, though not every flag is meaningful everywhere:
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
 | `ZS_NOAUTOREPACK` | open | do not run D-16e's cascade from a write transaction (A-14) |
 | `ZS_IFNOTEXIST` | store | store only if the key is absent, else `ZS_EXISTS` |
+| `ZS_IFCHANGED` | store | skip the write when the stored state already matches (A-1d) |
 | `ZS_IFEXIST` | store | store only if the key is present, else `ZS_NOTFOUND` |
 | `ZS_FETCHNEXT` | fetch | return the record with the smallest key ≥ the given key; with `ZS_SKIPROOT`, strictly > (A-12) |
 | `ZS_FETCHPREV` | fetch | return the record with the largest key ≤ the given key; with `ZS_SKIPROOT`, strictly < (A-12) |
@@ -1980,6 +1981,33 @@ different calls, though not every flag is meaningful everywhere:
   `cursor_replace`, not separate entry points, so there is exactly one write
   path to implement and test. `ZS_IFEXIST` composes with them naturally to mean
   "delete only if present".
+- **A-1d** `ZS_IFCHANGED` on a store means **write nothing if the stored state
+  already matches what is being written**, returning `ZS_OK` either way — the
+  requested state holds, which is what the caller asked for. "Matches" is
+  judged under A-1's distinction: a deletion matches only an absent or deleted
+  key, and a value matches only an equal value of equal length, so storing an
+  empty value over a tombstone **is** a change.
+
+  It is evaluated against the transaction's own view, like `ZS_IFEXIST` and
+  `ZS_IFNOTEXIST` and sharing their probe, so it composes with earlier writes
+  in the same transaction (A-1a).
+
+  This is a **caller's** optimisation, not the implementation's: a store MUST
+  NOT skip a redundant write without it. Deciding costs a point lookup, which
+  the write path otherwise never performs — that lookup is exactly what was
+  removed with the ancestor (§4.6), and reintroducing it for every store would
+  give back the cost this format changed to avoid. A caller whose workload
+  rewrites identical values knows that and can ask; one that does not, should
+  not pay.
+
+  A skipped write MUST be invisible: it makes no record, and it MUST NOT be
+  reported as a change to a cursor traversing the transaction (D-14j), because
+  nothing changed for a cursor to observe.
+
+  Its use with a deletion is worth naming, because it is the one case where the
+  saving is structural rather than incidental: deleting an absent key otherwise
+  writes a tombstone for a key that never existed, which a later repack must
+  then carry until it can prove the key is absent below it (D-19).
 - **A-1a** A write inside a transaction is visible to subsequent reads on that
   same transaction, and to nothing else until commit. `zs_txn_fetch` and
   `zs_txn_foreach` therefore consult the transaction's own uncommitted records

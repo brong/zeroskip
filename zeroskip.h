@@ -77,6 +77,23 @@ enum zs_flagspec {
 
     ZS_IFNOTEXIST    = 1<<11,  /* store:   only if absent, else ZS_EXISTS */
     ZS_IFEXIST       = 1<<12,  /* store:   only if present, else ZS_NOTFOUND */
+    ZS_IFCHANGED     = 1<<22,  /* store:   write nothing when the stored state
+                                  already matches, returning ZS_OK either way
+                                  (A-1d).  A deletion matches only an absent or
+                                  deleted key, and a value only an equal value
+                                  of equal length -- so storing an empty value
+                                  over a deletion IS a change (A-1).
+                                  Judged against this transaction's own view,
+                                  so it composes with earlier writes in it.
+
+                                  Opt-in because deciding costs a point lookup,
+                                  which the write path otherwise never does.
+                                  Worth it for a caller that rewrites identical
+                                  values, and for deleting keys that may not
+                                  exist -- without it that writes a tombstone
+                                  for a key that never existed, which a repack
+                                  then carries until it can prove the key is
+                                  absent below it. */
     ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record with the smallest
                                   key >= the given key; with ZS_SKIPROOT,
                                   strictly > (A-12).  Exclusive with

@@ -7098,6 +7098,70 @@ static void test_write_unclean_rollover(void)
  *
  * Asserted on the bytes rather than through a round-trip, for the same reason
  * the old test was: a symmetric encode/decode bug survives a round-trip. */
+/* A-1d's actual claim: the write is SKIPPED, not merely redundant.
+ *
+ * Every assertion in test_read_seek_and_flags would hold just as well if the
+ * flag did nothing and the store went through, because storing the same value
+ * twice leaves the same visible state.  So this one watches the bytes and the
+ * change counter instead: the active file must not grow, and a cursor
+ * traversing the transaction must not be told anything happened. */
+static void test_ifchanged_writes_nothing(void)
+{
+    struct zs_db *db = fresh_db_noautorepack();
+    struct zs_txn *txn = NULL;
+    size_t before, after, grown;
+    unsigned long seq;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "k", 1, "value", 5, 0));
+
+    before = zsi_snapshot_active(db->snap)->size;
+
+    /* Skipped: not one byte. */
+    ASSERT_OK(zs_db_store(db, "k", 1, "value", 5, ZS_IFCHANGED));
+    after = zsi_snapshot_active(db->snap)->size;
+    ASSERT_EQU(after, before);
+
+    /* The same store WITHOUT the flag writes a record, which is what makes the
+     * assertion above mean something -- a store that could not have grown the
+     * file either way would prove nothing. */
+    ASSERT_OK(zs_db_store(db, "k", 1, "value", 5, 0));
+    grown = zsi_snapshot_active(db->snap)->size;
+    ASSERT(grown > before);
+
+    /* Deleting an absent key is likewise free. */
+    before = grown;
+    ASSERT_OK(zs_db_delete(db, "absent", 6, ZS_IFCHANGED));
+    ASSERT_EQU(zsi_snapshot_active(db->snap)->size, before);
+    /* ...and without the flag it writes a tombstone for a key that never
+     * existed, which is exactly the record A-1d exists to avoid. */
+    ASSERT_OK(zs_db_delete(db, "absent", 6, 0));
+    ASSERT(zsi_snapshot_active(db->snap)->size > before);
+
+    /* And the change counter: a skipped write MUST NOT bump pend_seq, or every
+     * cursor on the transaction refreshes and re-seeks for a write that did
+     * not happen (D-14j). */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "pending", 7, 0));
+    seq = txn->pend_seq;
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "pending", 7, ZS_IFCHANGED));
+    ASSERT_EQU(txn->pend_seq, seq);                 /* nothing to observe */
+    ASSERT_OK(zs_txn_store(txn, "k", 1, "changed", 7, ZS_IFCHANGED));
+    ASSERT(txn->pend_seq != seq);                   /* a real write does bump */
+
+    /* Both skip branches, not just the value one: deleting an absent key is
+     * the other way to return without writing, and it has its own early exit
+     * to get wrong. */
+    seq = txn->pend_seq;
+    ASSERT_OK(zs_txn_delete(txn, "still-absent", 12, ZS_IFCHANGED));
+    ASSERT_EQU(txn->pend_seq, seq);
+    ASSERT_OK(zs_txn_delete(txn, "k", 1, ZS_IFCHANGED));   /* present: a change */
+    ASSERT(txn->pend_seq != seq);
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    zs_db_close(&db);
+}
+
 static void test_write_record_is_self_contained(void)
 {
     struct zsi_rec r;
@@ -7275,6 +7339,54 @@ static void test_api_three_forms(void)
     ASSERT_OK(zs_db_delete(db, "k", 1, ZS_IFEXIST));
     ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     ASSERT_EQ(zs_db_delete(db, "k", 1, ZS_IFEXIST), ZS_NOTFOUND);
+
+    /* ZS_IFCHANGED (A-1d): the write is skipped when the stored state already
+     * matches, and ZS_OK is returned either way -- the requested state holds. */
+    ASSERT_OK(zs_db_store(db, "c1", 2, "same", 4, 0));
+    ASSERT_OK(zs_db_store(db, "c1", 2, "same", 4, ZS_IFCHANGED));   /* skipped */
+    ASSERT_OK(zs_db_store(db, "c1", 2, "diff", 4, ZS_IFCHANGED));   /* written */
+    ASSERT_OK(zs_db_fetch(db, "c1", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "diff", 4);
+
+    /* Deleting a key that is already absent is not a change, so nothing is
+     * written -- which is the case where the saving is structural, since
+     * otherwise a tombstone exists for a key that never did. */
+    ASSERT_OK(zs_db_delete(db, "never", 5, ZS_IFCHANGED));
+    ASSERT_EQ(zs_db_fetch(db, "never", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* And deleting a key that IS present is a change. */
+    ASSERT_OK(zs_db_delete(db, "c1", 2, ZS_IFCHANGED));
+    ASSERT_EQ(zs_db_fetch(db, "c1", 2, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    /* ...and deleting it again is not. */
+    ASSERT_OK(zs_db_delete(db, "c1", 2, ZS_IFCHANGED));
+
+    /* A-1's distinction survives: an EMPTY VALUE over a deletion is a change,
+     * and is not confused with the deletion it replaces.  This is the case a
+     * naive "compare the value bytes" test gets wrong, since both have length
+     * zero. */
+    ASSERT_OK(zs_db_store(db, "c1", 2, "", 0, ZS_IFCHANGED));
+    ASSERT_OK(zs_db_fetch(db, "c1", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_NOT_NULL(v);
+    ASSERT_EQU(vl, 0u);
+    /* Storing the empty value again IS now a no-op. */
+    ASSERT_OK(zs_db_store(db, "c1", 2, "", 0, ZS_IFCHANGED));
+    ASSERT_OK(zs_db_fetch(db, "c1", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 0u);
+    /* But deleting it is a change, not a match for the empty value. */
+    ASSERT_OK(zs_db_delete(db, "c1", 2, ZS_IFCHANGED));
+    ASSERT_EQ(zs_db_fetch(db, "c1", 2, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* Judged against the TRANSACTION's own view (A-1a), so it composes with an
+     * earlier write in the same transaction rather than with what is
+     * committed. */
+    ASSERT_OK(zs_db_store(db, "c2", 2, "committed", 9, 0));
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "c2", 2, "pending", 7, 0));
+    ASSERT_OK(zs_txn_store(txn, "c2", 2, "pending", 7, ZS_IFCHANGED));
+    ASSERT_OK(zs_txn_store(txn, "c2", 2, "committed", 9, ZS_IFCHANGED));
+    ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_OK(zs_db_fetch(db, "c2", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "committed", 9);   /* the last one was a change, and took */
 
     /* ZS_FETCHNEXT: the record AFTER the given key -- the strict bound, which
      * since 2026-08-13 is spelled with ZS_SKIPROOT (A-12) -- through both
@@ -16242,6 +16354,7 @@ static struct test_entry tests[] = {
                                         test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
+    { "test_ifchanged_writes_nothing",   test_ifchanged_writes_nothing },
     { "test_write_record_is_self_contained",
                                     test_write_record_is_self_contained },
     { "test_write_encoding_boundaries", test_write_encoding_boundaries },

@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 266 |
-| With an enforcing test | 256 |
+| Requirements | 267 |
+| With an enforcing test | 257 |
 | Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -289,6 +289,7 @@ a spec label is missing here.
 | `A-1` | `store` with `val == NULL` writes a deletion; with a non-NULL | `record_byte_layout`, `span_basic`, `tool.sh`, +1 more, `empty_value_is_not_null_on_read` |
 | `A-1a` | A write inside a transaction is visible to subsequent reads on that | `tool.sh`, `write_txn_isolation` |
 | `A-1b` | The `*_delete` forms are **macros** over `store` and | `api_cursor_replace`, `api_three_forms`, `write_basic` |
+| `A-1d` | `ZS_IFCHANGED` on a store means **write nothing if the stored state | `ifchanged_writes_nothing`, `read_seek_and_flags` |
 | `A-1c` | A transaction supports **any number of cursors open at once**, and | `txn_many_cursors`, `txn_insert_select_self` |
 | `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |

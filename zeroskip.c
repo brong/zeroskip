@@ -8567,9 +8567,10 @@ int zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
     if (keylen < 1) return ZS_BADUSAGE;             /* F-14 */
     if (txn->readonly) return ZS_READONLY;          /* A-5 */
 
-    /* ZS_IFNOTEXIST / ZS_IFEXIST are evaluated against the transaction's own
-     * view, so they compose with earlier writes in the same transaction (A-1a). */
-    if (flags & (ZS_IFNOTEXIST | ZS_IFEXIST)) {
+    /* ZS_IFNOTEXIST / ZS_IFEXIST / ZS_IFCHANGED are evaluated against the
+     * transaction's own view, so they compose with earlier writes in the same
+     * transaction (A-1a).  All three share ONE probe. */
+    if (flags & (ZS_IFNOTEXIST | ZS_IFEXIST | ZS_IFCHANGED)) {
         /* Always ephemeral (A-4b): this probe wants the ANSWER, not the bytes.
          * `r` never leaves this function, so forcing the chunk out to the file
          * to look at a record we are about to discard is pure loss -- and a
@@ -8579,6 +8580,28 @@ int zs_txn_store(struct zs_txn *txn, const char *key, size_t keylen,
         if ((flags & ZS_IFNOTEXIST) && rc == ZS_OK) return ZS_EXISTS;
         if ((flags & ZS_IFEXIST) && rc == ZS_NOTFOUND) return ZS_NOTFOUND;
         if (rc != ZS_OK && rc != ZS_NOTFOUND) return rc;
+
+        /* A-1d: nothing to write when the stored state already matches.
+         *
+         * Compared under A-1's distinction rather than by value bytes alone: a
+         * deletion matches only an absent or deleted key, and an empty value
+         * over a deletion is a CHANGE.  zsi_lookup folds a tombstone into
+         * ZS_NOTFOUND, so rc alone answers both halves: NOTFOUND means absent
+         * or deleted, and ZS_OK means a live value -- which is why the value
+         * case needs no NULL check on r.val, and why the deletion case never
+         * touches r at all.
+         *
+         * Returning before zsi_pend_set is what makes the skip invisible: no
+         * record, and no pend_seq bump, so a cursor traversing this
+         * transaction does not refresh for a write that did not happen. */
+        if (flags & ZS_IFCHANGED) {
+            if (val == NULL) {
+                if (rc == ZS_NOTFOUND) return ZS_OK;
+            } else if (rc == ZS_OK && r.vallen == vallen
+                       && (vallen == 0 || memcmp(r.val, val, vallen) == 0)) {
+                return ZS_OK;
+            }
+        }
     }
 
     return zsi_pend_set(txn, key, keylen, val, vallen);

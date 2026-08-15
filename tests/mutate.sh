@@ -1044,6 +1044,32 @@ mutant "compact: reports success regardless" catch \
 # launders a corrupt body: the output is written under a FRESH checksum computed
 # over the corrupt copy, and D-23 then removes the input -- the only evidence.
 echo
+echo "ZS_IFCHANGED (A-1d)"
+
+# The flag doing nothing is the failure mode that no behaviour test can see:
+# storing the same value twice leaves the same visible state either way.  Only
+# an assertion on the BYTES catches it.
+mutant "ifchanged: never skips" catch \
+  's/        if \(flags & ZS_IFCHANGED\) \{/        if (0) {/'
+
+# ... and the opposite, which LOSES DATA: skipping a store whose value differs.
+mutant "ifchanged: skips even when changed" catch \
+  's/            \} else if \(rc == ZS_OK && r.vallen == vallen\n                       && \(vallen == 0 \|\| memcmp\(r.val, val, vallen\) == 0\)\) \{/            } else if (rc == ZS_OK) {/'
+
+# A-1: an empty value and a deletion are DISTINCT states, and comparing lengths
+# alone collapses them -- both are zero bytes.  Storing an empty value over a
+# tombstone is a change, and this is the mutant that proves the test knows it.
+mutant "ifchanged: empty value matches a deletion" catch \
+  's/            if \(val == NULL\) \{\n                if \(rc == ZS_NOTFOUND\) return ZS_OK;/            if (vallen == 0) {\n                if (rc == ZS_NOTFOUND) return ZS_OK;/'
+
+# A skipped write must be invisible to a cursor on the same transaction, which
+# means not bumping pend_seq (D-14j).  Bumping it is harmless for correctness
+# -- every cursor just refreshes and re-seeks for nothing -- so it needs a
+# mutant rather than a data test.
+mutant "ifchanged: skip still counts as a change" catch \
+  's/            if \(val == NULL\) \{\n                if \(rc == ZS_NOTFOUND\) return ZS_OK;/            if (val == NULL) {\n                if (rc == ZS_NOTFOUND) { txn->pend_seq++; return ZS_OK; }/'
+
+echo
 echo "repack: what is emitted and what is dropped (D-17b, D-18, D-19)"
 
 # D-17b.  The emitted value comes from V3 under the total order -- oldest to
