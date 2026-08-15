@@ -3329,11 +3329,35 @@ struct zsi_fcur {
      * cyrusdb both want.  In reverse, NULL means "after the last" instead, and
      * texclusive records whether a seek bound was < rather than <= -- it only
      * matters until the first record is consumed (tstarted), after which the
-     * position is always strictly below tkey. */
-    char                *tkey;   /* owned; NULL means "before the first" */
+     * position is always strictly below tkey.
+     *
+     * BORROWED, not owned.  Two sources, both stable for as long as the arm can
+     * read them:
+     *
+     *   - after a step, the PENDING ARRAY's own key for the record just yielded
+     *     (tloadedkey).  zsi_pend_set mallocs each key once; a same-key
+     *     overwrite only repoints off/len, and a new key memmoves the ENTRIES
+     *     and may realloc the array -- neither of which moves a key block.  They
+     *     are freed only by zsi_pend_clear, from zsi_txn_free.  So the array
+     *     moving underneath us, which is the whole of D-14j-a, does not move
+     *     this.
+     *   - after a seek, the caller's key.  Every call site passes one that
+     *     outlives the arm: the cursor's own start_key or rev_succ, its
+     *     last_key (borrowed in turn from a record, so A-4-stable), or a lookup
+     *     key held across the call by zsi_fcur_find's scratch arm.
+     *
+     * Copying instead was a malloc + memcpy + free on EVERY step of a
+     * traversal inside a write transaction. */
+    const char          *tkey;   /* borrowed; NULL means "before the first" */
     size_t               tkeylen;
     bool                 tstarted;
     bool                 texclusive;
+
+    /* The pending array's key for the record currently loaded, recorded by the
+     * load that landed on it so that stepping past it costs no search.  Only
+     * meaningful while !exhausted. */
+    const char          *tloadedkey;
+    size_t               tloadedkeylen;
 };
 
 /* Filled in by the WRITE PATH section, which owns struct zs_txn.  Declared here
@@ -3436,7 +3460,6 @@ static int zsi_fcur_seek_first(struct zsi_fcur *fc)
     case ZSI_SRC_INORDER:   fc->pi = 0; break;
     case ZSI_SRC_UNORDERED: zsi_index_cur_seek_first(&fc->ic); break;
     case ZSI_SRC_TXN:
-        free(fc->tkey);
         fc->tkey = NULL;
         fc->tkeylen = 0;
         fc->tstarted = false;
@@ -3489,7 +3512,6 @@ static int zsi_fcur_seek_last(struct zsi_fcur *fc)
         zsi_index_cur_seek_last(fc->file->index, &fc->ic);
         break;
     case ZSI_SRC_TXN:
-        free(fc->tkey);
         fc->tkey = NULL;
         fc->tkeylen = 0;
         fc->tstarted = false;
@@ -3518,20 +3540,17 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
         else
             zsi_index_cur_next(fc->file->index, fc->compar, &fc->ic);
         break;
-    case ZSI_SRC_TXN: {
+    case ZSI_SRC_TXN:
         /* Remember the key just yielded, so the next load finds its successor
          * in the array as it stands THEN -- which is the whole point (D-14j-a).
-         * Copied, because the pending array may be reallocated by a write made
-         * from the callback before the next step. */
-        char *k = fc->cur.keylen ? malloc(fc->cur.keylen) : NULL;
-        if (fc->cur.keylen && !k) { fc->exhausted = true; return ZS_INTERNAL; }
-        if (k) memcpy(k, fc->cur.key, fc->cur.keylen);
-        free(fc->tkey);
-        fc->tkey = k;
-        fc->tkeylen = fc->cur.keylen;
+         *
+         * The pending array's own key for it, recorded by the load that landed
+         * here, so a write from a callback may move the ARRAY without moving
+         * this.  See the tkey comment on struct zsi_fcur for why that holds. */
+        fc->tkey = fc->tloadedkey;
+        fc->tkeylen = fc->tloadedkeylen;
         fc->tstarted = true;
         break;
-    }
     }
 
     return zsi_fcur_load(fc);
@@ -3546,18 +3565,20 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
  * Both file kinds MUST report "absent" for an empty source rather than
  * misbehaving: a binary search over a zero-length array and an index for a file
  * with no committed records are both ordinary cases. */
-/* Release anything a per-file cursor owns.
+/* Release anything a per-file cursor owns -- which, since the transaction arm's
+ * position key became a borrow, is NOTHING.  Both of its pointers are into
+ * storage that outlives the arm: the pending array's own key blocks, or a key
+ * the caller of a seek holds.
  *
- * Only the transaction arm owns anything -- the key it holds instead of an index
- * (D-14j-a) -- but every arm goes through this, so a STACK-allocated fcur is
- * cleaned up the same way as one inside a cursor.  Those are easy to miss:
- * zsi_lookup builds one per source on the stack, and the key copy leaked from
- * exactly there until `make leaks` said so. */
+ * Kept, and kept called from all six sites, because "the arm owns nothing" is a
+ * property of the arm's fields rather than of this function -- the moment one
+ * of them grows an allocation again, the cleanup has somewhere to go and every
+ * site already reaches it.  The history is why: the transaction arm's key copy
+ * leaked out of the stack arms zsi_lookup builds until `make leaks` found it,
+ * and it leaked again out of zsi_fcur_find's scratch copy right after. */
 static void zsi_fcur_fini(struct zsi_fcur *fc)
 {
-    free(fc->tkey);
-    fc->tkey = NULL;
-    fc->tkeylen = 0;
+    (void)fc;
 }
 
 static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
@@ -6150,7 +6171,12 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
     struct zs_txn *txn = fc->txn;
     size_t ti;
 
-    if (!zsi_txn_cur_at(fc, &ti)) { fc->exhausted = true; return ZS_OK; }
+    if (!zsi_txn_cur_at(fc, &ti)) {
+        fc->exhausted = true;
+        fc->tloadedkey = NULL;
+        fc->tloadedkeylen = 0;
+        return ZS_OK;
+    }
 
     /* The record was streamed to the active file when it was stored (C-8);
      * decode it back through the transaction's accumulated mappings, whose
@@ -6162,9 +6188,19 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
     if (!b
         || zsi_rec_decode(b, p->len, txn->wgen, &fc->cur) != ZS_OK) {
         fc->exhausted = true;
+        fc->tloadedkey = NULL;
+        fc->tloadedkeylen = 0;
         return ZS_IOERROR;
     }
     fc->exhausted = false;
+
+    /* Where the step past this record will resume from.  Recorded HERE, beside
+     * the entry it came from, so advancing needs no second search -- and taken
+     * from the pending array rather than from the record just decoded, because
+     * the decoded key may live in the writer's chunk buffer under A-4b whereas
+     * this one is stable for the whole transaction. */
+    fc->tloadedkey = p->key;
+    fc->tloadedkeylen = p->keylen;
 
     return ZS_OK;
 }
@@ -6176,16 +6212,16 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
  * zsi_txn_cur_index recomputes against the array as it is then. */
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
 {
-    free(fc->tkey);
     fc->tkey = NULL;
     fc->tkeylen = 0;
     fc->tstarted = false;
 
     if (!fc->txn || !key || !keylen) return;
 
-    fc->tkey = malloc(keylen);
-    if (!fc->tkey) return;              /* degrades to "from the beginning" */
-    memcpy(fc->tkey, key, keylen);
+    /* Borrowed from the caller, who holds it for at least as long as this arm
+     * will read it -- see the tkey comment on struct zsi_fcur for the four call
+     * sites and why each one qualifies. */
+    fc->tkey = key;
     fc->tkeylen = keylen;
 
     /* A seek lands ON the key if present, so the first load must NOT skip it:

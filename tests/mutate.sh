@@ -1214,6 +1214,20 @@ mutant "cursor: txn arm resumes from the index" catch \
 mutant "cursor: txn arm always skips the seek hit" catch \
   's/        && fc->tstarted\)\n        pos\+\+;/        )\n        pos++;/'
 
+# EQUIVALENT, and worth the words because it looks like it should not be.  The
+# txn arm's position key is borrowed from the pending array's own key block, so
+# freeing that block on an overwrite reads like a dangle -- but the arm's two
+# borrowed pointers are only ever READ inside a seek/next -> load chain that
+# just wrote them, with no caller code in between, and any write to the
+# transaction bumps pend_seq, which forces the next step to refresh and re-seek
+# the arm from the CURSOR's last_key, overwriting both before they are read.
+#
+# Verified as equivalent rather than assumed: applied to a scratch copy and run
+# under ASan, where a genuine use-after-free would report, and it does not.
+# Listed so that anyone loosening the refresh rule knows this became live.
+mutant "pend: reallocates the key block on overwrite" equivalent \
+  's/    if \(found\) \{\n        txn->pend\[pos\]\.off = off;/    if (found) {\n        char *nk_ = malloc(keylen);\n        if (nk_) { memcpy(nk_, key, keylen); free(txn->pend[pos].key); txn->pend[pos].key = nk_; }\n        txn->pend[pos].off = off;/'
+
 # A-1a.  The merge caches each arm's current record, so without noticing the
 # pending array changed, a write made during the traversal is never seen.
 mutant "cursor: ignores writes on its own txn" catch \

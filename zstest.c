@@ -14599,6 +14599,117 @@ static void test_txn_cursor_store_behind_not_yielded(void)
     ASSERT_OK(zs_db_close(&live_db));
 }
 
+/* D-14j-a at the size where the pending array actually MOVES.
+ *
+ * The transaction arm's position is a key rather than an index because a write
+ * mid-traversal inserts into the sorted pending array and shifts everything
+ * from the insertion point on.  That key is now BORROWED from the array's own
+ * key block instead of copied -- three independent things make it sound, and
+ * the weakest of them is the one worth pinning: zsi_pend_set allocates each key
+ * once and neither the memmove of the ENTRIES, nor a realloc of the array, nor
+ * an overwrite repointing off/len, moves a key block.
+ *
+ * The other D-14j-a tests cannot exercise any of that.  They store a handful of
+ * one-byte keys, so the array never outgrows its initial 16 slots and never
+ * reallocs, and they only ever insert keys that are absent -- so the overwrite
+ * path never runs at all.  This one inserts 200 keys BELOW the cursor in a
+ * single callback, which memmoves the whole array 200 times and reallocs it
+ * through 64 -> 128 -> 256, and overwrites both the key just yielded and the
+ * one the arm has already advanced onto.
+ *
+ * Everything below the resume point is invisible to the rest of the walk by
+ * D-14j-b, so the expected output is just the "k" keys, once each, in order. */
+struct pend_move_rock {
+    size_t n;
+    char   last[8];
+    bool   out_of_order;
+    bool   unexpected;
+    bool   mutate;          /* do the mid-walk writes on the first yield */
+};
+
+static int pend_move_cb(void *rock, const char *k, size_t kl,
+                        const char *v, size_t vl)
+{
+    struct pend_move_rock *r = rock;
+    (void)v; (void)vl;
+
+    if (kl != 4 || k[0] != 'k') { r->unexpected = true; return 0; }
+    if (r->n && memcmp(k, r->last, 4) <= 0) r->out_of_order = true;
+    memcpy(r->last, k, 4);
+    r->last[4] = '\0';
+    r->n++;
+
+    if (r->mutate && r->n == 1) {
+        char key[8];
+        int i;
+
+        /* 200 inserts, every one of them below the cursor's position, so the
+         * array is rebuilt under the arm again and again. */
+        for (i = 0; i < 200; i++) {
+            snprintf(key, sizeof(key), "a%03d", i);
+            CB_ASSERT(zs_txn_store(live_txn, key, 4, "v", 1, 0) == ZS_OK);
+        }
+
+        /* And OVERWRITES, the one zsi_pend_set path that could free a key block
+         * the arm has borrowed.  Both the key just yielded and the NEXT one:
+         * D-14e step 5 advances element 0 before the record is handed over, so
+         * by the time this callback runs the arm is already loaded on "k001"
+         * and it is "k001"'s block, not "k000"'s, that it holds a pointer to. */
+        CB_ASSERT(zs_txn_store(live_txn, "k000", 4, "V", 1, 0) == ZS_OK);
+        CB_ASSERT(zs_txn_store(live_txn, "k001", 4, "V", 1, 0) == ZS_OK);
+    }
+    return 0;
+}
+
+static void test_txn_cursor_survives_pending_array_growth(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct pend_move_rock rock;
+    const char *v;
+    size_t vl;
+    char key[8];
+    int i;
+
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &live_db));
+
+    /* Everything pending and nothing committed, so the traversal is the
+     * transaction arm alone and the mechanism is not masked by a file. */
+    ASSERT_OK(zs_db_begin_txn(live_db, 0, &live_txn));
+    for (i = 0; i < 40; i++) {
+        snprintf(key, sizeof(key), "k%03d", i);
+        ASSERT_OK(zs_txn_store(live_txn, key, 4, "v", 1, 0));
+    }
+
+    memset(&rock, 0, sizeof(rock));
+    rock.mutate = true;
+    ASSERT_OK(zs_txn_foreach(live_txn, NULL, 0, NULL, pend_move_cb, &rock, 0));
+
+    ASSERT(!rock.unexpected);           /* no "a" key yielded: all behind */
+    ASSERT(!rock.out_of_order);         /* and none yielded twice */
+    ASSERT_EQU(rock.n, 40u);
+    ASSERT_STR_EQ(rock.last, "k039");
+
+    /* The writes really landed, including the overwrite. */
+    ASSERT_OK(zs_txn_fetch(live_txn, "a199", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, 1u);
+    ASSERT_OK(zs_txn_fetch(live_txn, "k000", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "V", 1);
+
+    /* And a fresh traversal, with the array at its grown size and nothing
+     * writing underneath it, still walks the "k" range exactly once. */
+    memset(&rock, 0, sizeof(rock));
+    ASSERT_OK(zs_txn_foreach(live_txn, "k", 1, NULL, pend_move_cb, &rock,
+                             ZS_CURSOR_PREFIX));
+    ASSERT(!rock.unexpected);
+    ASSERT(!rock.out_of_order);
+    ASSERT_EQU(rock.n, 40u);
+
+    ASSERT_OK(zs_txn_abort(&live_txn));
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
 /* A-4a with D-14j-b: the resume point is BORROWED from the record the cursor
  * yielded, not copied, so the bytes it points into must outlive the refresh
  * that reads them.  A-4a is exactly that promise -- the cursor references every
@@ -16198,6 +16309,8 @@ static struct test_entry tests[] = {
                                         test_txn_cursor_store_behind_not_yielded },
     { "test_cursor_resume_key_survives_retirement",
                                         test_cursor_resume_key_survives_retirement },
+    { "test_txn_cursor_survives_pending_array_growth",
+                                        test_txn_cursor_survives_pending_array_growth },
 
     { NULL, NULL }
 };
