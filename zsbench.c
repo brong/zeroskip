@@ -597,6 +597,112 @@ static void bench_scan(void)
     free(val);
 }
 
+/* Traverse from INSIDE a write transaction, which every other read workload
+ * here misses.
+ *
+ * bench_scan reads through a handle, so the merge is files only.  A traversal
+ * on an open write transaction adds the transaction's own arm, and that arm is
+ * a different machine from a file cursor: its position is a KEY rather than an
+ * index (D-14j-a), so each step re-resolves it by binary search over the
+ * pending array, and each record is decoded back out of the active file through
+ * the transaction's mappings rather than read straight from a pointer section.
+ *
+ * It exists for the same reason bench_read_after_write does, one level up.  That
+ * one covers point reads inside a write transaction; nothing covered a WALK, so
+ * a malloc + memcpy + free per step in the transaction arm sat unmeasured until
+ * a consumer's profile happened to show it.  Both lines are wanted: the first
+ * isolates the arm, the second is the cyrusdb shape -- a mostly-committed
+ * database walked by a transaction that is also writing -- where the arm's cost
+ * is paid on top of a normal merge rather than instead of it. */
+static void bench_txn_scan_once(struct zs_txn *txn, const char *slug,
+                                const char *label)
+{
+    struct reptimes rt = { {0}, 0 };
+    long seen = 0;
+    char note[96];
+
+    if (!selected(label)) return;
+
+    for (int r = 0; r < reps; r++) {
+        double t0 = now();
+        struct zs_cursor *c = NULL;
+        seen = 0;
+        if (zs_txn_begin_cursor(txn, NULL, 0, &c, 0) == ZS_OK) {
+            const char *k, *v;
+            size_t kl, vl;
+            while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) seen++;
+            zs_cursor_abort(&c);
+        }
+        rep_add(&rt, now() - t0);
+    }
+
+    snprintf(note, sizeof(note), "%ld records", seen);
+    record(slug, label, (size_t)seen, &rt, note);
+}
+
+static void bench_txn_scan(void)
+{
+    char dir[1200];
+    char *val = malloc(valsize);
+    memset(val, 'v', valsize);
+
+    /* All pending: nothing is committed, so the transaction arm is the whole
+     * source and the line is the arm's per-step cost with nothing else in it. */
+    if (selected("scan in a write txn")) {
+        snprintf(dir, sizeof(dir), "%s/txnscan", workdir);
+        cleanup(dir);
+        struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+        struct zs_txn *txn = NULL;
+        if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+
+        for (int i = 0; i < nrecs; i++) {
+            char k[64];
+            makekey(k, sizeof(k), i);
+            zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+        }
+
+        bench_txn_scan_once(txn, "txn_scan", "scan in a write txn");
+
+        /* Aborted, not committed: the commit is not what is being measured, and
+         * it is outside the timed region either way. */
+        zs_txn_abort(&txn);
+        zs_db_close(&db);
+        cleanup(dir);
+    }
+
+    /* Mostly committed, a few pending: the arm joins a real merge.  The
+     * overwrites are spread across the key range so the arm is consulted
+     * throughout the walk rather than being exhausted early. */
+    if (selected("scan in a write txn, few pending")) {
+        snprintf(dir, sizeof(dir), "%s/txnscanmix", workdir);
+        cleanup(dir);
+        struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+        for (int i = 0; i < nrecs; i++) {
+            char k[64];
+            makekey(k, sizeof(k), i);
+            zs_db_store(db, k, strlen(k), val, valsize, 0);
+        }
+
+        struct zs_txn *txn = NULL;
+        if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+        int step = nrecs / 16 > 0 ? nrecs / 16 : 1;
+        for (int i = 0; i < nrecs; i += step) {
+            char k[64];
+            makekey(k, sizeof(k), i);
+            zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+        }
+
+        bench_txn_scan_once(txn, "txn_scan_mixed",
+                            "scan in a write txn, few pending");
+
+        zs_txn_abort(&txn);
+        zs_db_close(&db);
+        cleanup(dir);
+    }
+
+    free(val);
+}
+
 static void bench_rollover_and_convert(void)
 {
     /* D-12d: a writer's extra cost is bounded by rollover_size rather than
@@ -1189,6 +1295,7 @@ int main(int argc, char **argv)
         bench_read_after_write();
         bench_fetch();
         bench_scan();
+        bench_txn_scan();
         bench_rollover_and_convert();
         bench_repack_cascade();
         bench_snapshot_open();
