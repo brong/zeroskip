@@ -445,6 +445,39 @@ plus a decode. A **32-byte** bound is worse than 64 wherever keys share a
 structured head — `Ndomain!user.foo` runs measured 40% down — and no better
 anywhere else.
 
+## Measuring on the server: pair the runs, and print what you measured
+
+Two things went wrong here on one afternoon, and both produced numbers that
+looked like results.
+
+**Unpaired runs cannot see 6%.** A single `--run` of the same workload on the
+same fixture varies by more than that on a shared machine: the scan figures that
+prompted a regression hunt were 11.5M/s and 9.4M/s from two such runs, and the
+real difference was 6.3%. Alternate the builds inside one loop, take medians of
+five or more pairs, and count how many pairs agree — 5 of 5 in one direction is
+a result, 3 of 5 is noise.
+
+**Print the commit you are about to measure.** Three separate runs measured the
+wrong tree: a stale checkout whose `zsbench` predated `--path` (its usage dump
+scrolled past inside a `grep`), a `git pull` onto a detached head that silently
+did nothing, and a fetch against a stale origin that resolved "latest" to a
+commit from two days earlier. Each printed something plausible. The loop below
+asserts its own state instead:
+
+```
+for i in 1 2 3 4 5; do
+  for d in /tmp/zs-old /tmp/zs-hd; do
+    printf '%-9s %-40s ' "$(git -C $d rev-parse --short HEAD)" \
+                         "$(git -C $d log -1 --format=%s | cut -c1-38)"
+    $d/zsbench --path=FIXTURE --run --reps 10 shadowed | grep shadowed
+  done
+done
+```
+
+And when a regression does appear, `perf stat -e cycles,instructions,cache-misses,branch-misses,L1-icache-load-misses`
+separates the cases before any guessing: flat instructions with more cycles is a
+memory or layout effect, more instructions is real work.
+
 ## Reading the rollover rows
 
 The `store, rollover Nk` figures are not monotonic, and that is expected rather
