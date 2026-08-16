@@ -163,17 +163,30 @@ mutant() {
 
 echo "primitives (Task 2)"
 
+# The platform hazard, restated now that the prefix goes through memcmp: a
+# hand-rolled loop over SIGNED char misorders every key above 0x7F, which is
+# what plain `char` gives on x86 and not on ARM.  memcmp cannot express this
+# bug -- it is defined as unsigned -- so the mutant has to replace it.
 mutant "compar: signed char" catch \
-  's/const unsigned char \*ua = \(const unsigned char \*\)a;\n    const unsigned char \*ub = \(const unsigned char \*\)b;/const signed char *ua = (const signed char *)a;\n    const signed char *ub = (const signed char *)b;/'
+  's/    int c = memcmp\(a, b, n\);\n    if \(c\) return c < 0 \? -1 : 1;/    { const signed char *ua = (const signed char *)a;\n      const signed char *ub = (const signed char *)b;\n      for (size_t i = 0; i < n; i++)\n          if (ua[i] != ub[i]) return ua[i] < ub[i] ? -1 : 1; }/'
 
 mutant "compar: longer key first" catch \
   's/return alen < blen \? -1 : 1;/return alen < blen ? 1 : -1;/'
 
+# The comparator now goes THROUGH memcmp; this is the old hand-rolled loop, and
+# it is equivalent because memcmp is defined to compare as unsigned char.
 # memcmp is defined to compare as unsigned char, and the length tie-break below
 # it is kept, so this variant is genuinely correct.  F-11a's objection is to
 # memcmp *alone* (no length ordering) and to its unspecified magnitude.
-mutant "compar: memcmp for the prefix" equivalent \
-  's/for \(size_t i = 0; i < n; i\+\+\) \{\n        if \(ua\[i\] != ub\[i\]\) return ua\[i\] < ub\[i\] \? -1 : 1;\n    \}/(void)ua; (void)ub;\n    { int c = memcmp(a, b, n); if (c) return c; }/'
+mutant "compar: byte-at-a-time prefix" equivalent \
+  's/    int c = memcmp\(a, b, n\);\n    if \(c\) return c < 0 \? -1 : 1;/    { const unsigned char *ua = (const unsigned char *)a;\n      const unsigned char *ub = (const unsigned char *)b;\n      for (size_t i = 0; i < n; i++)\n          if (ua[i] != ub[i]) return ua[i] < ub[i] ? -1 : 1; }/'
+
+# ...and the direction that is NOT equivalent: memcmp's magnitude is
+# unspecified, so returning it raw is only safe while every caller looks at the
+# sign alone.  Every caller in this file does -- which is exactly why this needs
+# a mutant rather than a test, and why it is listed as equivalent too.
+mutant "compar: memcmp magnitude returned raw" equivalent \
+  's/    if \(c\) return c < 0 \? -1 : 1;/    if (c) return c;/'
 
 mutant "csum: empty-input short-circuit" catch \
   's/\{\n    return \(uint32_t\)\(XXH3_64bits\(buf, len\) & 0xFFFFFFFFu\);\n\}/{\n    if (!len) return 0;\n    return (uint32_t)(XXH3_64bits(buf, len) \& 0xFFFFFFFFu);\n}/'
@@ -533,7 +546,7 @@ mutant "search: probe returns wrong end" catch \
   's/        if \(c > 0\) \{\n            \*idx = f->nptrs;            \/\* past every key \*\/\n            return ZS_OK;\n        \}/        if (c > 0) {\n            *idx = f->nptrs - 1;\n            return ZS_OK;\n        }/'
 
 mutant "search: exact flag never set" catch \
-  's/        \*exact = \(compar\(r.key, r.keylen, key, keylen\) == 0\);/        *exact = false;/'
+  's/        \*exact = \(zsi_cmp\(compar, r.key, r.keylen, key, keylen\) == 0\);/        *exact = false;/'
 
 echo
 echo "private index (Task 8)"
@@ -545,7 +558,7 @@ mutant "sort: offset tie-break ascending" catch \
   's/    return a > b \? -1 : 1;              \/\* higher offset first \*\//    return a < b ? -1 : 1;/'
 
 mutant "dedup: keeps the last of a run" catch \
-  's/                if \(compar\(ka, la, kb, lb\) == 0\) continue;/                if (compar(ka, la, kb, lb) == 0) { b.offs[w - 1] = b.offs[i]; continue; }/'
+  's/                if \(zsi_cmp\(compar, ka, la, kb, lb\) == 0\) continue;/                if (zsi_cmp(compar, ka, la, kb, lb) == 0) { b.offs[w - 1] = b.offs[i]; continue; }/'
 
 mutant "dedup: not done at all" catch \
   's/            if \(w\) \{\n                const char \*ka, \*kb;/            if (0) {\n                const char *ka, *kb;/'
@@ -556,7 +569,7 @@ mutant "find: base consulted before delta" catch \
   's/    i = zsi_index_lb\(ix->delta, ix->ndelta, &ks, key, keylen\);\n    if \(zsi_index_eq\(ix->delta, ix->ndelta, i, &ks, key, keylen\)\) \{\n        \*off = ix->delta\[i\];\n        return ZS_OK;\n    \}\n\n    i = zsi_index_lb\(ix->base, ix->nbase, &ks, key, keylen\);\n    if \(zsi_index_eq\(ix->base, ix->nbase, i, &ks, key, keylen\)\) \{\n        \*off = ix->base\[i\];\n        return ZS_OK;\n    \}/    i = zsi_index_lb(ix->base, ix->nbase, \&ks, key, keylen);\n    if (zsi_index_eq(ix->base, ix->nbase, i, \&ks, key, keylen)) {\n        *off = ix->base[i];\n        return ZS_OK;\n    }\n\n    i = zsi_index_lb(ix->delta, ix->ndelta, \&ks, key, keylen);\n    if (zsi_index_eq(ix->delta, ix->ndelta, i, \&ks, key, keylen)) {\n        *off = ix->delta[i];\n        return ZS_OK;\n    }/'
 
 mutant "get: prefers base on a tie" catch \
-  's/        chosen = \(compar\(kd, ld, kb, lb\) <= 0\) \? ix->delta\[c->di\]\n                                              : ix->base\[c->bi\];/        chosen = (compar(kd, ld, kb, lb) < 0) ? ix->delta[c->di]\n                                              : ix->base[c->bi];/'
+  's/        chosen = \(zsi_cmp\(compar, kd, ld, kb, lb\) <= 0\) \? ix->delta\[c->di\]\n                                              : ix->base\[c->bi\];/        chosen = (zsi_cmp(compar, kd, ld, kb, lb) < 0) ? ix->delta[c->di]\n                                              : ix->base[c->bi];/'
 
 # D-14h, one level down: on a tie both sides must advance, or the base'"'"'s stale copy
 # of the key surfaces on the following step and the key is yielded twice.
@@ -595,7 +608,7 @@ mutant "merge: drops the tied base entry twice" catch \
 # Lower bound: an off-by-one here makes an exact match miss, or a seek land one
 # entry early, which shows up as a key that cannot be found or one emitted twice.
 mutant "lower_bound: <= instead of <" catch \
-  's/        if \(ks->compar\(k, kl, key, keylen\) < 0\) lo = mid \+ 1;/        if (ks->compar(k, kl, key, keylen) <= 0) lo = mid + 1;/'
+  's/        if \(zsi_cmp\(ks->compar, k, kl, key, keylen\) < 0\) lo = mid \+ 1;/        if (zsi_cmp(ks->compar, k, kl, key, keylen) <= 0) lo = mid + 1;/'
 
 mutant "lower_bound: hi = mid - 1" catch \
   's/        else hi = mid;\n    \}\n\n    return lo;/        else hi = mid ? mid - 1 : 0;\n    }\n\n    return lo;/'
@@ -1336,7 +1349,7 @@ mutant "cursor: explicit txn goes live too" catch \
 # D-14j-b.  A refresh re-seeks by key, and a seek lands ON that key when it is
 # still present -- which has already been yielded.  Not skipping it re-emits it.
 mutant "cursor: re-yields the key it resumed from" catch \
-  's/    if \(!fc->exhausted\n        && c->db->compar\(fc->cur.key, fc->cur.keylen,\n                         c->last_key, c->last_keylen\) == 0\)\n        return zsi_fcur_next\(fc\);/    \/* landed-on-key skip removed *\//'
+  's/    if \(!fc->exhausted\n        && zsi_cmp\(c->db->compar, fc->cur.key, fc->cur.keylen,\n                         c->last_key, c->last_keylen\) == 0\)\n        return zsi_fcur_next\(fc\);/    \/* landed-on-key skip removed *\//'
 
 # D-14j-b, reported downstream (Cyrus aaa-db foreach_changes).  On a pending
 # write, re-positioning the transaction arm from ITS OWN state -- the last key
@@ -1673,7 +1686,7 @@ mutant "fetch: ephemeral still flushes" catch \
 # for keys it is about to insert misses every time, which is how a bulk load in
 # ONE transaction issued 300k write() against 10 fdatasync.
 mutant "txn lookup materialises before comparing" catch \
-  's/        zsi_txn_cur_seek\(&scratch, key, keylen\);\n\n        if \(zsi_txn_cur_peek_key\(&scratch, &pk, &pkl\)\n            && fc->compar\(pk, pkl, key, keylen\) == 0\) \{\n            r = zsi_fcur_load\(&scratch\);\n            if \(r == ZS_OK\) \{\n                if \(scratch.exhausted\) r = ZS_NOTFOUND;\n                else \*out = scratch.cur;\n            \}\n        \}/        zsi_txn_cur_seek(\&scratch, key, keylen);\n        (void)pk; (void)pkl;\n        r = zsi_fcur_load(\&scratch);\n        if (r == ZS_OK) {\n            if (scratch.exhausted\n                || fc->compar(scratch.cur.key, scratch.cur.keylen,\n                              key, keylen) != 0)\n                r = ZS_NOTFOUND;\n            else *out = scratch.cur;\n        }/'
+  's/        zsi_txn_cur_seek\(&scratch, key, keylen\);\n\n        if \(zsi_txn_cur_peek_key\(&scratch, &pk, &pkl\)\n            && zsi_cmp\(fc->compar, pk, pkl, key, keylen\) == 0\) \{\n            r = zsi_fcur_load\(&scratch\);\n            if \(r == ZS_OK\) \{\n                if \(scratch.exhausted\) r = ZS_NOTFOUND;\n                else \*out = scratch.cur;\n            \}\n        \}/        zsi_txn_cur_seek(\&scratch, key, keylen);\n        (void)pk; (void)pkl;\n        r = zsi_fcur_load(\&scratch);\n        if (r == ZS_OK) {\n            if (scratch.exhausted\n                || zsi_cmp(fc->compar, scratch.cur.key, scratch.cur.keylen,\n                              key, keylen) != 0)\n                r = ZS_NOTFOUND;\n            else *out = scratch.cur;\n        }/'
 
 # A-4b: the conditional-store probe made durable again.  ZS_IFNOTEXIST and
 # ZS_IFEXIST look up a record only to decide, and never let it escape, so a

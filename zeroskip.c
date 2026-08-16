@@ -376,16 +376,48 @@ static size_t zsi_roundup8(size_t n)
 static int zsi_compar_default(const char *a, size_t alen,
                               const char *b, size_t blen)
 {
-    const unsigned char *ua = (const unsigned char *)a;
-    const unsigned char *ub = (const unsigned char *)b;
     size_t n = alen < blen ? alen : blen;
 
-    for (size_t i = 0; i < n; i++) {
-        if (ua[i] != ub[i]) return ua[i] < ub[i] ? -1 : 1;
-    }
+    /* memcmp is DEFINED to compare as unsigned char, which is the whole of
+     * F-11a's prefix rule -- and it is the one place the platform hazard bites,
+     * because plain `char` is signed on x86 and unsigned on ARM, so a
+     * hand-rolled loop over `char` misorders every key above 0x7F on one of
+     * them and produces pointer sections the other cannot read.  Going through
+     * memcmp states that requirement rather than re-implementing it, and lets
+     * the compiler compare a word at a time instead of a byte.
+     *
+     * Only its SIGN is used: the magnitude is unspecified, so it is normalised
+     * to -1/0/1 here rather than returned raw.  The length tie-break below is
+     * the half memcmp says nothing about -- without it a key and its own prefix
+     * compare equal, which is the bug "compar: longer key first" preserves. */
+    int c = memcmp(a, b, n);
+    if (c) return c < 0 ? -1 : 1;
 
     if (alen == blen) return 0;
     return alen < blen ? -1 : 1;
+}
+
+/* Dispatch a comparison, taking the BUILT-IN through a direct call.
+ *
+ * zs_compar is a function pointer, so every comparison was an indirect call:
+ * the disassembly of the merge loop had no direct calls left in it at all, only
+ * `blr` through db->compar and file->csum.  An indirect call cannot be inlined,
+ * and the default comparator's body is small enough that the call is comparable
+ * to the work it does -- a handful of byte compares and a length tiebreak.
+ *
+ * The test is pointer equality against a static symbol, so the branch is
+ * perfectly predicted: a database's comparator is fixed at open and never
+ * changes.  What it buys is not the branch but what the branch enables --
+ * a direct call to a static function, which the compiler then inlines.
+ *
+ * A caller-supplied comparator keeps the indirect path, unchanged.  Both arms
+ * run the same function they always did, so F-11a's total order is untouched
+ * and this is not interoperability surface. */
+static inline int zsi_cmp(zs_compar *f, const char *a, size_t alen,
+                          const char *b, size_t blen)
+{
+    if (f == zsi_compar_default) return zsi_compar_default(a, alen, b, blen);
+    return f(a, alen, b, blen);
 }
 
 /* A caller supplying its own comparator MUST supply a name; names are compared
@@ -1990,7 +2022,7 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
 #if ZSI_PROBE_ENDS
     {
         if (zsi_ptrs_rec(f, 0, &r) != ZS_OK) return ZS_BADFORMAT;
-        int c = compar(key, keylen, r.key, r.keylen);
+        int c = zsi_cmp(compar, key, keylen, r.key, r.keylen);
         if (c <= 0) {
             *idx = 0;
             *exact = (c == 0);
@@ -1998,7 +2030,7 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
         }
 
         if (zsi_ptrs_rec(f, f->nptrs - 1, &r) != ZS_OK) return ZS_BADFORMAT;
-        c = compar(key, keylen, r.key, r.keylen);
+        c = zsi_cmp(compar, key, keylen, r.key, r.keylen);
         if (c > 0) {
             *idx = f->nptrs;            /* past every key */
             return ZS_OK;
@@ -2015,14 +2047,14 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
     while (lo < hi) {
         uint64_t mid = lo + (hi - lo) / 2;
         if (zsi_ptrs_rec(f, mid, &r) != ZS_OK) return ZS_BADFORMAT;
-        if (compar(r.key, r.keylen, key, keylen) < 0) lo = mid + 1;
+        if (zsi_cmp(compar, r.key, r.keylen, key, keylen) < 0) lo = mid + 1;
         else hi = mid;
     }
 
     *idx = lo;
     if (lo < f->nptrs) {
         if (zsi_ptrs_rec(f, lo, &r) != ZS_OK) return ZS_BADFORMAT;
-        *exact = (compar(r.key, r.keylen, key, keylen) == 0);
+        *exact = (zsi_cmp(compar, r.key, r.keylen, key, keylen) == 0);
     }
 
     return ZS_OK;
@@ -2171,7 +2203,7 @@ static int zsi_ksort_cmp(struct zsi_ksort *ks, size_t a, size_t b)
     zsi_index_key_at(ks->f, a, &ka, &la);
     zsi_index_key_at(ks->f, b, &kb, &lb);
 
-    int c = ks->compar(ka, la, kb, lb);
+    int c = zsi_cmp(ks->compar, ka, la, kb, lb);
     if (c) return c;
 
     if (a == b) return 0;
@@ -2206,7 +2238,7 @@ static size_t zsi_index_lb(const size_t *arr, size_t n, struct zsi_ksort *ks,
         const char *k;
         size_t kl;
         zsi_index_key_at(ks->f, arr[mid], &k, &kl);
-        if (ks->compar(k, kl, key, keylen) < 0) lo = mid + 1;
+        if (zsi_cmp(ks->compar, k, kl, key, keylen) < 0) lo = mid + 1;
         else hi = mid;
     }
 
@@ -2222,7 +2254,7 @@ static bool zsi_index_eq(const size_t *arr, size_t n, size_t i,
 
     if (i >= n) return false;
     zsi_index_key_at(ks->f, arr[i], &k, &kl);
-    return ks->compar(k, kl, key, keylen) == 0;
+    return zsi_cmp(ks->compar, k, kl, key, keylen) == 0;
 }
 
 /* Collector for the build replay. */
@@ -2327,7 +2359,7 @@ static int zsi_index_build_from(struct zsi_file *f, zs_compar *compar,
                 size_t la, lb;
                 zsi_index_key_at(f, b.offs[w - 1], &ka, &la);
                 zsi_index_key_at(f, b.offs[i], &kb, &lb);
-                if (compar(ka, la, kb, lb) == 0) continue;
+                if (zsi_cmp(compar, ka, la, kb, lb) == 0) continue;
             }
             b.offs[w++] = b.offs[i];
         }
@@ -2412,7 +2444,7 @@ static int zsi_index_cur_get(struct zsi_index *ix, zs_compar *compar,
         zsi_index_key_at(ix->file, ix->base[c->bi], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[c->di], &kd, &ld);
         /* Prefer the delta when the keys are equal: it is the newer record. */
-        chosen = (compar(kd, ld, kb, lb) <= 0) ? ix->delta[c->di]
+        chosen = (zsi_cmp(compar, kd, ld, kb, lb) <= 0) ? ix->delta[c->di]
                                               : ix->base[c->bi];
     } else {
         chosen = have_d ? ix->delta[c->di] : ix->base[c->bi];
@@ -2441,7 +2473,7 @@ static void zsi_index_cur_next(struct zsi_index *ix, zs_compar *compar,
         size_t lb, ld;
         zsi_index_key_at(ix->file, ix->base[c->bi], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[c->di], &kd, &ld);
-        int cmp = compar(kd, ld, kb, lb);
+        int cmp = zsi_cmp(compar, kd, ld, kb, lb);
 
         if (cmp == 0) {
             /* Advance BOTH.  The delta's record was just yielded; leaving the
@@ -2507,7 +2539,7 @@ static int zsi_index_cur_get_rev(struct zsi_index *ix, zs_compar *compar,
         zsi_index_key_at(ix->file, ix->base[c->bi - 1], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[c->di - 1], &kd, &ld);
         /* The LARGER key is next; equal keys prefer the delta, the newer. */
-        chosen = (compar(kd, ld, kb, lb) >= 0) ? ix->delta[c->di - 1]
+        chosen = (zsi_cmp(compar, kd, ld, kb, lb) >= 0) ? ix->delta[c->di - 1]
                                               : ix->base[c->bi - 1];
     } else {
         chosen = have_d ? ix->delta[c->di - 1] : ix->base[c->bi - 1];
@@ -2536,7 +2568,7 @@ static void zsi_index_cur_prev(struct zsi_index *ix, zs_compar *compar,
         size_t lb, ld;
         zsi_index_key_at(ix->file, ix->base[c->bi - 1], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[c->di - 1], &kd, &ld);
-        int cmp = compar(kd, ld, kb, lb);
+        int cmp = zsi_cmp(compar, kd, ld, kb, lb);
 
         if (cmp == 0) {
             /* Step past BOTH -- the D-14h reason zsi_index_cur_next gives. */
@@ -2606,7 +2638,7 @@ static int zsi_index_insert(struct zsi_index *ix, zs_compar *compar, size_t off)
         size_t lb, ld;
         zsi_index_key_at(ix->file, ix->base[bi], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[di], &kd, &ld);
-        int cmp = compar(kd, ld, kb, lb);
+        int cmp = zsi_cmp(compar, kd, ld, kb, lb);
 
         if (cmp == 0)      { merged[w++] = ix->delta[di++]; bi++; }
         else if (cmp < 0)  { merged[w++] = ix->delta[di++]; }
@@ -2648,7 +2680,7 @@ static int zsi_index_flatten(struct zsi_index *ix, zs_compar *compar,
         size_t lb, ld;
         zsi_index_key_at(ix->file, ix->base[bi], &kb, &lb);
         zsi_index_key_at(ix->file, ix->delta[di], &kd, &ld);
-        int cmp = compar(kd, ld, kb, lb);
+        int cmp = zsi_cmp(compar, kd, ld, kb, lb);
 
         /* Delta wins ties: it is the newer record (D-14). */
         if (cmp == 0)      { merged[w++] = ix->delta[di++]; bi++; }
@@ -3594,7 +3626,7 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
         zsi_txn_cur_seek(&scratch, key, keylen);
 
         if (zsi_txn_cur_peek_key(&scratch, &pk, &pkl)
-            && fc->compar(pk, pkl, key, keylen) == 0) {
+            && zsi_cmp(fc->compar, pk, pkl, key, keylen) == 0) {
             r = zsi_fcur_load(&scratch);
             if (r == ZS_OK) {
                 if (scratch.exhausted) r = ZS_NOTFOUND;
@@ -5159,7 +5191,7 @@ static int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
     if (a->exhausted) return 1;
     if (b->exhausted) return -1;
 
-    int r = c->db->compar(a->cur.key, a->cur.keylen, b->cur.key, b->cur.keylen);
+    int r = zsi_cmp(c->db->compar, a->cur.key, a->cur.keylen, b->cur.key, b->cur.keylen);
     /* D-14k: reverse flips the KEY order only.  The generation tie-break is
      * direction-blind -- equal keys must stay newest-first however the walk
      * travels, or step 3 would suppress the wrong duplicate. */
@@ -5413,7 +5445,7 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
     size_t nstale = 0;
     for (size_t i = 1; i < c->ncur; i++) {
         if (c->cur[i].exhausted) break;
-        if (c->db->compar(c->cur[i].cur.key, c->cur[i].cur.keylen,
+        if (zsi_cmp(c->db->compar, c->cur[i].cur.key, c->cur[i].cur.keylen,
                           rec.key, rec.keylen) != 0)
             break;
         nstale++;
@@ -5474,7 +5506,7 @@ static int zsi_cursor_reseek_arm(struct zs_cursor *c, struct zsi_fcur *fc)
     if (r != ZS_OK) return r;
 
     if (!fc->exhausted
-        && c->db->compar(fc->cur.key, fc->cur.keylen,
+        && zsi_cmp(c->db->compar, fc->cur.key, fc->cur.keylen,
                          c->last_key, c->last_keylen) == 0)
         return zsi_fcur_next(fc);
 
@@ -5619,7 +5651,7 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
              * exactly.  Only the first, and only an exact match. */
             if (!c->started && (c->flags & ZS_SKIPROOT)
                 && c->skiproot_key
-                && c->db->compar(out->key, out->keylen,
+                && zsi_cmp(c->db->compar, out->key, out->keylen,
                                  c->skiproot_key, c->skiproot_keylen) == 0) {
                 c->started = true;
                 continue;
@@ -5729,7 +5761,7 @@ static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        int c = txn->db->compar(txn->pend[mid].key, txn->pend[mid].keylen,
+        int c = zsi_cmp(txn->db->compar, txn->pend[mid].key, txn->pend[mid].keylen,
                                 key, keylen);
         if (c < 0) lo = mid + 1;
         else hi = mid;
@@ -5737,7 +5769,7 @@ static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
 
     *pos = lo;
     if (lo < txn->npend
-        && txn->db->compar(txn->pend[lo].key, txn->pend[lo].keylen,
+        && zsi_cmp(txn->db->compar, txn->pend[lo].key, txn->pend[lo].keylen,
                            key, keylen) == 0)
         return ZS_OK;
 
@@ -7448,7 +7480,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
         size_t bestkl = 0;
         for (size_t i = 0; i < count; i++) {
             if (fc[i].exhausted) continue;
-            if (!bestk || db->compar(fc[i].cur.key, fc[i].cur.keylen,
+            if (!bestk || zsi_cmp(db->compar, fc[i].cur.key, fc[i].cur.keylen,
                                      bestk, bestkl) < 0) {
                 bestk = fc[i].cur.key;
                 bestkl = fc[i].cur.keylen;
@@ -7463,7 +7495,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
 
         for (size_t i = 0; i < count; i++) {
             if (fc[i].exhausted) continue;
-            if (db->compar(fc[i].cur.key, fc[i].cur.keylen, bestk, bestkl) != 0)
+            if (zsi_cmp(db->compar, fc[i].cur.key, fc[i].cur.keylen, bestk, bestkl) != 0)
                 continue;
 
             mk.have = true;
@@ -7799,7 +7831,7 @@ static int zsi_check_inorder(struct zs_db *db, struct zsi_file *f)
         }
 
         if (i > 0) {
-            int c = db->compar(prev.key, prev.keylen, cur.key, cur.keylen);
+            int c = zsi_cmp(db->compar, prev.key, prev.keylen, cur.key, cur.keylen);
             if (c == 0) {
                 zsi_report(db, "duplicate key in pointer array", f->fname, i);
                 r = ZS_BADFORMAT;
