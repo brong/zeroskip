@@ -1881,8 +1881,10 @@ static size_t zsi_ptrs_section_len(uint64_t count, bool wide)
 }
 
 /* The record offset at index i.  i must be < f->nptrs; the caller has already
- * bounds-checked the array as a whole in zsi_ptrs_load. */
-static uint64_t zsi_ptrs_at(const struct zsi_file *f, uint64_t i)
+ * bounds-checked the array as a whole in zsi_ptrs_load.
+ *
+ * `inline` is load-bearing rather than decorative -- see zsi_cur_order. */
+static inline uint64_t zsi_ptrs_at(const struct zsi_file *f, uint64_t i)
 {
     size_t hdr = f->ptr_wide ? 16 : 8;
     size_t per = f->ptr_wide ? 8 : 4;
@@ -2017,8 +2019,9 @@ static int zsi_ptrs_verify_records(struct zsi_file *f)
     return ZS_OK;
 }
 
-/* Decode the record at pointer index i. */
-static int zsi_ptrs_rec(struct zsi_file *f, uint64_t i, struct zsi_rec *out)
+/* Decode the record at pointer index i.  `inline` per zsi_cur_order. */
+static inline int zsi_ptrs_rec(struct zsi_file *f, uint64_t i,
+                               struct zsi_rec *out)
 {
     uint64_t off = zsi_ptrs_at(f, i);
     const char *b = zsi_file_at(f, (size_t)off, 1);
@@ -5222,8 +5225,26 @@ struct zs_cursor {
 /* Order two per-file cursors: exhausted last, then key ascending, then generation
  * descending.  D-14g gives the transaction ZSI_GEN_TXN so its records win equal
  * keys with no special case here. */
-static int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
-                         const struct zsi_fcur *b)
+/* `static inline`, and it is a measurement rather than a style.
+ *
+ * This and zsi_ptrs_at / zsi_ptrs_rec are small enough that clang inlines them
+ * into the merge loop at -O2 and GCC does not: GCC's -O2 auto-inline budget
+ * (max-inline-insns-auto) is far tighter, and all three are called from more
+ * than one site.  A GCC profile of a full scan therefore shows call frames
+ * clang's has no symbol for at all -- zsi_cur_order 3.6%, zsi_ptrs_rec 2.1%,
+ * zsi_ptrs_at 1.9%, alongside zsi_cursor_refresh below -- about 12% of the
+ * samples, per record, for calls whose bodies are a comparison and two loads.
+ * Saying `inline` moves them to max-inline-insns-single and GCC takes them:
+ * measured at +8.8% on a four-file scan and +8.0% compacted, and flat on
+ * clang, which was already doing it.
+ *
+ * It has to be said in the SOURCE.  zeroskip.c is vendored, so it is built with
+ * the host project's flags, not ours; an inlining decision that matters cannot
+ * live in our CFLAGS.  (Nothing here depends on it for correctness -- deleting
+ * the keyword is a silent 8% on GCC builds and no test can see it, which is why
+ * it is written down here.) */
+static inline int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
+                                const struct zsi_fcur *b)
 {
     if (a->exhausted && b->exhausted) return 0;
     if (a->exhausted) return 1;
@@ -5594,25 +5615,35 @@ static int zsi_cursor_reseek_txn(struct zs_cursor *c)
     return ZS_OK;
 }
 
-/* D-14j: has anything this cursor is allowed to observe changed since the last
- * step?  Both checks are a comparison, not a syscall -- ZS_CURSOR_LIVE is the
- * only case that costs, and it is opt-in. */
-static int zsi_cursor_refresh(struct zs_cursor *c)
+/* The half of D-14j's refresh that runs when something HAS changed.
+ *
+ * Split out so the common answer -- nothing has -- is a few loads inlined into
+ * the merge loop instead of a call into this, which GCC will not inline because
+ * of the snapshot rebuild below (4.7% of a scan profile, per record, to learn
+ * that nothing happened).  See zsi_cur_order for the general point.
+ *
+ * BOTH conditions are decided by the fast path and passed in, and this function
+ * re-derives neither.  The hazard of a split like this is the two halves
+ * disagreeing about when there is work to do -- a fast path that wrongly says
+ * "nothing" is a cursor that silently stops refreshing (G-4) -- so each question
+ * is asked in exactly one place.  That is also what keeps the D-14j mutants
+ * pointed at something reachable: a mutation of a test the gate has already
+ * decided would be dead code behind it. */
+static int zsi_cursor_refresh_slow(struct zs_cursor *c, bool txn_moved,
+                                   bool look)
 {
-    bool files_moved = false, txn_moved = false;
+    bool files_moved = false;
 
     /* The transaction's own pending records, whether the transaction is ours or
      * the caller's: A-1a makes a write on it visible to a traversal already in
      * progress on it. */
-    if (c->txn && zsi_txn_seq(c->txn) != c->txn_seq) {
-        c->txn_seq = zsi_txn_seq(c->txn);
-        txn_moved = true;
-    }
+    if (txn_moved) c->txn_seq = zsi_txn_seq(c->txn);
 
     /* The file set, but only for a cursor from a DATABASE HANDLE.  Inside an
      * explicit transaction the file set is fixed for the cursor's lifetime
-     * (G-4), which is what a transactional read promises. */
-    if (c->handle_live) {
+     * (G-4), which is what a transactional read promises.  `look` carries that
+     * decision down from the gate; it is not re-asked here. */
+    if (look) {
         if (c->flags & ZS_CURSOR_LIVE) {
             /* Still the case that costs, and still a flag -- but C-4i's probe
              * makes each step a few syscalls, not the full snapshot rebuild
@@ -5684,6 +5715,25 @@ static int zsi_cursor_refresh(struct zs_cursor *c)
     if (txn_moved)   return zsi_cursor_reseek_txn(c);
 
     return ZS_OK;
+}
+
+/* D-14j: has anything this cursor is allowed to observe changed since the last
+ * step?  Both checks are a comparison, not a syscall -- ZS_CURSOR_LIVE is the
+ * only case that costs, and it is opt-in.
+ *
+ * The three terms are exactly the three things the slow half acts on: a write to
+ * the transaction, a ZS_CURSOR_LIVE cursor (which must go and look, since
+ * readers take no lock and a peer's commit cannot announce itself), and the
+ * handle having swapped snapshots underneath a handle-live cursor. */
+static inline int zsi_cursor_refresh(struct zs_cursor *c)
+{
+    bool txn_moved = c->txn && zsi_txn_seq(c->txn) != c->txn_seq;
+    bool look = c->handle_live && ((c->flags & ZS_CURSOR_LIVE)
+                                   || c->snap != c->db->snap);
+
+    if (!txn_moved && !look) return ZS_OK;
+
+    return zsi_cursor_refresh_slow(c, txn_moved, look);
 }
 
 static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)

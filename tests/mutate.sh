@@ -1388,18 +1388,28 @@ mutant "pend: reallocates the key block on overwrite" equivalent \
 
 # A-1a.  The merge caches each arm's current record, so without noticing the
 # pending array changed, a write made during the traversal is never seen.
+#
+# The three below aim at zsi_cursor_refresh's GATE, which is where each of these
+# questions is asked -- once.  The slow half re-derives none of them, so a
+# mutation there would sit behind a gate that had already said "nothing to do",
+# which is a mutant testing nothing while looking like a line item.
 mutant "cursor: ignores writes on its own txn" catch \
-  's/    if \(c->txn && zsi_txn_seq\(c->txn\) != c->txn_seq\) \{/    if (0) {/'
+  's/    bool txn_moved = c->txn && zsi_txn_seq\(c->txn\) != c->txn_seq;/    bool txn_moved = false;/'
 
 # D-14j.  The same for a non-transactional foreach whose callback commits --
 # which is exactly what cyrusdb promises and what the integration hit.
+mutant "cursor: fast path ignores a snapshot swap" catch \
+  's/                                   \|\| c->snap != c->db->snap\);/                                   || false);/'
+
+# ... and the rebuild itself, behind the gate: the gate opens, and nothing is
+# re-derived.  Both halves have to work, so both are mutated.
 mutant "cursor: ignores its own handle's commits" catch \
   's/        if \(c->snap != c->db->snap\) \{/        if (0) {/'
 
 # G-4, from the other side: a cursor inside an EXPLICIT transaction must keep a
 # fixed file set.  Making every cursor live breaks the transactional read.
 mutant "cursor: explicit txn goes live too" catch \
-  's/    if \(c->handle_live\) \{/    if (1) {/'
+  's/    bool look = c->handle_live &&/    bool look = true \&\&/'
 
 # D-14j-b.  A refresh re-seeks by key, and a seek lands ON that key when it is
 # still present -- which has already been yielded.  Not skipping it re-emits it.

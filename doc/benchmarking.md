@@ -221,6 +221,16 @@ is being measured where it matters least.
 Most figures recorded in this file and in CLAUDE.md were taken on the laptop.
 Treat them as ratios, not absolutes.
 
+**The compiler is part of the machine.** A GCC `-O2` build of the merge loop
+carries four call frames a clang build does not have symbols for — GCC's
+auto-inline budget is much tighter than clang's — which is why `zsi_cur_order`,
+`zsi_ptrs_at`, `zsi_ptrs_rec` and the fast half of `zsi_cursor_refresh` say
+`inline` explicitly. Before that, the EPYC profile spent about 12% of its
+samples in those calls; saying `inline` was worth +8.8% on a four-file scan and
++8.0% compacted, and nothing at all on clang. So a scan figure is a
+(machine, compiler) pair, and the two columns above were also a comparison of
+clang against GCC without saying so.
+
 ## Fixtures are built with ZS_NOSYNC
 
 A read-only workload's database is setup, not measurement, so `bench_fetch`,
