@@ -1117,6 +1117,16 @@ mutant "resort: shortcut taken unconditionally" catch \
 mutant "resort: shortcut condition inverted" catch \
   's/    if \(zsi_cur_order\(c, &c->cur\[0\], &c->cur\[1\]\) <= 0\) return;/    if (zsi_cur_order(c, \&c->cur[0], \&c->cur[1]) > 0) return;/'
 
+# The same shortcut in the FULL sort, which step 3 runs on every step of a scan
+# whose keys are duplicated across files.  Inverted it skips exactly the element
+# that had to move, so the array comes out mis-sorted and the merge yields out
+# of key order -- and, as above, silently.
+mutant "sort: shortcut condition inverted" catch \
+  's/        if \(zsi_cur_order\(c, &c->cur\[i - 1\], &c->cur\[i\]\) <= 0\) continue;/        if (zsi_cur_order(c, \&c->cur[i - 1], \&c->cur[i]) >= 0) continue;/'
+
+mutant "sort: shortcut taken unconditionally" catch \
+  's/        if \(zsi_cur_order\(c, &c->cur\[i - 1\], &c->cur\[i\]\) <= 0\) continue;/        continue;/'
+
 echo
 echo "the txn arm's step hint (D-14j-a)"
 

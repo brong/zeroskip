@@ -5289,8 +5289,23 @@ static inline int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
 static void zsi_cur_sort(struct zs_cursor *c)
 {
     /* Insertion sort: the array is small by design (D-16 keeps the file count
-     * low), and it is almost always already sorted. */
+     * low), and it is almost always already sorted.
+     *
+     * The guard is D-14i-a's shortcut one level up, and for the same reason:
+     * without it an element already in place is still lifted into a local and
+     * put back, which is 320 bytes of struct zsi_fcur to move nothing.  It is
+     * free when the element DOES move, because that comparison is the while
+     * loop's first iteration either way.
+     *
+     * It matters because step 3 calls this on EVERY step of a scan whose keys
+     * are duplicated across files -- an ordinary database after updates, and
+     * `full scan, shadowed` in zsbench, where zsi_cur_sort was 10.3% of an EPYC
+     * profile before the guard.  Nothing measured that shape until the
+     * shadowed fixture existed, which is why resort_head got this in 2026-08-15
+     * and the sort did not. */
     for (size_t i = 1; i < c->ncur; i++) {
+        if (zsi_cur_order(c, &c->cur[i - 1], &c->cur[i]) <= 0) continue;
+
         struct zsi_fcur t = c->cur[i];
         size_t j = i;
         while (j > 0 && zsi_cur_order(c, &c->cur[j - 1], &t) > 0) {
