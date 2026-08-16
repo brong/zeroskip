@@ -16,6 +16,10 @@
 #                                    test binaries PER MUTANT -- the better part
 #                                    of an hour, and growing with the suite)
 #     ./tests/mutate.sh compar       run mutants whose name matches a substring
+#     ./tests/mutate.sh --build-only apply and COMPILE every pattern, running
+#                                    no tests -- catches a mutant whose pattern
+#                                    matches but whose result no longer builds,
+#                                    which --rot-only reports as intact
 #     ./tests/mutate.sh --rot-only   apply every pattern with no build and no
 #                                    run, reporting only PATTERN ROTTED: seconds,
 #                                    not an hour, and the right check after
@@ -55,7 +59,9 @@ set +m          # no async job-control messages: a crashing mutant's
 cd "$(dirname "$0")/.." || exit 1
 
 ROTONLY=0
+BUILDONLY=0
 if [ "${1:-}" = "--rot-only" ]; then ROTONLY=1; shift; fi
+if [ "${1:-}" = "--build-only" ]; then BUILDONLY=1; shift; fi
 FILTER="${1:-}"
 
 # Mutate a COPY, never the checkout.  Everything the two test binaries need to
@@ -91,16 +97,30 @@ mutant() {
     fi
 
     # --rot-only stops here: the pattern matched, which is all it asks.  It
-    # says nothing about whether the mutant would be caught.
+    # says nothing about whether the mutant would be caught -- nor even about
+    # whether the result COMPILES, which is what --build-only is for.
     if [ "$ROTONLY" -eq 1 ]; then
         intact=$((intact + 1)); cp "$BAK" zeroskip.c; return
     fi
 
+    # --build-only: apply and compile, but run nothing.  This is the gap
+    # --rot-only cannot cover.  A pattern that still matches can still produce
+    # code that does not build -- a mutant naming a function since renamed, or
+    # a variable the code no longer has -- and such a mutant reports
+    # "inconclusive" in a full run, which is to say it has been testing nothing
+    # while looking like a line item.  Three were in that state when this was
+    # added, two of them for a long time.  A build is a couple of seconds
+    # against a couple of minutes for the full verdict, so this is affordable
+    # after any refactor, where a full run is not.
     rm -f zstest zstest-crash
     if ! make zstest zstest-crash EXTRA_CFLAGS=-O0 >"$WORK/build.log" 2>&1; then
         printf '  %-46s BUILD FAILED (inconclusive)\n' "$name"
         sed 's/^/        /' "$WORK/build.log" | grep -m2 error
         broken=$((broken + 1)); cp "$BAK" zeroskip.c; return
+    fi
+
+    if [ "$BUILDONLY" -eq 1 ]; then
+        intact=$((intact + 1)); cp "$BAK" zeroskip.c; return
     fi
 
     # Run detached from the shell's job control, so a crashing mutant does not
@@ -724,11 +744,15 @@ mutant "bounds: NULL base not checked" equivalent \
 
 # D-10: a zero-length or corrupt-header active file must be a legal state, not an
 # error, or a crash leaves a database that cannot be opened at all (G-3).
+# zsi_file_close has not existed for a long time -- the function is
+# zsi_file_release, as every error path in zsi_file_open uses.  Both of these
+# built nothing and reported inconclusive, and --rot-only could not see it: the
+# PATTERN matched, only the replacement failed to compile.
 mutant "D-10: zero length is an error" catch \
-  's/    if \(f->size > 0\) \{/    if (f->size == 0) { zsi_file_close(\&f); return ZS_BADFORMAT; }\n    if (f->size > 0) {/'
+  's/    if \(f->size > 0\) \{/    if (f->size == 0) { zsi_file_release(\&f); return ZS_BADFORMAT; }\n    if (f->size > 0) {/'
 
 mutant "D-10: bad header is an error" catch \
-  's/    if \(!f->hdr_valid\) \{\n        \/\* Restore the name-derived generation/    if (!f->hdr_valid) { zsi_file_close(\&f); return ZS_BADFORMAT; }\n    if (!f->hdr_valid) {\n        \/* Restore the name-derived generation/'
+  's/    if \(!f->hdr_valid\) \{\n        \/\* Restore the name-derived generation/    if (!f->hdr_valid) { zsi_file_release(\&f); return ZS_BADFORMAT; }\n    if (!f->hdr_valid) {\n        \/* Restore the name-derived generation/'
 
 mutant "D-10: generation not taken from name" catch \
   's/        f->hdr.start = name_start;\n        f->hdr.end = 0;\n        f->csum = zsi_csum_none;/        f->hdr.start = 0;\n        f->hdr.end = 0;\n        f->csum = zsi_csum_none;/'
@@ -773,9 +797,6 @@ mutant "vallen boundary: 65536 stays short" catch \
 # internally contradictory state.  Mutating only one made the encoder write at big
 # offsets into a short-length buffer, so it was "caught" by a heap overflow --
 # detected, but not by any assertion, and therefore no evidence about the tests.
-mutant "ancestor promotes to big form" catch \
-  's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);/bool big = store_ancestor || keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);/g'
-
 mutant "lengths include the NUL terminators" catch \
   's/        if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0 + 4, \&body)) return 0;/'
 
@@ -1565,10 +1586,25 @@ mutant "retire: leaves without referencing the files" catch \
 mutant "hold: references never released" catch \
   's/    for \(size_t i = 0; i < h->n; i\+\+\)\n        zsi_file_release\(&h->f\[i\]\);/    \/* leaked *\//'
 
-# A cursor's references do two jobs: A-4a retention, and telling the fold that
-# somebody is reading the active file.  Dropping them breaks BOTH, and the
-# second is a G-4 violation a data test can see.
-mutant "cursor: takes no reference to the files it reads" catch \
+# EQUIVALENT, and the claim it used to carry -- "a G-4 violation a data test
+# can see" -- was aspirational: no test ever saw it, at any commit.  Both of the
+# jobs it does are covered by something else in every configuration a caller can
+# reach:
+#
+#   A-4a retention: the outgoing snapshot's files are put in the hold by
+#   zsi_snapshot_retire at each live swap, and before any swap they are held by
+#   db->snap and by the transaction's own snapshot reference.
+#
+#   The fold guard: a cursor always sits inside a transaction, and a READ one
+#   holds per file (zsi_txn_begin with ZS_SHARED), including the implicit one
+#   zs_db_begin_cursor makes.  A cursor on a WRITE transaction is the only case
+#   where this hold is alone -- and a write transaction owns the write lock, so
+#   no other commit can run underneath it, and its own commit frees the cursor
+#   immediately afterwards without reading.
+#
+# It becomes live the moment a cursor may outlive its own transaction's commit.
+# Listed rather than deleted for that reason.
+mutant "cursor: takes no reference to the files it reads" equivalent \
   's/    if \(zsi_hold_add_snapshot\(&c->hold, c->snap\) != ZS_OK\) return ZS_INTERNAL;/    \/* unreferenced *\//'
 
 # The same for a read transaction, which is the other holder of a fixed view.
@@ -1761,6 +1797,9 @@ mutant "rollover: only bytes are counted" catch \
 echo
 if [ "$ROTONLY" -eq 1 ]; then
     printf '%d patterns intact, %d ROTTED (no mutant was built or run)\n' \
+        "$intact" "$broken"
+elif [ "$BUILDONLY" -eq 1 ]; then
+    printf '%d patterns build, %d DO NOT BUILD (no mutant was run)\n' \
         "$intact" "$broken"
 else
     printf '%d caught, %d equivalent, %d NOT CAUGHT, %d inconclusive\n' \

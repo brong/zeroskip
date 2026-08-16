@@ -14436,6 +14436,7 @@ static void test_salvage_invalid_header(void)
  * makes the newest file in the database the first one applied. */
 static void test_salvage_active_file_is_newest(void)
 {
+    char newest[16];
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
     struct zs_db *db = NULL;
@@ -14455,17 +14456,28 @@ static void test_salvage_active_file_is_newest(void)
     }
 
     /* Deliberately NOT sealed: the newest version must be in the ACTIVE file,
-     * which is what this test is about.
+     * which is what this test is about -- salvage must scan it LAST (S-3), and
+     * the only way to tell that from the opposite is for the active file to
+     * hold a version no other file has.
      *
-     * Reached by storing until one exists rather than by trusting the loop
-     * above to end that way.  A commit that crosses rollover_size seals in
+     * Reached by storing until an active file exists rather than by trusting
+     * the loop above to end that way: a commit crossing rollover_size seals in
      * place (D-25d), so whether the last iteration leaves a clean active file
-     * is a function of the exact encoded record size -- which made this test
-     * fail the moment records got 4 bytes shorter, for a reason that had
-     * nothing to do with salvage.  Re-storing the SAME newest value keeps the
-     * expectation below unchanged. */
-    for (int i = 0; i < 8 && !zsi_snapshot_active(db->snap); i++)
-        ASSERT_OK(zs_db_store(db, "same", 4, "v29", 3, 0));
+     * is a function of the exact encoded record size, and this test started
+     * failing the moment records got 4 bytes shorter, for a reason that had
+     * nothing to do with salvage.
+     *
+     * Each attempt writes a DISTINCT value, which is the part that matters.  An
+     * earlier version of this retry re-stored "v29", so when an attempt sealed,
+     * "v29" ended up in both the sealed file and the next active one -- and the
+     * ordering it exists to pin stopped mattering.  It passed, and
+     * "salvage: active file sorts first, not last" went from caught to NOT
+     * CAUGHT without anything in the library changing. */
+    for (int i = 0; i < 8; i++) {
+        snprintf(newest, sizeof(newest), "final%d", i);
+        ASSERT_OK(zs_db_store(db, "same", 4, newest, strlen(newest), 0));
+        if (zsi_snapshot_active(db->snap)) break;
+    }
     ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
     ASSERT(db->snap->nfiles > 1);
     ASSERT_OK(zs_db_close(&db));
@@ -14475,7 +14487,7 @@ static void test_salvage_active_file_is_newest(void)
     ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
 
     ASSERT_OK(salv_fetch("same", val, sizeof(val)));
-    ASSERT_STR_EQ(val, "v29");
+    ASSERT_STR_EQ(val, newest);      /* the ACTIVE file's version, not an older */
 }
 
 static void test_salvage_ignores_pointer_section(void)
@@ -14885,6 +14897,147 @@ static void test_txn_cursor_no_duplicate_on_write(void)
 /* D-14j: an explicit READ transaction keeps its fixed view (G-4), even while the
  * same handle commits underneath it.  This is the case cyrusdb calls a
  * transactional read, and it must NOT become live. */
+/* G-4 for a read transaction with NO cursor, which is the configuration that
+ * makes its file references load-bearing rather than redundant.
+ *
+ * A read transaction keeps its snapshot alive by referencing the SNAPSHOT, so
+ * the bytes survive without any per-file hold.  What the hold does is raise the
+ * active FILE's refcount, and that is what tells the commit-site fold somebody
+ * is reading it -- so the fold rebuilds instead of extending the index and the
+ * complete point in place (D-13b, G-6).  Mutated in place, this transaction's
+ * fixed view would grow records committed after it began.
+ *
+ * test_txn_cursor_view_is_fixed cannot see that: it holds a cursor as well, and
+ * either hold is enough to keep the refcount above one, so removing one leaves
+ * the other.  They mask each other completely, and the mutant for the
+ * transaction's hold went NOT CAUGHT until this existed. */
+/* Open descriptors, for the leak test below.  /dev/fd is the process's own
+ * descriptor table on macOS and a symlink to /proc/self/fd on Linux, so this
+ * reads the same thing on both.  Returns -1 where neither exists, which the
+ * caller treats as "cannot check" rather than as a failure. */
+static int count_open_fds(void)
+{
+    DIR *d = opendir("/dev/fd");
+    struct dirent *de;
+    int n = 0;
+
+    if (!d) return -1;
+    while ((de = readdir(d))) if (de->d_name[0] != '.') n++;
+    closedir(d);
+    return n;                       /* includes the one opendir just took */
+}
+
+/* A-4a's other half: the references a hold takes must come BACK.
+ *
+ * zsi_hold_fini releasing them is what lets a retired file's descriptor and
+ * mapping go at all -- a snapshot rebuild retires the old files, and they are
+ * freed only when the last reference drops.  Leak the hold's references and
+ * nothing is ever freed: descriptors accumulate for the life of the handle,
+ * and a long-lived writer runs out of them.
+ *
+ * A leak is not a test failure, which is why "hold: references never released"
+ * went NOT CAUGHT for the whole suite -- `make leaks` sees it and mutate.sh
+ * does not run `make leaks`.  Counting descriptors turns it into one.
+ *
+ * The loop commits between transactions on purpose: a commit replaces the
+ * handle's snapshot, which is the only thing that retires a file and so the
+ * only way a missing release becomes observable. */
+static void test_hold_releases_its_references(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db;
+    int before, after;
+
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_size = 4096;         /* small, so generations turn over */
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* Warm up: reach a steady state before counting, so the baseline is not
+     * measuring first-use allocation. */
+    for (int i = 0; i < 10; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "w%d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+
+    before = count_open_fds();
+    if (before < 0) SKIP("no /dev/fd on this platform");
+
+    for (int i = 0; i < 60; i++) {
+        struct zs_txn *rd = NULL;
+        const char *v;
+        size_t vl;
+        char k[16];
+
+        /* A SHARED transaction takes a hold per file... */
+        ASSERT_OK(zs_db_begin_txn(db, ZS_SHARED, &rd));
+        zs_txn_fetch(rd, "w0", 2, NULL, NULL, &v, &vl, 0);
+        ASSERT_OK(zs_txn_abort(&rd));
+
+        /* ...and a commit retires what it was holding. */
+        snprintf(k, sizeof(k), "k%d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "0123456789012345", 16, 0));
+    }
+
+    after = count_open_fds();
+    ASSERT(after >= 0);
+
+    /* The file count is bounded by the layout, not by the number of
+     * transactions -- so a per-transaction leak shows up here as growth.  A few
+     * descriptors of slack, since the set legitimately gains files as
+     * generations turn over. */
+    if (after > before + 8) {
+        fprintf(stderr, "\n    FAIL open fds went %d -> %d over 60 "
+                        "transactions: references are not being released\n",
+                before, after);
+        current_test_failed = 1;
+    }
+
+    zs_db_close(&db);
+}
+
+static void test_read_txn_view_is_fixed_without_a_cursor(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_txn *rd = NULL;
+    const char *v;
+    size_t vl;
+
+    live_seed(&setup);                          /* a b d, committed */
+
+    ASSERT_OK(zs_db_begin_txn(live_db, ZS_SHARED, &rd));
+
+    /* Establish the view.  No cursor is opened, deliberately. */
+    ASSERT_OK(zs_txn_fetch(rd, "a", 1, NULL, NULL, &v, &vl, 0));
+
+    /* Commit through the handle behind its back, several times, so the active
+     * file grows and the fold has something to fold. */
+    for (int i = 0; i < 4; i++) {
+        char k[8];
+        snprintf(k, sizeof(k), "z%d", i);
+        ASSERT_OK(zs_db_store(live_db, k, strlen(k), "new", 3, 0));
+    }
+
+    /* None of it is visible: the transaction's file set was fixed at begin. */
+    for (int i = 0; i < 4; i++) {
+        char k[8];
+        snprintf(k, sizeof(k), "z%d", i);
+        ASSERT_EQ(zs_txn_fetch(rd, k, strlen(k), NULL, NULL, &v, &vl, 0),
+                  ZS_NOTFOUND);
+    }
+    /* ...and what was there still is. */
+    ASSERT_OK(zs_txn_fetch(rd, "d", 1, NULL, NULL, &v, &vl, 0));
+
+    ASSERT_OK(zs_txn_abort(&rd));
+
+    /* The writes really did commit -- otherwise the assertions above would
+     * hold for the wrong reason. */
+    ASSERT_OK(zs_db_fetch(live_db, "z3", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "new", 3);
+    ASSERT_OK(zs_db_close(&live_db));
+}
+
 static void test_txn_cursor_view_is_fixed(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -15948,6 +16101,26 @@ static void test_index_cur_reverse_base_delta(void)
     ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
     ASSERT_MEM_EQ(r.key, "aa", 2);
 
+    /* And the same on a key that is in the BASE ONLY.
+     *
+     * Seeking on "dup" cannot test the base's half of the inclusive rule: the
+     * key is in both arrays and the delta's record wins the tie either way, so
+     * breaking the base branch changes nothing observable.  "aa" was committed
+     * in the first session and never rewritten, so it exists only in the base
+     * -- and there is nothing below it, so getting the inclusive rule wrong
+     * there does not yield the wrong record, it yields NOTHING.  That is what
+     * "index: reverse inclusive seek dropped (base)" does, and what went
+     * uncaught until this. */
+    zsi_index_cur_seek_rev(act->index, db->compar, "aa", 2, true, &ic);
+    ASSERT_OK(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off));
+    ASSERT_MEM_EQ(r.key, "aa", 2);
+    ASSERT_MEM_EQ(r.val, "x", 1);
+
+    /* Exclusive of the lowest key really is the end. */
+    zsi_index_cur_seek_rev(act->index, db->compar, "aa", 2, false, &ic);
+    ASSERT_EQ(zsi_index_cur_get_rev(act->index, db->compar, &ic, &r, &off),
+              ZS_DONE);
+
     ASSERT_OK(zs_db_close(&db));
 }
 
@@ -16797,6 +16970,10 @@ static struct test_entry tests[] = {
     { "test_txn_cursor_sees_own_writes", test_txn_cursor_sees_own_writes },
     { "test_txn_cursor_no_duplicate_on_write",
                                         test_txn_cursor_no_duplicate_on_write },
+    { "test_hold_releases_its_references",
+                                    test_hold_releases_its_references },
+    { "test_read_txn_view_is_fixed_without_a_cursor",
+                                    test_read_txn_view_is_fixed_without_a_cursor },
     { "test_txn_cursor_view_is_fixed",  test_txn_cursor_view_is_fixed },
     { "test_cursor_start_key_survives_refresh",
                                         test_cursor_start_key_survives_refresh },
