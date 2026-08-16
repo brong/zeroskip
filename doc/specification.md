@@ -1035,6 +1035,30 @@ The per-file cursors are held in an array kept sorted by:
   advanced cursor stays at or near the front, so the insertion terminates
   immediately. The sources are fixed for the cursor's lifetime, so no file can
   appear or vanish mid-scan (C-4).
+- **D-14i-a** Those costs are an **upper bound, not a required schedule**. An
+  implementation MAY do less work per record whenever it can establish that the
+  order cannot change, and the yields it produces MUST be identical either way —
+  this is a permission about effort, not about results, and nothing about it
+  reaches disk.
+
+  Two such shortcuts are worth naming because they are not obvious:
+
+  - The advanced source is usually still the smallest, so **one comparison
+    decides that nothing moves**, and the re-sort can return without touching
+    the array at all. Worth stating because the naive insertion sort lifts the
+    element out and puts it back regardless, which costs two copies of a source's
+    whole state on every record of every scan.
+  - A source can be shown to win a **run** of records rather than one: if the
+    key it will hold *K* advances from now still orders before the next source's
+    current key, then for those *K* yields it stays at the front and no other
+    source can hold any of those keys — so both the duplicate scan (step 3) and
+    the re-sort (step 5) are provably no-ops throughout. Any bound on that
+    future key may be used, and a **conservative** one is always safe: it can
+    only shorten the run. Sources above the front cannot shorten it, since a
+    source that has already been passed cannot come back.
+
+  Neither is required, and an implementation that does the straightforward thing
+  per record is conforming.
 - **D-14k Reverse iteration.** A cursor MAY traverse in descending key order.
   The sources, the per-source structures, and the visibility rule are exactly
   D-14's — the array of per-file cursors is instead kept sorted by **current

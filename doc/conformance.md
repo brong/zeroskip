@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 267 |
-| With an enforcing test | 257 |
+| Requirements | 268 |
+| With an enforcing test | 258 |
 | Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -151,6 +151,7 @@ a spec label is missing here.
 | `D-14g` | The write transaction's own records sort as though they had a | **none** |
 | `D-14h` | A per-file cursor never yields the same key twice: an in-order file | `fcur_no_duplicate_keys`, `index_delta_shadows_base` |
 | `D-14j` | **Liveness.** What a cursor observes of writes made while it runs | `cursor_sees_own_handle_writes`, `txn_cursor_sees_own_writes`, `txn_cursor_view_is_fixed`, +1 more |
+| `D-14i-a` | Those costs are an **upper bound, not a required schedule**. An | `cursor_resort_no_move`, `index_ordered_traversal` |
 | `D-14j-a` | A source's records MUST NOT be yielded twice because of a write | `txn_cursor_no_duplicate_on_write` |
 | `D-14j-b` | After observing a change, a cursor resumes at the first key | `cursor_start_key_survives_refresh`, `txn_cursor_store_behind_not_yielded`, +1 more |
 | `D-14i` | Picking the next record is O(1) and re-sorting one cursor is O(k) | `read_cursor_invariant` |

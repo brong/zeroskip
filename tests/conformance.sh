@@ -33,9 +33,14 @@ for f in "$SPEC" "$MAP"; do
 done
 
 # --- labels ------------------------------------------------------------------
-spec_labels=$(grep -oE '\b(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*' "$SPEC" | sort -u)
-map_labels=$(grep -oE '^\| `(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*`' "$MAP" \
-             | grep -oE '(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*' | sort -u)
+# The suffix may itself be suffixed -- D-14j-a, D-14i-a -- and until 2026-08-15
+# the pattern stopped at the first one, so a label like D-14j-a read as D-14j
+# and its row was never cross-checked in either direction.  Rows existed by
+# convention; nothing enforced them.
+LABEL='(G|F|D|C|R|A|P|S|T)-[0-9]+[a-z]*(-[a-z]+)?'
+spec_labels=$(grep -oE "\b$LABEL" "$SPEC" | sort -u)
+map_labels=$(grep -oE "^\| \`$LABEL\`" "$MAP" \
+             | grep -oE "$LABEL" | sort -u)
 
 missing=$(comm -23 <(echo "$spec_labels") <(echo "$map_labels"))
 extra=$(comm -13 <(echo "$spec_labels") <(echo "$map_labels"))

@@ -7117,6 +7117,71 @@ static void test_write_unclean_rollover(void)
  *
  * Stepping the arm directly separates them: a write with no seek exercises the
  * sequence check, and a seek with no write exercises the clear. */
+/* Walk a handle's whole key range, joining the keys with '|'. */
+static void resort_walk(struct zs_db *db, char *out, size_t outlen)
+{
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl, used = 0;
+
+    out[0] = '\0';
+    if (zs_db_begin_cursor(db, NULL, 0, &c, ZS_SHARED) != ZS_OK) return;
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        if (used + kl + 2 >= outlen) break;
+        if (used) out[used++] = '|';
+        memcpy(out + used, k, kl);
+        used += kl;
+        out[used] = '\0';
+    }
+    zs_cursor_abort(&c);
+}
+
+/* D-14i-a: the re-sort may take a shortcut, and the yields must be identical
+ * either way.
+ *
+ * The shortcut is one comparison deciding that the advanced arm is still the
+ * smallest, so nothing moves and the array is not touched.  Its failure mode is
+ * returning early when the arm SHOULD have moved -- which leaves the array
+ * mis-sorted and the merge yielding out of key order, silently.
+ *
+ * So both shapes are here.  Interleaved files make the head change on EVERY
+ * step, so the shortcut must decline every time; a dominant file makes it
+ * apply every time.  The naive insertion sort passes both, which is the point:
+ * this pins the yields, not the effort. */
+static void test_cursor_resort_no_move(void)
+{
+    struct zs_db *db;
+    char seen[64];
+
+    /* Interleaved: a,c,e in one generation and b,d,f in the next, so the
+     * smallest arm alternates and the head moves at every single step. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){
+        {"a","1"}, {"c","3"}, {"e","5"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){
+        {"b","2"}, {"d","4"}, {"f","6"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    resort_walk(db, seen, sizeof(seen));
+    ASSERT_STR_EQ(seen, "a|b|c|d|e|f");
+    zs_db_close(&db);
+
+    /* Dominant: one generation holds everything below the other's single key,
+     * so the head never moves until it is exhausted and the shortcut applies
+     * on every step. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){
+        {"a","1"}, {"b","2"}, {"c","3"}, {"d","4"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"z","9"}, {NULL,NULL} });
+    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    resort_walk(db, seen, sizeof(seen));
+    ASSERT_STR_EQ(seen, "a|b|c|d|z");
+    zs_db_close(&db);
+}
+
 static void test_txn_arm_step_hint(void)
 {
     struct zs_db *db = fresh_db();
@@ -16439,6 +16504,7 @@ static struct test_entry tests[] = {
                                         test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
+    { "test_cursor_resort_no_move",      test_cursor_resort_no_move },
     { "test_txn_arm_step_hint",          test_txn_arm_step_hint },
     { "test_ifchanged_writes_nothing",   test_ifchanged_writes_nothing },
     { "test_write_record_is_self_contained",

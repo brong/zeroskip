@@ -5227,6 +5227,17 @@ static void zsi_cur_resort_head(struct zs_cursor *c)
 {
     if (c->ncur < 2) return;
 
+    /* The overwhelmingly common case, and the one D-14i names: the advanced
+     * arm is still the smallest, so nothing moves.  Answer that with ONE
+     * comparison and return.
+     *
+     * Without this the function lifts c->cur[0] into a local and puts it back
+     * whatever happens -- and struct zsi_fcur is 160 bytes, so a step that
+     * moved nothing still copied 320 bytes.  Per record.  The insertion below
+     * needs the local because it shifts the array down over it; the case where
+     * it shifts nothing does not. */
+    if (zsi_cur_order(c, &c->cur[0], &c->cur[1]) <= 0) return;
+
     struct zsi_fcur t = c->cur[0];
     size_t j = 0;
     while (j + 1 < c->ncur && zsi_cur_order(c, &t, &c->cur[j + 1]) > 0) {

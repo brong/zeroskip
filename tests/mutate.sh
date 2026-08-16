@@ -1057,6 +1057,23 @@ mutant "compact: reports success regardless" catch \
 # launders a corrupt body: the output is written under a FRESH checksum computed
 # over the corrupt copy, and D-23 then removes the input -- the only evidence.
 echo
+echo "the merge re-sort shortcut (D-14i-a)"
+
+# D-14i-a permits doing LESS work when the order cannot change; it does not
+# permit skipping work that was needed.  Taking the shortcut unconditionally
+# leaves the array mis-sorted the moment the head really does move, and the
+# merge then yields out of key order -- silently, which is why the interleaved
+# half of the test exists.
+mutant "resort: shortcut taken unconditionally" catch \
+  's/    if \(zsi_cur_order\(c, &c->cur\[0\], &c->cur\[1\]\) <= 0\) return;/    return;/'
+
+# ... and the sign inverted, which is the same bug reached the other way: it
+# declines the shortcut exactly when nothing moves and takes it when something
+# must.
+mutant "resort: shortcut condition inverted" catch \
+  's/    if \(zsi_cur_order\(c, &c->cur\[0\], &c->cur\[1\]\) <= 0\) return;/    if (zsi_cur_order(c, \&c->cur[0], \&c->cur[1]) > 0) return;/'
+
+echo
 echo "the txn arm's step hint (D-14j-a)"
 
 # The hint caches where tkey resolved to, and is trusted only while pend_seq is
