@@ -15700,6 +15700,138 @@ static void test_cursor_reverse_prefix(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* Keys longer than the pending set's inlined prefix, agreeing within it.
+ *
+ * A node inlines at most ZSI_PEND_KPREFIX (32) key bytes, and a comparison is
+ * settled from those unless BOTH keys run past the bound AND match inside it --
+ * only then is the record read.  So this is the case the bound introduces, and
+ * nothing else in the suite reaches it: every other test uses keys of a few
+ * bytes.  Cyrus's mailboxes.db is full of exactly this shape ("Ndomain!user."
+ * repeated over long runs), which is why it is worth a test rather than a
+ * comment.
+ *
+ * Covered here: two long keys differing only past the bound, a long key that is
+ * a strict PREFIX of another (the F-11a length tie-break, reached through a
+ * truncated inline), a key exactly at the bound, and one just over it. */
+static void test_txn_long_keys_past_the_prefix(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    char got[512] = "";
+    static const char p[] = "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"; /* 40 */
+    char a[64], b[64], pre[64], at32[64], at33[64];
+
+    snprintf(a,     sizeof(a),     "%sAAA", p);      /* differ at byte 40 */
+    snprintf(b,     sizeof(b),     "%sBBB", p);
+    snprintf(pre,   sizeof(pre),   "%s",    p);      /* a strict prefix of both */
+    memset(at32, 'Q', 32); at32[32] = '\0';         /* exactly the bound */
+    memset(at33, 'Q', 33); at33[33] = '\0';         /* one past it */
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    /* Stored out of order, so the ordering below is the structure's doing. */
+    ASSERT_OK(zs_txn_store(txn, b,     strlen(b),     "b",  1, 0));
+    ASSERT_OK(zs_txn_store(txn, at33,  strlen(at33),  "33", 2, 0));
+    ASSERT_OK(zs_txn_store(txn, pre,   strlen(pre),   "p",  1, 0));
+    ASSERT_OK(zs_txn_store(txn, at32,  strlen(at32),  "32", 2, 0));
+    ASSERT_OK(zs_txn_store(txn, a,     strlen(a),     "a",  1, 0));
+
+    /* Every one is found -- a lookup that mis-decided a tie would miss. */
+    ASSERT_OK(zs_txn_fetch(txn, a,    strlen(a),    NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "a", 1);
+    ASSERT_OK(zs_txn_fetch(txn, b,    strlen(b),    NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "b", 1);
+    ASSERT_OK(zs_txn_fetch(txn, pre,  strlen(pre),  NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "p", 1);
+    ASSERT_OK(zs_txn_fetch(txn, at32, strlen(at32), NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "32", 2);
+    ASSERT_OK(zs_txn_fetch(txn, at33, strlen(at33), NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "33", 2);
+
+    /* A key that shares the whole prefix but was never stored must MISS. */
+    {
+        char miss[64];
+        snprintf(miss, sizeof(miss), "%sCCC", p);
+        ASSERT_EQ(zs_txn_fetch(txn, miss, strlen(miss), NULL, NULL, &v, &vl, 0),
+                  ZS_NOTFOUND);
+    }
+
+    /* F-11a order: P*40 < P*40+"AAA" < P*40+"BBB" < Q*32 < Q*33. */
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, 0));
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        if (got[0]) strncat(got, "|", sizeof(got) - strlen(got) - 1);
+        strncat(got, v, sizeof(got) - strlen(got) - 1);
+    }
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "p|a|b|32|33");
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A CALLER's comparator, over keys past the pending set's inlined prefix.
+ *
+ * The prefix shortcut is a specialisation of the built-in order: F-11a compares
+ * bytes and then lengths, so a difference inside the prefix is the answer.  A
+ * caller's comparator may order by anything -- alt_compar here reverses the
+ * order outright -- so nothing whatever follows from a byte prefix and the full
+ * key has to be read every time.  Applying the shortcut anyway builds the
+ * pending set in one order and searches it in another; the mutant is
+ * `pend: prefix logic applied to a caller comparator`, and nothing caught it
+ * until this test, because every other custom-comparator test uses short keys
+ * where the whole key is inlined and the two orders coincide by accident. */
+static void test_txn_caller_comparator_long_keys(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    const char *k, *v;
+    size_t kl, vl;
+    char got[256] = "";
+    char a[64], b[64], d[64];
+
+    /* Long keys that differ INSIDE the inlined prefix, which is the only place
+     * the shortcut decides anything: keys agreeing past the bound fall through
+     * to the full key and the caller's comparator either way, so a test built
+     * from those would pass whether the specialisation was guarded or not. */
+    memset(a, 'A', 40); a[40] = '\0';
+    memset(b, 'B', 40); b[40] = '\0';
+    memset(d, 'D', 40); d[40] = '\0';
+
+    setup.flags = ZS_CREATE;
+    setup.compar = alt_compar;
+    setup.compar_name = "reverse";
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    ASSERT_OK(zs_txn_store(txn, b, strlen(b), "b", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, d, strlen(d), "d", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, a, strlen(a), "a", 1, 0));
+
+    ASSERT_OK(zs_txn_fetch(txn, a, strlen(a), NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "a", 1);
+    ASSERT_OK(zs_txn_fetch(txn, d, strlen(d), NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "d", 1);
+
+    /* Reversed: D before B before A. */
+    ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, 0));
+    while (zs_cursor_next(c, &k, &kl, &v, &vl) == ZS_OK) {
+        if (got[0]) strncat(got, "|", sizeof(got) - strlen(got) - 1);
+        strncat(got, v, sizeof(got) - strlen(got) - 1);
+    }
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "d|b|a");
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* The same exclusive bound, on the TRANSACTION arm.
  *
  * test_cursor_reverse_prefix above stores everything first, so its keys are in
@@ -17024,6 +17156,10 @@ static struct test_entry tests[] = {
                                         test_cursor_reverse_seek_and_skiproot },
     { "test_cursor_reverse_tombstones", test_cursor_reverse_tombstones },
     { "test_cursor_reverse_prefix",     test_cursor_reverse_prefix },
+    { "test_txn_long_keys_past_the_prefix",
+                                        test_txn_long_keys_past_the_prefix },
+    { "test_txn_caller_comparator_long_keys",
+                                        test_txn_caller_comparator_long_keys },
     { "test_txn_cursor_reverse_prefix_bound",
                                         test_txn_cursor_reverse_prefix_bound },
     { "test_cursor_reverse_own_writes", test_cursor_reverse_own_writes },

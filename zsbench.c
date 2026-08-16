@@ -43,6 +43,14 @@ static size_t valsize = 100;
  * run passes a matching --keysize to both tools. */
 static size_t keysize = 11;
 static const char *csum_name = "xxh64";
+/* Where a long key VARIES, which decides what a key comparison costs and is
+ * therefore a property of the workload, not a detail.  "head" puts the digits
+ * first and pads after them -- a message-id or a G<40 random chars> key, which
+ * two comparisons settle.  "shared" pads first, so every key agrees for its
+ * first --keysize-11 bytes: Cyrus mailboxes.db's "Ndomain!user.foo" runs.  At
+ * the default --keysize 11 there is no padding and the two are identical, so
+ * every figure recorded before this option existed is a "head" figure. */
+static const char *keyshape = "head";
 static int selftest = 0;
 static const char *filter = NULL;
 static const char *csv_path = NULL;
@@ -220,8 +228,16 @@ static int csv_write(const char *path)
 static void makekey(char *buf, size_t bufsz, long i)
 {
     size_t want = keysize < bufsz ? keysize : bufsz - 1;
-    int digits = (int)(want > 3 ? want - 3 : 1);
-    snprintf(buf, bufsz, "key%0*ld", digits, i);
+
+    if (keyshape[0] == 's') {           /* shared: pad first, vary last */
+        int digits = (int)(want > 3 ? want - 3 : 1);
+        snprintf(buf, bufsz, "key%0*ld", digits, i);
+    } else {                            /* head: vary first, pad after */
+        int digits = (int)(want > 11 ? 8 : (want > 3 ? want - 3 : 1));
+        size_t n = (size_t)snprintf(buf, bufsz, "key%0*ld", digits, i);
+        while (n < want) buf[n++] = 'x';
+    }
+
     buf[want] = '\0';
 }
 
@@ -1796,6 +1812,8 @@ static int usage(void)
         "      --reps N     repetitions per benchmark, median kept (default %d)\n"
         "      --keysize N  key length in bytes (default %zu, minimum 4)\n"
         "      --valsize N  value length in bytes (default %zu)\n"
+        "      --keyshape S head (default) or shared -- where a long key\n"
+        "                   varies; identical at the default --keysize\n"
         "      --csum ENG   xxh64 (default) or null\n"
         "      --path DIR   working directory (default $TMPDIR)\n"
         "      --csv FILE   write results as CSV\n"
@@ -1869,6 +1887,10 @@ int main(int argc, char **argv)
             valsize = (size_t)atol(val);
             valsize_given = 1;
         }
+        else if (!strcmp(opt, "--keyshape")) {
+            if (!ARGVAL()) return usage();
+            keyshape = val;
+        }
         else if (!strcmp(opt, "--csum")) {
             if (!ARGVAL()) return usage();
             csum_name = val;
@@ -1905,6 +1927,10 @@ int main(int argc, char **argv)
     }
     if (keysize < 4) {
         fprintf(stderr, "zsbench: --keysize must be at least 4\n");
+        return 2;
+    }
+    if (strcmp(keyshape, "head") && strcmp(keyshape, "shared")) {
+        fprintf(stderr, "zsbench: --keyshape must be head or shared\n");
         return 2;
     }
     if (strcmp(csum_name, "xxh64") && strcmp(csum_name, "null")) {
