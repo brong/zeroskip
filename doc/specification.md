@@ -93,8 +93,8 @@ tolerate compaction happening out of band.
 | private index | the in-memory ordered index a snapshot builds over an unordered file's committed records (D-13); private to the process that built it |
 | pointer section | the sorted array of record offsets, plus trailer, that an in-order file carries (F-26) |
 | pointer table | an optional cached private index for an unordered file, persisted outside the database (§8) |
-| pending array | a write transaction's uncommitted records, held sorted in memory until commit (A-1a); the highest-priority read source (D-14) |
-| source | anything a read draws records from: the pending array, then each data file newest to oldest (D-14) |
+| pending set | a write transaction's uncommitted records, held in an ordered in-memory index until commit (A-1a); the highest-priority read source (D-14). The *ordering* is normative, since D-14e merges it against the files; the structure holding it is not, and is an implementation's own affair |
+| source | anything a read draws records from: the pending set, then each data file newest to oldest (D-14) |
 | merge | the traversal over all of a cursor's sources that implements D-14e's six steps |
 | arm | one per-source cursor inside a merge; the sorted array of arms is what D-14e's steps operate on |
 | exhausted | an arm with no record at or after its position; exhausted arms sort last (D-14e step 1) |
