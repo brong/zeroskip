@@ -3392,7 +3392,7 @@ struct zsi_fcur {
              * (D-14j-b, zsi_cursor_reseek_arm), because a write may land
              * between the last key yielded and wherever this arm is sitting --
              * the arm reads one record AHEAD of what the caller has seen. */
-            struct zsi_pnode *node;
+            size_t node;         /* an ARENA OFFSET; 0 is "exhausted" */
         } t;
     } u;
 };
@@ -5828,13 +5828,35 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
  * a fresh search per record. */
 #define ZSI_PEND_MAXLEVEL 16     /* 4^16 nodes at p = 1/4, far past any txn */
 
+/* Nodes live in ONE arena and refer to each other by OFFSET, the way Cyrus's
+ * skiplist file does -- and for the same reason it works on disk: an offset
+ * survives the arena moving.  The arena doubles by realloc, which relocates
+ * every node at once, and not one link needs fixing up.
+ *
+ * That is what makes this representation compatible with the property the
+ * skiplist was chosen for.  A raw pointer would have been invalidated by the
+ * realloc; an offset is not, so a cursor's position is still stable across any
+ * write (see struct zsi_fcur).
+ *
+ * It also removes two allocations per distinct key -- the node and its key copy
+ * -- which is the whole cost the skiplist added over the sorted array it
+ * replaced: an array append wrote into a slot that already existed.
+ *
+ * Offset 0 is the null link, so the arena's first 8 bytes are never used.
+ * KEY BYTES are inlined after the level array, so the key a descent compares is
+ * in the same cache line as the links it followed to reach it -- and MOVE with
+ * the arena, which is safe because every borrow of one is read inside the call
+ * that took it (zsi_pend_lb's own comparisons, zsi_txn_cur_peek_key ->
+ * zsi_fcur_find's equality test).  Nothing holds a pending key across a store,
+ * which is the only thing that can grow the arena.  The cursor's D-14j-b resume
+ * key is borrowed from a RECORD, not from here. */
 struct zsi_pnode {
-    char             *key;  size_t keylen;
-    size_t            off;            /* record offset in the active file */
-    size_t            len;            /* its encoded length */
-    struct zsi_pnode *prev;           /* level 0 only (D-14k) */
-    int               nlevels;
-    struct zsi_pnode *next[];         /* nlevels entries */
+    size_t off;                       /* record offset in the active file */
+    size_t len;                       /* its encoded length */
+    size_t prev;                      /* arena offset, 0 = none (level 0) */
+    size_t keylen;
+    size_t nlevels;
+    size_t next[];                    /* nlevels links, then keylen key bytes */
 };
 
 /* One read-only mapping of the active file.  A transaction accumulates these
@@ -5855,9 +5877,12 @@ struct zs_txn {
      * what makes its cursors observe this handle's later commits (D-14j). */
     bool                 implicit;
 
-    /* The pending set (see struct zsi_pnode): a skiplist, not an array. */
-    struct zsi_pnode    *phead[ZSI_PEND_MAXLEVEL];
-    struct zsi_pnode    *ptail;       /* for a reverse walk's start (D-14k) */
+    /* The pending set (see struct zsi_pnode): a skiplist in one arena, and
+     * every reference to a node is an OFFSET into it. */
+    char                *parena;
+    size_t               pused, pcap;
+    size_t               phead[ZSI_PEND_MAXLEVEL];
+    size_t               ptail;       /* for a reverse walk's start (D-14k) */
     int                  plevel;      /* levels currently in use */
     size_t               npend;
     uint64_t             prand;       /* level generator, seeded at begin */
@@ -5899,52 +5924,92 @@ struct zs_txn {
     struct zsi_hold      hold;
 };
 
-/* The first node with key >= the given one, or NULL past the end.
+/* Resolving an offset, and where a node keeps its key.  Macros rather than
+ * functions so a descent's inner loop is two adds. */
+#define ZSI_PN(txn, o)      ((struct zsi_pnode *)((txn)->parena + (o)))
+#define ZSI_PN_KEY(n)       ((const char *)((n)->next + (n)->nlevels))
+
+/* Room for `need` more bytes, 8-aligned.  Reserved BEFORE the record is
+ * streamed, because a streamed record must be indexed: everything that can fail
+ * has to fail first.  The bump itself cannot. */
+static int zsi_pend_reserve(struct zs_txn *txn, size_t need)
+{
+    size_t want;
+
+    if (!zsi_add_sz(txn->pused, need, &want)) return ZS_INTERNAL;
+    if (want <= txn->pcap) return ZS_OK;
+
+    size_t cap = txn->pcap ? txn->pcap : 1024;
+    while (cap < want) {
+        if (cap > SIZE_MAX / 2) return ZS_INTERNAL;
+        cap *= 2;
+    }
+
+    char *p = realloc(txn->parena, cap);
+    if (!p) return ZS_INTERNAL;
+
+    /* Offset 0 is the null link, so the first word is never a node. */
+    if (!txn->pused) txn->pused = 8;
+
+    txn->parena = p;
+    txn->pcap = cap;
+    return ZS_OK;
+}
+
+/* The first node with key >= the given one, or 0 past the end.
  *
  * `update`, when asked for, is the descent path: the last node strictly below
- * the key at each level, NULL meaning the head.  An insert splices into exactly
+ * the key at each level, 0 meaning the head.  An insert splices into exactly
  * those links, which is why the search and the insert are one walk. */
-static struct zsi_pnode *zsi_pend_lb(struct zs_txn *txn, const char *key,
-                                     size_t keylen, struct zsi_pnode **update)
+static size_t zsi_pend_lb(struct zs_txn *txn, const char *key,
+                          size_t keylen, size_t *update)
 {
-    struct zsi_pnode *x = NULL, *n = NULL;
+    size_t x = 0, n = 0;
 
     for (int lv = txn->plevel - 1; lv >= 0; lv--) {
-        /* x was reached AT this level or above, so x->next[lv] is in range. */
-        n = x ? x->next[lv] : txn->phead[lv];
-        while (n && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) < 0) {
+        /* x was reached AT this level or above, so its next[lv] is in range. */
+        n = x ? ZSI_PN(txn, x)->next[lv] : txn->phead[lv];
+        while (n) {
+            struct zsi_pnode *p = ZSI_PN(txn, n);
+            if (zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) >= 0)
+                break;
             x = n;
-            n = x->next[lv];
+            n = p->next[lv];
         }
         if (update) update[lv] = x;
     }
 
-    return n;               /* level 0's candidate, or NULL for an empty list */
+    return n;               /* level 0's candidate, or 0 for an empty list */
 }
 
-static struct zsi_pnode *zsi_pend_find(struct zs_txn *txn, const char *key,
-                                       size_t keylen)
+static size_t zsi_pend_find(struct zs_txn *txn, const char *key, size_t keylen)
 {
-    struct zsi_pnode *n = zsi_pend_lb(txn, key, keylen, NULL);
+    size_t n = zsi_pend_lb(txn, key, keylen, NULL);
+    struct zsi_pnode *p;
 
-    if (n && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) == 0)
+    if (!n) return 0;
+    p = ZSI_PN(txn, n);
+    if (zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) == 0)
         return n;
-    return NULL;
+    return 0;
 }
 
 /* The largest key <= (inclusive) or < (exclusive) the given one: a reverse
  * seek's landing point (D-14k).  The lower bound's PREDECESSOR is the strictly
  * smaller answer, and it is already linked at level 0. */
-static struct zsi_pnode *zsi_pend_lt(struct zs_txn *txn, const char *key,
-                                     size_t keylen, bool inclusive)
+static size_t zsi_pend_lt(struct zs_txn *txn, const char *key,
+                          size_t keylen, bool inclusive)
 {
-    struct zsi_pnode *n = zsi_pend_lb(txn, key, keylen, NULL);
+    size_t n = zsi_pend_lb(txn, key, keylen, NULL);
 
-    if (inclusive && n
-        && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) == 0)
+    if (!n) return txn->ptail;
+
+    struct zsi_pnode *p = ZSI_PN(txn, n);
+    if (inclusive
+        && zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) == 0)
         return n;
 
-    return n ? n->prev : txn->ptail;
+    return p->prev;
 }
 
 /* A node's level: geometric with p = 1/4, from a per-transaction xorshift.
@@ -5968,71 +6033,66 @@ static int zsi_pend_level(struct zs_txn *txn)
     return lv;
 }
 
-/* Allocating and LINKING a node are separate because everything that can fail
- * must happen before the record is streamed: a streamed record must be indexed,
- * or this handle's commit-time fold would disagree with every other reader's
- * replay of the same span.  The link itself cannot fail, and a store whose
- * stream fails frees the node instead -- leaving the key absent, which is what
- * a caller reading a poisoned transaction should see. */
-static struct zsi_pnode *zsi_pend_alloc(struct zs_txn *txn, char *kcopy,
-                                        size_t keylen)
+/* Bytes a node of `lv` levels holding `keylen` key bytes occupies, rounded so
+ * the next node is 8-aligned. */
+static size_t zsi_pend_nodelen(int lv, size_t keylen)
 {
-    int lv = zsi_pend_level(txn);
-    struct zsi_pnode *n = malloc(sizeof(*n) + (size_t)lv * sizeof(n->next[0]));
-
-    if (!n) return NULL;
-
-    n->key = kcopy;
-    n->keylen = keylen;
-    n->off = 0;
-    n->len = 0;
-    n->prev = NULL;
-    n->nlevels = lv;
-    for (int i = 0; i < lv; i++) n->next[i] = NULL;
-
-    return n;
+    size_t n;
+    if (!zsi_add3_sz(sizeof(struct zsi_pnode), (size_t)lv * sizeof(size_t),
+                     keylen, &n))
+        return 0;
+    return zsi_roundup8(n);
 }
 
-/* Splice a node the caller has established is absent.  One walk: the descent
- * path IS the set of links to rewrite. */
-static void zsi_pend_link(struct zs_txn *txn, struct zsi_pnode *n)
+/* Splice a node for a key the caller has established is absent.  One walk: the
+ * descent path IS the set of links to rewrite.  Cannot fail -- the arena was
+ * reserved before the record was streamed. */
+static size_t zsi_pend_link(struct zs_txn *txn, const char *key, size_t keylen,
+                            int lv, size_t off, size_t len)
 {
-    struct zsi_pnode *update[ZSI_PEND_MAXLEVEL];
+    size_t update[ZSI_PEND_MAXLEVEL];
+    size_t at = txn->pused;
+    struct zsi_pnode *n;
 
-    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = NULL;
-    zsi_pend_lb(txn, n->key, n->keylen, update);
+    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = 0;
+    zsi_pend_lb(txn, key, keylen, update);
+
+    txn->pused += zsi_pend_nodelen(lv, keylen);
+
+    n = ZSI_PN(txn, at);
+    n->off = off;
+    n->len = len;
+    n->keylen = keylen;
+    n->nlevels = (size_t)lv;
+    memcpy((char *)ZSI_PN_KEY(n), key, keylen);
 
     /* Levels above the current top are reached from the head, and update[] is
-     * already NULL there. */
-    if (n->nlevels > txn->plevel) txn->plevel = n->nlevels;
+     * already 0 there. */
+    if (lv > txn->plevel) txn->plevel = lv;
 
-    for (int i = 0; i < n->nlevels; i++) {
-        struct zsi_pnode *p = update[i];
-        n->next[i] = p ? p->next[i] : txn->phead[i];
-        if (p) p->next[i] = n;
-        else   txn->phead[i] = n;
+    for (int i = 0; i < lv; i++) {
+        size_t p = update[i];
+        n->next[i] = p ? ZSI_PN(txn, p)->next[i] : txn->phead[i];
+        if (p) ZSI_PN(txn, p)->next[i] = at;
+        else   txn->phead[i] = at;
     }
 
     n->prev = update[0];
-    if (n->next[0]) n->next[0]->prev = n;
-    else            txn->ptail = n;
+    if (n->next[0]) ZSI_PN(txn, n->next[0])->prev = at;
+    else            txn->ptail = at;
 
     txn->npend++;
+    return at;
 }
 
 static void zsi_pend_clear(struct zs_txn *txn)
 {
-    struct zsi_pnode *n = txn->phead[0];
+    free(txn->parena);
+    txn->parena = NULL;
+    txn->pused = txn->pcap = 0;
 
-    while (n) {
-        struct zsi_pnode *next = n->next[0];
-        free(n->key);
-        free(n);
-        n = next;
-    }
-
-    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) txn->phead[i] = NULL;
-    txn->ptail = NULL;
+    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) txn->phead[i] = 0;
+    txn->ptail = 0;
     txn->plevel = 0;
     txn->npend = 0;
 }
@@ -6225,7 +6285,7 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
 static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
                         const char *val, size_t vallen)
 {
-    struct zsi_pnode *found = zsi_pend_find(txn, key, keylen);
+    size_t found = zsi_pend_find(txn, key, keylen);
 
     /* Bumped up front so every early return below still counts as a change:
      * an over-count costs one wasted reload, an under-count costs a cursor that
@@ -6247,15 +6307,16 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
     /* EVERYTHING fallible happens before the stream: a streamed record MUST
      * be indexed, or this handle's fold at commit would disagree with every
      * other reader's replay of the same span. */
-    char *kcopy = NULL;
-    struct zsi_pnode *node = NULL;
+    /* The level is drawn HERE, not at link time, because the arena reservation
+     * depends on it and the reservation is what can fail. */
+    int lv = 0;
     if (!found) {
-        kcopy = malloc(keylen);
-        if (!kcopy) { free(rec); return ZS_INTERNAL; }
-        memcpy(kcopy, key, keylen);
-
-        node = zsi_pend_alloc(txn, kcopy, keylen);
-        if (!node) { free(kcopy); free(rec); return ZS_INTERNAL; }
+        size_t need;
+        lv = zsi_pend_level(txn);
+        need = zsi_pend_nodelen(lv, keylen);
+        if (!need) { free(rec); return ZS_INTERNAL; }
+        r = zsi_pend_reserve(txn, need);
+        if (r != ZS_OK) { free(rec); return r; }
     }
 
     size_t off = txn->wsize;
@@ -6267,20 +6328,19 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
          * terminator over a torn record makes replay complete the file at
          * the tear (F-24) and lose the span. */
         txn->broken = true;
-        free(node);
-        free(kcopy);
+        /* The reservation stays -- it is capacity, not a node.  Nothing was
+         * linked, so the key is absent, which is what a caller reading a
+         * poisoned transaction should see. */
         return r;
     }
 
     if (found) {
-        found->off = off;
-        found->len = n;
+        ZSI_PN(txn, found)->off = off;
+        ZSI_PN(txn, found)->len = n;
         return ZS_OK;
     }
 
-    node->off = off;
-    node->len = n;
-    zsi_pend_link(txn, node);
+    zsi_pend_link(txn, key, keylen, lv, off, n);
 
     return ZS_OK;
 }
@@ -6317,7 +6377,7 @@ static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap)
 static bool zsi_txn_cur_at(struct zsi_fcur *fc, struct zsi_pnode **np)
 {
     if (!fc->txn || !fc->u.t.node) return false;
-    *np = fc->u.t.node;
+    *np = ZSI_PN(fc->txn, fc->u.t.node);
     return true;
 }
 
@@ -6335,7 +6395,7 @@ static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
 {
     struct zsi_pnode *n;
     if (!zsi_txn_cur_at(fc, &n)) return false;
-    *kp  = n->key;
+    *kp  = ZSI_PN_KEY(n);
     *klp = n->keylen;
     return true;
 }
@@ -6375,7 +6435,7 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
  * has already been yielded. */
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
 {
-    if (!fc->txn) { fc->u.t.node = NULL; return; }
+    if (!fc->txn) { fc->u.t.node = 0; return; }
 
     if (!key || !keylen) {         /* from the beginning */
         fc->u.t.node = fc->txn->phead[0];
@@ -6392,7 +6452,8 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
 static void zsi_txn_cur_step(struct zsi_fcur *fc)
 {
     if (!fc->u.t.node) return;
-    fc->u.t.node = fc->reverse ? fc->u.t.node->prev : fc->u.t.node->next[0];
+    struct zsi_pnode *n = ZSI_PN(fc->txn, fc->u.t.node);
+    fc->u.t.node = fc->reverse ? n->prev : n->next[0];
 }
 
 /* Reverse seek: largest pending key <= (inclusive) or < the given key.  A NULL
@@ -6401,7 +6462,7 @@ static void zsi_txn_cur_step(struct zsi_fcur *fc)
 static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
                                  size_t keylen, bool inclusive)
 {
-    if (!fc->txn) { fc->u.t.node = NULL; return; }
+    if (!fc->txn) { fc->u.t.node = 0; return; }
 
     if (!key || !keylen) {
         fc->u.t.node = fc->txn->ptail;
@@ -6876,8 +6937,8 @@ static int zsi_txn_commit(struct zs_txn *txn)
         /* Level 0 is every node, in key order -- which the fold does not care
          * about, but walking it is the only way to reach them all. */
         size_t i = 0;
-        for (struct zsi_pnode *n = txn->phead[0]; n; n = n->next[0])
-            offs[i++] = n->off;
+        for (size_t o = txn->phead[0]; o; o = ZSI_PN(txn, o)->next[0])
+            offs[i++] = ZSI_PN(txn, o)->off;
         noffs = i;
     }
 

@@ -1134,18 +1134,18 @@ echo "the pending set (a skiplist since 2026-08-16)"
 # back-link leaves a reverse traversal starting at the tail and stopping after
 # one record, which reads as an empty result rather than as a crash.
 mutant "pend: level 0 not doubly linked" catch \
-  's/    n->prev = update\[0\];/    n->prev = NULL;/'
+  's/    n->prev = update\[0\];/    n->prev = 0;/'
 
 # A node taller than the list must RAISE the list, or its upper links are
 # written into levels no search ever descends to -- and the node below them is
 # reachable only through level 0, so a lookup misses a key that is present.
 mutant "pend: insert does not raise the level" catch \
-  's/    if \(n->nlevels > txn->plevel\) txn->plevel = n->nlevels;/    \/* level not raised *\//'
+  's/    if \(lv > txn->plevel\) txn->plevel = lv;/    \/* level not raised *\//'
 
 # The tail is where a reverse walk STARTS (D-14k).  Failing to move it as the
 # list grows past it makes the last key invisible to every reverse cursor.
 mutant "pend: tail not moved on append" catch \
-  's/    if \(n->next\[0\]\) n->next\[0\]->prev = n;\n    else            txn->ptail = n;/    if (n->next[0]) n->next[0]->prev = n;/'
+  's/    if \(n->next\[0\]\) ZSI_PN\(txn, n->next\[0\]\)->prev = at;\n    else            txn->ptail = at;/    if (n->next[0]) ZSI_PN(txn, n->next[0])->prev = at;/'
 
 # EQUIVALENT, and listed so nobody writes a test chasing it.  A skiplist whose
 # every node is one level tall is a sorted linked list: still correct, still
@@ -1369,7 +1369,7 @@ echo "cursor liveness (D-14j)"
 # D-14j-b the other way: always advancing past the key means a seek that lands
 # ON a key skips it, so a scan from a start key loses its first record.
 mutant "cursor: txn arm always skips the seek hit" catch \
-  's/    fc->u\.t\.node = zsi_pend_lb\(fc->txn, key, keylen, NULL\);/    fc->u.t.node = zsi_pend_lb(fc->txn, key, keylen, NULL);\n    if (fc->u.t.node \&\& zsi_cmp(fc->txn->db->compar, fc->u.t.node->key,\n                                fc->u.t.node->keylen, key, keylen) == 0)\n        fc->u.t.node = fc->u.t.node->next[0];/'
+  's/    fc->u\.t\.node = zsi_pend_lb\(fc->txn, key, keylen, NULL\);/    fc->u.t.node = zsi_pend_lb(fc->txn, key, keylen, NULL);\n    if (fc->u.t.node) {\n        struct zsi_pnode *hit_ = ZSI_PN(fc->txn, fc->u.t.node);\n        if (zsi_cmp(fc->txn->db->compar, ZSI_PN_KEY(hit_), hit_->keylen,\n                    key, keylen) == 0)\n            fc->u.t.node = hit_->next[0];\n    }/'
 
 # A-1a.  The merge caches each arm's current record, so without noticing the
 # pending array changed, a write made during the traversal is never seen.

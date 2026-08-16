@@ -396,12 +396,21 @@ strided permutation. Its throughput used to **halve with every doubling of `n`**
 | 100 000 | 1 691 000/s | 124 000/s | 1 481 000/s |
 | 200 000 | 1 090 000/s | ~40 000/s | 1 110 000/s |
 
-The pending set is a skiplist now, so a store is O(log n) with no bulk movement
-and the arrival order stops mattering: at 200 000 records the random line and
-the ascending line are the same figure. **It cost 12% on the ascending case**
-(1 742 000/s → 1 538 000/s at 100 000, measured paired), which is the shape the
-array was perfect for — an append into a slot that already existed, against a
-node allocation.
+The pending set is a skiplist now — in one arena, linked by offset, the shape of
+Cyrus's skiplist file — so a store is O(log n) with no bulk movement and the
+arrival order stops mattering: at 200 000 records the random line and the
+ascending line are the same figure. **It costs about 10% on the ascending case**
+(1 697 000/s → 1 519 000/s at 100 000, medians of seven), which is the shape the
+array was perfect for — an append into a slot that already existed. The cost is
+monotonic in transaction size and disappears at the small end, where the two
+commit gates swamp it:
+
+| records per transaction | sorted array | skiplist |
+|---|---|---|
+| 10 | 201 284/s | 201 602/s |
+| 100 | 1 018 599/s | 962 557/s |
+| 1 000 | 2 241 840/s | 2 058 453/s |
+| 100 000 | 1 696 903/s | 1 519 389/s |
 
 Readers never paid it: a commit that large crosses `rollover_size` and seals
 itself (D-25d), so a reader gets a pointer section rather than a replay.
