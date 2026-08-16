@@ -784,7 +784,7 @@ mutant "type: 0x00 accepted" catch \
   's/    case ZSI_PTRS64:\n        return true;\n    \}\n\n    return false;/    case ZSI_PTRS64:\n    case 0x00:\n        return true;\n    }\n\n    return false;/'
 
 mutant "type: reserved bit ignored" catch \
-  's/static bool zsi_type_valid\(uint8_t type\)\n\{\n    switch \(type\) \{/static bool zsi_type_valid(uint8_t type)\n{\n    type \&= 0x3F;\n    switch (type) {/'
+  's/static inline bool zsi_type_valid\(uint8_t type\)\n\{\n    switch \(type\) \{/static inline bool zsi_type_valid(uint8_t type)\n{\n    type \&= 0x3F;\n    switch (type) {/'
 
 mutant "keylen boundary: 256 stays short" catch \
   's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        hdr = big \? ZSI_HDRLEN_BIGDELETION/bool big = keylen > 256\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);\n\n    if (isdelete) {\n        hdr = big ? ZSI_HDRLEN_BIGDELETION/'
@@ -833,7 +833,13 @@ mutant "decode: total not bounded by len" catch \
   's/    if \(total > len\) return ZS_BADFORMAT;/    \/* bound removed *\//'
 
 mutant "decode: unchecked keylen+vallen" catch \
-  's/        if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return ZS_BADFORMAT;/        body = keylen + vallen + 2 + 4;/'
+  's/            if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return ZS_BADFORMAT;/            body = keylen + vallen + 2 + 4;/'
+
+# The short form skips those guards because its lengths cannot wrap, which means
+# the size expression exists twice.  Two copies drift; a record sized differently
+# by the two forms puts the key and value pointers into the wrong bytes.
+mutant "decode: short form sizes a record differently" catch \
+  's/        total = zsi_roundup8\(hdr \+ keylen \+ \(isdelete \? 1 : vallen \+ 2\) \+ 4\);/        total = zsi_roundup8(hdr + keylen + (isdelete ? 1 : vallen + 2) + 12);/'
 
 mutant "decode: data record accepts COMMIT" catch \
   's/    if \(!\(type & ZSI_HASKEY\)\) return ZS_BADFORMAT;   \/\* not a data record \*\//    \/* family check removed *\//'
@@ -857,7 +863,7 @@ mutant "terminator: long csum at +16 not +20" catch \
 # non-canonical record.  Combined with F-24 that discards every committed record
 # after it, which G-3 forbids.  The mutant restores the bug; a test must object.
 mutant "decode: reject non-canonical (data loss)" catch \
-  's/    \/\* Total size, every term overflow-checked/    if (big \&\& keylen <= ZSI_SHORT_KEYLEN_MAX\n            \&\& (isdelete || vallen <= ZSI_SHORT_VALLEN_MAX))\n        return ZS_BADFORMAT;\n\n    \/* Total size, every term overflow-checked/'
+  's/    size_t total;\n    if \(big\) \{/    if (big \&\& keylen <= ZSI_SHORT_KEYLEN_MAX\n            \&\& (isdelete || vallen <= ZSI_SHORT_VALLEN_MAX))\n        return ZS_BADFORMAT;\n\n    size_t total;\n    if (big) {/'
 
 echo
 echo "pointer table cache (spec section 8)"

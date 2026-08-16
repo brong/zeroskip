@@ -899,7 +899,11 @@ static unsigned zsi_header_engine_id(const char *buf)
  * the retired 0x08 set, IsDelete with Pointers, either reserved bit set.
  * Each is a plausible result of a single flipped bit in a valid type, and each
  * must be rejected rather than half-interpreted (T-2b). */
-static bool zsi_type_valid(uint8_t type)
+/* `inline` for the reason zsi_cur_order gives -- it is called once per record
+ * decoded, and GCC leaves it out of line otherwise (1.2% of a scan for a
+ * switch).  It stays a SWITCH: F-12's table is normative and a computed
+ * predicate would be a second specification. */
+static inline bool zsi_type_valid(uint8_t type)
 {
     switch (type) {
     case ZSI_KEYVALUE:
@@ -1136,19 +1140,41 @@ static int zsi_rec_decode(const char *buf, size_t len, struct zsi_rec *out)
      * divergence while still reading the data (T-6).  zsi_rec_is_canonical below
      * is what that uses. */
 
-    /* Total size, every term overflow-checked (G-0b).  keylen + vallen + 2 is
-     * exactly the expression that turns a bounds check into a bypass when it
-     * wraps.  The +4 is F-32's trailing checksum, counted here exactly as
-     * zsi_rec_encoded_len counts it. */
-    size_t body, total;
-    if (isdelete) {
-        if (!zsi_add_sz(keylen, 1 + 4, &body)) return ZS_BADFORMAT;
+    /* Total size.  The +4 is F-32's trailing checksum, counted here exactly as
+     * zsi_rec_encoded_len counts it.
+     *
+     * The BIG form's lengths come off disk as 64-bit values, so every term is
+     * overflow-checked (G-0b): keylen + vallen + 2 is exactly the expression
+     * that turns a bounds check into a bypass when it wraps.  The SHORT form's
+     * cannot wrap and the guards are dead branches -- keylen is one byte and
+     * vallen sixteen bits, so hdr + keylen + vallen + 6 is at most 65 800 and
+     * roundup8 cannot saturate either.
+     *
+     * They are separate branches rather than one guarded path because a JOIN
+     * POINT erases what the compiler knows: with both forms assigning `keylen`,
+     * its range at the arithmetic is the union of a byte and a 64-bit load, so
+     * every check survives and every short-form record pays them.  Measured at
+     * 8.7% of a scan profile in this function, on a body that is otherwise two
+     * loads and an add.
+     *
+     * The cost of the split is that the size expression is written twice, and
+     * two copies can drift -- a record sized differently by the two forms is a
+     * key or value pointer into the wrong bytes.  `decode: short form sizes a
+     * record differently` is the mutant that holds them together. */
+    size_t total;
+    if (big) {
+        size_t body;
+        if (isdelete) {
+            if (!zsi_add_sz(keylen, 1 + 4, &body)) return ZS_BADFORMAT;
+        } else {
+            if (!zsi_add3_sz(keylen, vallen, 2 + 4, &body)) return ZS_BADFORMAT;
+        }
+        if (!zsi_add_sz(hdr, body, &total)) return ZS_BADFORMAT;
+        total = zsi_roundup8(total);
+        if (total == 0) return ZS_BADFORMAT;         /* roundup8 saturated */
     } else {
-        if (!zsi_add3_sz(keylen, vallen, 2 + 4, &body)) return ZS_BADFORMAT;
+        total = zsi_roundup8(hdr + keylen + (isdelete ? 1 : vallen + 2) + 4);
     }
-    if (!zsi_add_sz(hdr, body, &total)) return ZS_BADFORMAT;
-    total = zsi_roundup8(total);
-    if (total == 0) return ZS_BADFORMAT;             /* roundup8 saturated */
     if (total > len) return ZS_BADFORMAT;
 
     out->type     = type;
