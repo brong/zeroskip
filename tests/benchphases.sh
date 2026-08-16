@@ -35,7 +35,7 @@ trap cleanup EXIT
 # The workloads that can be split.  Everything else in zsbench either measures
 # its own setup (the store rows) or has setup that cannot cross a process
 # boundary (a live write transaction), so the run phase skips it.
-SPLIT="fetch fetch_repacked scan scan_compacted txn_scan_mixed"
+SPLIT="fetch fetch_repacked scan scan_compacted scan_interleaved scan_shadowed txn_scan_mixed"
 
 # slug,ops for the splittable rows only, sorted, so two CSVs can be diffed
 # whatever order they were produced in.
@@ -83,7 +83,7 @@ case "$setup_out" in
     *"/s "*) bad "--setup times nothing" ;;
     *)       ok "--setup times nothing" ;;
 esac
-for d in fetch fetch-repacked scan scan-compacted txnscanmix; do
+for d in fetch fetch-repacked scan scan-compacted scan-interleaved scan-shadowed txnscanmix; do
     if [ -d "$FIX/$d" ]; then ok "fixture $d built"; else bad "fixture $d built"; fi
 done
 if [ -f "$FIX/zsbench.setup" ]; then ok "stamp written"; else bad "stamp written"; fi
@@ -155,7 +155,7 @@ fi
 FIX2=$(mktemp -d "${TMPDIR:-/tmp}/zsbench-phases2.XXXXXX") || exit 1
 $ZSBENCH --path="$FIX2" --setup -n $N fetch >/dev/null 2>&1
 missing=""
-for d in fetch fetch-repacked scan scan-compacted txnscanmix; do
+for d in fetch fetch-repacked scan scan-compacted scan-interleaved scan-shadowed txnscanmix; do
     [ -d "$FIX2/$d" ] || missing="$missing $d"
 done
 check "a filtered --setup builds every fixture" "$missing" ""

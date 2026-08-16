@@ -944,6 +944,120 @@ static void bench_scan(void)
     fixture_done(compacted);
 }
 
+/* Scans where the merge actually MERGES.
+ *
+ * `full scan` above does not, and it took a profile to notice.  Its keys are
+ * stored in ascending order, so every generation -- and every repack output
+ * built from them -- holds a contiguous key range no other file touches:
+ *
+ *     gen 00000001-00000080  131072 recs  key00000000 .. key00131071
+ *     gen 00000081-000000C0   65536 recs  key00131072 .. key00196607
+ *     gen 000000C1-000000C2    2048 recs  key00196608 .. key00198655
+ *     gen 000000C3-000000C3    1024 recs  key00198656 .. key00199679
+ *
+ * So one arm is live and the rest sit on first keys above everything being
+ * yielded.  D-14e's re-sort declines to move on every step but the three file
+ * boundaries, and its duplicate scan breaks on the first comparison every time.
+ * The line measures decode and checksums with three idle arms; the ~30% it
+ * gives up against the compacted line is arm-array stride and one extra
+ * comparison per record, not merge work.  Anyone tuning zsi_cur_resort_head
+ * against it would be tuning against a workload that never calls the expensive
+ * half.
+ *
+ * These two lines are that workload, and they differ from `full scan` in the
+ * ORDER OF THE STORES and nothing else:
+ *
+ *   interleaved  keys stored in a strided permutation, so each generation is
+ *                scattered across the whole key range and every file overlaps
+ *                every other.  The winning arm changes at nearly every step, so
+ *                the re-sort lifts a 160-byte arm and shifts the array.
+ *   shadowed     every key stored TWICE, in two files that no cascade merges.
+ *                Each step finds the key duplicated, so D-14e step 3 advances
+ *                the stale arm as well and the step ends in a full
+ *                zsi_cur_sort rather than the incremental resort.
+ */
+static long long scan_stride(long long i)
+{
+    /* i -> (i * P) mod n is a permutation of [0, n) when gcd(P, n) = 1.  P is
+     * prime and larger than any n anyone benchmarks, so the only way to lose
+     * that is n being a multiple of P; the second prime covers it, and being a
+     * multiple of both needs n above 10^12. */
+    long long p = (nrecs % 1000003 == 0) ? 999983 : 1000003;
+    return (i * p) % nrecs;
+}
+
+static void scanmerge_dirs(char *inter, char *shadow, size_t sz)
+{
+    snprintf(inter, sz, "%s/scan-interleaved", workdir);
+    snprintf(shadow, sz, "%s/scan-shadowed", workdir);
+}
+
+static void scanmerge_setup(void)
+{
+    char inter[1200], shadow[1200];
+    char *val = malloc(valsize);
+    memset(val, 'v', valsize);
+    scanmerge_dirs(inter, shadow, sizeof(inter));
+
+    /* Per-record commits and the cascade left on, exactly as scan_setup does,
+     * so this line and `full scan` differ in the key order and nothing else. */
+    cleanup(inter);
+    struct zs_db *db = open_at(inter, FIXTURE_FLAGS, 0);
+    for (int i = 0; i < nrecs; i++) {
+        char k[64];
+        makekey(k, sizeof(k), (long)scan_stride(i));
+        zs_db_store(db, k, strlen(k), val, valsize, 0);
+    }
+    zs_db_close(&db);
+
+    /* One transaction per pass, because a commit that crosses rollover_size
+     * seals the generation itself (D-25d) -- so each pass lands as ONE in-order
+     * file holding every key.  Per-record commits could not: rollover_txns
+     * bounds a generation at 1024 spans as well as at rollover_size, which is
+     * what cuts `full scan`'s fixture into 1024-record generations.
+     * ZS_NOAUTOREPACK so the cascade does not merge the two passes back
+     * together, which would collapse exactly the duplicates being measured. */
+    cleanup(shadow);
+    db = open_at(shadow, FIXTURE_FLAGS | ZS_NOAUTOREPACK, 0);
+    for (int pass = 0; pass < 2; pass++) {
+        struct zs_txn *txn = NULL;
+        if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+        for (int i = 0; i < nrecs; i++) {
+            char k[64];
+            makekey(k, sizeof(k), (long)scan_stride(i));
+            zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+        }
+        if (zs_txn_commit(&txn) != ZS_OK) exit(1);
+        zs_db_seal(db);         /* whatever D-25d left behind */
+    }
+    zs_db_close(&db);
+
+    free(val);
+    if (phase == PHASE_SETUP) { setup_note(inter); setup_note(shadow); }
+}
+
+static void bench_scan_merge(void)
+{
+    char inter[1200], shadow[1200];
+    scanmerge_dirs(inter, shadow, sizeof(inter));
+
+    if (phase != PHASE_RUN) scanmerge_setup();
+    if (phase == PHASE_SETUP) return;
+
+    fixture_require(inter);
+    struct zs_db *db = open_at(inter, ZS_NOAUTOREPACK, 0);
+    bench_scan_once(db, "scan_interleaved", "full scan, interleaved");
+    zs_db_close(&db);
+
+    fixture_require(shadow);
+    db = open_at(shadow, ZS_NOAUTOREPACK, 0);
+    bench_scan_once(db, "scan_shadowed", "full scan, shadowed");
+    zs_db_close(&db);
+
+    fixture_done(inter);
+    fixture_done(shadow);
+}
+
 /* Traverse from INSIDE a write transaction, which every other read workload
  * here misses.
  *
@@ -1748,6 +1862,7 @@ int main(int argc, char **argv)
                    "to --run)\n", filter);
         bench_fetch();
         bench_scan();
+        bench_scan_merge();
         bench_txn_scan();
         stamp_write();
         /* The suggestion has to be a command that WORKS.  It omitted -n at
@@ -1778,6 +1893,7 @@ int main(int argc, char **argv)
         bench_store_into_files();
         bench_fetch();
         bench_scan();
+        bench_scan_merge();
         bench_txn_scan();
         bench_rollover_and_convert();
         bench_repack_cascade();

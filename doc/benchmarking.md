@@ -57,7 +57,9 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 | `store, one txn each` | the worst case: two `fdatasync` calls per record (C-7) |
 | `store, N per txn` | how much batching amortises those two syncs (C-7b) |
 | `fetch (N files)` | lookup cost, before and after a repack — it is proportional to the **number of files** (D-14d) |
-| `full scan` | the merge cursor over whatever file set exists |
+| `full scan` | the merge cursor over whatever file set exists — but see below: its files do not overlap, so the merge never merges |
+| `full scan, interleaved` | the same scan with files that DO overlap: D-14e's re-sort moving an arm at nearly every step |
+| `full scan, shadowed` | every key in two files: duplicate suppression and the full re-sort |
 | `store, rollover Nk` | whether a writer's inline conversion really is bounded by `rollover_size` (D-12d) |
 | `repack cascade` | one unbounded cascade (D-16b, open item 1) |
 | `snapshot open` | the per-open replay cost, without a pointer table |
@@ -324,6 +326,55 @@ order and wrong the moment the fixture is reused — a second `--run` would have
 timed the compacted database under the fragmented line's name and reported the
 merge overhead those two lines exist to isolate as zero. The cost is disk: a
 scan or fetch fixture is on disk twice.
+
+## `full scan` does not measure a merge
+
+Worth knowing before optimising anything in the merge loop, and it took a
+profile to notice. zsbench stores keys in ascending order, so every generation —
+and every repack output built from them — holds a contiguous key range that no
+other file touches:
+
+```
+gen 00000001-00000080  131072 recs  key00000000 .. key00131071
+gen 00000081-000000C0   65536 recs  key00131072 .. key00196607
+gen 000000C1-000000C2    2048 recs  key00196608 .. key00198655
+gen 000000C3-000000C3    1024 recs  key00198656 .. key00199679
+```
+
+One arm is live and the rest sit on first keys above everything being yielded.
+D-14e's re-sort declines to move at every step but the three file boundaries,
+and the duplicate scan breaks on its first comparison every time. So the line
+measures decode and checksums with three idle arms, and the ~30% it gives up
+against the compacted line is arm-array stride plus one extra comparison per
+record — not merge work.
+
+`full scan, interleaved` and `full scan, shadowed` are the shapes that do merge.
+They differ from `full scan` in the **order of the stores** and nothing else:
+
+- **interleaved** stores keys in a strided permutation, so each generation is
+  scattered across the whole key range and every file overlaps every other. The
+  winning arm changes at nearly every step, so `zsi_cur_resort_head` lifts a
+  160-byte arm and shifts the array instead of returning after one comparison.
+- **shadowed** stores every key twice, in two files no cascade merges — one
+  transaction per pass, since a commit crossing `rollover_size` seals the
+  generation itself (D-25d), and `ZS_NOAUTOREPACK` so the cascade does not put
+  the two passes back together. Every step finds its key duplicated, so step 3
+  advances the stale arm too and the step ends in a full `zsi_cur_sort`.
+
+At 20 000 records, 100-byte values, on the laptop:
+
+| | records/s | vs `full scan` |
+|---|---|---|
+| `full scan, compacted` (k=1) | 58.0M | +20% |
+| `full scan` (4 files, disjoint) | 48.2M | — |
+| `full scan, interleaved` | 37.8M | −22% |
+| `full scan, shadowed` | 29.1M | −40% |
+
+So the merge machinery costs about 40% when it is actually used, and roughly
+nothing on the workload that was being profiled. A change to
+`zsi_cur_resort_head` or to the arm layout has to be measured against the lower
+two rows; measured against `full scan` it would be measuring a workload that
+never calls the expensive half.
 
 ## Reading the rollover rows
 
