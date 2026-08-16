@@ -193,6 +193,34 @@ point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
 bounded half — at most `rollover_size` of work — and is what to reach for if the
 goal is only to stop readers replaying the active file.
 
+## The machines these numbers came from
+
+An ops/sec figure means little without one, and the two used here differ by
+about 3.5x per record:
+
+| | |
+|---|---|
+| **laptop** | Apple M5, macOS, clang |
+| **server** | AMD EPYC 7402P (Zen 2), 24C/48T, ~2.75 GHz effective, L1d 32 KiB/core, L2 512 KiB/core, L3 16 MiB/CCX, Linux, GCC |
+
+Per record, which travels better than ops/sec:
+
+| | 4-file scan | compacted (k=1) | merge overhead |
+|---|---|---|---|
+| EPYC 7402P | 52.8 ns (145 cycles) | 36.8 ns (101 cycles) | 16.0 ns / 44 cycles |
+| Apple M5 | 18.9 ns | 12.4 ns | 6.5 ns |
+
+Two things follow that are easy to get wrong the other way round. The **arms
+array is about 640 bytes** for a four-file cursor, which is 2% of the server's
+32 KiB L1d — so there is no cache *capacity* effect to find on either machine,
+and any per-arm size effect can only be stride and line-crossing. And the merge
+overhead is **44 cycles per record** on the server against roughly a third of
+that on the laptop, so a merge-loop optimisation measured only on fast silicon
+is being measured where it matters least.
+
+Most figures recorded in this file and in CLAUDE.md were taken on the laptop.
+Treat them as ratios, not absolutes.
+
 ## Fixtures are built with ZS_NOSYNC
 
 A read-only workload's database is setup, not measurement, so `bench_fetch`,
