@@ -1057,6 +1057,23 @@ mutant "compact: reports success regardless" catch \
 # launders a corrupt body: the output is written under a FRESH checksum computed
 # over the corrupt copy, and D-23 then removes the input -- the only evidence.
 echo
+echo "the active file's over-sized mapping"
+
+# The whole point: a file that grew into space the mapping already covers needs
+# no syscall.  Removing the early return restores an munmap plus an mmap on
+# every commit -- correct, and the thing that put find_vmap_area at 12% of an
+# EPYC profile.  It costs no DATA, so only a mutant can hold it.
+mutant "remap: unmaps and remaps even when the map already covers" equivalent \
+  's/    if \(f->base && \(size_t\)sb.st_size <= f->maplen\) \{\n        f->size = \(size_t\)sb.st_size;\n        return ZS_OK;\n    \}/    \/* always remap *\//'
+
+# ... and the direction that DOES lose data: bounding an access by the mapping
+# rather than by the file lets a read run past EOF into the headroom, which is
+# SIGBUS at best and another file's page at worst.  zsi_file_at bounding by
+# `size` is what makes the over-map safe at all.
+mutant "file_at: bounds by the mapping, not the file" catch \
+  's/    if \(end > f->size\) return NULL;/    if (end > f->maplen) return NULL;/'
+
+echo
 echo "the merge re-sort shortcut (D-14i-a)"
 
 # D-14i-a permits doing LESS work when the order cannot change; it does not

@@ -7148,6 +7148,108 @@ static void resort_walk(struct zs_db *db, char *out, size_t outlen)
  * step, so the shortcut must decline every time; a dominant file makes it
  * apply every time.  The naive insertion sort passes both, which is the point:
  * this pins the yields, not the effort. */
+/* The platform assumption the active file's mapping rests on: an over-sized
+ * MAP_SHARED mapping sees bytes appended through a SEPARATE descriptor,
+ * without being remapped.
+ *
+ * zsi_file_remap maps the active file with headroom and then only moves the
+ * `size` bound as it grows, which turns an munmap plus an mmap per commit into
+ * no syscall at all.  That is sound wherever the page cache is shared between
+ * a mapping and a descriptor -- Linux, macOS and the BSDs all are -- but it is
+ * an assumption about the SYSTEM rather than about this code, so it is checked
+ * here.  A platform that fails it would otherwise read zeros where committed
+ * records should be, and would find out in production.
+ *
+ * Deliberately at the syscall level rather than through the library: the point
+ * is to test the kernel's behaviour, and going through zeroskip would let a
+ * bug in zeroskip mask it. */
+static void test_file_grows_under_an_oversized_map(void)
+{
+    const size_t initial = 4096, maplen = 1u << 20, appended = 8192;
+    char *path = dbpath("oversized-map");
+    char buf[8192];
+    struct stat sb;
+    int fd, wfd;
+    const char *m;
+
+    ASSERT_EQ(mkdbdir(), 0);
+    unlink(path);
+    fd = open(path, O_RDWR | O_CREAT, 0600);
+    ASSERT(fd >= 0);
+    memset(buf, 'A', initial);
+    ASSERT_EQ((size_t)write(fd, buf, initial), initial);
+
+    /* Map far past EOF.  A platform may refuse this outright. */
+    m = mmap(NULL, maplen, PROT_READ, MAP_SHARED, fd, 0);
+    ASSERT(m != MAP_FAILED);
+    ASSERT_EQ(m[0], 'A');
+
+    /* Append through a second descriptor, which is what the writer does -- it
+     * never writes through the mapping. */
+    wfd = open(path, O_WRONLY | O_APPEND);
+    ASSERT(wfd >= 0);
+    memset(buf, 'B', appended);
+    ASSERT_EQ((size_t)write(wfd, buf, appended), appended);
+    ASSERT_EQ(fstat(fd, &sb), 0);
+    ASSERT_EQU((size_t)sb.st_size, initial + appended);
+
+    /* And the appended bytes are visible through the mapping made BEFORE them,
+     * with no remap in between.  This is the whole assumption. */
+    for (size_t off = initial; off < initial + appended; off++) {
+        if (m[off] != 'B') {
+            fprintf(stderr, "\n    FAIL byte %zu reads 0x%02x, expected 'B' -- "
+                            "this platform does not show appends through an "
+                            "existing mapping\n", off, (unsigned char)m[off]);
+            current_test_failed = 1;
+            break;
+        }
+    }
+
+    ASSERT_EQ(munmap((void *)m, maplen), 0);
+    close(wfd);
+    close(fd);
+    unlink(path);
+}
+
+/* The active file is mapped with HEADROOM, and access is bounded by the file
+ * rather than by the mapping.
+ *
+ * These are two halves of one thing.  The headroom is what removes the munmap
+ * and mmap from every commit; bounding by `size` is the only reason the
+ * headroom is safe, since reading into it past EOF is SIGBUS.  Everywhere else
+ * in the suite maplen == size, so the difference between the two bounds is
+ * invisible -- which is why "file_at: bounds by the mapping, not the file" went
+ * NOT CAUGHT until this existed. */
+static void test_active_file_headroom_is_bounded_by_size(void)
+{
+    struct zs_db *db = fresh_db_noautorepack();
+    struct zsi_file *act;
+
+    ASSERT_NOT_NULL(db);
+    /* A few commits, so the commit-site fold has remapped with headroom. */
+    for (int i = 0; i < 5; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+
+    act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    ASSERT(act->size > 0);
+    ASSERT(act->maplen > act->size);            /* headroom really is applied */
+
+    /* The last real byte is reachable... */
+    ASSERT_NOT_NULL(zsi_file_at(act, act->size - 1, 1));
+    /* ...and the first byte of headroom is NOT, though the mapping covers it.
+     * Bounding by maplen here would hand out a pointer past EOF, which reads
+     * as SIGBUS rather than as data. */
+    ASSERT_NULL(zsi_file_at(act, act->size, 1));
+    ASSERT_NULL(zsi_file_at(act, act->size, 64));
+    ASSERT_NULL(zsi_file_at(act, act->maplen - 1, 1));
+
+    zs_db_close(&db);
+}
+
 static void test_cursor_resort_no_move(void)
 {
     struct zs_db *db;
@@ -16504,6 +16606,10 @@ static struct test_entry tests[] = {
                                         test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
+    { "test_file_grows_under_an_oversized_map",
+                                    test_file_grows_under_an_oversized_map },
+    { "test_active_file_headroom_is_bounded_by_size",
+                                    test_active_file_headroom_is_bounded_by_size },
     { "test_cursor_resort_no_move",      test_cursor_resort_no_move },
     { "test_txn_arm_step_hint",          test_txn_arm_step_hint },
     { "test_ifchanged_writes_nothing",   test_ifchanged_writes_nothing },

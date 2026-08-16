@@ -1532,28 +1532,66 @@ static int zsi_file_open(const char *dir, const char *name,
     return ZS_OK;
 }
 
-/* Re-stat and re-map after appending, so bytes written through a separate
- * descriptor become visible through this object.
+/* Re-stat after appending, so bytes written through a separate descriptor
+ * become visible through this object -- re-mapping only when it has to.
  *
  * Needed because a writer maintains the active file's index incrementally
  * (D-13b) and the index holds offsets that must be readable.  Only ever called
  * on a file nobody else is reading -- see the refcount guard at the call site --
- * because replacing a mapping under a live reader is exactly what G-6 forbids. */
-static int zsi_file_remap(struct zsi_file *f)
+ * because replacing a mapping under a live reader is exactly what G-6 forbids.
+ *
+ * `maplen` is deliberately allowed to EXCEED `size`.  A mapping that already
+ * covers the file's new end needs no syscall at all: the page cache is shared
+ * with the writing descriptor, so an append becomes visible through a mapping
+ * made before it.  So the active file is mapped once with headroom and then
+ * grows underneath the map for the rest of its life, instead of being unmapped
+ * and remapped on every commit.
+ *
+ * That is not a micro-optimisation.  A sole writer takes this branch at every
+ * commit (the refcount is 1 whenever nobody is reading), so per-record commits
+ * meant an munmap plus an mmap each -- and the active file grows toward
+ * rollover_size, so by the end each one was tearing down and refaulting
+ * hundreds of pages.  On an EPYC server under `perf record -e cache-misses`,
+ * find_vmap_area alone was 12% of the profile and the whole mmap path about
+ * 20%, against a merge loop that did not appear at all.
+ *
+ * Reading past EOF in an over-sized mapping is SIGBUS, which is exactly why
+ * this is safe HERE and would not be everywhere: zsi_file_at is the single
+ * bounds-checked accessor and it bounds every access by `size`, never by
+ * `maplen`.  Nothing else indexes `base`.  And files are append-only, so the
+ * bound only ever moves up.
+ *
+ * `mapahead` is a hint, not a commitment: a failed over-sized mmap falls back
+ * to an exact one, and a platform that would not show the growth is caught by
+ * test_file_grows_under_an_oversized_map rather than by a wrong answer. */
+static int zsi_file_remap(struct zsi_file *f, size_t mapahead)
 {
     struct stat sb;
 
     if (fstat(f->fd, &sb) < 0) return ZS_IOERROR;
     if ((size_t)sb.st_size == f->size) return ZS_OK;
 
+    /* The common case once the headroom is in place: the file grew into space
+     * the mapping already covers, so only the bound moves. */
+    if (f->base && (size_t)sb.st_size <= f->maplen) {
+        f->size = (size_t)sb.st_size;
+        return ZS_OK;
+    }
+
     if (f->base) { munmap((void *)f->base, f->maplen); f->base = NULL; f->maplen = 0; }
     f->size = (size_t)sb.st_size;
 
     if (f->size) {
-        void *m = mmap(NULL, f->size, PROT_READ, MAP_SHARED, f->fd, 0);
-        if (m == MAP_FAILED) { f->size = 0; return ZS_IOERROR; }
+        size_t want = mapahead > f->size ? mapahead : f->size;
+        void *m = mmap(NULL, want, PROT_READ, MAP_SHARED, f->fd, 0);
+        if (m == MAP_FAILED) {
+            /* Headroom is optional; the file itself is not. */
+            want = f->size;
+            m = mmap(NULL, want, PROT_READ, MAP_SHARED, f->fd, 0);
+            if (m == MAP_FAILED) { f->size = 0; return ZS_IOERROR; }
+        }
         f->base = (const char *)m;
-        f->maplen = f->size;
+        f->maplen = want;
     }
 
     return ZS_OK;
@@ -6735,7 +6773,7 @@ static int zsi_txn_commit(struct zs_txn *txn)
      * the file is both simpler and the actual question. */
     if (act && offs && act->refcount == 1
         && act->hdr.start == gen && act->index) {
-        r = zsi_file_remap(act);
+        r = zsi_file_remap(act, db->rollover_size);
         if (r == ZS_OK) {
             act->complete = act->size;
             /* The span just written ends the file, so its terminator is the one
