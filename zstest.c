@@ -15700,6 +15700,45 @@ static void test_cursor_reverse_prefix(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* The same exclusive bound, on the TRANSACTION arm.
+ *
+ * test_cursor_reverse_prefix above stores everything first, so its keys are in
+ * files and only the file arms' seek is exercised.  The transaction arm is a
+ * separate seek with its own inclusivity, and nothing reached it: when the
+ * pending set became a skiplist the mutant `cursor: reverse txn arm resumes
+ * inclusively` went NOT CAUGHT, because the other half of what it used to break
+ * -- resuming past a yielded key -- now lives in zsi_cursor_reseek_arm and
+ * compensated for it.  What is left is exactly this: a reverse prefix scan whose
+ * PENDING records include the prefix's byte-successor as a real key. */
+static void test_txn_cursor_reverse_prefix_bound(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    struct zs_cursor *c = NULL;
+    char got[256];
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+
+    ASSERT_OK(zs_txn_store(txn, "b1", 2, "x", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "b2", 2, "x", 1, 0));
+    ASSERT_OK(zs_txn_store(txn, "b3", 2, "x", 1, 0));
+    /* "c" is the byte-successor of prefix "b".  An inclusive seek starts the
+     * scan ON it, the prefix test then fails, and a populated range reports
+     * empty. */
+    ASSERT_OK(zs_txn_store(txn, "c", 1, "x", 1, 0));
+
+    ASSERT_OK(zs_txn_begin_cursor(txn, "b", 1, &c,
+                                  ZS_REVERSE | ZS_CURSOR_PREFIX));
+    collect_cursor_keys(c, got, sizeof(got));
+    zs_cursor_fini(&c);
+    ASSERT_STR_EQ(got, "b3|b2|b1");
+
+    ASSERT_OK(zs_txn_abort(&txn));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* D-14j reversed: a store BELOW the position -- ahead, in the direction of
  * travel -- is yielded when reached; one above is already passed and is not.
  * And write-through at the current position works (A-13). */
@@ -16985,6 +17024,8 @@ static struct test_entry tests[] = {
                                         test_cursor_reverse_seek_and_skiproot },
     { "test_cursor_reverse_tombstones", test_cursor_reverse_tombstones },
     { "test_cursor_reverse_prefix",     test_cursor_reverse_prefix },
+    { "test_txn_cursor_reverse_prefix_bound",
+                                        test_txn_cursor_reverse_prefix_bound },
     { "test_cursor_reverse_own_writes", test_cursor_reverse_own_writes },
     { "test_reverse_rejected_compositions",
                                         test_reverse_rejected_compositions },

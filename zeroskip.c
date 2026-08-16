@@ -3371,51 +3371,28 @@ struct zsi_fcur {
         } f;
 
         struct {
-            /* txn: the KEY reached, not an index into the pending array
-             * (D-14j-a).
+            /* txn: the NODE reached, and nothing else.
              *
-             * An index is the trap.  The pending array is sorted and a write
-             * during the traversal inserts into it, shifting every element
-             * from the insertion point onward -- so an index stops referring
-             * to the record it referred to, and the cursor re-yields a key it
-             * has already returned.  A key survives that, and makes a write
-             * ahead of the cursor visible, which is what A-1a and cyrusdb both
-             * want.  In reverse, NULL means "after the last" instead, and
-             * `exclusive` records whether a seek bound was < rather than <= --
-             * it only matters until the first record is consumed (`started`),
-             * after which the position is always strictly below `key`.
+             * A skiplist node never moves and is freed only when the
+             * transaction ends, so a position is a pointer: a step is
+             * node->next[0], a reverse step is node->prev, and a write during
+             * the traversal cannot invalidate either.
              *
-             * BORROWED, not owned.  Two sources, both stable for as long as
-             * the arm can read them:
+             * This was six fields and a binary search per step.  With the
+             * pending set as a sorted ARRAY, an index stopped referring to its
+             * record the moment an insert shifted the array (D-14j-a), so the
+             * position had to be the KEY, re-resolved on every load, with the
+             * resolved index cached beside it behind two guards -- both of
+             * which were unreachable through a cursor, since any write bumps
+             * pend_seq and the resulting refresh cleared the other.  The
+             * skiplist deletes the problem rather than the guards.
              *
-             *   - after a step, the PENDING ARRAY's own key for the record
-             *     just yielded (loadedkey).  zsi_pend_set mallocs each key
-             *     once; an insert memmoves the ENTRIES and may realloc the
-             *     array, and an overwrite repoints off/len -- neither moves a
-             *     key block.  They are freed only by zsi_pend_clear, from
-             *     zsi_txn_free.  So the array moving underneath us, which is
-             *     the whole of D-14j-a, does not move this.
-             *   - after a seek, the caller's key.  Every call site passes one
-             *     that outlives the arm: the cursor's own start_key or
-             *     rev_succ, its last_key (borrowed in turn from a record, so
-             *     A-4-stable), or a lookup key held across the call by
-             *     zsi_fcur_find's scratch arm.
-             *
-             * Copying instead was a malloc + memcpy + free on EVERY step of a
-             * traversal inside a write transaction. */
-            const char   *key;
-            size_t        keylen;
-
-            /* The pending array's key for the record currently loaded, and its
-             * index, recorded by the load that landed on them.  Only
-             * meaningful while !exhausted. */
-            const char   *loadedkey;
-            size_t        loadedkeylen;
-            size_t        loadedti;
-            unsigned long loadedseq;    /* the pend_seq that index was true at */
-
-            bool          started;
-            bool          exclusive;
+             * What survives is at the CURSOR level, where it always belonged:
+             * a refresh re-seeks this arm from the cursor's resume key
+             * (D-14j-b, zsi_cursor_reseek_arm), because a write may land
+             * between the last key yielded and wherever this arm is sitting --
+             * the arm reads one record AHEAD of what the caller has seen. */
+            struct zsi_pnode *node;
         } t;
     } u;
 };
@@ -3428,6 +3405,7 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc);
 static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
                                  size_t *klp);
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
+static void zsi_txn_cur_step(struct zsi_fcur *fc);
 static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
                                  size_t keylen, bool inclusive);
 
@@ -3520,9 +3498,7 @@ static int zsi_fcur_seek_first(struct zsi_fcur *fc)
     case ZSI_SRC_INORDER:   fc->u.f.pi = 0; break;
     case ZSI_SRC_UNORDERED: zsi_index_cur_seek_first(&fc->u.f.ic); break;
     case ZSI_SRC_TXN:
-        fc->u.t.key = NULL;
-        fc->u.t.keylen = 0;
-        fc->u.t.started = false;
+        zsi_txn_cur_seek(fc, NULL, 0);             /* the head */
         break;
     }
 
@@ -3572,10 +3548,7 @@ static int zsi_fcur_seek_last(struct zsi_fcur *fc)
         zsi_index_cur_seek_last(fc->file->index, &fc->u.f.ic);
         break;
     case ZSI_SRC_TXN:
-        fc->u.t.key = NULL;
-        fc->u.t.keylen = 0;
-        fc->u.t.started = false;
-        fc->u.t.exclusive = false;
+        zsi_txn_cur_seek_rev(fc, NULL, 0, true);   /* the tail (D-14k) */
         break;
     }
 
@@ -3601,16 +3574,11 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
             zsi_index_cur_next(fc->file->index, fc->compar, &fc->u.f.ic);
         break;
     case ZSI_SRC_TXN:
-        /* Remember the key just yielded, so the next load finds its successor
-         * in the array as it stands THEN -- which is the whole point (D-14j-a).
-         *
-         * The pending array's own key for it, recorded by the load that landed
-         * here, so a write from a callback may move the ARRAY without moving
-         * this.  See the tkey comment on struct zsi_fcur for why that holds. */
-        fc->u.t.key = fc->u.t.loadedkey;
-        fc->u.t.keylen = fc->u.t.loadedkeylen;
-        fc->u.t.started = true;
-
+        /* One link.  The node cannot have moved -- see struct zsi_fcur -- so
+         * there is nothing to re-resolve, and a write landing between the last
+         * key yielded and this position is caught by the cursor's refresh
+         * re-seeking the arm (D-14j-b), not by the arm second-guessing itself. */
+        zsi_txn_cur_step(fc);
         break;
     }
 
@@ -5819,21 +5787,54 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 static int zsi_write_all(int fd, const char *buf, size_t len);
 static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
 
-/* A transaction's own uncommitted records: a sorted KEY -> OFFSET index over
+/* A transaction's own uncommitted records: an ordered KEY -> OFFSET index over
  * records already streamed into the active file (C-8's shape).  The key is an
- * owned copy -- the sorted index and D-14j-a's key-based cursor positions need
- * it -- but the VALUE lives in the file: transaction memory is O(keys), never
- * O(bytes written), so a terabyte transaction does not eat a terabyte of RAM.
+ * owned copy -- the ordering and the cursor's positions need it -- but the
+ * VALUE lives in the file: transaction memory is O(keys), never O(bytes
+ * written), so a terabyte transaction does not eat a terabyte of RAM.
  *
  * They are the highest-priority source in D-14's table, visible to subsequent
  * reads on the same transaction and to nothing else until commit (A-1a).
  * A same-key overwrite appends a new record and repoints `off`; the old
  * record becomes a shadowed version in the span, exactly like a shadowed
- * version across spans, and vanishes at the file's next conversion. */
-struct zsi_pending {
-    char   *key;  size_t keylen;
-    size_t  off;                      /* record offset in the active file */
-    size_t  len;                      /* its encoded length */
+ * version across spans, and vanishes at the file's next conversion.
+ *
+ * A SKIPLIST, since 2026-08-16.  It was a single sorted array, which splices a
+ * new key in with a memmove -- and the cost of that depends entirely on the
+ * order the keys arrive in.  Ascending keys land at the end and move nothing;
+ * a key arriving anywhere else moves half the array, so a transaction cost
+ * O(n^2) in the number of DISTINCT keys it held.  Measured at 0.19s ascending
+ * against 4.99s random for 200 000 records in one transaction, four times the
+ * time for twice the keys, and no benchmark could see it because every store
+ * workload wrote ascending keys (`store, all in one txn, random` exists now).
+ * The file already said so in ZSI_DELTA_MAX's comment, about the read-side
+ * index: "a single sorted array with no delta would memmove the entire index
+ * per commit".  The pending set was that array.
+ *
+ * The base+delta shape that comment describes was the other candidate.  A
+ * skiplist was chosen over it for a reason that is not performance: **a node
+ * never moves**, so a cursor's position can be a POINTER.  D-14j-a exists
+ * entirely because an array index stops referring to its record when an insert
+ * shifts the array -- the arm had to hold a key and re-resolve it by binary
+ * search on every step, with a cached index behind two guards that no test
+ * could reach through a cursor.  All of that is gone: `struct zsi_fcur`'s
+ * transaction half is one pointer, a step is `node->next[0]`, and the arm
+ * cannot be invalidated by a write at all.  What remains of D-14j-a is the
+ * cursor-level rule that a refresh re-seeks from the CURSOR's resume key
+ * (D-14j-b), which was always the part that mattered.
+ *
+ * Level 0 is doubly linked because D-14k walks backwards and a skiplist is
+ * otherwise forward-only; `prev` is what makes a reverse step O(1) rather than
+ * a fresh search per record. */
+#define ZSI_PEND_MAXLEVEL 16     /* 4^16 nodes at p = 1/4, far past any txn */
+
+struct zsi_pnode {
+    char             *key;  size_t keylen;
+    size_t            off;            /* record offset in the active file */
+    size_t            len;            /* its encoded length */
+    struct zsi_pnode *prev;           /* level 0 only (D-14k) */
+    int               nlevels;
+    struct zsi_pnode *next[];         /* nlevels entries */
 };
 
 /* One read-only mapping of the active file.  A transaction accumulates these
@@ -5854,8 +5855,12 @@ struct zs_txn {
      * what makes its cursors observe this handle's later commits (D-14j). */
     bool                 implicit;
 
-    struct zsi_pending  *pend;
-    size_t               npend, apend;
+    /* The pending set (see struct zsi_pnode): a skiplist, not an array. */
+    struct zsi_pnode    *phead[ZSI_PEND_MAXLEVEL];
+    struct zsi_pnode    *ptail;       /* for a reverse walk's start (D-14k) */
+    int                  plevel;      /* levels currently in use */
+    size_t               npend;
+    uint64_t             prand;       /* level generator, seeded at begin */
 
     /* Bumped on every change to `pend`.  A cursor over this transaction caches
      * the arm's current record, so it needs to know when that cache is stale --
@@ -5894,32 +5899,141 @@ struct zs_txn {
     struct zsi_hold      hold;
 };
 
-static int zsi_pend_search(struct zs_txn *txn, const char *key, size_t keylen,
-                           size_t *pos)
+/* The first node with key >= the given one, or NULL past the end.
+ *
+ * `update`, when asked for, is the descent path: the last node strictly below
+ * the key at each level, NULL meaning the head.  An insert splices into exactly
+ * those links, which is why the search and the insert are one walk. */
+static struct zsi_pnode *zsi_pend_lb(struct zs_txn *txn, const char *key,
+                                     size_t keylen, struct zsi_pnode **update)
 {
-    size_t lo = 0, hi = txn->npend;
+    struct zsi_pnode *x = NULL, *n = NULL;
 
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        int c = zsi_cmp(txn->db->compar, txn->pend[mid].key, txn->pend[mid].keylen,
-                                key, keylen);
-        if (c < 0) lo = mid + 1;
-        else hi = mid;
+    for (int lv = txn->plevel - 1; lv >= 0; lv--) {
+        /* x was reached AT this level or above, so x->next[lv] is in range. */
+        n = x ? x->next[lv] : txn->phead[lv];
+        while (n && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) < 0) {
+            x = n;
+            n = x->next[lv];
+        }
+        if (update) update[lv] = x;
     }
 
-    *pos = lo;
-    if (lo < txn->npend
-        && zsi_cmp(txn->db->compar, txn->pend[lo].key, txn->pend[lo].keylen,
-                           key, keylen) == 0)
-        return ZS_OK;
+    return n;               /* level 0's candidate, or NULL for an empty list */
+}
 
-    return ZS_NOTFOUND;
+static struct zsi_pnode *zsi_pend_find(struct zs_txn *txn, const char *key,
+                                       size_t keylen)
+{
+    struct zsi_pnode *n = zsi_pend_lb(txn, key, keylen, NULL);
+
+    if (n && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) == 0)
+        return n;
+    return NULL;
+}
+
+/* The largest key <= (inclusive) or < (exclusive) the given one: a reverse
+ * seek's landing point (D-14k).  The lower bound's PREDECESSOR is the strictly
+ * smaller answer, and it is already linked at level 0. */
+static struct zsi_pnode *zsi_pend_lt(struct zs_txn *txn, const char *key,
+                                     size_t keylen, bool inclusive)
+{
+    struct zsi_pnode *n = zsi_pend_lb(txn, key, keylen, NULL);
+
+    if (inclusive && n
+        && zsi_cmp(txn->db->compar, n->key, n->keylen, key, keylen) == 0)
+        return n;
+
+    return n ? n->prev : txn->ptail;
+}
+
+/* A node's level: geometric with p = 1/4, from a per-transaction xorshift.
+ *
+ * Deterministic on purpose -- a level depends on nothing but the sequence, so
+ * there is no input that can degrade the structure, and a reproducible shape is
+ * worth more here than an unpredictable one.  No syscall either: zsi_random_bytes
+ * reads /dev/urandom, which is fine once per database and not once per store. */
+static int zsi_pend_level(struct zs_txn *txn)
+{
+    int lv = 1;
+
+    while (lv < ZSI_PEND_MAXLEVEL) {
+        txn->prand ^= txn->prand << 13;
+        txn->prand ^= txn->prand >> 7;
+        txn->prand ^= txn->prand << 17;
+        if ((txn->prand & 3) != 0) break;
+        lv++;
+    }
+
+    return lv;
+}
+
+/* Allocating and LINKING a node are separate because everything that can fail
+ * must happen before the record is streamed: a streamed record must be indexed,
+ * or this handle's commit-time fold would disagree with every other reader's
+ * replay of the same span.  The link itself cannot fail, and a store whose
+ * stream fails frees the node instead -- leaving the key absent, which is what
+ * a caller reading a poisoned transaction should see. */
+static struct zsi_pnode *zsi_pend_alloc(struct zs_txn *txn, char *kcopy,
+                                        size_t keylen)
+{
+    int lv = zsi_pend_level(txn);
+    struct zsi_pnode *n = malloc(sizeof(*n) + (size_t)lv * sizeof(n->next[0]));
+
+    if (!n) return NULL;
+
+    n->key = kcopy;
+    n->keylen = keylen;
+    n->off = 0;
+    n->len = 0;
+    n->prev = NULL;
+    n->nlevels = lv;
+    for (int i = 0; i < lv; i++) n->next[i] = NULL;
+
+    return n;
+}
+
+/* Splice a node the caller has established is absent.  One walk: the descent
+ * path IS the set of links to rewrite. */
+static void zsi_pend_link(struct zs_txn *txn, struct zsi_pnode *n)
+{
+    struct zsi_pnode *update[ZSI_PEND_MAXLEVEL];
+
+    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = NULL;
+    zsi_pend_lb(txn, n->key, n->keylen, update);
+
+    /* Levels above the current top are reached from the head, and update[] is
+     * already NULL there. */
+    if (n->nlevels > txn->plevel) txn->plevel = n->nlevels;
+
+    for (int i = 0; i < n->nlevels; i++) {
+        struct zsi_pnode *p = update[i];
+        n->next[i] = p ? p->next[i] : txn->phead[i];
+        if (p) p->next[i] = n;
+        else   txn->phead[i] = n;
+    }
+
+    n->prev = update[0];
+    if (n->next[0]) n->next[0]->prev = n;
+    else            txn->ptail = n;
+
+    txn->npend++;
 }
 
 static void zsi_pend_clear(struct zs_txn *txn)
 {
-    for (size_t i = 0; i < txn->npend; i++)
-        free(txn->pend[i].key);
+    struct zsi_pnode *n = txn->phead[0];
+
+    while (n) {
+        struct zsi_pnode *next = n->next[0];
+        free(n->key);
+        free(n);
+        n = next;
+    }
+
+    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) txn->phead[i] = NULL;
+    txn->ptail = NULL;
+    txn->plevel = 0;
     txn->npend = 0;
 }
 
@@ -6111,8 +6225,7 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
 static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
                         const char *val, size_t vallen)
 {
-    size_t pos;
-    bool found = (zsi_pend_search(txn, key, keylen, &pos) == ZS_OK);
+    struct zsi_pnode *found = zsi_pend_find(txn, key, keylen);
 
     /* Bumped up front so every early return below still counts as a change:
      * an over-count costs one wasted reload, an under-count costs a cursor that
@@ -6135,18 +6248,14 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
      * be indexed, or this handle's fold at commit would disagree with every
      * other reader's replay of the same span. */
     char *kcopy = NULL;
+    struct zsi_pnode *node = NULL;
     if (!found) {
         kcopy = malloc(keylen);
         if (!kcopy) { free(rec); return ZS_INTERNAL; }
         memcpy(kcopy, key, keylen);
 
-        if (txn->npend == txn->apend) {
-            size_t want = txn->apend ? txn->apend * 2 : 16;
-            struct zsi_pending *p = realloc(txn->pend, want * sizeof(*p));
-            if (!p) { free(kcopy); free(rec); return ZS_INTERNAL; }
-            txn->pend = p;
-            txn->apend = want;
-        }
+        node = zsi_pend_alloc(txn, kcopy, keylen);
+        if (!node) { free(kcopy); free(rec); return ZS_INTERNAL; }
     }
 
     size_t off = txn->wsize;
@@ -6158,23 +6267,20 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
          * terminator over a torn record makes replay complete the file at
          * the tear (F-24) and lose the span. */
         txn->broken = true;
+        free(node);
         free(kcopy);
         return r;
     }
 
     if (found) {
-        txn->pend[pos].off = off;
-        txn->pend[pos].len = n;
+        found->off = off;
+        found->len = n;
         return ZS_OK;
     }
 
-    memmove(txn->pend + pos + 1, txn->pend + pos,
-            (txn->npend - pos) * sizeof(*txn->pend));
-    txn->pend[pos].key = kcopy;
-    txn->pend[pos].keylen = keylen;
-    txn->pend[pos].off = off;
-    txn->pend[pos].len = n;
-    txn->npend++;
+    node->off = off;
+    node->len = n;
+    zsi_pend_link(txn, node);
 
     return ZS_OK;
 }
@@ -6183,36 +6289,6 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
  *
  * Presenting pending records through the same interface as a file is what lets
  * D-14g work by sorting rather than by a special case in the merge. */
-/* Resolve the transaction arm's key position to an index, NOW.
- *
- * Done on every load rather than once, because the pending array may have moved
- * under us since the last step: that is the whole point of holding a key
- * (D-14j-a).  Before the first step tkey is NULL, meaning "start at the
- * beginning"; afterwards it is the last key yielded and the next record is the
- * first strictly after it (D-14j-b). */
-static size_t zsi_txn_cur_index(struct zsi_fcur *fc)
-{
-    size_t pos = 0;
-
-    if (!fc->txn || !fc->u.t.key) return 0;        /* from the beginning */
-
-    /* The step hint, valid only after a STEP and only while the array has not
-     * been written to.  See struct zsi_fcur: this is what keeps a traversal
-     * O(n) rather than O(n log n), and it is a cache of the search below, never
-     * a replacement for the key D-14j-a requires the position to be. */
-    if (fc->u.t.started && fc->u.t.loadedseq == zsi_txn_seq(fc->txn))
-        return fc->u.t.loadedti + 1;
-
-    /* An exact hit means the array still holds the key we are positioned on.
-     * After a step that key has been yielded, so the next record is the one
-     * after it (D-14j-b); after a seek it has not, so it is the answer. */
-    if (zsi_pend_search(fc->txn, fc->u.t.key, fc->u.t.keylen, &pos) == ZS_OK
-        && fc->u.t.started)
-        pos++;
-
-    return pos;
-}
-
 static unsigned long zsi_txn_seq(struct zs_txn *txn)
 {
     return txn ? txn->pend_seq : 0;
@@ -6226,66 +6302,26 @@ static void zsi_txn_set_snapshot(struct zs_txn *txn, struct zsi_snapshot *snap)
     txn->snap->refcount++;
 }
 
-/* The reverse mirror of zsi_txn_cur_index, D-14j-a intact: the position is a
- * key, resolved against the array as it stands NOW, so a store below the
- * position mid-walk is seen and one at or above it is already passed.
- * Returns false when the arm is exhausted. */
-static bool zsi_txn_cur_index_rev(struct zsi_fcur *fc, size_t *ti)
+/* The node this cursor is positioned on, without touching a byte of the record.
+ * Both the load below and the exact-match test in zsi_fcur_find go through here
+ * so they cannot disagree about WHERE the cursor is -- which matters more than
+ * it looks, since the two would then answer for different records and a lookup
+ * would return the wrong value.
+ *
+ * A node, not an index.  This used to resolve a KEY against the pending array on
+ * every load, because an array index stops referring to its record the moment an
+ * insert shifts the array (D-14j-a) -- a binary search per step, with a cached
+ * index behind two guards no test could reach through a cursor.  A skiplist node
+ * never moves and is freed only when the transaction ends, so the position is
+ * simply the node, and a write cannot invalidate it. */
+static bool zsi_txn_cur_at(struct zsi_fcur *fc, struct zsi_pnode **np)
 {
-    struct zs_txn *txn = fc->txn;
-    size_t pos;
-
-    if (!txn->npend) return false;
-
-    if (fc->u.t.started && fc->u.t.loadedseq == zsi_txn_seq(txn)) {
-        if (fc->u.t.loadedti == 0) return false;   /* the step hint, mirrored */
-        *ti = fc->u.t.loadedti - 1;
-        return true;
-    }
-
-    if (!fc->u.t.key) {                            /* "after the last": the top */
-        *ti = txn->npend - 1;
-        return true;
-    }
-
-    bool exact = (zsi_pend_search(txn, fc->u.t.key, fc->u.t.keylen, &pos) == ZS_OK);
-
-    /* An inclusive seek that landed on a present key answers with it; after a
-     * yield (tstarted), or under an exclusive bound, the answer is strictly
-     * below -- pos counts the keys strictly below tkey either way. */
-    if (exact && !fc->u.t.started && !fc->u.t.exclusive) {
-        *ti = pos;
-        return true;
-    }
-    if (pos == 0) return false;
-    *ti = pos - 1;
+    if (!fc->txn || !fc->u.t.node) return false;
+    *np = fc->u.t.node;
     return true;
 }
 
-/* The pending entry this cursor is positioned on, without touching a byte of
- * the record.  Both the load below and the exact-match test in zsi_fcur_find
- * go through here so they cannot disagree about WHERE the cursor is -- which
- * matters more than it looks, since the two would then answer for different
- * records and a lookup would return the wrong value. */
-static bool zsi_txn_cur_at(struct zsi_fcur *fc, size_t *tip)
-{
-    struct zs_txn *txn = fc->txn;
-    size_t ti;
-
-    if (!txn) return false;
-
-    if (fc->reverse) {
-        if (!zsi_txn_cur_index_rev(fc, &ti)) return false;
-    } else {
-        ti = zsi_txn_cur_index(fc);
-    }
-    if (ti >= txn->npend) return false;
-
-    *tip = ti;
-    return true;
-}
-
-/* The key at the cursor's position, straight from the pending array.
+/* The key at the cursor's position, straight from the pending set.
  *
  * zsi_pend_set records the key alongside the offset, so an exact-match test
  * needs no record at all -- which is the whole point: materialising it would
@@ -6297,22 +6333,20 @@ static bool zsi_txn_cur_at(struct zsi_fcur *fc, size_t *tip)
 static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
                                  size_t *klp)
 {
-    size_t ti;
-    if (!zsi_txn_cur_at(fc, &ti)) return false;
-    *kp  = fc->txn->pend[ti].key;
-    *klp = fc->txn->pend[ti].keylen;
+    struct zsi_pnode *n;
+    if (!zsi_txn_cur_at(fc, &n)) return false;
+    *kp  = n->key;
+    *klp = n->keylen;
     return true;
 }
 
 static int zsi_txn_cur_load(struct zsi_fcur *fc)
 {
     struct zs_txn *txn = fc->txn;
-    size_t ti;
+    struct zsi_pnode *n;
 
-    if (!zsi_txn_cur_at(fc, &ti)) {
+    if (!zsi_txn_cur_at(fc, &n)) {
         fc->exhausted = true;
-        fc->u.t.loadedkey = NULL;
-        fc->u.t.loadedkeylen = 0;
         return ZS_OK;
     }
 
@@ -6321,62 +6355,60 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
      * pointers live until the transaction ends (A-4) -- or straight out of the
      * chunk buffer, if whoever opened this source accepted A-4b's shorter
      * lifetime. */
-    struct zsi_pending *p = &txn->pend[ti];
-    const char *b = zsi_txn_at(txn, p->off, p->len, fc->ephemeral);
-    if (!b
-        || zsi_rec_decode(b, p->len, &fc->cur) != ZS_OK) {
+    const char *b = zsi_txn_at(txn, n->off, n->len, fc->ephemeral);
+    if (!b || zsi_rec_decode(b, n->len, &fc->cur) != ZS_OK) {
         fc->exhausted = true;
-        fc->u.t.loadedkey = NULL;
-        fc->u.t.loadedkeylen = 0;
         return ZS_IOERROR;
     }
     fc->exhausted = false;
-
-    /* Where the step past this record will resume from.  Recorded HERE, beside
-     * the entry it came from, so advancing needs no second search -- and taken
-     * from the pending array rather than from the record just decoded, because
-     * the decoded key may live in the writer's chunk buffer under A-4b whereas
-     * this one is stable for the whole transaction. */
-    fc->u.t.loadedkey = p->key;
-    fc->u.t.loadedkeylen = p->keylen;
-    fc->u.t.loadedti = ti;
-    fc->u.t.loadedseq = zsi_txn_seq(txn);
 
     return ZS_OK;
 }
 
 /* Seek to the first pending record with key >= the given key.
  *
- * Recorded as "the key before this one" rather than as a position: tstarted
- * stays false so the next load begins at the search result, which
- * zsi_txn_cur_index recomputes against the array as it is then. */
+ * Resolved to a NODE here rather than recorded as a key to resolve later.  The
+ * deferral existed because the array could move between the seek and the load;
+ * a node cannot, and every caller loads immediately anyway (zsi_fcur_seek ends
+ * in zsi_fcur_load).  A seek lands ON the key when it is present, and it is the
+ * caller -- zsi_cursor_reseek_arm, for D-14j-b -- that steps past it if that key
+ * has already been yielded. */
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
 {
-    fc->u.t.key = NULL;
-    fc->u.t.keylen = 0;
-    fc->u.t.started = false;           /* which also disarms the step hint */
+    if (!fc->txn) { fc->u.t.node = NULL; return; }
 
-    if (!fc->txn || !key || !keylen) return;
+    if (!key || !keylen) {         /* from the beginning */
+        fc->u.t.node = fc->txn->phead[0];
+        return;
+    }
 
-    /* Borrowed from the caller, who holds it for at least as long as this arm
-     * will read it -- see the tkey comment on struct zsi_fcur for the four call
-     * sites and why each one qualifies. */
-    fc->u.t.key = key;
-    fc->u.t.keylen = keylen;
-
-    /* A seek lands ON the key if present, so the first load must NOT skip it:
-     * tstarted false makes zsi_txn_cur_index return the search position rather
-     * than one past it. */
+    fc->u.t.node = zsi_pend_lb(fc->txn, key, keylen, NULL);
 }
 
-/* Reverse seek: largest pending key <= (inclusive) or < the given key.  An
- * empty key means "after the last" here, since a reverse walk begins at the
- * top (D-14k). */
+/* One step in the cursor's direction.  The whole of it: a node is stable, so
+ * there is nothing to re-resolve and no search to repeat.  Lives here rather
+ * than in zsi_fcur_next so struct zsi_pnode stays private to the write path,
+ * exactly as struct zs_txn does. */
+static void zsi_txn_cur_step(struct zsi_fcur *fc)
+{
+    if (!fc->u.t.node) return;
+    fc->u.t.node = fc->reverse ? fc->u.t.node->prev : fc->u.t.node->next[0];
+}
+
+/* Reverse seek: largest pending key <= (inclusive) or < the given key.  A NULL
+ * key means "after the last" here, since a reverse walk begins at the top
+ * (D-14k) -- which is the tail, kept for exactly this. */
 static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
                                  size_t keylen, bool inclusive)
 {
-    zsi_txn_cur_seek(fc, key, keylen);
-    fc->u.t.exclusive = !inclusive;
+    if (!fc->txn) { fc->u.t.node = NULL; return; }
+
+    if (!key || !keylen) {
+        fc->u.t.node = fc->txn->ptail;
+        return;
+    }
+
+    fc->u.t.node = zsi_pend_lt(fc->txn, key, keylen, inclusive);
 }
 
 /* Defined in CONVERSION.  D-12 requires a writer convert any non-active unordered
@@ -6634,7 +6666,6 @@ static void zsi_txn_free(struct zs_txn *txn)
     if (!txn) return;
 
     zsi_pend_clear(txn);
-    free(txn->pend);
 
     /* The mappings outlive every pointer this transaction's reads returned
      * (A-4), so HERE -- the end of the transaction -- is the first moment any
@@ -6724,6 +6755,13 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
     txn->db = db;
     txn->readonly = shared;
     txn->wfd = -1;              /* no stream until the first store */
+
+    /* The pending set's level generator.  Any non-zero seed will do -- xorshift
+     * is a bijection on the non-zero words and a fixed one keeps the structure
+     * reproducible -- but ZERO IS A FIXED POINT, and zsi_zmalloc leaves it
+     * there: every node would then draw the maximum level, which is a correct
+     * skiplist with every node in every list and so a linear search. */
+    txn->prand = 0x9E3779B97F4A7C15ULL;
 
     if (!shared) {
         /* The write lock is held for the whole transaction (C-1).  A read
@@ -6835,8 +6873,12 @@ static int zsi_txn_commit(struct zs_txn *txn)
      * skipping it here. */
     offs = malloc(txn->npend * sizeof(*offs));
     if (offs) {
-        for (size_t i = 0; i < txn->npend; i++) offs[i] = txn->pend[i].off;
-        noffs = txn->npend;
+        /* Level 0 is every node, in key order -- which the fold does not care
+         * about, but walking it is the only way to reach them all. */
+        size_t i = 0;
+        for (struct zsi_pnode *n = txn->phead[0]; n; n = n->next[0])
+            offs[i++] = n->off;
+        noffs = i;
     }
 
     /* D-13b: a writer is a reader that also maintains the active file's index

@@ -1128,41 +1128,32 @@ mutant "sort: shortcut taken unconditionally" catch \
   's/        if \(zsi_cur_order\(c, &c->cur\[i - 1\], &c->cur\[i\]\) <= 0\) continue;/        continue;/'
 
 echo
-echo "the txn arm's step hint (D-14j-a)"
+echo "the pending set (a skiplist since 2026-08-16)"
 
-# The hint caches where tkey resolved to, and is trusted only while pend_seq is
-# unchanged.  Trusting it across a write is the D-14j-a bug wearing a new hat:
-# the array shifts under the cursor and the hint points at whatever moved into
-# that slot -- so a key is re-yielded or skipped, silently.
-mutant "txn arm: step hint never goes stale" catch \
-  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->u\.t\.loadedti \+ 1;/    if (fc->u\.t\.started)\n        return fc->u\.t\.loadedti + 1;/'
+# Level 0 is doubly linked for one reason: D-14k walks backwards.  Dropping the
+# back-link leaves a reverse traversal starting at the tail and stopping after
+# one record, which reads as an empty result rather than as a crash.
+mutant "pend: level 0 not doubly linked" catch \
+  's/    n->prev = update\[0\];/    n->prev = NULL;/'
 
-mutant "txn arm: reverse step hint never goes stale" catch \
-  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(txn\)\) \{/    if (fc->u\.t\.started) {/'
+# A node taller than the list must RAISE the list, or its upper links are
+# written into levels no search ever descends to -- and the node below them is
+# reachable only through level 0, so a lookup misses a key that is present.
+mutant "pend: insert does not raise the level" catch \
+  's/    if \(n->nlevels > txn->plevel\) txn->plevel = n->nlevels;/    \/* level not raised *\//'
 
-# The bug this shipped with on the first attempt, preserved: re-stamping the
-# sequence at the STEP reads a pend_seq that a write between the load and the
-# step has already bumped, so the hint looks fresh exactly when it is stale and
-# the arm re-yields the record it just returned.
-#
-# ONE substitution deliberately.  This was a compound pattern until the hint
-# stopped being stored in its own fields; the half that targeted those fields
-# rotted away while the other half still matched, so the mutant applied
-# partially -- disabling the hint rather than corrupting it, which is
-# equivalent, and it read as NOT CAUGHT.  --rot-only cannot see that: it
-# reports a pattern intact if it matches at all.
-mutant "txn arm: sequence re-stamped at the step" catch \
-  's/        fc->u\.t\.started = true;\n\n        break;/        fc->u\.t\.started = true;\n        fc->u\.t\.loadedseq = zsi_txn_seq(fc->txn);\n\n        break;/'
+# The tail is where a reverse walk STARTS (D-14k).  Failing to move it as the
+# list grows past it makes the last key invisible to every reverse cursor.
+mutant "pend: tail not moved on append" catch \
+  's/    if \(n->next\[0\]\) n->next\[0\]->prev = n;\n    else            txn->ptail = n;/    if (n->next[0]) n->next[0]->prev = n;/'
 
-# A seek moves the position arbitrarily, so a hint armed by an earlier step
-# describes nothing.  Keeping it makes a re-seeked arm resume from wherever it
-# happened to be -- which is the refresh path, so it lands on every liveness
-# test at once.
-# tstarted is what separates a STEP from a SEEK, and so what disarms the hint
-# after one.  Dropping it from the test makes a re-seeked arm resume from
-# wherever the previous step had reached.
-mutant "txn arm: a seek keeps the old hint" catch \
-  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->u\.t\.loadedti \+ 1;/    if (fc->u\.t\.loadedseq == zsi_txn_seq(fc->txn))\n        return fc->u\.t\.loadedti + 1;/'
+# EQUIVALENT, and listed so nobody writes a test chasing it.  A skiplist whose
+# every node is one level tall is a sorted linked list: still correct, still
+# ordered, still every key present -- just O(n) to search.  The level generator
+# is a performance device and nothing else, which is exactly why the quadratic
+# bug it replaced could not be caught by a behaviour test either.
+mutant "pend: every node is one level tall" equivalent \
+  's/    int lv = 1;\n\n    while \(lv < ZSI_PEND_MAXLEVEL\) \{/    int lv = 1;\n\n    while (0) {/'
 
 echo
 echo "ZS_IFCHANGED (A-1d)"
@@ -1375,32 +1366,10 @@ mutant "salvage: opens the source writable" catch \
 
 echo
 echo "cursor liveness (D-14j)"
-
-# D-14j-a, the bug the Cyrus integration surfaced.  Holding an INDEX into the
-# transaction's sorted pending array means a write during the traversal shifts
-# the element under it and the cursor re-yields a key it already returned --
-# silently, so the caller processes a record twice.
-mutant "cursor: txn arm resumes from the index" catch \
-  's/    if \(zsi_pend_search\(fc->txn, fc->u\.t\.key, fc->u\.t\.keylen, &pos\) == ZS_OK\n        && fc->u\.t\.started\)\n        pos\+\+;/    (void)zsi_pend_search(fc->txn, fc->u\.t\.key, fc->u\.t\.keylen, \&pos);/'
-
 # D-14j-b the other way: always advancing past the key means a seek that lands
 # ON a key skips it, so a scan from a start key loses its first record.
 mutant "cursor: txn arm always skips the seek hit" catch \
-  's/        && fc->u\.t\.started\)\n        pos\+\+;/        )\n        pos++;/'
-
-# EQUIVALENT, and worth the words because it looks like it should not be.  The
-# txn arm's position key is borrowed from the pending array's own key block, so
-# freeing that block on an overwrite reads like a dangle -- but the arm's two
-# borrowed pointers are only ever READ inside a seek/next -> load chain that
-# just wrote them, with no caller code in between, and any write to the
-# transaction bumps pend_seq, which forces the next step to refresh and re-seek
-# the arm from the CURSOR's last_key, overwriting both before they are read.
-#
-# Verified as equivalent rather than assumed: applied to a scratch copy and run
-# under ASan, where a genuine use-after-free would report, and it does not.
-# Listed so that anyone loosening the refresh rule knows this became live.
-mutant "pend: reallocates the key block on overwrite" equivalent \
-  's/    if \(found\) \{\n        txn->pend\[pos\]\.off = off;/    if (found) {\n        char *nk_ = malloc(keylen);\n        if (nk_) { memcpy(nk_, key, keylen); free(txn->pend[pos].key); txn->pend[pos].key = nk_; }\n        txn->pend[pos].off = off;/'
+  's/    fc->u\.t\.node = zsi_pend_lb\(fc->txn, key, keylen, NULL\);/    fc->u.t.node = zsi_pend_lb(fc->txn, key, keylen, NULL);\n    if (fc->u.t.node \&\& zsi_cmp(fc->txn->db->compar, fc->u.t.node->key,\n                                fc->u.t.node->keylen, key, keylen) == 0)\n        fc->u.t.node = fc->u.t.node->next[0];/'
 
 # A-1a.  The merge caches each arm's current record, so without noticing the
 # pending array changed, a write made during the traversal is never seen.
@@ -1729,7 +1698,7 @@ mutant "index: reverse tie leaves the base entry" catch \
 # D-14j-b reversed: after a yield the txn arm must resume strictly BELOW the
 # key it yielded; answering the exact hit again re-yields it forever.
 mutant "cursor: reverse txn arm resumes inclusively" catch \
-  's/    if \(exact && !fc->u\.t\.started && !fc->u\.t\.exclusive\) \{/    if (exact \&\& !fc->u\.t\.exclusive) {/'
+  's/    fc->u\.t\.node = zsi_pend_lt\(fc->txn, key, keylen, inclusive\);/    fc->u.t.node = zsi_pend_lt(fc->txn, key, keylen, true);/'
 
 # D-14k: seeking at the prefix ITSELF instead of its byte-successor starts the
 # scan below every key carrying the prefix, reporting a populated range empty.
