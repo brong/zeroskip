@@ -1152,6 +1152,22 @@ mutant "pend: tail not moved on append" catch \
 # ordered, still every key present -- just O(n) to search.  The level generator
 # is a performance device and nothing else, which is exactly why the quadratic
 # bug it replaced could not be caught by a behaviour test either.
+# The inlined prefix settles a comparison unless BOTH keys run past the bound
+# and agree inside it.  Treating "equal within the prefix" as EQUAL loses every
+# key that shares its first 64 bytes with another -- Cyrus's mailboxes.db shape.
+mutant "pend: prefix equality decides a tie it cannot" catch \
+  's/        if \(keylen <= ZSI_PEND_KPREFIX\) return 1;   \/\* the search key is shorter \*\//        return 0;/'
+
+# ... and the other undecidable-looking case that IS decidable: a search key that
+# ended inside the prefix is SHORTER, so the node sorts above it (F-11a).
+mutant "pend: a key ending inside the prefix sorts the wrong way" catch \
+  's/        if \(keylen <= ZSI_PEND_KPREFIX\) return 1;   \/\* the search key is shorter \*\//        if (keylen <= ZSI_PEND_KPREFIX) return -1;/'
+
+# A caller-supplied comparator may order by anything, so nothing follows from a
+# byte prefix for it -- inferring anyway reorders the pending set under it.
+mutant "pend: prefix logic applied to a caller comparator" catch \
+  's/    if \(txn->db->compar == zsi_compar_default\) \{/    if (1) {/'
+
 mutant "pend: every node is one level tall" equivalent \
   's/    int lv = 1;\n\n    while \(lv < ZSI_PEND_MAXLEVEL\) \{/    int lv = 1;\n\n    while (0) {/'
 
@@ -1751,7 +1767,7 @@ mutant "fetch: ephemeral still flushes" catch \
 # for keys it is about to insert misses every time, which is how a bulk load in
 # ONE transaction issued 300k write() against 10 fdatasync.
 mutant "txn lookup materialises before comparing" catch \
-  's/        zsi_txn_cur_seek\(&scratch, key, keylen\);\n\n        if \(zsi_txn_cur_peek_key\(&scratch, &pk, &pkl\)\n            && zsi_cmp\(fc->compar, pk, pkl, key, keylen\) == 0\) \{\n            r = zsi_fcur_load\(&scratch\);\n            if \(r == ZS_OK\) \{\n                if \(scratch.exhausted\) r = ZS_NOTFOUND;\n                else \*out = scratch.cur;\n            \}\n        \}/        zsi_txn_cur_seek(\&scratch, key, keylen);\n        (void)pk; (void)pkl;\n        r = zsi_fcur_load(\&scratch);\n        if (r == ZS_OK) {\n            if (scratch.exhausted\n                || zsi_cmp(fc->compar, scratch.cur.key, scratch.cur.keylen,\n                              key, keylen) != 0)\n                r = ZS_NOTFOUND;\n            else *out = scratch.cur;\n        }/'
+  's/        if \(zsi_txn_cur_cmp\(&scratch, key, keylen, &cmp\) && cmp == 0\) \{/        r = zsi_fcur_load(\&scratch);\n        if (r == ZS_OK \&\& !scratch.exhausted\n            \&\& zsi_cmp(fc->compar, scratch.cur.key, scratch.cur.keylen,\n                       key, keylen) == 0) {/'
 
 # A-4b: the conditional-store probe made durable again.  ZS_IFNOTEXIST and
 # ZS_IFEXIST look up a record only to decide, and never let it escape, so a

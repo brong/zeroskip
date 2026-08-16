@@ -3402,8 +3402,8 @@ struct zsi_fcur {
  * source; the alternative is a special case in the merge, which D-14g exists to
  * avoid. */
 static int zsi_txn_cur_load(struct zsi_fcur *fc);
-static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
-                                 size_t *klp);
+static bool zsi_txn_cur_cmp(struct zsi_fcur *fc, const char *key, size_t keylen,
+                            int *cmp);
 static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen);
 static void zsi_txn_cur_step(struct zsi_fcur *fc);
 static void zsi_txn_cur_seek_rev(struct zsi_fcur *fc, const char *key,
@@ -3643,8 +3643,9 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
          * grows an owned pointer is exactly where this goes wrong; `make leaks`
          * is what caught it.
          *
-         * The match is tested against the PENDING ARRAY's own key, and the
-         * record is decoded only once it is going to be returned.  Loading
+         * The match is tested against the pending set's own inlined key
+         * prefix, and the record is decoded only once it is going to be
+         * returned.  Loading
          * first and comparing the decoded key -- which is what this did until
          * 2026-08-14 -- makes a MISS cost a write(2): the seek lands on the
          * neighbouring pending record, materialising it flushes the writer's
@@ -3654,14 +3655,12 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
          * write() against 10 fdatasync.  ZS_EPHEMERAL (A-4b) covers the other
          * half, where the read HITS and the bytes really are wanted. */
         struct zsi_fcur scratch = *fc;
-        const char *pk;
-        size_t pkl;
+        int cmp = 0;
         int r = ZS_NOTFOUND;
 
         zsi_txn_cur_seek(&scratch, key, keylen);
 
-        if (zsi_txn_cur_peek_key(&scratch, &pk, &pkl)
-            && zsi_cmp(fc->compar, pk, pkl, key, keylen) == 0) {
+        if (zsi_txn_cur_cmp(&scratch, key, keylen, &cmp) && cmp == 0) {
             r = zsi_fcur_load(&scratch);
             if (r == ZS_OK) {
                 if (scratch.exhausted) r = ZS_NOTFOUND;
@@ -5843,20 +5842,49 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
  * replaced: an array append wrote into a slot that already existed.
  *
  * Offset 0 is the null link, so the arena's first 8 bytes are never used.
- * KEY BYTES are inlined after the level array, so the key a descent compares is
- * in the same cache line as the links it followed to reach it -- and MOVE with
- * the arena, which is safe because every borrow of one is read inside the call
- * that took it (zsi_pend_lb's own comparisons, zsi_txn_cur_peek_key ->
- * zsi_fcur_find's equality test).  Nothing holds a pending key across a store,
- * which is the only thing that can grow the arena.  The cursor's D-14j-b resume
- * key is borrowed from a RECORD, not from here. */
+ *
+ * A BOUNDED PREFIX of the key is inlined after the level array -- the whole key
+ * when it fits -- so the bytes a descent compares are beside the links it
+ * followed to reach them.  The record itself holds the key too, and deriving it
+ * through zsi_txn_at instead would store nothing at all; measured, that costs a
+ * decode and a second cache line per comparison, which is 23% of a bulk load at
+ * 11-byte keys and 7.6% at 500-byte ones.  Inlining the WHOLE key instead is
+ * what those figures beat, but it makes an entry O(keylen): a million 500-byte
+ * keys is 552MB of pending set against 43MB, and since values live in the file
+ * that is the transaction's whole footprint.
+ *
+ * The bound gets both.  An entry is O(1) -- at most 112 bytes -- and a
+ * comparison is decided from the inlined bytes unless BOTH keys are longer than
+ * the bound AND equal within it, which is the case where inlining the whole key
+ * would have cost the most memory anyway.  Only then is the record read.
+ *
+ * 64 rather than 32, and the difference is not subtle: a key at or under the
+ * bound is inlined WHOLE, so it is decided without ever reading a record, and 64
+ * covers the shapes that matter -- sqlite's 12-byte rowid keys and 30-60 byte
+ * text index keys, a conversations.db G<40 random chars>, most mailbox names.
+ * At 32 those all still fit or discriminate, except the ones with a structured
+ * head: "Ndomain!user.foo" runs agree past 32 and were measured 40% slower for
+ * it.  Above 64 the prefix still discriminates for anything that varies early,
+ * which is what a message-id does even at 1200 bytes.
+ *
+ * The inline is VARIABLE-LENGTH, not a slot: a 12-byte key costs 12 bytes, not
+ * 64.  Reported from the sqlite integration, where the distribution is sharply
+ * bimodal and a fixed slot would have been 5x the payload for the commonest
+ * record in any database.
+ *
+ * The inlined bytes MOVE with the arena, which is safe because every borrow is
+ * read inside the call that took it.  Nothing holds a pending key across a
+ * store, which is the only thing that grows the arena; the cursor's D-14j-b
+ * resume key is borrowed from a RECORD, not from here. */
+#define ZSI_PEND_KPREFIX 64
 struct zsi_pnode {
     size_t off;                       /* record offset in the active file */
     size_t len;                       /* its encoded length */
     size_t prev;                      /* arena offset, 0 = none (level 0) */
-    size_t keylen;
+    size_t keylen;                    /* the WHOLE key's length */
     size_t nlevels;
-    size_t next[];                    /* nlevels links, then keylen key bytes */
+    size_t next[];                    /* nlevels links, then min(keylen,
+                                         ZSI_PEND_KPREFIX) key bytes */
 };
 
 /* One read-only mapping of the active file.  A transaction accumulates these
@@ -5929,6 +5957,115 @@ struct zs_txn {
 #define ZSI_PN(txn, o)      ((struct zsi_pnode *)((txn)->parena + (o)))
 #define ZSI_PN_KEY(n)       ((const char *)((n)->next + (n)->nlevels))
 
+/* Defined in the streaming section below: the pending set reads a record when
+ * its inlined prefix cannot settle a comparison, and the streamer is what knows
+ * where a record's bytes currently are (mapped, or still in the chunk). */
+static const char *zsi_txn_at(struct zs_txn *txn, size_t off, size_t len,
+                              bool ephemeral);
+
+/* The full key of the record a node points at, for the cases the inlined prefix
+ * cannot settle.
+ *
+ * Ephemeral (A-4b) deliberately: the answer is used inside the call that asks,
+ * and asking any other way would flush the chunk buffer to look at a record this
+ * transaction just wrote -- the 300k-write() bug the pending set exists to
+ * avoid.  On a derivation failure it reports an empty key rather than an error,
+ * which is what zsi_index_key_at does and for the same reason: a comparison has
+ * nowhere to return one, and the only way here is an mmap failure. */
+static void zsi_pend_key(struct zs_txn *txn, size_t o, const char **kp,
+                         size_t *klp)
+{
+    struct zsi_pnode *n = ZSI_PN(txn, o);
+    struct zsi_rec r;
+    const char *b = zsi_txn_at(txn, n->off, n->len, true);
+
+    if (!b || zsi_rec_decode(b, n->len, &r) != ZS_OK) {
+        *kp = "";
+        *klp = 0;
+        return;
+    }
+
+    *kp = r.key;
+    *klp = r.keylen;
+}
+
+/* Order a node against a key, from the inlined prefix where that is enough.
+ *
+ * F-11a is memcmp over the common prefix, then shorter-key-first, so a
+ * difference inside the prefix IS the answer and needs nothing more.  Equality
+ * across the compared span leaves three cases, and two of them are still
+ * decidable: if the node's whole key is inlined the length rule settles it, and
+ * if the SEARCH key ended inside the prefix then the node's key is longer.  Only
+ * two keys that both run past the bound and agree within it need the record.
+ *
+ * A caller-supplied comparator may order by anything at all, so nothing can be
+ * inferred from a prefix for it -- it takes the full key, every time.  Same
+ * split as zsi_cmp, and the same reason. */
+/* The long half, split out so the common one inlines into the descent: a
+ * comparison happens ~log n times per store and GCC will not inline a function
+ * carrying the derivation below, so leaving them together put a call on every
+ * one of them -- 10% of a bulk load at 12-byte keys, for a branch.  Same shape
+ * and same reason as zsi_cursor_refresh's gate.
+ *
+ * Longer than the bound, so only a prefix is on hand.  F-11a is memcmp over
+     * the common prefix and then shorter-key-first, so a difference inside the
+     * prefix IS the answer, and a search key that ended inside it is the
+     * shorter of the two.  Only two keys that both run past the bound and agree
+     * within it need the record.
+     *
+     * None of that follows for a CALLER's comparator, which may order by
+     * anything at all -- it takes the full key, every time.  Same split as
+     * zsi_cmp, and the same reason. */
+static int zsi_pend_cmp_long(struct zs_txn *txn, size_t o, const char *key,
+                             size_t keylen)
+{
+    struct zsi_pnode *n = ZSI_PN(txn, o);
+    const char *nk;
+    size_t nkl;
+
+    if (txn->db->compar == zsi_compar_default) {
+        size_t m = keylen < ZSI_PEND_KPREFIX ? keylen : ZSI_PEND_KPREFIX;
+        int c = m ? memcmp(ZSI_PN_KEY(n), key, m) : 0;
+
+        if (c) return c < 0 ? -1 : 1;
+        if (keylen <= ZSI_PEND_KPREFIX) return 1;   /* the search key is shorter */
+
+        /* Equal within the bound, so the record settles it -- resuming PAST the
+         * bytes already known equal rather than repeating them, which would
+         * make this cost strictly more than storing no prefix at all. */
+        zsi_pend_key(txn, o, &nk, &nkl);
+        if (nkl < ZSI_PEND_KPREFIX)                 /* derivation failed */
+            return nkl < keylen ? -1 : 1;
+        {
+            size_t ra = nkl - ZSI_PEND_KPREFIX;
+            size_t rb = keylen - ZSI_PEND_KPREFIX;
+            size_t rm = ra < rb ? ra : rb;
+            int rc = rm ? memcmp(nk + ZSI_PEND_KPREFIX,
+                                 key + ZSI_PEND_KPREFIX, rm) : 0;
+            if (rc) return rc < 0 ? -1 : 1;
+            return ra < rb ? -1 : ra > rb ? 1 : 0;
+        }
+    }
+
+    zsi_pend_key(txn, o, &nk, &nkl);
+    return zsi_cmp(txn->db->compar, nk, nkl, key, keylen);
+}
+
+/* Order a node against a key.  The whole key is inlined at or under the bound,
+ * which is the common case and the only one on the hot path: the ordinary
+ * comparison, whatever the comparator, with nothing inferred and no record
+ * read. */
+static inline int zsi_pend_cmp(struct zs_txn *txn, size_t o, const char *key,
+                               size_t keylen)
+{
+    struct zsi_pnode *n = ZSI_PN(txn, o);
+
+    if (n->keylen <= ZSI_PEND_KPREFIX)
+        return zsi_cmp(txn->db->compar, ZSI_PN_KEY(n), n->keylen, key, keylen);
+
+    return zsi_pend_cmp_long(txn, o, key, keylen);
+}
+
 /* Room for `need` more bytes, 8-aligned.  Reserved BEFORE the record is
  * streamed, because a streamed record must be indexed: everything that can fail
  * has to fail first.  The bump itself cannot. */
@@ -5970,9 +6107,16 @@ static size_t zsi_pend_lb(struct zs_txn *txn, const char *key,
         /* x was reached AT this level or above, so its next[lv] is in range. */
         n = x ? ZSI_PN(txn, x)->next[lv] : txn->phead[lv];
         while (n) {
+            /* The node is loaded ONCE and used for both the comparison and the
+             * link -- the compare through zsi_pend_cmp instead re-resolved the
+             * offset every iteration, which is a load of txn->parena and an add
+             * per step of the descent. */
             struct zsi_pnode *p = ZSI_PN(txn, n);
-            if (zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) >= 0)
-                break;
+            int c = p->keylen <= ZSI_PEND_KPREFIX
+                  ? zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen,
+                            key, keylen)
+                  : zsi_pend_cmp_long(txn, n, key, keylen);
+            if (c >= 0) break;
             x = n;
             n = p->next[lv];
         }
@@ -5985,12 +6129,9 @@ static size_t zsi_pend_lb(struct zs_txn *txn, const char *key,
 static size_t zsi_pend_find(struct zs_txn *txn, const char *key, size_t keylen)
 {
     size_t n = zsi_pend_lb(txn, key, keylen, NULL);
-    struct zsi_pnode *p;
 
     if (!n) return 0;
-    p = ZSI_PN(txn, n);
-    if (zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) == 0)
-        return n;
+    if (zsi_pend_cmp(txn, n, key, keylen) == 0) return n;
     return 0;
 }
 
@@ -6003,13 +6144,8 @@ static size_t zsi_pend_lt(struct zs_txn *txn, const char *key,
     size_t n = zsi_pend_lb(txn, key, keylen, NULL);
 
     if (!n) return txn->ptail;
-
-    struct zsi_pnode *p = ZSI_PN(txn, n);
-    if (inclusive
-        && zsi_cmp(txn->db->compar, ZSI_PN_KEY(p), p->keylen, key, keylen) == 0)
-        return n;
-
-    return p->prev;
+    if (inclusive && zsi_pend_cmp(txn, n, key, keylen) == 0) return n;
+    return ZSI_PN(txn, n)->prev;
 }
 
 /* A node's level: geometric with p = 1/4, from a per-transaction xorshift.
@@ -6038,6 +6174,7 @@ static int zsi_pend_level(struct zs_txn *txn)
 static size_t zsi_pend_nodelen(int lv, size_t keylen)
 {
     size_t n;
+    if (keylen > ZSI_PEND_KPREFIX) keylen = ZSI_PEND_KPREFIX;
     if (!zsi_add3_sz(sizeof(struct zsi_pnode), (size_t)lv * sizeof(size_t),
                      keylen, &n))
         return 0;
@@ -6064,7 +6201,8 @@ static size_t zsi_pend_link(struct zs_txn *txn, const char *key, size_t keylen,
     n->len = len;
     n->keylen = keylen;
     n->nlevels = (size_t)lv;
-    memcpy((char *)ZSI_PN_KEY(n), key, keylen);
+    memcpy((char *)ZSI_PN_KEY(n), key,
+           keylen < ZSI_PEND_KPREFIX ? keylen : ZSI_PEND_KPREFIX);
 
     /* Levels above the current top are reached from the head, and update[] is
      * already 0 there. */
@@ -6381,22 +6519,20 @@ static bool zsi_txn_cur_at(struct zsi_fcur *fc, struct zsi_pnode **np)
     return true;
 }
 
-/* The key at the cursor's position, straight from the pending set.
+/* Order the record at the cursor's position against a key, without touching a
+ * byte of it when the inlined prefix is enough (zsi_pend_cmp).
  *
- * zsi_pend_set records the key alongside the offset, so an exact-match test
- * needs no record at all -- which is the whole point: materialising it would
- * call zsi_txn_at, and a record still in the writer's chunk buffer is flushed
- * to the file just to be looked at.  A lookup that MISSES would pay a write(2)
- * for a record it then discards, and a bulk load probing for keys it is about
- * to insert misses on nearly every one.  Reported from the sqlite integration
- * as 300k write() against 10 fdatasync over 100k rows in ONE transaction. */
-static bool zsi_txn_cur_peek_key(struct zsi_fcur *fc, const char **kp,
-                                 size_t *klp)
+ * The point is that a MISS costs nothing.  Materialising the record would call
+ * zsi_txn_at, and a record still in the writer's chunk buffer gets flushed to
+ * the file just to be looked at -- so a lookup that misses would pay a write(2)
+ * for a record it then discards, and a bulk load probing for keys it is about to
+ * insert misses on nearly every one.  Reported from the sqlite integration as
+ * 300k write() against 10 fdatasync over 100k rows in ONE transaction. */
+static bool zsi_txn_cur_cmp(struct zsi_fcur *fc, const char *key, size_t keylen,
+                            int *cmp)
 {
-    struct zsi_pnode *n;
-    if (!zsi_txn_cur_at(fc, &n)) return false;
-    *kp  = ZSI_PN_KEY(n);
-    *klp = n->keylen;
+    if (!fc->txn || !fc->u.t.node) return false;
+    *cmp = zsi_pend_cmp(fc->txn, fc->u.t.node, key, keylen);
     return true;
 }
 

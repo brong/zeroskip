@@ -415,6 +415,36 @@ commit gates swamp it:
 Readers never paid it: a commit that large crosses `rollover_size` and seals
 itself (D-25d), so a reader gets a pointer section rather than a replay.
 
+## Key length, key shape, and the pending set's inline bound
+
+A comparison's cost depends on where two keys first differ, so both matter and
+`--keysize` alone cannot express it: use `--keyshape head` (varies early — a
+message-id, a `G`+40-random key, a sqlite index key) or `--keyshape shared`
+(agrees for a long head — Cyrus's `Ndomain!user.foo` runs).
+
+The pending set inlines a key up to **64 bytes** in its node and reads the
+record only when two keys both run past that and agree within it. Inlining the
+whole key instead is faster nearly everywhere, and was rejected on memory: an
+entry becomes O(keylen), so a million 1 200-byte message-ids in one transaction
+is 1.2 GB of pending set against ~112 MB. Random-order bulk load, 100 000 keys,
+medians of five:
+
+| keysize | shape | whole key inlined | bounded at 64 |
+|---|---|---|---|
+| 12 | head | 1 613 293/s | 1 487 695/s (−7.8%) |
+| 41 | head | 1 562 183/s | 1 506 661/s (−3.6%) |
+| 200 | head | 1 091 107/s | 1 063 988/s (−2.5%) |
+| 1 000 | head | 542 847/s | 569 062/s (**+4.8%**) |
+| 41 | shared | 1 472 125/s | 1 375 326/s (−6.6%) |
+| 200 | shared | 872 189/s | 717 690/s (−17.7%) |
+
+Two alternatives were measured and rejected. Storing **no key at all** and
+deriving it from the record every time costs 16–23%: an inlined key shares the
+node's cache line, a derived one is a second line in a multi-megabyte mapping
+plus a decode. A **32-byte** bound is worse than 64 wherever keys share a
+structured head — `Ndomain!user.foo` runs measured 40% down — and no better
+anywhere else.
+
 ## Reading the rollover rows
 
 The `store, rollover Nk` figures are not monotonic, and that is expected rather
