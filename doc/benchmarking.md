@@ -56,6 +56,7 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 |---|---|
 | `store, one txn each` | the worst case: two `fdatasync` calls per record (C-7) |
 | `store, N per txn` | how much batching amortises those two syncs (C-7b) |
+| `store, all in one txn, random` | the same bulk load with keys arriving in a different ORDER — the pending array's insertion cost, which is quadratic |
 | `fetch (N files)` | lookup cost, before and after a repack — it is proportional to the **number of files** (D-14d) |
 | `full scan` | the merge cursor over whatever file set exists — but see below: its files do not overlap, so the merge never merges |
 | `full scan, interleaved` | the same scan with files that DO overlap: D-14e's re-sort moving an arm at nearly every step |
@@ -375,6 +376,33 @@ nothing on the workload that was being profiled. A change to
 `zsi_cur_resort_head` or to the arm layout has to be measured against the lower
 two rows; measured against `full scan` it would be measuring a workload that
 never calls the expensive half.
+
+## The pending array is quadratic in a transaction's size
+
+The read-path lesson again, from the other end. Every store workload here wrote
+keys in **ascending order**, which is the best case for `zsi_pend_set`: it keeps
+a transaction's pending records in one sorted array and splices each new key in
+with a `memmove`, and an ascending key always lands at the end and moves
+nothing. A key arriving anywhere else moves half the array.
+
+`store, all in one txn, random` is that same bulk load over the same keys in a
+strided permutation. Its throughput **halves with every doubling of `n`**, which
+is total time going up by four:
+
+| n | ascending | random |
+|---|---|---|
+| 25 000 | 2 308 000/s | 466 000/s |
+| 50 000 | 2 153 000/s | 245 000/s |
+| 100 000 | 1 691 000/s | 124 000/s |
+
+Measured through `zstool batch` before the workload existed, the same shape in
+wall clock: 0.19s against 4.99s for 200 000 records in one transaction.
+
+The fix the file already knows about is `ZSI_DELTA_MAX`, whose comment describes
+this exact bug for the *read*-side index — "a single sorted array with no delta
+would memmove the entire index per commit" — and the pending array is that
+array. Readers do not pay it: a commit that large crosses `rollover_size` and
+seals itself (D-25d), so a reader gets a pointer section rather than a replay.
 
 ## Reading the rollover rows
 

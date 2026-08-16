@@ -225,6 +225,25 @@ static void makekey(char *buf, size_t bufsz, long i)
     buf[want] = '\0';
 }
 
+/* Key i of a strided PERMUTATION of [0, nrecs), for the workloads whose subject
+ * is the order keys arrive in rather than how many there are.
+ *
+ * i -> (i * P) mod n is a permutation when gcd(P, n) = 1.  P is prime and larger
+ * than any n anyone benchmarks, so the only way to lose that is n being a
+ * multiple of P; the second prime covers it, and being a multiple of both needs
+ * n above 10^12.
+ *
+ * Two workloads want it, for the same reason from opposite ends: ascending keys
+ * are the best case for the sorted structures on both sides of the library, and
+ * every workload here used to write them.  On the read side that made a file set
+ * whose ranges never overlap (`full scan`); on the write side it makes every
+ * insert into a transaction's pending array land at the end. */
+static long long strided(long long i)
+{
+    long long p = (nrecs % 1000003 == 0) ? 999983 : 1000003;
+    return (i * p) % nrecs;
+}
+
 static void quiet_error(const char *msg, const char *fmt, ...)
 {
     (void)msg;
@@ -560,6 +579,69 @@ static void bench_batched_store(void)
         record(slug, label, (size_t)nrecs, &rt, "");
         if (per == nrecs) break;    /* the sweep ends at "all" */
     }
+    free(val);
+}
+
+/* The same bulk load, with the keys arriving in a different ORDER.
+ *
+ * `store, all in one txn` above stores ascending keys, and so does every other
+ * store workload here -- which is the best case for a transaction's pending
+ * array and hides its cost completely.  zsi_pend_set keeps the pending records
+ * in one sorted array and splices each new key in with a memmove: an ascending
+ * key always lands at the end and moves nothing, a random one moves half the
+ * array.  So the cost is quadratic in the transaction's size, and no figure this
+ * tool produced could show it.  Measured through zstool before this line
+ * existed, one transaction, 100-byte values:
+ *
+ *      n        ascending   random
+ *      25 000   0.01s       0.08s
+ *      50 000   0.02s       0.31s
+ *      100 000  0.06s       1.22s
+ *      200 000  0.19s       4.99s      <- four times the time for twice the keys
+ *
+ * Read against `store, all in one txn`, which is this same loop over the same
+ * keys in ascending order.  The gap between them IS the pending array's
+ * insertion cost, and it should shrink to nothing if that array ever gets the
+ * base+delta treatment zsi_index has (see ZSI_DELTA_MAX, whose comment describes
+ * this exact bug for the read side).
+ *
+ * A caller cannot dodge it by sorting first: the point of a transaction is that
+ * the caller writes what it has when it has it, and cyrusdb's callers do. */
+static void bench_random_store(void)
+{
+    UNSPLITTABLE();
+    char dir[1200], note[96];
+    char *val = malloc(valsize);
+    struct reptimes rt = { {0}, 0 };
+    memset(val, 'v', valsize);
+
+    if (!selected("store, all in one txn, random")) { free(val); return; }
+
+    for (int r = 0; r < reps; r++) {
+        snprintf(dir, sizeof(dir), "%s/randstore", workdir);
+        cleanup(dir);
+        struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+
+        double t0 = now();
+        struct zs_txn *txn = NULL;
+        if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+        for (int i = 0; i < nrecs; i++) {
+            char k[64];
+            makekey(k, sizeof(k), (long)strided(i));
+            zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+        }
+        /* Committed inside the timed region, as the ascending line is, or the
+         * two would differ in more than the key order. */
+        zs_txn_commit(&txn);
+        rep_add(&rt, now() - t0);
+
+        zs_db_close(&db);
+        cleanup(dir);
+    }
+
+    snprintf(note, sizeof(note), "vs `store, all in one txn`");
+    record("store_all_random", "store, all in one txn, random", (size_t)nrecs,
+           &rt, note);
     free(val);
 }
 
@@ -976,16 +1058,6 @@ static void bench_scan(void)
  *                the stale arm as well and the step ends in a full
  *                zsi_cur_sort rather than the incremental resort.
  */
-static long long scan_stride(long long i)
-{
-    /* i -> (i * P) mod n is a permutation of [0, n) when gcd(P, n) = 1.  P is
-     * prime and larger than any n anyone benchmarks, so the only way to lose
-     * that is n being a multiple of P; the second prime covers it, and being a
-     * multiple of both needs n above 10^12. */
-    long long p = (nrecs % 1000003 == 0) ? 999983 : 1000003;
-    return (i * p) % nrecs;
-}
-
 static void scanmerge_dirs(char *inter, char *shadow, size_t sz)
 {
     snprintf(inter, sz, "%s/scan-interleaved", workdir);
@@ -1005,7 +1077,7 @@ static void scanmerge_setup(void)
     struct zs_db *db = open_at(inter, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
         char k[64];
-        makekey(k, sizeof(k), (long)scan_stride(i));
+        makekey(k, sizeof(k), (long)strided(i));
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
     zs_db_close(&db);
@@ -1024,7 +1096,7 @@ static void scanmerge_setup(void)
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
         for (int i = 0; i < nrecs; i++) {
             char k[64];
-            makekey(k, sizeof(k), (long)scan_stride(i));
+            makekey(k, sizeof(k), (long)strided(i));
             zs_txn_store(txn, k, strlen(k), val, valsize, 0);
         }
         if (zs_txn_commit(&txn) != ZS_OK) exit(1);
@@ -1889,6 +1961,7 @@ int main(int argc, char **argv)
         printf("\n");
         bench_sequential_store();
         bench_batched_store();
+        bench_random_store();
         bench_read_after_write();
         bench_store_into_files();
         bench_fetch();
