@@ -1044,6 +1044,43 @@ mutant "compact: reports success regardless" catch \
 # launders a corrupt body: the output is written under a FRESH checksum computed
 # over the corrupt copy, and D-23 then removes the input -- the only evidence.
 echo
+echo "the txn arm's step hint (D-14j-a)"
+
+# The hint caches where tkey resolved to, and is trusted only while pend_seq is
+# unchanged.  Trusting it across a write is the D-14j-a bug wearing a new hat:
+# the array shifts under the cursor and the hint points at whatever moved into
+# that slot -- so a key is re-yielded or skipped, silently.
+mutant "txn arm: step hint never goes stale" catch \
+  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->tloadedti \+ 1;/    if (fc->tstarted)\n        return fc->tloadedti + 1;/'
+
+mutant "txn arm: reverse step hint never goes stale" catch \
+  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(txn\)\) \{/    if (fc->tstarted) {/'
+
+# The bug this shipped with on the first attempt, preserved: re-stamping the
+# sequence at the STEP reads a pend_seq that a write between the load and the
+# step has already bumped, so the hint looks fresh exactly when it is stale and
+# the arm re-yields the record it just returned.
+#
+# ONE substitution deliberately.  This was a compound pattern until the hint
+# stopped being stored in its own fields; the half that targeted those fields
+# rotted away while the other half still matched, so the mutant applied
+# partially -- disabling the hint rather than corrupting it, which is
+# equivalent, and it read as NOT CAUGHT.  --rot-only cannot see that: it
+# reports a pattern intact if it matches at all.
+mutant "txn arm: sequence re-stamped at the step" catch \
+  's/        fc->tstarted = true;\n\n        break;/        fc->tstarted = true;\n        fc->tloadedseq = zsi_txn_seq(fc->txn);\n\n        break;/'
+
+# A seek moves the position arbitrarily, so a hint armed by an earlier step
+# describes nothing.  Keeping it makes a re-seeked arm resume from wherever it
+# happened to be -- which is the refresh path, so it lands on every liveness
+# test at once.
+# tstarted is what separates a STEP from a SEEK, and so what disarms the hint
+# after one.  Dropping it from the test makes a re-seeked arm resume from
+# wherever the previous step had reached.
+mutant "txn arm: a seek keeps the old hint" catch \
+  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->tloadedti \+ 1;/    if (fc->tloadedseq == zsi_txn_seq(fc->txn))\n        return fc->tloadedti + 1;/'
+
+echo
 echo "ZS_IFCHANGED (A-1d)"
 
 # The flag doing nothing is the failure mode that no behaviour test can see:

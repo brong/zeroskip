@@ -3299,6 +3299,41 @@ struct zsi_fcur {
      * meaningful while !exhausted. */
     const char          *tloadedkey;
     size_t               tloadedkeylen;
+    size_t               tloadedti;      /* and its index, for the hint below */
+    unsigned long        tloadedseq;     /* ...and the pend_seq it was true at */
+
+    /* An O(1) hint for the next position, and the whole point of it: resolving
+     * tkey costs a BINARY SEARCH of the pending array (zsi_pend_search), so a
+     * traversal of n pending records was O(n log n) comparisons.  Measured at
+     * about 5ns per search level -- roughly 60% of this arm's per-step cost at
+     * 200k pending, and growing without bound.
+     *
+     * The position is still a KEY, which is what D-14j-a requires; this is a
+     * cache of where that key resolved to, and it is only trusted while
+     * `thintseq` still equals the transaction's pend_seq.  Any write bumps
+     * pend_seq (zsi_pend_set does it up front, before anything fallible), so a
+     * stale hint cannot survive the write that would invalidate it -- and the
+     * fallback is the search that was always there.
+     *
+     * Two conditions make the hint applicable, and both are already recorded,
+     * so it costs no field of its own:
+     *
+     *   - `tstarted`, which distinguishes a STEP from a SEEK.  Every seek path
+     *     clears it and only a step sets it, so a seek cannot leave a hint
+     *     behind describing a position it just moved away from.
+     *   - `tloadedseq` against the transaction's pend_seq now.  The sequence
+     *     is captured by the LOAD, not by the step, because the hint is derived
+     *     from where that load landed and that is the moment it was true.
+     *     Stamping it at the step instead reads a pend_seq that a write between
+     *     the two has already bumped, so the hint looks fresh exactly when it
+     *     is not, and a write below the position makes the arm re-yield the
+     *     record it just returned.  That is the bug this had on its first
+     *     attempt; test_txn_arm_step_hint is what found it.
+     *
+     * The destination itself is `tloadedti` plus or minus one by `reverse`, so
+     * it is not stored either.  Both were fields until the arms array turned
+     * out to be cache-sensitive: struct zsi_fcur is what the merge loop walks,
+     * and four of these grew it 19%. */
 };
 
 /* Filled in by the WRITE PATH section, which owns struct zs_txn.  Declared here
@@ -3491,6 +3526,7 @@ static int zsi_fcur_next(struct zsi_fcur *fc)
         fc->tkey = fc->tloadedkey;
         fc->tkeylen = fc->tloadedkeylen;
         fc->tstarted = true;
+
         break;
     }
 
@@ -6003,6 +6039,13 @@ static size_t zsi_txn_cur_index(struct zsi_fcur *fc)
 
     if (!fc->txn || !fc->tkey) return 0;        /* from the beginning */
 
+    /* The step hint, valid only after a STEP and only while the array has not
+     * been written to.  See struct zsi_fcur: this is what keeps a traversal
+     * O(n) rather than O(n log n), and it is a cache of the search below, never
+     * a replacement for the key D-14j-a requires the position to be. */
+    if (fc->tstarted && fc->tloadedseq == zsi_txn_seq(fc->txn))
+        return fc->tloadedti + 1;
+
     /* An exact hit means the array still holds the key we are positioned on.
      * After a step that key has been yielded, so the next record is the one
      * after it (D-14j-b); after a seek it has not, so it is the answer. */
@@ -6036,6 +6079,12 @@ static bool zsi_txn_cur_index_rev(struct zsi_fcur *fc, size_t *ti)
     size_t pos;
 
     if (!txn->npend) return false;
+
+    if (fc->tstarted && fc->tloadedseq == zsi_txn_seq(txn)) {
+        if (fc->tloadedti == 0) return false;   /* the step hint, mirrored */
+        *ti = fc->tloadedti - 1;
+        return true;
+    }
 
     if (!fc->tkey) {                            /* "after the last": the top */
         *ti = txn->npend - 1;
@@ -6133,6 +6182,8 @@ static int zsi_txn_cur_load(struct zsi_fcur *fc)
      * this one is stable for the whole transaction. */
     fc->tloadedkey = p->key;
     fc->tloadedkeylen = p->keylen;
+    fc->tloadedti = ti;
+    fc->tloadedseq = zsi_txn_seq(txn);
 
     return ZS_OK;
 }
@@ -6146,7 +6197,7 @@ static void zsi_txn_cur_seek(struct zsi_fcur *fc, const char *key, size_t keylen
 {
     fc->tkey = NULL;
     fc->tkeylen = 0;
-    fc->tstarted = false;
+    fc->tstarted = false;           /* which also disarms the step hint */
 
     if (!fc->txn || !key || !keylen) return;
 

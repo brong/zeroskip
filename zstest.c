@@ -7105,6 +7105,91 @@ static void test_write_unclean_rollover(void)
  * twice leaves the same visible state.  So this one watches the bytes and the
  * change counter instead: the active file must not grow, and a cursor
  * traversing the transaction must not be told anything happened. */
+/* The transaction arm's step hint (D-14j-a), tested at the ARM rather than
+ * through a cursor -- which is the only place its two guards are separable.
+ *
+ * The hint caches where tkey resolved to, and is trusted only while the
+ * transaction's pend_seq is unchanged.  A seek clears it outright.  Through a
+ * cursor those two guards mask each other completely: any write bumps
+ * pend_seq, which makes the cursor refresh and re-seek every txn arm, which
+ * clears the hint -- so the stale-hint path is unreachable from above, and all
+ * three mutants for it went NOT CAUGHT until this test existed.
+ *
+ * Stepping the arm directly separates them: a write with no seek exercises the
+ * sequence check, and a seek with no write exercises the clear. */
+static void test_txn_arm_step_hint(void)
+{
+    struct zs_db *db = fresh_db();
+    struct zs_txn *txn = NULL;
+    struct zsi_fcur fc;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (const char *p = "abcd"; *p; p++)
+        ASSERT_OK(zs_txn_store(txn, p, 1, "v", 1, 0));
+
+    memset(&fc, 0, sizeof(fc));
+    fc.kind = ZSI_SRC_TXN;
+    fc.txn = txn;
+    fc.compar = db->compar;
+    fc.gen = ZSI_GEN_TXN;
+
+    ASSERT_OK(zsi_fcur_seek_first(&fc));
+    ASSERT(!fc.exhausted);
+    ASSERT_MEM_EQ(fc.cur.key, "a", 1);
+
+    ASSERT_OK(zsi_fcur_next(&fc));              /* arms the hint at index 1 */
+    ASSERT_MEM_EQ(fc.cur.key, "b", 1);
+
+    /* A write BELOW the position, with no seek in between.  "aa" inserts at
+     * index 1, so every entry from there up shifts and the arm's record moves
+     * from index 1 to index 2 -- a hint that survived the write would name
+     * index 2 and re-yield "b". */
+    ASSERT_OK(zs_txn_store(txn, "aa", 2, "!", 1, 0));
+    ASSERT_OK(zsi_fcur_next(&fc));
+    ASSERT(!fc.exhausted);
+    ASSERT_MEM_EQ(fc.cur.key, "c", 1);          /* NOT "b" */
+
+    /* And a seek with NO write, so pend_seq still matches whatever the hint
+     * was armed at.  Only clearing the hint gets this right; the sequence
+     * check cannot, because nothing changed. */
+    ASSERT_OK(zsi_fcur_next(&fc));              /* re-arms, now at "d" */
+    ASSERT_MEM_EQ(fc.cur.key, "d", 1);
+    ASSERT_OK(zsi_fcur_seek(&fc, "aa", 2));
+    ASSERT(!fc.exhausted);
+    ASSERT_MEM_EQ(fc.cur.key, "aa", 2);         /* not wherever the hint said */
+
+    zsi_fcur_fini(&fc);
+
+    /* The same, travelling the other way (D-14k).  Reverse has its own index
+     * resolution and so its own hint check, and a write below the position
+     * moves the arm's record UP the array rather than leaving it put -- so a
+     * stale hint lands short of where it should. */
+    memset(&fc, 0, sizeof(fc));
+    fc.kind = ZSI_SRC_TXN;
+    fc.txn = txn;
+    fc.compar = db->compar;
+    fc.gen = ZSI_GEN_TXN;
+    fc.reverse = true;
+
+    ASSERT_OK(zsi_fcur_seek_last(&fc));         /* a aa b c d -> "d" */
+    ASSERT_MEM_EQ(fc.cur.key, "d", 1);
+    ASSERT_OK(zsi_fcur_next(&fc));              /* arms the hint below "c" */
+    ASSERT_MEM_EQ(fc.cur.key, "c", 1);
+
+    /* "a0" sorts between "a" and "aa", so it inserts at index 1 and shifts
+     * "c" from index 3 to index 4.  A surviving hint names index 2 -- "aa" --
+     * skipping "b" entirely. */
+    ASSERT_OK(zs_txn_store(txn, "a0", 2, "!", 1, 0));
+    ASSERT_OK(zsi_fcur_next(&fc));
+    ASSERT(!fc.exhausted);
+    ASSERT_MEM_EQ(fc.cur.key, "b", 1);          /* NOT "aa" */
+
+    zsi_fcur_fini(&fc);
+    ASSERT_OK(zs_txn_abort(&txn));
+    zs_db_close(&db);
+}
+
 static void test_ifchanged_writes_nothing(void)
 {
     struct zs_db *db = fresh_db_noautorepack();
@@ -16354,6 +16439,7 @@ static struct test_entry tests[] = {
                                         test_commit_folds_index_incrementally },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
+    { "test_txn_arm_step_hint",          test_txn_arm_step_hint },
     { "test_ifchanged_writes_nothing",   test_ifchanged_writes_nothing },
     { "test_write_record_is_self_contained",
                                     test_write_record_is_self_contained },
