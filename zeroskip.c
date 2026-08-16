@@ -5127,7 +5127,6 @@ struct zs_cursor {
     struct zs_db     *db;
     struct zs_txn    *txn;          /* owning txn, or NULL for an implicit one */
     struct zsi_snapshot *snap;
-    bool              owns_txn;
 
     /* A-4a: mappings from snapshots this cursor has swapped away from, kept
      * until it ends because pointers it yielded still point into them. */
@@ -5144,14 +5143,30 @@ struct zs_cursor {
     char             *skiproot_key;
     size_t            skiproot_keylen;
 
+    /* Every flag together.
+     *
+     * Spread among the pointers these seven bools cost 29 bytes of padding, and
+     * a cursor allocates this struct alongside a zs_txn -- whose size turned out
+     * to be worth 6.3% on a scan, through nothing but heap layout (CLAUDE.md).
+     * Grouping changes no instructions, and no on-disk layout depends on field
+     * order: G-0 keeps that in explicit memcpy at literal offsets.
+     *
+     * reverse is fixed at open (D-14k).  rev_succ_none means the prefix was all
+     * 0xFF -- no successor, so seek from the end.  handle_live is whether this
+     * cursor may observe the HANDLE's later commits (D-14j), and cannot be
+     * derived from txn, since a read-only implicit transaction arrives NULL. */
     uint32_t          flags;
-
+    bool              owns_txn;
     bool              started;
     bool              done;
+    bool              have_emitted;
+    bool              reverse;
+    bool              rev_succ_none;
+    bool              handle_live;
+
 
     /* the last record handed out, and its owning source */
     struct zsi_rec    emitted;
-    bool              have_emitted;
 
     /* D-14j liveness.  A cursor caches each arm's current record, so it must
      * notice when the world underneath changed:
@@ -5200,10 +5215,8 @@ struct zs_cursor {
      * so a refresh re-derives the same bound the open used rather than
      * trusting a stale arm position.  rev_succ NULL with rev_succ_none set
      * means the prefix was all 0xFF: no successor, seek from the end. */
-    bool              reverse;
     char             *rev_succ;
     size_t            rev_succlen;
-    bool              rev_succ_none;
 
     /* Whether this cursor may observe the HANDLE's later commits.
      *
@@ -5212,7 +5225,6 @@ struct zs_cursor {
      * where G-4 promises a fixed file set.  It cannot be derived from c->txn,
      * because a read-only implicit transaction is passed to the cursor as NULL
      * -- so the wrapper that created it says so. */
-    bool              handle_live;
 };
 
 /* Order two per-file cursors: exhausted last, then key ascending, then generation
@@ -5898,12 +5910,28 @@ struct zsi_txnmap {
 struct zs_txn {
     struct zs_db        *db;
     struct zsi_snapshot *snap;        /* the transaction's fixed snapshot */
+
+    /* Every flag and small counter, together.
+     *
+     * Scattered among the pointers they cost 20 bytes of padding, and struct
+     * zs_txn's SIZE is on the read path: zs_db_begin_cursor makes an implicit
+     * transaction, so every cursor allocates one, and growing this struct by
+     * 160 bytes once cost 6.3% on a scan that reads none of it (CLAUDE.md).
+     * Grouping is free -- no instruction changes, and nothing here is on-disk
+     * layout, which G-0 keeps in explicit memcpy at literal offsets. */
     bool                 readonly;
     bool                 holds_write_lock;
 
     /* Created by a zs_db_* wrapper rather than by the caller (A-0), which is
      * what makes its cursors observe this handle's later commits (D-14j). */
     bool                 implicit;
+    bool                 broken;      /* a stream failure poisoned the span:
+                                         commit MUST refuse (see zsi_pend_set) */
+    int                  plevel;      /* pending set: levels in use */
+    int                  wfd;         /* -1 until the first store */
+    uint32_t             wgen;        /* generation being appended to */
+    unsigned             wcsum_id;
+    unsigned             nmaps, amaps;
 
     /* The pending set (see struct zsi_pnode): a skiplist in one arena, and
      * every reference to a node is an OFFSET into it.
@@ -5911,20 +5939,18 @@ struct zs_txn {
      * The LEVEL HEADS live at the head of the arena rather than here, which is
      * the flat-file layout again -- a skiplist file keeps them in its header.
      * Inline they were 128 bytes in every transaction, and a READ transaction
-     * never stores: zs_db_begin_cursor makes one implicitly, so every cursor
-     * was allocating and zeroing a pending set it could not use.  With the
-     * arena allocated on first store, a read transaction now has none at all. */
+     * never stores, so every cursor was allocating and zeroing a pending set it
+     * could not use.  With the arena allocated on first store, a read
+     * transaction now has none at all. */
     char                *parena;
     size_t               pused, pcap;
     size_t               ptail;       /* for a reverse walk's start (D-14k) */
-    int                  plevel;      /* levels currently in use */
     size_t               npend;
     uint64_t             prand;       /* level generator, seeded at begin */
 
-    /* Bumped on every change to `pend`.  A cursor over this transaction caches
-     * the arm's current record, so it needs to know when that cache is stale --
-     * and comparing a counter is free, where re-reading the array every step
-     * would not be (D-14j). */
+    /* Bumped on every change to the pending set.  A cursor over this
+     * transaction caches the arm's current record, so it needs to know when
+     * that cache is stale -- and comparing a counter is free (D-14j). */
     unsigned long        pend_seq;
 
     /* Streaming state (C-8).  The active file is chosen at the FIRST store --
@@ -5937,20 +5963,15 @@ struct zs_txn {
      * flushed is what has reached the fd.  A read maps the file on demand,
      * each new mapping at least DOUBLING the last (and mapping ahead of EOF,
      * which MAP_SHARED fills in as the file grows), so a transaction holds
-     * O(log bytes) mappings and unmaps none of them until it ends (A-4). */
-    int                  wfd;         /* -1 until the first store */
-    bool                 broken;      /* a stream failure poisoned the span:
-                                         commit MUST refuse (see zsi_pend_set) */
-    uint32_t             wgen;        /* generation being appended to */
+     * O(log bytes) mappings -- which is why nmaps and amaps are `unsigned`
+     * above and not size_t -- and unmaps none of them until it ends (A-4). */
     zs_csum             *wcs;         /* the FILE's engine (A-6, F-5a) */
-    unsigned             wcsum_id;
     size_t               span_base;   /* where this transaction's span begins */
     size_t               wsize;
     size_t               flushed;
     char                *chunk;
     size_t               chunklen, chunkcap;
     struct zsi_txnmap   *maps;
-    size_t               nmaps, amaps;
 
     /* A-4a: mappings from the snapshot this transaction swapped away from at
      * its first store, kept until it ends.  The other half of the same
