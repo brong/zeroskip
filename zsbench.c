@@ -225,6 +225,13 @@ static void makekey(char *buf, size_t bufsz, long i)
     buf[want] = '\0';
 }
 
+/* Every workload builds its keys in a buffer of this size.  It was 64, which
+ * silently TRUNCATED --keysize above 63: makekey clamps to the buffer and the
+ * run then reported the keysize it was asked for while measuring 63-byte keys.
+ * The figures that matters for are the ones comparing key handling at realistic
+ * mailbox-key lengths, which is exactly where it lied. */
+#define ZSB_KEYMAX 1024
+
 /* Key i of a strided PERMUTATION of [0, nrecs), for the workloads whose subject
  * is the order keys arrive in rather than how many there are.
  *
@@ -514,7 +521,7 @@ static void bench_sequential_store(void)
 
         double t0 = now();
         for (int i = 0; i < nrecs; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_db_store(db, k, strlen(k), val, valsize, 0);
         }
@@ -563,7 +570,7 @@ static void bench_batched_store(void)
                 struct zs_txn *txn = NULL;
                 if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) break;
                 for (int i = 0; i < per && done < nrecs; i++, done++) {
-                    char k[64];
+                    char k[ZSB_KEYMAX];
                     makekey(k, sizeof(k), done);
                     zs_txn_store(txn, k, strlen(k), val, valsize, 0);
                 }
@@ -626,7 +633,7 @@ static void bench_random_store(void)
         struct zs_txn *txn = NULL;
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
         for (int i = 0; i < nrecs; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), (long)strided(i));
             zs_txn_store(txn, k, strlen(k), val, valsize, 0);
         }
@@ -700,7 +707,7 @@ static void bench_read_after_write(void)
 
             double t0 = now();
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 const char *v;
                 size_t vl;
                 makekey(k, sizeof(k), i);
@@ -786,7 +793,7 @@ static void bench_store_into_files(void)
              * workload measures. */
             struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), (long)i * 2);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
@@ -816,7 +823,7 @@ static void bench_store_into_files(void)
 
             double t0 = now();
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 /* update: the even keys, all present.  create: the odd ones,
                  * all absent and interleaved among them. */
                 makekey(k, sizeof(k), (long)i * 2 + (pass ? 1 : 0));
@@ -864,7 +871,7 @@ static void fetch_setup(void)
     cleanup(plain);
     struct zs_db *db = open_at(plain, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
-        char k[64];
+        char k[ZSB_KEYMAX];
         makekey(k, sizeof(k), i);
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
@@ -911,7 +918,7 @@ static void bench_fetch(void)
             double t0 = now();
             hits = 0;
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 const char *v;
                 size_t vl;
                 makekey(k, sizeof(k), (i * 7919) % nrecs);
@@ -986,7 +993,7 @@ static void scan_setup(void)
     cleanup(plain);
     struct zs_db *db = open_at(plain, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
-        char k[64];
+        char k[ZSB_KEYMAX];
         makekey(k, sizeof(k), i);
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
@@ -1076,7 +1083,7 @@ static void scanmerge_setup(void)
     cleanup(inter);
     struct zs_db *db = open_at(inter, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
-        char k[64];
+        char k[ZSB_KEYMAX];
         makekey(k, sizeof(k), (long)strided(i));
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
@@ -1095,7 +1102,7 @@ static void scanmerge_setup(void)
         struct zs_txn *txn = NULL;
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
         for (int i = 0; i < nrecs; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), (long)strided(i));
             zs_txn_store(txn, k, strlen(k), val, valsize, 0);
         }
@@ -1193,7 +1200,7 @@ static void bench_txn_scan(void)
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
 
         for (int i = 0; i < nrecs; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_txn_store(txn, k, strlen(k), val, valsize, 0);
         }
@@ -1225,7 +1232,7 @@ static void bench_txn_scan(void)
             cleanup(dir);
             struct zs_db *fx = open_at(dir, FIXTURE_FLAGS, 0);
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_store(fx, k, strlen(k), val, valsize, 0);
             }
@@ -1241,7 +1248,7 @@ static void bench_txn_scan(void)
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
         int step = nrecs / 16 > 0 ? nrecs / 16 : 1;
         for (int i = 0; i < nrecs; i += step) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_txn_store(txn, k, strlen(k), val, valsize, 0);
         }
@@ -1287,7 +1294,7 @@ static void bench_rollover_and_convert(void)
 
             double t0 = now();
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
@@ -1334,7 +1341,7 @@ static void bench_repack_cascade(void)
         struct zs_db *db = open_at(dir, ZS_CREATE | ZS_NOAUTOREPACK, 32 * 1024);
 
         for (int i = 0; i < nrecs; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_db_store(db, k, strlen(k), val, valsize, 0);
         }
@@ -1397,7 +1404,7 @@ static void bench_snapshot_open(void)
         /* A rollover big enough that everything stays in one active file. */
         struct zs_db *db = open_at(dir, ZS_CREATE, 512 * 1024 * 1024);
         for (int i = 0; i < n; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_db_store(db, k, strlen(k), val, valsize, 0);
         }
@@ -1472,7 +1479,7 @@ static void bench_cached_open(void)
          * The threshold's own cost is measured separately below. */
         struct zs_db *db = open_cached(dir, ZS_CREATE, 512 * 1024 * 1024, idx, 1);
         for (int i = 0; i < n; i++) {
-            char k[64];
+            char k[ZSB_KEYMAX];
             makekey(k, sizeof(k), i);
             zs_db_store(db, k, strlen(k), val, valsize, 0);
         }
@@ -1557,7 +1564,7 @@ static void bench_index_threshold(void)
             double t0 = now();
             db = open_at(dir, ZS_CREATE, 512 * 1024 * 1024);
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
@@ -1598,7 +1605,7 @@ static void bench_index_threshold(void)
             db = open_cached(dir, ZS_CREATE, 512 * 1024 * 1024,
                              idx, thresholds[t]);
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
@@ -1684,12 +1691,12 @@ static void bench_compact(void)
 
             struct zs_db *db = open_at(dir, ZS_CREATE, 64 * 1024);
             for (int i = 0; i < nrecs; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
             for (int i = 0; i < nrecs * deleted_pct[t] / 100; i++) {
-                char k[64];
+                char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_delete(db, k, strlen(k), 0);
             }
@@ -1891,6 +1898,11 @@ int main(int argc, char **argv)
         return 2;
     }
     /* "key" plus at least one digit, or the keys stop being distinct. */
+    if (keysize > ZSB_KEYMAX - 1) {
+        fprintf(stderr, "zsbench: --keysize must be at most %d\n",
+                ZSB_KEYMAX - 1);
+        return 2;
+    }
     if (keysize < 4) {
         fprintf(stderr, "zsbench: --keysize must be at least 4\n");
         return 2;
