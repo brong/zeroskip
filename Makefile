@@ -202,10 +202,13 @@ endif
 mutate:
 	./tests/mutate.sh
 
-# Benchmarks
+# Benchmarks.  benchphases.sh checks the --setup / --run split: that the run
+# phase measures what the combined run does, and that a run phase paired with
+# the wrong fixtures is refused rather than measured.
 bench: zsbench
 	./zsbench --selftest
 	./zsbench -n 4000 --reps 1
+	./tests/benchphases.sh
 
 # Regenerate the language-neutral golden corpus (T-0).  The checked-in bytes
 # are the contract, so this target exists to add cases, not to paper over a

@@ -48,6 +48,25 @@ static const char *filter = NULL;
 static const char *csv_path = NULL;
 static char workdir[1024];
 
+/* Setup and run as separate invocations: --setup / --run.
+ *
+ * A read-only workload's fixture costs far more to build than the thing it
+ * measures costs to run -- 435 seconds against 0.25 for a 500k-record scan on a
+ * network-backed mount -- so `perf record ./zsbench scan` profiles the fixture
+ * build and reports almost nothing about the merge loop.  FIXTURE_FLAGS took the
+ * fdatasync storm out of that build; this takes the build out of the PROCESS.
+ * --setup builds the fixtures under --path and exits; --run times them and
+ * builds nothing, so the profiled process opens a database and reads it.
+ *
+ * Only the read-only workloads can split.  A store workload's setup IS its
+ * measurement, and `scan in a write txn` needs a live transaction, which cannot
+ * cross a process boundary; UNSPLITTABLE() names them, and the run banner says
+ * they were skipped rather than leaving a short report to be read as a full one. */
+enum phase { PHASE_ALL, PHASE_SETUP, PHASE_RUN };
+static enum phase phase = PHASE_ALL;
+
+#define UNSPLITTABLE() do { if (phase != PHASE_ALL) return; } while (0)
+
 /* ------------------------------------------------------------------------- */
 
 /* Repetition timing.
@@ -226,6 +245,98 @@ static void cleanup(const char *dir)
     if (system(cmd)) {}
 }
 
+/* A second fixture in a different state, without a second build.
+ *
+ * `fetch, repacked` and `full scan, compacted` used to repack and compact the
+ * fixture they had just timed, IN PLACE -- which is fine when one process does
+ * both lines in order, and wrong the moment the fixture is reused: a --run
+ * invocation would find the compacted database under the plain scan's name and
+ * time it twice.  Each timed line gets its own directory instead, copied from
+ * the first rather than stored again, since the copy is a fraction of the cost
+ * of nrecs commits. */
+static void copydir(const char *src, const char *dst)
+{
+    char cmd[4096];
+    cleanup(dst);
+    snprintf(cmd, sizeof(cmd), "cp -R '%s' '%s'", src, dst);
+    if (system(cmd)) {
+        fprintf(stderr, "zsbench: cannot copy %s to %s\n", src, dst);
+        exit(1);
+    }
+}
+
+/* Removing a fixture the workload has finished with -- unless the point of this
+ * invocation was to leave it behind. */
+static void fixture_done(const char *dir)
+{
+    if (phase == PHASE_ALL) cleanup(dir);
+}
+
+/* A fixture --setup should have left here, and did not.  --setup ignores the
+ * filter precisely so this cannot happen by pairing two invocations differently,
+ * which leaves a stale or half-removed --path directory.  Named here rather than
+ * left to the open, which would report a database that cannot be opened and send
+ * the reader looking for corruption. */
+static void fixture_require(const char *dir)
+{
+    struct stat st;
+    if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) return;
+    fprintf(stderr, "zsbench: fixture %s is missing -- "
+                    "run --setup on this --path again\n", dir);
+    exit(2);
+}
+
+/* The parameters the fixtures were built with.
+ *
+ * A --run at a different -n would fetch keys that were never stored and scan a
+ * database of the wrong size, then report an excellent number for missing every
+ * time.  That is the failure --selftest exists to prevent, arriving by a
+ * different door, so the pairing is checked rather than trusted. */
+#define STAMP_NAME "zsbench.setup"
+
+static void stamp_write(void)
+{
+    char path[1200];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", workdir, STAMP_NAME);
+    f = fopen(path, "w");
+    if (!f) { perror(path); exit(1); }
+    fprintf(f, "%d %zu %zu %s\n", nrecs, keysize, valsize, csum_name);
+    if (fclose(f)) { perror(path); exit(1); }
+}
+
+static void stamp_check(void)
+{
+    char path[1200], cs[64] = "";
+    int n = 0;
+    size_t ks = 0, vs = 0;
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", workdir, STAMP_NAME);
+    f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "zsbench: no fixtures in %s -- "
+                        "run --setup there first\n", workdir);
+        exit(2);
+    }
+    if (fscanf(f, "%d %zu %zu %63s", &n, &ks, &vs, cs) != 4) {
+        fprintf(stderr, "zsbench: cannot read %s\n", path);
+        fclose(f);
+        exit(2);
+    }
+    fclose(f);
+
+    if (n != nrecs || ks != keysize || vs != valsize || strcmp(cs, csum_name)) {
+        fprintf(stderr,
+                "zsbench: --run does not match the fixtures in %s\n"
+                "  fixtures: -n %d --keysize %zu --valsize %zu --csum %s\n"
+                "  this run: -n %d --keysize %zu --valsize %zu --csum %s\n",
+                workdir, n, ks, vs, cs, nrecs, keysize, valsize, csum_name);
+        exit(2);
+    }
+}
+
 /* twombench spells its engines "xxh64" and "null"; the same two words select
  * F-5's engine 1 and engine 0 here, so a side-by-side run configures both
  * tools identically. */
@@ -314,12 +425,22 @@ static int count_files(const char *dir)
     return n;
 }
 
+/* One line per fixture built, so --setup reports what a later --run can time. */
+static void setup_note(const char *dir)
+{
+    int files = count_files(dir);
+    printf("setup: %-40s %d records, %d file%s\n", dir, nrecs, files,
+           files == 1 ? "" : "s");
+    fflush(stdout);
+}
+
 /* ------------------------------------------------------------------------- */
 
 /* Mutating: a fresh database per repetition, or the second one measures
  * overwrites of the first's records rather than inserts. */
 static void bench_sequential_store(void)
 {
+    UNSPLITTABLE();
     char dir[1200], note[96] = "";
     char *val = malloc(valsize);
     struct reptimes rt = { {0}, 0 };
@@ -352,6 +473,7 @@ static void bench_sequential_store(void)
 
 static void bench_batched_store(void)
 {
+    UNSPLITTABLE();
     /* C-7b: the two durability gates are paid per TRANSACTION, not per record, so a
      * caller that batches amortises them.  This is the measurement that shows by
      * how much, and it is the reason zs_txn_* exists alongside zs_db_*. */
@@ -420,6 +542,7 @@ static void bench_batched_store(void)
  * exactly, and no zsbench figure would have predicted it. */
 static void bench_read_after_write(void)
 {
+    UNSPLITTABLE();
     char dir[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
@@ -511,6 +634,7 @@ static void bench_read_after_write(void)
  * away at the begin (D-16e). */
 static void bench_store_into_files(void)
 {
+    UNSPLITTABLE();
     char dir[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
@@ -594,39 +718,63 @@ static void bench_store_into_files(void)
     free(val);
 }
 
-static void bench_fetch(void)
+/* Before and after a repack, because the cost of a point lookup is proportional
+ * to the NUMBER OF FILES (D-14d) -- which is the whole reason the repack policy
+ * exists.
+ *
+ * Two directories rather than one repacked in place.  The repack is setup either
+ * way -- it mutates, so it was always outside the timed loop -- but done in place
+ * it CONSUMES the fragmented fixture, which only works while one process runs
+ * both passes in order.  Copying costs a fraction of nrecs commits. */
+static void fetch_dirs(char *plain, char *repacked, size_t sz)
 {
-    char dir[1200];
+    snprintf(plain, sz, "%s/fetch", workdir);
+    snprintf(repacked, sz, "%s/fetch-repacked", workdir);
+}
+
+static void fetch_setup(void)
+{
+    char plain[1200], repacked[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
+    fetch_dirs(plain, repacked, sizeof(plain));
 
-    snprintf(dir, sizeof(dir), "%s/fetch", workdir);
-    cleanup(dir);
-    struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
-
+    cleanup(plain);
+    struct zs_db *db = open_at(plain, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
         char k[64];
         makekey(k, sizeof(k), i);
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
     zs_db_close(&db);
+    free(val);
 
-    /* Before and after a repack, because the cost of a point lookup is
-     * proportional to the NUMBER OF FILES (D-14d) -- which is the whole reason the
-     * repack policy exists.
-     *
-     * Read-only, so the repetitions reuse the database the pass built.  The
-     * repack in pass 1 mutates and therefore happens once, outside the loop --
-     * it is setup for what is being timed, not part of it. */
+    copydir(plain, repacked);
+    db = open_at(repacked, 0, 0);
+    while (zs_db_should_repack(db)) zs_db_repack(db);
+    zs_db_close(&db);
+
+    if (phase == PHASE_SETUP) { setup_note(plain); setup_note(repacked); }
+}
+
+static void bench_fetch(void)
+{
+    char dirs[2][1200];
+    fetch_dirs(dirs[0], dirs[1], sizeof(dirs[0]));
+
+    if (phase != PHASE_RUN) fetch_setup();
+    if (phase == PHASE_SETUP) return;
+
+    /* Read-only, so the repetitions reuse the fixture. */
     for (int pass = 0; pass < 2; pass++) {
+        const char *dir = dirs[pass];
         char label[64], slug[64];
         int files, hits = 0;
         struct reptimes rt = { {0}, 0 };
+        struct zs_db *db;
 
+        fixture_require(dir);
         db = open_at(dir, 0, 0);
-        if (pass == 1) {
-            while (zs_db_should_repack(db)) zs_db_repack(db);
-        }
 
         files = count_files(dir);
         /* The repacked pass is named as such rather than by its file count
@@ -659,8 +807,8 @@ static void bench_fetch(void)
         zs_db_close(&db);
     }
 
-    cleanup(dir);
-    free(val);
+    fixture_done(dirs[0]);
+    fixture_done(dirs[1]);
 }
 
 /* Read-only, so every repetition scans the same database. */
@@ -690,37 +838,70 @@ static void bench_scan_once(struct zs_db *db, const char *slug,
     record(slug, label, (size_t)seen, &rt, note);
 }
 
-static void bench_scan(void)
+/* Two lines, because per-record stores build the most fragmented file the format
+ * can produce -- one span per record -- and a scan of that is the write-heavy
+ * worst case, not the steady state.  The compacted line is what long-lived data
+ * reads like.
+ *
+ * The compaction has its own directory for the reason fetch_setup gives, and
+ * more sharply: compacting in place turned the fragmented fixture into the
+ * compacted one, so a second invocation timing `full scan` would have measured
+ * the compacted database under the fragmented line's name -- the merge overhead
+ * this pair exists to isolate, reported as zero. */
+static void scan_dirs(char *plain, char *compacted, size_t sz)
 {
-    char dir[1200];
+    snprintf(plain, sz, "%s/scan", workdir);
+    snprintf(compacted, sz, "%s/scan-compacted", workdir);
+}
+
+static void scan_setup(void)
+{
+    char plain[1200], compacted[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
+    scan_dirs(plain, compacted, sizeof(plain));
 
-    snprintf(dir, sizeof(dir), "%s/scan", workdir);
-    cleanup(dir);
-    struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
+    cleanup(plain);
+    struct zs_db *db = open_at(plain, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
         char k[64];
         makekey(k, sizeof(k), i);
         zs_db_store(db, k, strlen(k), val, valsize, 0);
     }
     zs_db_close(&db);
+    free(val);
 
-    /* Two lines, because per-record stores build the most fragmented file
-     * the format can produce -- one span per record -- and a scan of that is
-     * the write-heavy worst case, not the steady state.  The compacted line
-     * is what long-lived data reads like. */
-    db = open_at(dir, 0, 0);
+    copydir(plain, compacted);
+    db = open_at(compacted, 0, 0);
+    zs_db_compact(db);
+    zs_db_close(&db);
+
+    if (phase == PHASE_SETUP) { setup_note(plain); setup_note(compacted); }
+}
+
+static void bench_scan(void)
+{
+    char plain[1200], compacted[1200];
+    scan_dirs(plain, compacted, sizeof(plain));
+
+    if (phase != PHASE_RUN) scan_setup();
+    if (phase == PHASE_SETUP) return;
+
+    /* No filter check here: the two labels differ, and bench_scan_once applies
+     * the filter per line.  A filter of "compacted" selects the second line
+     * only, and testing either label out here would drop it. */
+    fixture_require(plain);
+    struct zs_db *db = open_at(plain, 0, 0);
     bench_scan_once(db, "scan", "full scan");
     zs_db_close(&db);
 
-    db = open_at(dir, 0, 0);
-    zs_db_compact(db);
+    fixture_require(compacted);
+    db = open_at(compacted, 0, 0);
     bench_scan_once(db, "scan_compacted", "full scan, compacted");
     zs_db_close(&db);
 
-    cleanup(dir);
-    free(val);
+    fixture_done(plain);
+    fixture_done(compacted);
 }
 
 /* Traverse from INSIDE a write transaction, which every other read workload
@@ -773,8 +954,12 @@ static void bench_txn_scan(void)
     memset(val, 'v', valsize);
 
     /* All pending: nothing is committed, so the transaction arm is the whole
-     * source and the line is the arm's per-step cost with nothing else in it. */
-    if (selected("scan in a write txn")) {
+     * source and the line is the arm's per-step cost with nothing else in it.
+     *
+     * This half cannot be split.  Its setup is nrecs records pending in a LIVE
+     * transaction, which is process state rather than anything on disk, so there
+     * is nothing for --setup to leave behind. */
+    if (phase == PHASE_ALL && selected("scan in a write txn")) {
         snprintf(dir, sizeof(dir), "%s/txnscan", workdir);
         cleanup(dir);
         struct zs_db *db = open_at(dir, ZS_CREATE, 0);
@@ -798,16 +983,33 @@ static void bench_txn_scan(void)
 
     /* Mostly committed, a few pending: the arm joins a real merge.  The
      * overwrites are spread across the key range so the arm is consulted
-     * throughout the walk rather than being exhausted early. */
-    if (selected("scan in a write txn, few pending")) {
+     * throughout the walk rather than being exhausted early.
+     *
+     * This half splits PARTLY: the committed database is a fixture, and the
+     * handful of pending overwrites (nrecs/16) are re-done in the run phase,
+     * because a live transaction cannot cross a process boundary.  Built with
+     * FIXTURE_FLAGS now that it is one -- it was ZS_CREATE, paying C-7's two
+     * gates per record for a database nothing measures the writing of.
+     *
+     * PHASE_SETUP ignores the filter, for the reason main() gives. */
+    if (phase == PHASE_SETUP || selected("scan in a write txn, few pending")) {
         snprintf(dir, sizeof(dir), "%s/txnscanmix", workdir);
-        cleanup(dir);
-        struct zs_db *db = open_at(dir, ZS_CREATE, 0);
-        for (int i = 0; i < nrecs; i++) {
-            char k[64];
-            makekey(k, sizeof(k), i);
-            zs_db_store(db, k, strlen(k), val, valsize, 0);
+
+        if (phase != PHASE_RUN) {
+            cleanup(dir);
+            struct zs_db *fx = open_at(dir, FIXTURE_FLAGS, 0);
+            for (int i = 0; i < nrecs; i++) {
+                char k[64];
+                makekey(k, sizeof(k), i);
+                zs_db_store(fx, k, strlen(k), val, valsize, 0);
+            }
+            zs_db_close(&fx);
+            if (phase == PHASE_SETUP) setup_note(dir);
         }
+        if (phase == PHASE_SETUP) { free(val); return; }
+
+        fixture_require(dir);
+        struct zs_db *db = open_at(dir, 0, 0);
 
         struct zs_txn *txn = NULL;
         if (zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
@@ -823,7 +1025,7 @@ static void bench_txn_scan(void)
 
         zs_txn_abort(&txn);
         zs_db_close(&db);
-        cleanup(dir);
+        fixture_done(dir);
     }
 
     free(val);
@@ -831,6 +1033,7 @@ static void bench_txn_scan(void)
 
 static void bench_rollover_and_convert(void)
 {
+    UNSPLITTABLE();
     /* D-12d: a writer's extra cost is bounded by rollover_size rather than
      * proportional to the database.  Measured as the per-store cost at several
      * rollover sizes: if the claim holds, a smaller rollover means more frequent
@@ -876,6 +1079,7 @@ static void bench_rollover_and_convert(void)
 
 static void bench_repack_cascade(void)
 {
+    UNSPLITTABLE();
     /* Open item 1: a repack cascade is unbounded in duration by design (D-16b).
      * Measured so the trade is a number rather than a worry. */
     char dir[1200];
@@ -940,6 +1144,7 @@ static void bench_repack_cascade(void)
 
 static void bench_snapshot_open(void)
 {
+    UNSPLITTABLE();
     if (!selected("snapshot open")) return;
 
     /* THE NUMBER OPEN ITEM 2 ASKS FOR.
@@ -1007,6 +1212,7 @@ static void bench_snapshot_open(void)
 
 static void bench_cached_open(void)
 {
+    UNSPLITTABLE();
     if (!selected("open cached") && !selected("open plain")) return;
 
     /* What spec section 8 buys: the same open, with a published pointer table
@@ -1086,6 +1292,7 @@ static void bench_cached_open(void)
 
 static void bench_index_threshold(void)
 {
+    UNSPLITTABLE();
     if (!selected("publish")) return;
 
     /* What P-13's threshold trades.
@@ -1216,6 +1423,7 @@ static void bench_index_threshold(void)
 
 static void bench_compact(void)
 {
+    UNSPLITTABLE();
     if (!selected("compact")) return;
 
     /* D-26/D-27: what compaction costs and what it reclaims.
@@ -1349,19 +1557,29 @@ static int usage(void)
         "or all of them if no filter is given.\n"
         "\n"
         "  --selftest       verify the harness, then exit\n"
+        "      --setup      build the read-only workloads' fixtures and exit\n"
+        "      --run        time fixtures a --setup left behind, building none\n"
         "  -n, --records N  records per run (default %d)\n"
         "      --reps N     repetitions per benchmark, median kept (default %d)\n"
         "      --keysize N  key length in bytes (default %zu, minimum 4)\n"
         "      --valsize N  value length in bytes (default %zu)\n"
         "      --csum ENG   xxh64 (default) or null\n"
         "      --path DIR   working directory (default $TMPDIR)\n"
-        "      --csv FILE   write results as CSV\n",
+        "      --csv FILE   write results as CSV\n"
+        "\n"
+        "--setup and --run need the same --path, and the same -n, --keysize,\n"
+        "--valsize and --csum.  They exist so a profiler sees the measurement\n"
+        "and not the fixture build:\n"
+        "\n"
+        "  ./zsbench --path=/tmp/fix --setup scan\n"
+        "  perf record -g ./zsbench --path=/tmp/fix --run scan\n",
         nrecs, reps, keysize, valsize);
     return 2;
 }
 
 int main(int argc, char **argv)
 {
+    int path_given = 0;
     const char *tmp = getenv("TMPDIR");
     if (!tmp) tmp = "/tmp";
     snprintf(workdir, sizeof(workdir), "%s/zsbench.%d", tmp, (int)getpid());
@@ -1391,6 +1609,14 @@ int main(int argc, char **argv)
                           val ? val : (const char *)NULL)
 
         if (!strcmp(opt, "--selftest")) selftest = 1;
+        else if (!strcmp(opt, "--setup") || !strcmp(opt, "--run")) {
+            enum phase want = !strcmp(opt, "--setup") ? PHASE_SETUP : PHASE_RUN;
+            if (phase != PHASE_ALL && phase != want) {
+                fprintf(stderr, "zsbench: --setup and --run are exclusive\n");
+                return 2;
+            }
+            phase = want;
+        }
         else if (!strcmp(opt, "-n") || !strcmp(opt, "--records")) {
             if (!ARGVAL()) return usage();
             nrecs = atoi(val);
@@ -1414,6 +1640,7 @@ int main(int argc, char **argv)
         else if (!strcmp(opt, "--path") || !strcmp(opt, "--dir")) {
             if (!ARGVAL()) return usage();
             snprintf(workdir, sizeof(workdir), "%s", val);
+            path_given = 1;
         }
         else if (!strcmp(opt, "--csv")) {
             if (!ARGVAL()) return usage();
@@ -1442,19 +1669,56 @@ int main(int argc, char **argv)
         fprintf(stderr, "zsbench: --csum must be xxh64 or null\n");
         return 2;
     }
+    /* The default workdir carries the pid, so two invocations would never name
+     * the same directory -- a phase without --path could not work. */
+    if (phase != PHASE_ALL && !path_given) {
+        fprintf(stderr, "zsbench: --setup and --run require --path\n");
+        return 2;
+    }
+    if (phase != PHASE_ALL && selftest) {
+        fprintf(stderr, "zsbench: --selftest takes no phase\n");
+        return 2;
+    }
 
     if (mkdir(workdir, 0700) && errno != EEXIST) {
         perror(workdir);
         return 1;
     }
 
+    if (phase == PHASE_RUN) stamp_check();
+
     int rc = 0;
     if (selftest) {
         rc = run_selftest();
+    } else if (phase == PHASE_SETUP) {
+        printf("zsbench setup: %d records, %zu-byte keys, %zu-byte values, "
+               "into %s\n", nrecs, keysize, valsize, workdir);
+        /* The filter is deliberately NOT applied here, and a given one says so.
+         * It belongs to the run phase, where it costs nothing to be exact; a
+         * setup phase that honoured it would let the two invocations disagree
+         * about which fixtures exist, and `fetch (N files)` cannot be tested
+         * against a filter before the files it names have been built anyway.
+         * So --setup always builds all five, and --run can rely on that. */
+        if (filter)
+            printf("  (--setup builds every fixture; the filter `%s' applies "
+                   "to --run)\n", filter);
+        bench_fetch();
+        bench_scan();
+        bench_txn_scan();
+        stamp_write();
+        printf("\nnow: perf record -g %s --path=%s --run%s%s\n",
+               argv[0], workdir, filter ? " " : "", filter ? filter : "");
     } else {
         printf("zeroskip benchmark: %d records, %zu-byte keys, "
-               "%zu-byte values, %d reps (median)\n\n",
+               "%zu-byte values, %d reps (median)\n",
                nrecs, keysize, valsize, reps);
+        /* Named rather than left out, or a short report reads as a full one. */
+        if (phase == PHASE_RUN)
+            printf("run phase over %s: the store workloads, `scan in a write "
+                   "txn`,\n  rollover, repack cascade, the open and threshold "
+                   "sweeps and compaction\n  are skipped -- their setup is what "
+                   "they measure.\n", workdir);
+        printf("\n");
         bench_sequential_store();
         bench_batched_store();
         bench_read_after_write();
@@ -1472,6 +1736,8 @@ int main(int argc, char **argv)
         if (csv_path && csv_write(csv_path) != 0) rc = 1;
     }
 
-    cleanup(workdir);
+    /* A phase leaves its work behind: the fixtures are the point of --setup, and
+     * --run wants them still there for the next profiling pass. */
+    if (phase == PHASE_ALL) cleanup(workdir);
     return rc;
 }

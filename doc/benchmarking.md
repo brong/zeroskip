@@ -1,7 +1,7 @@
 # Benchmarking zeroskip
 
 ```
-make bench          # --selftest, then a small smoke run
+make bench          # --selftest, a small smoke run, then the phase check
 ./zsbench           # the full run
 ./zsbench -n 100000 --valsize 500 --reps 5
 ./zsbench store     # only workloads whose name contains "store"
@@ -240,6 +240,58 @@ over the whole process reported the `fdatasync` storm and said nothing at all
 about the merge loop. Locally the same run went from 20.5s to 3.8s with the
 scan rate unchanged. A benchmark you cannot profile is most of the way to a
 benchmark you cannot trust.
+
+## Profiling only the run phase
+
+`ZS_NOSYNC` took the `fdatasync` storm out of the fixture build. `--setup` and
+`--run` take the build out of the **process**, which is what a profiler samples:
+
+```
+./zsbench --path=/tmp/fix --setup -n 200000 scan
+perf record -g ./zsbench --path=/tmp/fix --run -n 200000 --reps 3 scan
+```
+
+At 200 000 records that is 4.2 s of setup against **0.04 s** in the profiled
+process, reporting the same per-record rates as the combined run — so every
+sample belongs to a merge cursor rather than to a writer.
+
+`--setup` builds the fixtures under `--path` and exits, leaving them behind.
+`--run` builds nothing: it times what is there and leaves it, so the same
+fixture can be profiled again with different events. Both need an explicit
+`--path`, because the default working directory carries the pid.
+
+**The two invocations must agree**, and are checked rather than trusted.
+`--setup` writes `zsbench.setup` recording `-n`, `--keysize`, `--valsize` and
+`--csum`; a `--run` that disagrees is refused. A run phase at the wrong `-n`
+would fetch keys that were never stored and report an excellent number for
+missing every time — the failure `--selftest` exists to prevent, arriving by a
+different door.
+
+**The filter belongs to the run phase.** `--setup` builds all five fixtures
+whatever filter it is given, so the two invocations cannot disagree about which
+exist; `fetch (N files)` could not be tested against a filter before the files
+it names have been built anyway.
+
+**Only the read-only workloads split**, and the run phase names the ones it
+skipped rather than leaving a short report to be read as a full one:
+
+| splits | reason it does not |
+|---|---|
+| `fetch`, `fetch, repacked` | |
+| `full scan`, `full scan, compacted` | |
+| `scan in a write txn, few pending` | partly — its `nrecs/16` pending overwrites are redone in the run phase |
+| | the store workloads: setup **is** the measurement |
+| | `scan in a write txn`: its setup is a live transaction, which is process state |
+| | rollover, repack cascade, the open and threshold sweeps, compaction: each mutates what it measures and rebuilds per repetition |
+
+One consequence in every mode, not only the phase ones: `fetch, repacked` and
+`full scan, compacted` now get **their own fixture directory**, copied from the
+first rather than stored again. They used to repack and compact the fixture they
+had just timed, in place, which is fine while one process does both lines in
+order and wrong the moment the fixture is reused — a second `--run` would have
+timed the compacted database under the fragmented line's name and reported the
+merge overhead those two lines exist to isolate as zero. The cost is disk: a
+scan or fetch fixture is on disk twice.
 
 ## Reading the rollover rows
 
