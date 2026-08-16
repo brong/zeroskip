@@ -248,24 +248,46 @@ benchmark you cannot trust.
 
 ```
 ./zsbench --path=/tmp/fix --setup -n 200000 scan
-perf record -g ./zsbench --path=/tmp/fix --run -n 200000 --reps 3 scan
+perf record -g ./zsbench --path=/tmp/fix --run --reps 20 scan
 ```
 
 At 200 000 records that is 4.2 s of setup against **0.04 s** in the profiled
 process, reporting the same per-record rates as the combined run — so every
-sample belongs to a merge cursor rather than to a writer.
+sample belongs to a merge cursor rather than to a writer. `--setup` prints the
+second line for you, filter and all.
 
 `--setup` builds the fixtures under `--path` and exits, leaving them behind.
 `--run` builds nothing: it times what is there and leaves it, so the same
 fixture can be profiled again with different events. Both need an explicit
 `--path`, because the default working directory carries the pid.
 
-**The two invocations must agree**, and are checked rather than trusted.
-`--setup` writes `zsbench.setup` recording `-n`, `--keysize`, `--valsize` and
-`--csum`; a `--run` that disagrees is refused. A run phase at the wrong `-n`
-would fetch keys that were never stored and report an excellent number for
-missing every time — the failure `--selftest` exists to prevent, arriving by a
-different door.
+**Raise `--reps`.** A run phase is short by design — 40 ms for the three scan
+lines at 200 000 records — which is too few samples to profile. `--reps` is not
+part of the fixture, so it is the free knob; `-n` is the other, and costs a
+rebuild.
+
+**A `--run` adopts the parameters it was not given.** `--setup` writes
+`zsbench.setup` recording `-n`, `--keysize`, `--valsize` and `--csum`, and
+`--run` takes each of them from there unless it was told otherwise — so the
+invocation anyone types, `--path=DIR --run scan`, works at any fixture size. A
+parameter that *is* given must match, and the run is refused if it does not: a
+run phase at the wrong `-n` would fetch keys that were never stored and report
+an excellent number for missing every time, which is the failure `--selftest`
+exists to prevent arriving by a different door.
+
+That refusal used to be reachable by copy-pasting the command `--setup` printed,
+which omitted `-n`. It is worth knowing what a refusal looks like from inside
+`perf`, because it does not look like an error:
+
+```
+[ perf record: Captured and wrote 0.019 MB perf.data (12 samples) ]
+   34.24%  zsbench  [kernel.kallsyms]     [k] zpl_getattr
+   30.17%  zsbench  ld-linux-x86-64.so.2  [.] do_lookup_x
+```
+
+Twelve samples, all of them the dynamic linker and the `stat` of the stamp: a
+profile of a process that exited before it started. `tests/benchphases.sh` runs
+the command `--setup` prints, for this reason.
 
 **The filter belongs to the run phase.** `--setup` builds all five fixtures
 whatever filter it is given, so the two invocations cannot disagree about which

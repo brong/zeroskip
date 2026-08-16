@@ -117,6 +117,38 @@ refused "a different -n is refused" "match the fixtures" \
         $ZSBENCH --path="$FIX" --run -n $((N + 1))
 refused "a different --valsize is refused" "match the fixtures" \
         $ZSBENCH --path="$FIX" --run -n $N --valsize 999
+refused "an unreadable stamp is refused" "cannot read" \
+        sh -c "echo bogus > '$FIX/zsbench.setup'; $ZSBENCH --path='$FIX' --run"
+# Well-formed but not a fixture's: the adopted values are validated too, since
+# they no longer came from the command line that validates its own.
+refused "an out-of-range stamp is refused" "not a fixture stamp" \
+        sh -c "echo '0 11 100 xxh64' > '$FIX/zsbench.setup'; $ZSBENCH --path='$FIX' --run"
+$ZSBENCH --path="$FIX" --setup -n $N >/dev/null 2>&1   # put the stamp back
+
+# A --run that is told NOTHING takes the fixtures' parameters, rather than the
+# defaults.  This is the invocation that matters: `perf record ./zsbench --path
+# --run scan` is what anyone types, and requiring -n to be repeated made it
+# refuse at every fixture size but the default -- which under perf reports as a
+# dozen samples of the dynamic linker, not as a benchmark that never ran.
+out=$($ZSBENCH --path="$FIX" --run --reps 1 --csv "$OUT/bare.csv" 2>&1)
+case "$out" in
+    *"$N records"*) ok "a bare --run adopts the fixtures' -n" ;;
+    *)              bad "a bare --run adopts the fixtures' -n: [$out]" ;;
+esac
+check "a bare --run measures the same rows" \
+      "$(slugops "$OUT/bare.csv")" "$(slugops "$OUT/run1.csv")"
+
+# And the command --setup prints is a command that WORKS.  It is the answer to
+# "what do I run under perf now", so a copy-paste of it that gets refused costs
+# a profiling session.
+hint=$($ZSBENCH --path="$FIX" --setup -n $N scan 2>&1 | sed -n 's/^now: perf record -g //p')
+if [ -z "$hint" ]; then
+    bad "--setup prints a command to run"
+else
+    ok "--setup prints a command to run"
+    if $hint >/dev/null 2>&1; then ok "the printed command runs"
+    else bad "the printed command runs: [$hint]"; fi
+fi
 
 # The filter belongs to the run phase: a filtered --setup still builds every
 # fixture, so the two invocations cannot disagree about which ones exist.

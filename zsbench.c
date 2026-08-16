@@ -291,8 +291,20 @@ static void fixture_require(const char *dir)
  * A --run at a different -n would fetch keys that were never stored and scan a
  * database of the wrong size, then report an excellent number for missing every
  * time.  That is the failure --selftest exists to prevent, arriving by a
- * different door, so the pairing is checked rather than trusted. */
+ * different door, so the pairing is checked rather than trusted.
+ *
+ * A --run therefore ADOPTS whatever it was not told, rather than defaulting.
+ * Requiring the parameters to be repeated makes the common invocation --
+ * `perf record ./zsbench --path=DIR --run scan` -- refuse to run at any -n but
+ * the default, which is a fixture size nobody profiling would have built; and
+ * the refusal costs a whole profiling session, because `perf record` reports it
+ * as 12 samples of the dynamic linker rather than as a benchmark that never
+ * started.  A parameter that IS given still has to match: adopting it silently
+ * would answer a question the caller asked about a different database. */
 #define STAMP_NAME "zsbench.setup"
+
+static int nrecs_given = 0, keysize_given = 0, valsize_given = 0,
+           csum_given = 0;
 
 static void stamp_write(void)
 {
@@ -327,13 +339,41 @@ static void stamp_check(void)
     }
     fclose(f);
 
-    if (n != nrecs || ks != keysize || vs != valsize || strcmp(cs, csum_name)) {
+    /* Adopting means these are no longer the command line's, so they are
+     * validated here as well as there. */
+    if (n < 1 || ks < 4 || (strcmp(cs, "xxh64") && strcmp(cs, "null"))) {
+        fprintf(stderr, "zsbench: %s is not a fixture stamp\n", path);
+        exit(2);
+    }
+
+    if ((nrecs_given   && n  != nrecs)   ||
+        (keysize_given && ks != keysize) ||
+        (valsize_given && vs != valsize) ||
+        (csum_given    && strcmp(cs, csum_name))) {
+        /* Only what was actually GIVEN is echoed back: printing the effective
+         * values would show defaults the caller never typed, next to fixture
+         * values they do not match, and read as four disagreements. */
         fprintf(stderr,
                 "zsbench: --run does not match the fixtures in %s\n"
                 "  fixtures: -n %d --keysize %zu --valsize %zu --csum %s\n"
-                "  this run: -n %d --keysize %zu --valsize %zu --csum %s\n",
-                workdir, n, ks, vs, cs, nrecs, keysize, valsize, csum_name);
+                "  this run:", workdir, n, ks, vs, cs);
+        if (nrecs_given)   fprintf(stderr, " -n %d", nrecs);
+        if (keysize_given) fprintf(stderr, " --keysize %zu", keysize);
+        if (valsize_given) fprintf(stderr, " --valsize %zu", valsize);
+        if (csum_given)    fprintf(stderr, " --csum %s", csum_name);
+        fprintf(stderr, "\n  (omit them and --run takes the fixtures' own)\n");
         exit(2);
+    }
+
+    nrecs = n;
+    keysize = ks;
+    valsize = vs;
+    /* csum_name may point into argv; the stamp's copy is a local, so keep it in
+     * static storage of its own. */
+    {
+        static char adopted[64];
+        snprintf(adopted, sizeof(adopted), "%s", cs);
+        csum_name = adopted;
     }
 }
 
@@ -1620,6 +1660,7 @@ int main(int argc, char **argv)
         else if (!strcmp(opt, "-n") || !strcmp(opt, "--records")) {
             if (!ARGVAL()) return usage();
             nrecs = atoi(val);
+            nrecs_given = 1;
         }
         else if (!strcmp(opt, "--reps")) {
             if (!ARGVAL()) return usage();
@@ -1628,14 +1669,17 @@ int main(int argc, char **argv)
         else if (!strcmp(opt, "--keysize")) {
             if (!ARGVAL()) return usage();
             keysize = (size_t)atol(val);
+            keysize_given = 1;
         }
         else if (!strcmp(opt, "--valsize") || !strcmp(opt, "--value")) {
             if (!ARGVAL()) return usage();
             valsize = (size_t)atol(val);
+            valsize_given = 1;
         }
         else if (!strcmp(opt, "--csum")) {
             if (!ARGVAL()) return usage();
             csum_name = val;
+            csum_given = 1;
         }
         else if (!strcmp(opt, "--path") || !strcmp(opt, "--dir")) {
             if (!ARGVAL()) return usage();
@@ -1706,7 +1750,16 @@ int main(int argc, char **argv)
         bench_scan();
         bench_txn_scan();
         stamp_write();
-        printf("\nnow: perf record -g %s --path=%s --run%s%s\n",
+        /* The suggestion has to be a command that WORKS.  It omitted -n at
+         * first, which the stamp check then refused at every fixture size but
+         * the default -- and under `perf record` a refusal costs the whole
+         * session, reporting as a dozen samples of the dynamic linker rather
+         * than as a benchmark that never started.  --run adopts the fixtures'
+         * parameters now, so nothing here has to be repeated; --reps is
+         * suggested because it does not come from the stamp and a run phase is
+         * short by design: at 200k records the whole thing is 40ms, which is
+         * too few samples to profile. */
+        printf("\nnow: perf record -g %s --path=%s --run --reps 20%s%s\n",
                argv[0], workdir, filter ? " " : "", filter ? filter : "");
     } else {
         printf("zeroskip benchmark: %d records, %zu-byte keys, "
