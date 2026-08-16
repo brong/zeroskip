@@ -1346,23 +1346,62 @@ int main(int argc, char **argv)
     snprintf(workdir, sizeof(workdir), "%s/zsbench.%d", tmp, (int)getpid());
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--selftest")) selftest = 1;
-        else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--records"))
-                 && i + 1 < argc) nrecs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--keysize") && i + 1 < argc)
-            keysize = (size_t)atol(argv[++i]);
-        else if ((!strcmp(argv[i], "--valsize") || !strcmp(argv[i], "--value"))
-                 && i + 1 < argc) valsize = (size_t)atol(argv[++i]);
-        else if (!strcmp(argv[i], "--csum") && i + 1 < argc)
-            csum_name = argv[++i];
-        else if ((!strcmp(argv[i], "--path") || !strcmp(argv[i], "--dir"))
-                 && i + 1 < argc)
-            snprintf(workdir, sizeof(workdir), "%s", argv[++i]);
-        else if (!strcmp(argv[i], "--csv") && i + 1 < argc)
-            csv_path = argv[++i];
+        /* --opt=value and --opt value are both accepted.  The `=` spelling is
+         * what anyone types by reflex, and it used to fall through to the
+         * usage dump -- which, run under `perf stat`, looks like a benchmark
+         * that completed in a millisecond rather than one that never ran. */
+        char opt[64];
+        const char *inl = NULL, *val = NULL;
+        const char *eq = strchr(argv[i], '=');
+
+        if (argv[i][0] == '-' && eq && (size_t)(eq - argv[i]) < sizeof(opt)) {
+            size_t n = (size_t)(eq - argv[i]);
+            memcpy(opt, argv[i], n);
+            opt[n] = '\0';
+            inl = eq + 1;
+        } else {
+            snprintf(opt, sizeof(opt), "%s", argv[i]);
+        }
+
+        /* Every option below that takes a value calls this exactly once, so an
+         * option given without one is a usage error rather than a silent
+         * default. */
+        #define ARGVAL() (val = inl ? inl : (i + 1 < argc ? argv[++i] : NULL), \
+                          val ? val : (const char *)NULL)
+
+        if (!strcmp(opt, "--selftest")) selftest = 1;
+        else if (!strcmp(opt, "-n") || !strcmp(opt, "--records")) {
+            if (!ARGVAL()) return usage();
+            nrecs = atoi(val);
+        }
+        else if (!strcmp(opt, "--reps")) {
+            if (!ARGVAL()) return usage();
+            reps = atoi(val);
+        }
+        else if (!strcmp(opt, "--keysize")) {
+            if (!ARGVAL()) return usage();
+            keysize = (size_t)atol(val);
+        }
+        else if (!strcmp(opt, "--valsize") || !strcmp(opt, "--value")) {
+            if (!ARGVAL()) return usage();
+            valsize = (size_t)atol(val);
+        }
+        else if (!strcmp(opt, "--csum")) {
+            if (!ARGVAL()) return usage();
+            csum_name = val;
+        }
+        else if (!strcmp(opt, "--path") || !strcmp(opt, "--dir")) {
+            if (!ARGVAL()) return usage();
+            snprintf(workdir, sizeof(workdir), "%s", val);
+        }
+        else if (!strcmp(opt, "--csv")) {
+            if (!ARGVAL()) return usage();
+            csv_path = val;
+        }
         else if (argv[i][0] != '-' && !filter) filter = argv[i];
         else return usage();
+
+        #undef ARGVAL
     }
 
     if (nrecs < 1) {
