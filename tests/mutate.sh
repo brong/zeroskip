@@ -435,10 +435,10 @@ mutant "cursor: gen not taken from the file" catch \
 # Seek must be a lower bound, and exhaustion must be reported rather than
 # producing a stale record.
 mutant "seek: in-order lands one early" catch \
-  's/        fc->pi = idx;/        fc->pi = idx ? idx - 1 : 0;/'
+  's/        fc->u\.f\.pi = idx;/        fc->u\.f\.pi = idx ? idx - 1 : 0;/'
 
 mutant "load: exhaustion not detected in-order" catch \
-  's/        \} else if \(fc->pi >= fc->file->nptrs\) \{/        } else if (fc->pi > fc->file->nptrs) {/'
+  's/        \} else if \(fc->u\.f\.pi >= fc->file->nptrs\) \{/        } else if (fc->u\.f\.pi > fc->file->nptrs) {/'
 
 mutant "load: unordered never exhausts" catch \
   's/        fc->exhausted = \(r != ZS_OK\);/        fc->exhausted = false; (void)r;/'
@@ -448,7 +448,7 @@ mutant "load: unordered never exhausts" catch \
 # 2^64 next() calls on an exhausted in-order cursor would wrap pi back into range
 # -- which is why this is subsumed rather than equivalent, and why the guard stays.
 mutant "next: advances an exhausted cursor" subsumed \
-  's/    if \(fc->exhausted\) return ZS_OK;\n\n    switch \(fc->kind\) \{\n    case ZSI_SRC_INORDER:\n        if \(fc->reverse\) fc->pi--;/    switch (fc->kind) {\n    case ZSI_SRC_INORDER:\n        if (fc->reverse) fc->pi--;/'
+  's/    if \(fc->exhausted\) return ZS_OK;\n\n    switch \(fc->kind\) \{\n    case ZSI_SRC_INORDER:\n        if \(fc->reverse\) fc->u\.f\.pi--;/    switch (fc->kind) {\n    case ZSI_SRC_INORDER:\n        if (fc->reverse) fc->u\.f\.pi--;/'
 
 # find must report an exact hit only, or a point lookup silently returns a
 # neighbouring key -- which the read path would then treat as the answer.
@@ -1051,10 +1051,10 @@ echo "the txn arm's step hint (D-14j-a)"
 # the array shifts under the cursor and the hint points at whatever moved into
 # that slot -- so a key is re-yielded or skipped, silently.
 mutant "txn arm: step hint never goes stale" catch \
-  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->tloadedti \+ 1;/    if (fc->tstarted)\n        return fc->tloadedti + 1;/'
+  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->u\.t\.loadedti \+ 1;/    if (fc->u\.t\.started)\n        return fc->u\.t\.loadedti + 1;/'
 
 mutant "txn arm: reverse step hint never goes stale" catch \
-  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(txn\)\) \{/    if (fc->tstarted) {/'
+  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(txn\)\) \{/    if (fc->u\.t\.started) {/'
 
 # The bug this shipped with on the first attempt, preserved: re-stamping the
 # sequence at the STEP reads a pend_seq that a write between the load and the
@@ -1068,7 +1068,7 @@ mutant "txn arm: reverse step hint never goes stale" catch \
 # equivalent, and it read as NOT CAUGHT.  --rot-only cannot see that: it
 # reports a pattern intact if it matches at all.
 mutant "txn arm: sequence re-stamped at the step" catch \
-  's/        fc->tstarted = true;\n\n        break;/        fc->tstarted = true;\n        fc->tloadedseq = zsi_txn_seq(fc->txn);\n\n        break;/'
+  's/        fc->u\.t\.started = true;\n\n        break;/        fc->u\.t\.started = true;\n        fc->u\.t\.loadedseq = zsi_txn_seq(fc->txn);\n\n        break;/'
 
 # A seek moves the position arbitrarily, so a hint armed by an earlier step
 # describes nothing.  Keeping it makes a re-seeked arm resume from wherever it
@@ -1078,7 +1078,7 @@ mutant "txn arm: sequence re-stamped at the step" catch \
 # after one.  Dropping it from the test makes a re-seeked arm resume from
 # wherever the previous step had reached.
 mutant "txn arm: a seek keeps the old hint" catch \
-  's/    if \(fc->tstarted && fc->tloadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->tloadedti \+ 1;/    if (fc->tloadedseq == zsi_txn_seq(fc->txn))\n        return fc->tloadedti + 1;/'
+  's/    if \(fc->u\.t\.started && fc->u\.t\.loadedseq == zsi_txn_seq\(fc->txn\)\)\n        return fc->u\.t\.loadedti \+ 1;/    if (fc->u\.t\.loadedseq == zsi_txn_seq(fc->txn))\n        return fc->u\.t\.loadedti + 1;/'
 
 echo
 echo "ZS_IFCHANGED (A-1d)"
@@ -1297,12 +1297,12 @@ echo "cursor liveness (D-14j)"
 # the element under it and the cursor re-yields a key it already returned --
 # silently, so the caller processes a record twice.
 mutant "cursor: txn arm resumes from the index" catch \
-  's/    if \(zsi_pend_search\(fc->txn, fc->tkey, fc->tkeylen, &pos\) == ZS_OK\n        && fc->tstarted\)\n        pos\+\+;/    (void)zsi_pend_search(fc->txn, fc->tkey, fc->tkeylen, \&pos);/'
+  's/    if \(zsi_pend_search\(fc->txn, fc->u\.t\.key, fc->u\.t\.keylen, &pos\) == ZS_OK\n        && fc->u\.t\.started\)\n        pos\+\+;/    (void)zsi_pend_search(fc->txn, fc->u\.t\.key, fc->u\.t\.keylen, \&pos);/'
 
 # D-14j-b the other way: always advancing past the key means a seek that lands
 # ON a key skips it, so a scan from a start key loses its first record.
 mutant "cursor: txn arm always skips the seek hit" catch \
-  's/        && fc->tstarted\)\n        pos\+\+;/        )\n        pos++;/'
+  's/        && fc->u\.t\.started\)\n        pos\+\+;/        )\n        pos++;/'
 
 # EQUIVALENT, and worth the words because it looks like it should not be.  The
 # txn arm's position key is borrowed from the pending array's own key block, so
@@ -1620,7 +1620,7 @@ mutant "index: reverse tie leaves the base entry" catch \
 # D-14j-b reversed: after a yield the txn arm must resume strictly BELOW the
 # key it yielded; answering the exact hit again re-yields it forever.
 mutant "cursor: reverse txn arm resumes inclusively" catch \
-  's/    if \(exact && !fc->tstarted && !fc->texclusive\) \{/    if (exact \&\& !fc->texclusive) {/'
+  's/    if \(exact && !fc->u\.t\.started && !fc->u\.t\.exclusive\) \{/    if (exact \&\& !fc->u\.t\.exclusive) {/'
 
 # D-14k: seeking at the prefix ITSELF instead of its byte-successor starts the
 # scan below every key carrying the prefix, reporting a populated range empty.
