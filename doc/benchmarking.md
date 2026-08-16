@@ -193,6 +193,26 @@ point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
 bounded half — at most `rollover_size` of work — and is what to reach for if the
 goal is only to stop readers replaying the active file.
 
+## Fixtures are built with ZS_NOSYNC
+
+A read-only workload's database is setup, not measurement, so `bench_fetch`,
+`bench_scan` and the pre-existing database `store into N files` writes into are
+all built with `ZS_NOSYNC` (`FIXTURE_FLAGS`). That skips C-7's two commit gates
+and **nothing else** (C-6b), so the fixture is byte-for-byte the file set a
+durable build produces — still one span per record, which is the fragmented
+shape those workloads exist to read. Only the durability of writing it differs,
+and nothing measures that.
+
+The timed regions are untouched: `store into N files` reopens without it,
+because its subject *is* the store.
+
+It matters more than it sounds. On a network-backed mount a 500k-record scan
+fixture took **435 seconds to build and 0.25 seconds to scan**, so `perf stat`
+over the whole process reported the `fdatasync` storm and said nothing at all
+about the merge loop. Locally the same run went from 20.5s to 3.8s with the
+scan rate unchanged. A benchmark you cannot profile is most of the way to a
+benchmark you cannot trust.
+
 ## Reading the rollover rows
 
 The `store, rollover Nk` figures are not monotonic, and that is expected rather

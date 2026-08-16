@@ -251,6 +251,22 @@ static struct zs_db *open_at(const char *dir, uint32_t flags, size_t rollover)
     return db;
 }
 
+/* Building a FIXTURE for a read-only workload.
+ *
+ * ZS_NOSYNC, deliberately, and it does not change what is measured: it skips
+ * C-7's two commit gates and nothing else (C-6b), so the spans, terminators
+ * and records are byte-identical -- still one span per record, which is the
+ * fragmented shape these workloads exist to scan.  Only the durability of
+ * writing the fixture differs, and nobody is measuring that.
+ *
+ * Worth a great deal on real storage.  A 500k-record scan fixture on a
+ * network-backed mount took 435 seconds to build and 0.25 seconds to scan, so
+ * `perf stat` over the whole process reported the fsync storm and not the merge
+ * loop at all.  A benchmark you cannot profile is most of the way to a
+ * benchmark you cannot trust. */
+#define FIXTURE_FLAGS (ZS_CREATE | ZS_NOSYNC)
+
+
 /* The same, with the pointer table cache enabled (spec section 8). */
 static struct zs_db *open_cached(const char *dir, uint32_t flags, size_t rollover,
                                  const char *idxdir, size_t threshold)
@@ -516,8 +532,13 @@ static void bench_store_into_files(void)
              * so a miss above the top is the cheapest lookup the format has,
              * while the miss a bulk load actually pays is a full binary search
              * of every file.  Measured that way round, `create` came out
-             * FASTER than `update`, which is how the mistake surfaced. */
-            struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+             * FASTER than `update`, which is how the mistake surfaced.
+             *
+             * FIXTURE_FLAGS because this loop is SETUP -- it builds the
+             * database that is then stored into.  The timed region below opens
+             * separately and keeps its durability gates, which is what the
+             * workload measures. */
+            struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
             for (int i = 0; i < nrecs; i++) {
                 char k[64];
                 makekey(k, sizeof(k), (long)i * 2);
@@ -581,7 +602,7 @@ static void bench_fetch(void)
 
     snprintf(dir, sizeof(dir), "%s/fetch", workdir);
     cleanup(dir);
-    struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+    struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
 
     for (int i = 0; i < nrecs; i++) {
         char k[64];
@@ -677,7 +698,7 @@ static void bench_scan(void)
 
     snprintf(dir, sizeof(dir), "%s/scan", workdir);
     cleanup(dir);
-    struct zs_db *db = open_at(dir, ZS_CREATE, 0);
+    struct zs_db *db = open_at(dir, FIXTURE_FLAGS, 0);
     for (int i = 0; i < nrecs; i++) {
         char k[64];
         makekey(k, sizeof(k), i);
