@@ -7646,25 +7646,39 @@ static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
 
     if (nio < 2) { *first = 0; return 0; }      /* nothing to merge */
 
-    size_t lo = nio - 1;                        /* the newest in-order file */
-    size_t total = snap->files[lo]->size;
+    /* Walk from the OLDEST file and merge from the first one the files above it
+     * collectively outweigh.
+     *
+     * The invariant this leaves behind is that every file is at least as large
+     * as the sum of all newer ones, so sizes fall at least geometrically and
+     * the file count is bounded by log(total / smallest) directly.  Comparing
+     * against the SUM is what makes that hold: a rule comparing each file with
+     * its immediate neighbour stalls on an irregular tail -- sizes 100, 60, 50
+     * merge nothing under it, because 50 < 60 stops it at the first step, even
+     * though the two newer files together outweigh the oldest.  Deletions and
+     * dropped tombstones produce exactly those irregular sizes.
+     *
+     * A STRICT comparison is right here, because the left side is a sum: two
+     * files of equal size wait, and a third collapses all three.  A rule
+     * comparing neighbours needs to merge equals or it never merges at all,
+     * which is the opposite conclusion from the same-looking test.
+     *
+     * uint64_t rather than size_t for the accumulator: on a 32-bit host a few
+     * large files would overflow the sum, and reporting a too-small tail merges
+     * less rather than more, so it would fail quietly. */
+    uint64_t total = 0;
+    for (size_t i = 0; i < nio; i++) total += snap->files[i]->size;
 
-    while (lo > 0) {
-        size_t next = snap->files[lo - 1]->size;
+    uint64_t tail = total;
+    for (size_t i = 0; i + 1 < nio; i++) {
+        uint64_t here = snap->files[i]->size;
 
-        /* At least as large, NOT strictly larger.  Rollover produces files of
-         * near-identical size, so equality is the common case rather than a
-         * boundary: with a strict comparison neither the include rule nor the
-         * stop rule fires, nothing ever merges, and the file count grows
-         * without bound.  Merging equals is also what produces the geometric
-         * progression, two files of size s becoming one of 2s. */
-        if (total < next) break;
-        lo--;
-        total += next;
+        tail -= here;                   /* now the sum of everything above i */
+        if (tail > here) { *first = i; return nio - i; }
     }
 
-    *first = lo;
-    return nio - lo;
+    *first = 0;
+    return 0;
 }
 
 /* D-24: whether D-16 currently has work. */

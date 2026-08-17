@@ -8557,15 +8557,13 @@ static struct zsi_file *file_with_range(struct zs_db *db, uint32_t s, uint32_t e
 
 static void test_repack_selection(void)
 {
-    /* D-16's geometric rule: include the next lowest file only when the result so
-     * far is larger than it.  Sizes here are controlled by record counts. */
+    /* Selection merges from the oldest file the newer ones collectively
+     * outweigh.  Sizes here are controlled by record counts. */
     struct zs_db *db;
     size_t first, count;
 
-    /* Two files of EQUAL size are selected.  This is the case a strict
-     * comparison gets wrong: rollover produces near-identical sizes, so equality is
-     * the common case, and with a strict test neither the include rule nor the stop
-     * rule fires -- nothing ever merges and the file count grows without bound. */
+    /* TWO files of equal size wait: the sum above the first is exactly its own
+     * size, and the comparison is strict. */
     clear_db();
     put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
     put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
@@ -8574,9 +8572,63 @@ static void test_repack_selection(void)
     ASSERT_NOT_NULL(db);
     ASSERT_EQU(db->snap->files[0]->size, db->snap->files[1]->size);
     count = zsi_repack_select(db->snap, &first);
-    ASSERT_EQU(count, 2u);
+    ASSERT_EQU(count, 0u);
+    ASSERT(!zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* A THIRD collapses all three: two of them together outweigh the first. */
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_inorder_kv(2, 2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_inorder_kv(3, 3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+    put_unordered_kv(4, (const struct kv[]){ {"d","4"}, {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT_EQU(count, 3u);
     ASSERT_EQU(first, 0u);
     ASSERT(zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* The sum is what decides, not the neighbour: a big oldest file with two
+     * smaller ones above it that TOGETHER outweigh it is selected whole, even
+     * though no adjacent pair would trigger on its own. */
+    clear_db();
+    {
+        struct kv many[24];
+        char keys[24][16], vals[24][32];
+        for (int i = 0; i < 23; i++) {
+            snprintf(keys[i], 16, "k%03d", i);
+            memset(vals[i], 'v', 30); vals[i][30] = '\0';
+            many[i].k = keys[i]; many[i].v = vals[i];
+        }
+        many[23].k = NULL; many[23].v = NULL;
+        put_inorder_kv(1, 1, many);
+    }
+    {
+        struct kv some[16];
+        char keys[16][16], vals[16][32];
+        for (int i = 0; i < 15; i++) {
+            snprintf(keys[i], 16, "m%03d", i);
+            memset(vals[i], 'v', 30); vals[i][30] = '\0';
+            some[i].k = keys[i]; some[i].v = vals[i];
+        }
+        some[15].k = NULL; some[15].v = NULL;
+        put_inorder_kv(2, 2, some);
+        put_inorder_kv(3, 3, some);
+    }
+    put_unordered_kv(4, (const struct kv[]){ {"z","4"}, {NULL,NULL} });
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    /* Neither newer file alone reaches the oldest ... */
+    ASSERT(db->snap->files[1]->size < db->snap->files[0]->size);
+    ASSERT(db->snap->files[2]->size < db->snap->files[0]->size);
+    /* ... but together they exceed it. */
+    ASSERT(db->snap->files[1]->size + db->snap->files[2]->size
+           > db->snap->files[0]->size);
+    count = zsi_repack_select(db->snap, &first);
+    ASSERT_EQU(count, 3u);
+    ASSERT_EQU(first, 0u);
     zs_db_close(&db);
 
     /* A much larger older file is NOT absorbed by a small newer one: the stop rule
@@ -10221,7 +10273,12 @@ static bool corpus_replay(const char *txt, const char *dir, const char *uuid,
             if (fd < 0) return false;
             if (write(fd, vbuf, n) != (ssize_t)n) { close(fd); return false; }
             close(fd);
-            setup.flags = engine == 0 ? ZS_CSUM_NONE : ZS_CSUM_XXHASH;
+            /* ZS_NOAUTOREPACK: repack selection is not normative (D-16), so a
+             * replay that let the cascade fire would compare golden bytes
+             * against this implementation's policy rather than against the
+             * format.  Cases drive merges explicitly with `op repack`. */
+            setup.flags = (engine == 0 ? ZS_CSUM_NONE : ZS_CSUM_XXHASH)
+                        | ZS_NOAUTOREPACK;
             if (zs_db_open(dir, &setup, &db) != ZS_OK) return false;
         } else if (!strcmp(verb, "convert")) {
             struct zs_txn *t = NULL;
@@ -10229,6 +10286,8 @@ static bool corpus_replay(const char *txt, const char *dir, const char *uuid,
             if (zs_txn_commit(&t) != ZS_OK) return false;
         } else if (!strcmp(verb, "repack")) {
             if (zs_db_repack(db) != ZS_OK) return false;
+        } else if (!strcmp(verb, "compact")) {
+            if (zs_db_compact(db) != ZS_OK) return false;
         } else {
             return false;                   /* an op we do not implement */
         }
@@ -13704,7 +13763,10 @@ static void test_compact_reports_and_fails_on_bad_file(void)
     size_t files_before;
     int fd;
 
-    setup.flags = ZS_CREATE;
+    /* The subject is a LAYOUT -- files on both sides of a damaged one -- so the
+     * cascade must not merge it away, and the count must not depend on a
+     * selection policy that is deliberately not normative (D-16). */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
     setup.rollover_size = 512;
     setup.error = counting_error;
 
@@ -14263,7 +14325,10 @@ static void test_salvage_across_a_missing_generation(void)
     char name[ZSI_NAME_MAX], val[64];
     uint32_t victim;
 
-    setup.flags = ZS_CREATE;
+    /* A layout test: several generations, one of which is removed below.  The
+     * cascade would merge them away, and the file count must not depend on a
+     * selection policy that is not normative (D-16). */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
     setup.rollover_size = 256;
     setup.error = counting_error;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));

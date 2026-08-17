@@ -1198,6 +1198,23 @@ mutant "ifchanged: skip still counts as a change" catch \
   's/            if \(val == NULL\) \{\n                if \(rc == ZS_NOTFOUND\) return ZS_OK;/            if (val == NULL) {\n                if (rc == ZS_NOTFOUND) { txn->pend_seq++; return ZS_OK; }/'
 
 echo
+echo "repack: selection (a policy, not a requirement)"
+
+# Comparing each file with its immediate NEIGHBOUR instead of with the sum of
+# everything above it.  Both look like "merge when the newer side is big
+# enough", and the difference only shows on an irregular tail: sizes 100, 60, 50
+# merge nothing under the pairwise test because 50 < 60 stops it at the first
+# step, while together they outweigh the oldest file.
+mutant "repack select: compares the neighbour, not the sum" catch \
+  's/        tail -= here;                   \/\* now the sum of everything above i \*\/\n        if \(tail > here\) \{ \*first = i; return nio - i; \}/        tail -= here;\n        if (i + 1 < nio \&\& (uint64_t)snap->files[i + 1]->size > here)\n            { *first = i; return nio - i; }/'
+
+# The comparison is strict BECAUSE the left side is a sum: two equal files wait
+# and a third collapses all three.  Making it >= merges every pair on sight,
+# which rewrites the older file for no reduction in the file count.
+mutant "repack select: merges on equality" catch \
+  's/        if \(tail > here\) \{ \*first = i; return nio - i; \}/        if (tail >= here) { *first = i; return nio - i; }/'
+
+echo
 echo "repack: what is emitted and what is dropped (D-17b, D-18, D-19)"
 
 # D-17b.  The emitted value comes from V3 under the total order -- oldest to

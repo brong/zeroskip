@@ -26,7 +26,12 @@ UUID=4941da54-9406-4faa-a457-c4b65beae3eb
 # The corpus is hex end to end -- keys carry NULs and newlines, and case.txt is
 # compared as text -- so every invocation here opts in.  The tool's default is
 # raw, for humans.
-TOOL() { "$ZSTOOL" "$@" --hex; }
+# --noautorepack throughout: the corpus is the FORMAT contract, and repack
+# selection is explicitly not normative (D-16).  A case that let the cascade
+# fire would pin this implementation's policy into golden bytes, and a peer with
+# a different policy would read a spurious diff.  Cases that want a merge say so
+# with an explicit `op repack`.
+TOOL() { "$ZSTOOL" "$@" --hex --noautorepack; }
 
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
@@ -260,12 +265,16 @@ fi
 # ---------------------------------------------------------------------------
 begin_case empty-inorder
 if [ "$SKIP" -eq 0 ]; then
-    hdr "A repack output holding ZERO records: exactly 96 bytes, PTRS32 (F-26g)." 1
+    hdr "A repack output holding ZERO records: exactly 96 bytes, PTRS32 (F-26g).
+# The second generation is deliberately the larger one, so that the merge is
+# selected by size; the file it produces is what the case is about." 1
     TOOL "$DB" create --uuid "$UUID"
     TOOL "$DB" store 6f6e6c79 76; emit "op store 6f6e6c79 76"
     printf '\336\255\276\357\336\255\276\357' >> "$DB/$(newest_file "$DB")"
     emit "op garbage deadbeefdeadbeef"
     TOOL "$DB" delete 6f6e6c79;   emit "op delete 6f6e6c79"
+    TOOL "$DB" store 78 79;       emit "op store 78 79"
+    TOOL "$DB" delete 78;         emit "op delete 78"
     printf '\336\255\276\357\336\255\276\357' >> "$DB/$(newest_file "$DB")"
     emit "op garbage deadbeefdeadbeef"
     TOOL "$DB" store 7a 7a;       emit "op store 7a 7a"
