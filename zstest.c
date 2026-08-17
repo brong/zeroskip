@@ -2953,6 +2953,17 @@ static int index_file(struct sb *s, uint32_t gen, struct zsi_file **fp)
     return zsi_index_build(*fp, zsi_compar_default);
 }
 
+/* Fold ONE record into an index.
+ *
+ * The fold takes a sorted run of records with one entry per key (D-13b), and a
+ * single record is a run of one.  The delta tests below predate the run and go a
+ * record at a time, which is still the same path -- and still the shape a
+ * one-record transaction commits. */
+static int index_insert1(struct zsi_index *ix, zs_compar *compar, size_t off)
+{
+    return zsi_index_fold_run(ix, compar, &off, 1);
+}
+
 /* Walk the index and join its keys with '|', so an ordering assertion reads as
  * one string comparison rather than a loop. */
 static void index_keys(struct zsi_file *f, char *out, size_t outlen)
@@ -3163,7 +3174,7 @@ static void test_index_delta(void)
 
     bool merged_at_least_once = false;
     for (size_t i = 0; i < n; i++) {
-        ASSERT_OK(zsi_index_insert(f->index, zsi_compar_default, offs[i]));
+        ASSERT_OK(index_insert1(f->index, zsi_compar_default, offs[i]));
         if (f->index->nbase > 0) merged_at_least_once = true;
 
         /* Every key inserted so far is findable, and none that follow are. */
@@ -3264,8 +3275,8 @@ static void test_index_delta_shadows_base(void)
     index_keys(f, keys, sizeof(keys));
     ASSERT_STR_EQ(keys, "a|b|c");
 
-    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_a));
-    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_c));
+    ASSERT_OK(index_insert1(ix, zsi_compar_default, newer_a));
+    ASSERT_OK(index_insert1(ix, zsi_compar_default, newer_c));
     ASSERT_EQU(ix->ndelta, 2u);
 
     /* Lookup prefers the delta. */
@@ -3310,7 +3321,7 @@ static void test_index_delta_shadows_base(void)
 
     /* Re-inserting the same key replaces its delta entry rather than adding one,
      * which is what keeps the delta at one entry per key. */
-    ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, newer_a));
+    ASSERT_OK(index_insert1(ix, zsi_compar_default, newer_a));
     ASSERT_EQU(ix->ndelta, 2u);
 
     zsi_file_release(&f);
@@ -3379,7 +3390,7 @@ static void test_index_delta_merge_with_duplicates(void)
     bool merged = false;
     for (size_t i = 0; i < N; i++) {
         size_t before = ix->nbase;
-        ASSERT_OK(zsi_index_insert(ix, zsi_compar_default, new_off[i]));
+        ASSERT_OK(index_insert1(ix, zsi_compar_default, new_off[i]));
         if (ix->ndelta == 0 && before == N) merged = true;
 
         /* Whatever side it currently lives on, the newer record is what resolves. */
@@ -6954,6 +6965,128 @@ static void test_write_abort(void)
     ASSERT_EQ(filesize(name), before);
 
     zs_db_close(&db);
+}
+
+/* D-13b: the folded index is the index a REPLAY would have built.
+ *
+ * The two paths reach the same structure by different routes -- the fold merges
+ * the committed span as a sorted run, taking the pending skiplist's key order,
+ * while a rebuild sorts what a replay collected in offset order -- so reading one
+ * database through both is what tells them apart.  The writing handle's index was
+ * folded; a second handle opened on the same directory replays.
+ *
+ * The workload has to reach both halves of the fold, and both sides of each tie:
+ *
+ *   - a transaction bigger than ZSI_DELTA_MAX, so the fold overflows the delta
+ *     into the base merge, and one smaller, so it does not;
+ *   - keys arriving out of key order, or the run's order proves nothing;
+ *   - keys rewritten in a LATER transaction, where the run must beat the delta
+ *     and (after a flush) the base;
+ *   - a key rewritten and a key deleted WITHIN one transaction, which the pending
+ *     set resolves to one entry before the fold ever sees it (D-17b);
+ *   - a flush whose delta and base share keys, which is the merge's tie arm.
+ *
+ * The expected content is modelled rather than compared only between the two
+ * handles: a differential assertion alone would pass if both paths were wrong. */
+#define FOLD_KEYS 1200
+
+static void fold_key(char *out, size_t outlen, int i)
+{
+    snprintf(out, outlen, "k%04d", i);
+}
+
+static void test_index_fold_run_matches_replay(void)
+{
+    struct zs_db *db = fresh_db_noautorepack();
+    struct zs_txn *txn = NULL;
+    char *folded = malloc(1 << 17), *replayed = malloc(1 << 17);
+    char *want = malloc(1 << 17);
+    char *live = calloc(FOLD_KEYS + 200, 1);       /* 0 absent, else value tag */
+    char key[16], val[16];
+    size_t used = 0;
+
+    ASSERT_NOT_NULL(db);
+    ASSERT_NOT_NULL(folded);
+    ASSERT_NOT_NULL(replayed);
+    ASSERT_NOT_NULL(want);
+    ASSERT_NOT_NULL(live);
+
+    /* One transaction past ZSI_DELTA_MAX, keys strided so the run is not simply
+     * ascending.  A stride coprime with the count visits every key once. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (int n = 0, i = 0; n < FOLD_KEYS; n++, i = (i + 457) % FOLD_KEYS) {
+        fold_key(key, sizeof(key), i);
+        snprintf(val, sizeof(val), "a%04d", i);
+        ASSERT_OK(zs_txn_store(txn, key, strlen(key), val, strlen(val), 0));
+        live[i] = 'a';
+    }
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* Smaller than the delta bound, so this fold stays in the delta: rewrites of
+     * existing keys (the run beats the base), new keys above the range, and
+     * deletions of keys the first transaction created. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (int i = 0; i < FOLD_KEYS; i += 4) {
+        fold_key(key, sizeof(key), i);
+        snprintf(val, sizeof(val), "b%04d", i);
+        ASSERT_OK(zs_txn_store(txn, key, strlen(key), val, strlen(val), 0));
+        live[i] = 'b';
+    }
+    for (int i = 1; i < FOLD_KEYS; i += 40) {
+        fold_key(key, sizeof(key), i);
+        ASSERT_OK(zs_txn_store(txn, key, strlen(key), NULL, 0, 0));
+        live[i] = 0;
+    }
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* Rewritten and deleted WITHIN one transaction: the pending set resolves each
+     * to a single entry, so the run the fold sees has one offset per key even
+     * though the span holds two records for it. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    fold_key(key, sizeof(key), 7);
+    ASSERT_OK(zs_txn_store(txn, key, strlen(key), "first", 5, 0));
+    ASSERT_OK(zs_txn_store(txn, key, strlen(key), "c0007", 5, 0));
+    live[7] = 'c';
+    fold_key(key, sizeof(key), 11);
+    ASSERT_OK(zs_txn_store(txn, key, strlen(key), "gone", 4, 0));
+    ASSERT_OK(zs_txn_store(txn, key, strlen(key), NULL, 0, 0));
+    live[11] = 0;
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* And a fold that overflows a delta already holding keys the base holds too,
+     * which is the flush's tie arm. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (int i = 0; i < FOLD_KEYS; i += 2) {
+        fold_key(key, sizeof(key), i);
+        snprintf(val, sizeof(val), "d%04d", i);
+        ASSERT_OK(zs_txn_store(txn, key, strlen(key), val, strlen(val), 0));
+        live[i] = 'd';
+    }
+    ASSERT_OK(zs_txn_commit(&txn));
+
+    /* What the database should now hold, in key order. */
+    want[0] = '\0';
+    for (int i = 0; i < FOLD_KEYS; i++) {
+        if (!live[i]) continue;
+        if (used) want[used++] = '|';
+        used += (size_t)snprintf(want + used, 32, "k%04d=%c%04d", i, live[i], i);
+    }
+
+    api_scan(db, folded, 1 << 17);
+    ASSERT_STR_EQ(folded, want);
+
+    /* The same directory through a handle that never folded anything. */
+    ASSERT_OK(zs_db_close(&db));
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    api_scan(db, replayed, 1 << 17);
+    ASSERT_STR_EQ(replayed, want);
+
+    ASSERT_OK(zs_db_close(&db));
+    free(folded);
+    free(replayed);
+    free(want);
+    free(live);
 }
 
 /* D-13b: a writer folds the records it appended into the active file's index
@@ -12744,6 +12877,90 @@ static void test_idxcache_rejects_bad_term_binding(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* P-12 into D-13b: a table-seeded reader folds its replayed SUFFIX, and the fold
+ * takes a sorted run -- but a replay collects in OFFSET order, so this is the one
+ * caller that has to sort before folding.
+ *
+ * The commit site gets its order for free from the pending skiplist, so nothing
+ * else in the suite can tell a missing sort here from a present one.  Making it
+ * visible needs three things at once: a table that really loads (asserted through
+ * cached_upto, or this test silently exercises the plain build), records committed
+ * AFTER it by a handle with no cache configured, so they are left as a suffix
+ * rather than republished, and those records arriving in DESCENDING key order,
+ * which is what an offset-ordered run looks like when it is not sorted.
+ *
+ * The suffix also rewrites a key the table describes and deletes another, so the
+ * run has to win against the seeded base and not merely sit above it. */
+static void test_idxcache_seeded_suffix_folds_in_order(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    char got[4096], key[32], val[32];
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    /* A table over keys 00..19, published because the threshold is 1. */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 20; i++) {
+        snprintf(key, sizeof(key), "k%02d", i);
+        snprintf(val, sizeof(val), "a%02d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, strlen(val), 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    /* The suffix, through a handle with NO cache: descending keys, one rewrite of
+     * a key the table holds, one deletion of another. */
+    setup.flags = ZS_NOAUTOREPACK;
+    setup.index_dir = NULL;
+    setup.index_threshold = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    {
+        struct zs_txn *txn = NULL;
+        ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+        for (int i = 39; i >= 20; i--) {
+            snprintf(key, sizeof(key), "k%02d", i);
+            snprintf(val, sizeof(val), "b%02d", i);
+            ASSERT_OK(zs_txn_store(txn, key, strlen(key), val, strlen(val), 0));
+        }
+        ASSERT_OK(zs_txn_store(txn, "k05", 3, "B05", 3, 0));
+        ASSERT_OK(zs_txn_store(txn, "k10", 3, NULL, 0, 0));
+        ASSERT_OK(zs_txn_commit(&txn));
+    }
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And a reader that seeds from the table and replays the suffix. */
+    setup.flags = ZS_NOAUTOREPACK;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    /* The table was used: an unseeded build leaves cached_upto at the header. */
+    ASSERT(f->cached_upto > ZSI_HEADER_LEN);
+
+    api_scan(db, got, sizeof(got));
+    {
+        char want[4096];
+        size_t used = 0;
+        want[0] = '\0';
+        for (int i = 0; i < 40; i++) {
+            if (i == 10) continue;                  /* deleted */
+            if (used) want[used++] = '|';
+            used += (size_t)snprintf(want + used, 32, "k%02d=%c%02d", i,
+                                     i == 5 ? 'B' : i < 20 ? 'a' : 'b', i);
+        }
+        ASSERT_STR_EQ(got, want);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* P-13: nothing published below the threshold, something at it. */
 static void test_idxcache_threshold(void)
 {
@@ -17129,6 +17346,8 @@ static struct test_entry tests[] = {
     { "test_write_abort",               test_write_abort },
     { "test_commit_folds_index_incrementally",
                                         test_commit_folds_index_incrementally },
+    { "test_index_fold_run_matches_replay",
+                                        test_index_fold_run_matches_replay },
     { "test_write_rollover",            test_write_rollover },
     { "test_write_unclean_rollover",    test_write_unclean_rollover },
     { "test_file_grows_under_an_oversized_map",
@@ -17244,6 +17463,8 @@ static struct test_entry tests[] = {
     { "test_idxcache_rejection_rules",  test_idxcache_rejection_rules },
     { "test_idxcache_rejects_bad_term_binding",
                                         test_idxcache_rejects_bad_term_binding },
+    { "test_idxcache_seeded_suffix_folds_in_order",
+                                        test_idxcache_seeded_suffix_folds_in_order },
     { "test_idxcache_threshold",        test_idxcache_threshold },
     { "test_idxcache_open_agrees",      test_idxcache_open_agrees },
     { "test_idxcache_publishes_by_rename",

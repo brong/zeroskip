@@ -578,10 +578,10 @@ mutant "sort: offset tie-break ascending" catch \
   's/    return a > b \? -1 : 1;              \/\* higher offset first \*\//    return a < b ? -1 : 1;/'
 
 mutant "dedup: keeps the last of a run" catch \
-  's/                if \(zsi_cmp\(compar, ka, la, kb, lb\) == 0\) continue;/                if (zsi_cmp(compar, ka, la, kb, lb) == 0) { b.offs[w - 1] = b.offs[i]; continue; }/'
+  's/            if \(zsi_cmp\(compar, ka, la, kb, lb\) == 0\) continue;/            if (zsi_cmp(compar, ka, la, kb, lb) == 0) { offs[w - 1] = offs[i]; continue; }/'
 
 mutant "dedup: not done at all" catch \
-  's/            if \(w\) \{\n                const char \*ka, \*kb;/            if (0) {\n                const char *ka, *kb;/'
+  's/        if \(w\) \{\n            const char \*ka, \*kb;/        if (0) {\n            const char *ka, *kb;/'
 
 # The delta holds newer records than the base, so consulting the base first, or
 # preferring it on a tie, returns a stale record.
@@ -612,18 +612,47 @@ mutant "commit: incremental fold never taken" catch \
 mutant "commit: folds even while a reader holds the file" catch \
   's/    if \(act && offs && act->refcount == 1/    if (act \&\& offs \&\& act->refcount >= 1/'
 
-# The insert path (D-13b), and the bound that makes it amortised O(1).
-mutant "insert: no replace of an existing key" catch \
-  's/    if \(zsi_index_eq\(ix->delta, ix->ndelta, i, &ks, key, keylen\)\) \{\n        ix->delta\[i\] = off;\n        return ZS_OK;\n    \}/    \/* replace removed *\//'
+# The fold path (D-13b), and the bound that makes it amortised O(1).
+#
+# The run is NEWER than everything in the index, so it wins every tie -- against
+# the delta here and against the base at the flush.  Lose that and a rewritten key
+# keeps its old record, which is a stale value read back.
+mutant "fold: delta wins ties against the run" catch \
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = run\[ri\+\+\]; di\+\+; needr = needd = true; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; ri++; needr = needd = true; }/'
 
-mutant "insert: delta never merges" catch \
-  's/    if \(ix->ndelta <= ZSI_DELTA_MAX\) return ZS_OK;/    if (ix->ndelta <= SIZE_MAX) return ZS_OK;/'
+mutant "fold: keeps the tied delta entry too" catch \
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = run\[ri\+\+\]; di\+\+; needr = needd = true; \}/        if (cmp == 0)      { merged[w++] = run[ri++]; needr = needd = true; }/'
+
+# The run arrives SORTED, from the pending skiplist's level 0.  Merging it against
+# the delta in the other direction is what a caller handing over an unsorted run
+# would produce, and it leaves the delta mis-ordered rather than merely stale.
+mutant "fold: run merged in the wrong direction" catch \
+  's/        int cmp = zsi_cmp\(compar, kr, lr, kd, ld\);/        int cmp = zsi_cmp(compar, kd, ld, kr, lr);/'
+
+mutant "fold: delta never merges" catch \
+  's/    if \(ix->ndelta > ZSI_DELTA_MAX\) return zsi_index_flush_delta\(ix, compar\);/    if (ix->ndelta > SIZE_MAX) return zsi_index_flush_delta(ix, compar);/'
+
+# Each merge decodes a side's key ONCE and holds it until that side advances.
+# Failing to invalidate the held key compares the new entry against the previous
+# one's key, which mis-orders the output -- the hazard the caching introduced, in
+# both merges.
+mutant "fold: stale key after the run side advances" catch \
+  's/        else if \(cmp < 0\)  \{ merged\[w\+\+\] = run\[ri\+\+\]; needr = true; \}/        else if (cmp < 0)  { merged[w++] = run[ri++]; }/'
+
+mutant "flush: stale key after the base side advances" catch \
+  's/        else               \{ merged\[w\+\+\] = ix->base\[bi\+\+\]; needb = true; \}/        else               { merged[w++] = ix->base[bi++]; }/'
 
 mutant "merge: base wins ties" catch \
-  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; \}/        if (cmp == 0)      { merged[w++] = ix->base[bi++]; di++; }/'
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; needd = needb = true; \}/        if (cmp == 0)      { merged[w++] = ix->base[bi++]; di++; needd = needb = true; }/'
 
 mutant "merge: drops the tied base entry twice" catch \
-  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; }/'
+  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; needd = needb = true; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; needd = needb = true; }/'
+
+# The seeded build has to SORT its replayed suffix before folding it: the replay
+# collects in offset order.  Skipping the sort hands the fold an unsorted run,
+# which is P-12's path -- a reader seeded by a pointer table.
+mutant "build: seeded suffix folded unsorted" catch \
+  's/        r = zsi_index_sort_dedup\(f, compar, b.offs, &b.n\);\n        if \(r == ZS_OK\) r = zsi_index_fold_run\(ix, compar, b.offs, b.n\);/        r = zsi_index_fold_run(ix, compar, b.offs, b.n);/'
 
 # Lower bound: an off-by-one here makes an exact match miss, or a seek land one
 # entry early, which shows up as a key that cannot be found or one emitted twice.

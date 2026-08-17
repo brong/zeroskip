@@ -3,6 +3,13 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.1.2 — 2026-08-17
+
+- Committing is faster, and no longer slower per record for a larger
+  transaction: the commit fold merges the span as a sorted run rather than
+  inserting each record. 21% at 1000 records per transaction, 95% with 200k in
+  one. See D-13b in the spec.
+
 ## 2.1.1 — 2026-08-17
 
 - New `zs_open_data.repack_max_size` (default 512MB) bounds what one repack
