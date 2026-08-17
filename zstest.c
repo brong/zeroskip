@@ -789,10 +789,6 @@ static void test_filename_sort_property(void)
      * holds because '.' (0x2E) is above '-' (0x2D) at the position where the
      * names diverge.
      *
-     * This replaced a prefix rule: the active file used to be named for its
-     * generation, so its name was a strict prefix of the in-order name for the
-     * same generation and sorted BEFORE it.  Opposite direction, same purpose.
-     *
      * T-9 requires this be a test, so that changing the separator breaks a test
      * rather than the database. */
     char cur[ZSI_NAME_MAX];
@@ -1328,10 +1324,9 @@ static void test_type_byte_validity(void)
     ASSERT(!zsi_type_valid(ZSI_SPANTERM | ZSI_POINTERS));     /* 0x30 */
     ASSERT(!zsi_type_valid(0x31));
 
-    /* The retired 0x08 (was HasAncestor), alone and on top of each shape that
-     * used to pair with it.  F-12c reserves the bit rather than reusing it, so
-     * a peer still writing the old ancestor forms is rejected record by record
-     * rather than silently misread -- every one of these was a legal type. */
+    /* The reserved 0x08, alone and on top of each shape it can combine with.
+     * F-12c reserves the bit rather than reusing it, so a peer writing any of
+     * these is rejected record by record rather than silently misread. */
     ASSERT(!zsi_type_valid(0x08));
     ASSERT(!zsi_type_valid(0x09));                            /* KEYVALUE_ANC */
     ASSERT(!zsi_type_valid(0x0B));                            /* DELETION_ANC */
@@ -5301,10 +5296,8 @@ static void two_handles_are_excluded(void)
 }
 
 /* T-14, C-1j: two handles on one database within one process exclude each
- * other.  This asserted the OPPOSITE until 2026-08-14 -- fcntl locks are
- * per-process, so neither excluded the other and every caller that cared built
- * the exclusion itself (the sqlite integration did, with a dev/ino registry,
- * which is the mechanism C-1f described and declined to require).
+ * other.  Plain fcntl locks are per-process and would not, so a caller that
+ * cared would have to build the exclusion itself.
  *
  * Run against BOTH mechanisms.  F_OFD_SETLK exists on every platform anyone
  * develops on, so the registry is dead code here and would rot unexercised
@@ -6021,13 +6014,10 @@ static void test_read_arrangements(void)
     ASSERT_STR_EQ(got, expect);
     zs_db_close(&db);
 
-    /* 2. several generations, the newest of them unordered.
-     *
-     * This used to be "several unordered files", which D-1b makes
-     * unrepresentable: there is one active-file name, so at most one unordered
-     * file can exist (D-12a).  The arrangement that remains -- a prefix of
-     * in-order files with the active one above them -- is the one a real
-     * database is ever in, and it still exercises the multi-source merge. */
+    /* 2. several generations, the newest of them unordered.  D-1b allows only
+     * one active-file name, so at most one unordered file can exist (D-12a):
+     * a prefix of in-order files with the active one above them is the only
+     * arrangement a real database is in, and it exercises the merge. */
     clear_db();
     { static const struct kv p[] = {{"a","A"},{"b","B"},{NULL,NULL}};
       put_inorder_kv(1, 1, p); }
@@ -6527,10 +6517,8 @@ static void test_write_txn_isolation(void)
     ASSERT_NULL(txn);
 
     /* C-4i: `other` sees the commit on its NEXT read -- freshness belongs to
-     * the begin, not the open.  This line used to assert the opposite, and
-     * the opposite is the bug Cyrus found: one process created a mailbox and
-     * another, holding the database open since before that commit, answered
-     * that it did not exist. */
+     * the begin, not the open.  Otherwise a handle held open across another
+     * process's commit answers from the world as of its own last write. */
     ASSERT_OK(zs_db_fetch(other, "inside", 6, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "y", 1);
     zs_db_close(&other);
@@ -6541,10 +6529,9 @@ static int reap(pid_t pid);     /* defined with the multi-process tests */
 
 static void test_mp_read_sees_other_process_commit(void)
 {
-    /* C-4i, in the exact shape Cyrus reported: a long-lived READONLY handle
-     * in one process, a commit in another, then a read on the old handle.
-     * SETACL said "Mailbox does not exist" because this used to return
-     * ZS_NOTFOUND. */
+    /* C-4i in its sharpest shape: a long-lived READONLY handle in one process,
+     * a commit in another, then a read on the old handle.  Answering
+     * ZS_NOTFOUND here is a key that exists being reported absent. */
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL, *rdb = NULL;
     const char *v; size_t vl;
@@ -7112,8 +7099,7 @@ static void test_write_unclean_rollover(void)
  * transaction's pend_seq is unchanged.  A seek clears it outright.  Through a
  * cursor those two guards mask each other completely: any write bumps
  * pend_seq, which makes the cursor refresh and re-seek every txn arm, which
- * clears the hint -- so the stale-hint path is unreachable from above, and all
- * three mutants for it went NOT CAUGHT until this test existed.
+ * clears the hint -- so the stale-hint path is unreachable from above.
  *
  * Stepping the arm directly separates them: a write with no seek exercises the
  * sequence check, and a seek with no write exercises the clear. */
@@ -7217,9 +7203,8 @@ static void test_file_grows_under_an_oversized_map(void)
  * These are two halves of one thing.  The headroom is what removes the munmap
  * and mmap from every commit; bounding by `size` is the only reason the
  * headroom is safe, since reading into it past EOF is SIGBUS.  Everywhere else
- * in the suite maplen == size, so the difference between the two bounds is
- * invisible -- which is why "file_at: bounds by the mapping, not the file" went
- * NOT CAUGHT until this existed. */
+ * in the suite maplen == size, so this is the only place the difference between
+ * the two bounds is observable at all. */
 static void test_active_file_headroom_is_bounded_by_size(void)
 {
     struct zs_db *db = fresh_db_noautorepack();
@@ -7455,8 +7440,7 @@ static void test_write_record_is_self_contained(void)
         zs_db_close(&db);
     }
 
-    /* (c) an update of a key whose previous version is in an OLDER FILE -- the
-     * row that used to store a 4-byte ancestor and so encode differently. */
+    /* (c) an update of a key whose previous version is in an OLDER FILE. */
     {
         struct zs_db *db;
         clear_db();
@@ -7640,9 +7624,8 @@ static void test_api_three_forms(void)
     ASSERT_OK(zs_db_fetch(db, "c2", 2, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "committed", 9);   /* the last one was a change, and took */
 
-    /* ZS_FETCHNEXT: the record AFTER the given key -- the strict bound, which
-     * since 2026-08-13 is spelled with ZS_SKIPROOT (A-12) -- through both
-     * forms. */
+    /* ZS_FETCHNEXT: the record at or after the given key; the strict bound is
+     * spelled with ZS_SKIPROOT (A-12).  Through both forms. */
     ASSERT_OK(zs_db_store(db, "a", 1, "A", 1, 0));
     ASSERT_OK(zs_db_store(db, "b", 1, "B", 1, 0));
     ASSERT_OK(zs_db_store(db, "c", 1, "C", 1, 0));
@@ -7877,14 +7860,11 @@ static void test_a4_borrow_survives_cursor_swap(void)
 /* A-4a, the case the first fix missed: the outgoing snapshot is still SHARED.
  *
  * Taking the mappings over is only available to the last holder, so with a
- * cursor also referencing it the swap could only keep a reference -- and the
- * first version dropped one instead, on the assumption that the remaining
- * holder outlives us. It does not: the cursor closes, the snapshot hits zero,
- * and the TRANSACTION's borrow is unmapped underneath it.
- *
- * Reported from the sqlite integration as "database disk image is malformed"
- * out of a savepoint workload, which is where fetch, cursor and store land in
- * exactly this order. */
+ * cursor also referencing it the swap can only keep a reference.  Dropping one
+ * instead assumes the remaining holder outlives us, and it does not: the cursor
+ * closes, the snapshot hits zero, and the TRANSACTION's borrow is unmapped
+ * underneath it.  The shape that reaches it is fetch, then cursor, then
+ * store. */
 static void test_a4_borrow_survives_shared_snapshot_swap(void)
 {
     struct zs_db *db = fresh_db();
@@ -8382,14 +8362,10 @@ static void test_convert_steady_state(void)
 
 static void test_convert_only_one_unordered_file(void)
 {
-    /* T-10a's second half, rewritten for D-1b.
+    /* T-10a's second half.
      *
-     * This used to assert D-12b's OLDEST FIRST ordering, because several
-     * crashes could each leave an unclean unordered file and converting them
-     * out of order stranded one between in-order files, blocking the
-     * repacker's cascade (D-16c).
-     *
-     * That ordering has nothing left to order. There is exactly one
+     * D-12b's OLDEST FIRST ordering has nothing left to order: there is exactly
+     * one
      * active-file NAME (D-1b), so at most one unordered file can exist at all
      * -- the invariant is structural now rather than a steady state kept by
      * policy (D-12a), and "a backlog of unordered files" is not a state the
@@ -9031,10 +9007,8 @@ static void test_repack_d19_newer_file_recreates(void)
 /* D-19a: a record is emitted even when a NEWER file already shadows the key.
  *
  * Being shadowed does not permit dropping it -- only D-19 does, and D-19 asks
- * about what lies BELOW.  The rule survives the ancestor's removal, but its
- * justification changed: it used to be correctness (the retained record carried
- * the chain's reach) and is now cost, since proving a newer file shadows a key
- * would take a lookup per KEY rather than per surviving tombstone. */
+ * about what lies BELOW.  Proving that a newer file shadows a key would cost a
+ * lookup per KEY, where D-19's test costs one per surviving tombstone. */
 static void test_repack_d19a_shadowed(void)
 {
     struct zs_db *db;
@@ -9217,9 +9191,8 @@ static void test_seal_verifies_spans_nocsum(void)
 {
     /* D-20b on the conversion path.  Since span verification rides indexing
      * in every mode (F-5e), no handle -- NOCSUM included -- ever ADMITS a
-     * span whose checksum fails, so the shape this test used to build is
-     * unreachable.  What remains reachable is time: in-place damage AFTER
-     * the snapshot admitted the span changes neither the name set nor the
+     * span whose checksum fails.  What IS reachable is time: in-place damage
+     * AFTER the snapshot admitted the span changes neither the name set nor the
      * file size, so the C-4i probe cannot see it, and a commit-driven
      * conversion (D-25d, D-12) runs against the pre-damage snapshot.
      * D-20b's re-verify is what stands between that and an in-order file
@@ -9360,9 +9333,8 @@ static void test_record_csum_replay_no_truncate(void)
     /* F-32b, the G-3 half: a record checksum failure must NOT make replay
      * complete the file early.  "b" was stored AFTER the corrupt "a" in the
      * SAME span; a replay that verified record checksums would discard it
-     * (F-24), which is precisely the tempting wrong version the mutant
-     * "record: verified during replay" preserves.  A scan must also survive:
-     * the corrupt record fails its own yield and only its own yield. */
+     * (F-24).  A scan must also survive: the corrupt record fails its own
+     * yield and only its own yield. */
     struct zs_db *db;
     struct sb s;
     char name[ZSI_NAME_MAX];
@@ -9478,10 +9450,9 @@ static void test_repack_never_touches_unordered(void)
      * unordered file at all -- selection considers only the in-order prefix
      * (D-16).
      *
-     * One unordered file, not the crash backlog this used to build: D-1b gives
-     * the active file a single name, so a backlog is not a state the format can
-     * represent (D-12a).  The property under test is unchanged, since what it
-     * asserts is that selection stops at the in-order prefix. */
+     * One unordered file, since D-1b gives the active file a single name and a
+     * backlog is not a state the format can represent (D-12a).  What is
+     * asserted is that selection stops at the in-order prefix. */
     struct zs_db *db;
 
     clear_db();
@@ -10810,8 +10781,8 @@ static void test_mp_writer_and_readers(void)
         if (readers[i] == 0) {
             /* G-4 holds per TRANSACTION: a scan inside one explicit read
              * transaction must never change, however much the writer commits.
-             * It used to be asserted of the HANDLE, which C-4i deliberately
-             * broke: handle-level reads are now fresh at every begin. */
+             * It does NOT hold of the handle: C-4i makes handle-level reads
+             * fresh at every begin. */
             struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
             struct zs_db *rdb = NULL;
             struct zs_txn *rtxn = NULL;
@@ -12356,11 +12327,9 @@ static void test_idxcache_rejection_rules(void)
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
 
-        /* Rejected by EVERY reader since 2026-08-14: span verification rides
-         * indexing (F-5e), so a conforming builder always sets bit 4, and a
-         * table without it indexed spans nobody verified.  It used to be
-         * acceptable to a ZS_NOCSUM reader, which is exactly how unverified
-         * spans would have seeded a NOCSUM handle's index. */
+        /* Rejected by EVERY reader, ZS_NOCSUM included: span verification
+         * rides indexing (F-5e), so a conforming builder always sets bit 4,
+         * and a table without it indexed spans no one verified. */
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                                &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
         ASSERT_NULL(base);
@@ -13053,11 +13022,10 @@ static void test_index_local_sweeps_foreign_uuid(void)
  *
  * The case is COPIED to scratch before being opened, and the checked-in bytes
  * are never the ones handed to a live handle.  That is not belt and braces: a
- * cache directory is a directory this library UNLINKS from (P-16), so pointing
- * one at the corpus makes the golden bytes destroyable by any bug in the sweep.
- * Mutation testing demonstrated it -- the two `sweeps` mutants deleted the
- * shipped table outright, which would have read as a corpus that needed
- * regenerating rather than as the bug it was. */
+ * cache directory is one this library UNLINKS from (P-16), so pointing one at
+ * the corpus would put the golden bytes within reach of any bug in the sweep --
+ * and a deleted corpus file reads as a corpus that needs regenerating rather
+ * than as the bug it is. */
 static void test_corpus_index_table(void)
 {
     char cases[32][64];
@@ -14868,10 +14836,9 @@ static void test_txn_cursor_sees_own_writes(void)
 
 /* D-14j-a: a write during a traversal MUST NOT cause a key to be yielded twice.
  *
- * The regression this guards is precise: the transaction arm used to hold an
- * INDEX into the sorted pending array, so inserting ahead of it shifted the
- * element under the index and re-emitted a record.  Reported from the Cyrus
- * integration, and silent -- the traversal simply processed a record twice.
+ * The failure it guards against is silent -- the traversal simply processes a
+ * record twice -- and it is what an INDEX into an ordered pending set would
+ * produce: inserting ahead of the position shifts the element under it.
  *
  * "z" is pending before the walk starts, so the arm is live rather than
  * exhausted, which is the arrangement that exposed it. */
@@ -14908,9 +14875,9 @@ static void test_txn_cursor_no_duplicate_on_write(void)
  * fixed view would grow records committed after it began.
  *
  * test_txn_cursor_view_is_fixed cannot see that: it holds a cursor as well, and
- * either hold is enough to keep the refcount above one, so removing one leaves
- * the other.  They mask each other completely, and the mutant for the
- * transaction's hold went NOT CAUGHT until this existed. */
+ * either hold is enough to keep the refcount above one, so they mask each other
+ * completely.  This is the configuration where the transaction's hold stands
+ * alone. */
 /* Open descriptors, for the leak test below.  /dev/fd is the process's own
  * descriptor table on macOS and a symlink to /proc/self/fd on Linux, so this
  * reads the same thing on both.  Returns -1 where neither exists, which the
@@ -14935,9 +14902,9 @@ static int count_open_fds(void)
  * nothing is ever freed: descriptors accumulate for the life of the handle,
  * and a long-lived writer runs out of them.
  *
- * A leak is not a test failure, which is why "hold: references never released"
- * went NOT CAUGHT for the whole suite -- `make leaks` sees it and mutate.sh
- * does not run `make leaks`.  Counting descriptors turns it into one.
+ * A leak is not a test failure by itself: it needs `make leaks` to show, and
+ * mutation testing does not run that.  Counting descriptors turns it into
+ * one.
  *
  * The loop commits between transactions on purpose: a commit replaces the
  * handle's snapshot, which is the only thing that retires a file and so the
@@ -15212,8 +15179,6 @@ static void test_cursor_delete_during_traversal(void)
  * yielded.  It is before the resume point, so yielding it hands the caller a
  * key out of order and shifts everything after it by one.
  *
- * Reported from the Cyrus integration (aaa-db foreach_changes: "affect" stored
- * while the cursor sat on "cubist" came out between "cubist" and "eulogy").
  * The trap is resolving the transaction arm from ITS OWN position after a
  * pending write: the arm's position is the last key consumed FROM THAT ARM,
  * which lags the merge's progress -- for an arm that was exhausted at open it
@@ -15221,9 +15186,9 @@ static void test_cursor_delete_during_traversal(void)
  * the merge.  The resume point is the CURSOR's last yielded key, and only a
  * re-seek from it is correct.
  *
- * Two arrangements: the arm exhausted at open (empty pending -- the Cyrus
- * shape), and the arm having already yielded a key of its own, which lags the
- * merge by less but still lags. */
+ * Two arrangements: the arm exhausted at open (empty pending), and the arm
+ * having already yielded a key of its own, which lags the merge by less but
+ * still lags. */
 static int live_store_behind_cb(void *rock, const char *k, size_t kl,
                                 const char *v, size_t vl)
 {
@@ -15397,7 +15362,7 @@ static void test_txn_cursor_survives_pending_array_growth(void)
  * boundary belong to the snapshot that built them.  So every handle-live swap
  * over a live active file retires that object, and the cursor's resume key
  * points straight into it.  Drop the hold and the re-seek below reads unmapped
- * memory; the mutant "hold: takes no references at all" is that bug. */
+ * memory. */
 static void test_cursor_resume_key_survives_retirement(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -15837,12 +15802,10 @@ static void test_txn_caller_comparator_long_keys(void)
  *
  * test_cursor_reverse_prefix above stores everything first, so its keys are in
  * files and only the file arms' seek is exercised.  The transaction arm is a
- * separate seek with its own inclusivity, and nothing reached it: when the
- * pending set became a skiplist the mutant `cursor: reverse txn arm resumes
- * inclusively` went NOT CAUGHT, because the other half of what it used to break
- * -- resuming past a yielded key -- now lives in zsi_cursor_reseek_arm and
- * compensated for it.  What is left is exactly this: a reverse prefix scan whose
- * PENDING records include the prefix's byte-successor as a real key. */
+ * separate seek with its own inclusivity, and resuming past a yielded key is
+ * handled a level up in zsi_cursor_reseek_arm -- so the only thing that
+ * exercises the bound itself is this: a reverse prefix scan whose PENDING
+ * records include the prefix's byte-successor as a real key. */
 static void test_txn_cursor_reverse_prefix_bound(void)
 {
     struct zs_db *db = NULL;
@@ -16025,8 +15988,7 @@ static void test_fetchprev_sees_txn_writes(void)
 
 /* A-12: bare ZS_FETCHNEXT is the inclusive-≥ point form -- the family's
  * fourth cell, spelled by moving the strictness to ZS_SKIPROOT exactly as
- * FETCHPREV and a cursor seek already do.  (Bare FETCHNEXT was the strict
- * bound until 2026-08-13; this test is the semantics change.) */
+ * FETCHPREV and a cursor seek already do. */
 static void test_fetchnext_inclusive(void)
 {
     struct zs_db *db = NULL;
@@ -16397,10 +16359,10 @@ static void test_stream_bounded_memory(void)
 }
 
 /* A-4: a pointer returned for the transaction's OWN pending record survives a
- * later store to the same key.  The replace used to free the old value buffer
- * in place, leaving every earlier fetch of that key dangling -- found
- * downstream by sqlite-on-zeroskip, whose undo log held exactly such a
- * pointer across the overwrite and had to copy defensively.
+ * later store to the same key.  Freeing the old value buffer in place would
+ * leave every earlier fetch of that key dangling, which a caller holding a
+ * pointer across an overwrite -- an undo log, say -- would find the hard
+ * way.
  *
  * The second store of a same-sized value is the clobber: the allocator hands
  * the just-freed chunk straight back, so under the bug the saved pointer
@@ -16558,11 +16520,9 @@ static void test_ephemeral_avoids_the_flush(void)
  * record is materialised unless it is going to be returned.
  *
  * This is the read-before-insert shape: a caller probing for a key it is about
- * to store misses every time, and until 2026-08-14 each miss cost a write(2) --
- * the seek landed on a neighbouring pending record, decoding it flushed the
- * chunk, and the record was then discarded as not equal.  Reported from the
- * sqlite integration as 300k write() against 10 fdatasync over 100k rows in
- * ONE transaction, which no store-only benchmark could see.
+ * to store misses every time.  Materialising the neighbouring record to compare
+ * it would flush the chunk on every one of those misses, so a bulk load would
+ * issue a write(2) per row -- which no store-only benchmark can see.
  *
  * Deliberately WITHOUT ZS_EPHEMERAL: the flag covers reads that hit, and this
  * half must hold for a caller that never asked for the weaker lifetime. */

@@ -891,11 +891,9 @@ static void snapshot_gap(const char *dir)
     /* Called between C-4's resolve and open, and it must reproduce a whole packer
      * step: PUBLISH a superseding output, then retire the inputs.
      *
-     * Removing a superseded file is not enough, and an earlier version of this test
-     * did exactly that -- so the resolved set never contained the removed file,
-     * step 3 never opened it, no ENOENT ever happened, and the test passed without
-     * touching the retry path.  A mutant making ENOENT fatal went uncaught, which
-     * is how the hole was found.
+     * Removing a superseded file is not enough: the resolved set never contains
+     * one, so step 3 never opens it, no ENOENT ever happens, and the retry path
+     * is never touched.
      *
      * The victims here ARE in the resolved set at scan time, and the output that
      * supersedes them appears only now -- which is precisely the interleaving C-4b
@@ -996,10 +994,9 @@ static void test_snapshot_gap_retry(void)
      * FORCED, not raced -- an earlier version raced a remover against 300 snapshots
      * and took the retry path zero times.
      *
-     * And the forcing has to be a whole packer step.  A second version removed only
-     * a SUPERSEDED file, which the resolved set does not contain, so step 3 never
-     * opened it and the retry still never ran.  That version passed while a mutant
-     * making ENOENT fatal went uncaught -- the tell that it was asserting nothing.
+     * And the forcing has to be a whole packer step: removing only a SUPERSEDED
+     * file leaves it out of the resolved set, so step 3 never opens it and the
+     * retry still never runs.
      *
      * So: build the superseding output, hide it under a staging name the scan
      * ignores, and in the gap publish it and retire the two inputs that WERE

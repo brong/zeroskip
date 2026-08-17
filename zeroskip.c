@@ -95,16 +95,10 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * many spans (D-9d), whatever its size.  rollover_size bounds bytes; the
  * rebuild it stands in for is linear in spans, and many small transactions put
  * many spans into few bytes -- so with no cache configured the two come apart
- * completely.  Measured, a fresh open with no cache:
- *
- *      1024 spans   0.23ms
- *      4096 spans   0.52ms
- *     16384 spans   2.01ms      still far below 2MB of records
- *
- * 1024 sits at the point where the replay is still cheaper than the open's
- * other fixed costs.  A sole writer never rebuilds and never notices any of
- * this; writers alternating across processes rebuild at every begin (C-4i), so
- * for them the figures above are per transaction.
+ * completely.  1024 sits where the replay is still cheaper than an open's other
+ * fixed costs.  A sole writer never rebuilds and never notices; writers
+ * alternating across processes rebuild at every begin (C-4i), so for them it is
+ * a per-transaction cost.
  *
  * With a cache configured, P-13's threshold bounds the window first -- 311
  * spans replayed for a file holding 16384 -- so this condition simply never
@@ -112,15 +106,8 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
 #define ZSI_DEFAULT_ROLLOVER_TXNS 1024
 
 /* How far past the last published pointer table the active file may grow before
- * another is published (P-13).  Measured, not guessed -- zsbench's "publish
- * threshold" table, 16000 single-store transactions over a 2MB active file:
- *
- *     no cache  26.8s      every commit's snapshot refresh replays the whole file
- *     1          6.5s      the whole table rewritten on every commit
- *     4096       2.7s   <- flat minimum
- *     32768      2.8s   <-
- *     262144     6.5s      refresh replay growing again
- *     1048576   18.6s
+ * another is published (P-13).  Chosen from measurement rather than taste --
+ * zsbench's "publish threshold" table, and doc/benchmarking.md for the curve.
  *
  * BOTH ends cost, and the expensive one is the high end.  A write transaction
  * refreshes its snapshot at begin (C-4), and that refresh replays from the last
@@ -900,9 +887,9 @@ static unsigned zsi_header_engine_id(const char *buf)
  * Each is a plausible result of a single flipped bit in a valid type, and each
  * must be rejected rather than half-interpreted (T-2b). */
 /* `inline` for the reason zsi_cur_order gives -- it is called once per record
- * decoded, and GCC leaves it out of line otherwise (1.2% of a scan for a
- * switch).  It stays a SWITCH: F-12's table is normative and a computed
- * predicate would be a second specification. */
+ * decoded, and GCC leaves it out of line otherwise.  It stays a SWITCH: F-12's
+ * table is normative and a computed predicate would be a second
+ * specification. */
 static inline bool zsi_type_valid(uint8_t type)
 {
     switch (type) {
@@ -1152,15 +1139,13 @@ static int zsi_rec_decode(const char *buf, size_t len, struct zsi_rec *out)
      *
      * They are separate branches rather than one guarded path because a JOIN
      * POINT erases what the compiler knows: with both forms assigning `keylen`,
-     * its range at the arithmetic is the union of a byte and a 64-bit load, so
-     * every check survives and every short-form record pays them.  Measured at
-     * 8.7% of a scan profile in this function, on a body that is otherwise two
-     * loads and an add.
+     * its range at the arithmetic would be the union of a byte and a 64-bit
+     * load, so every check would survive and every short-form record would pay
+     * them.
      *
      * The cost of the split is that the size expression is written twice, and
-     * two copies can drift -- a record sized differently by the two forms is a
-     * key or value pointer into the wrong bytes.  `decode: short form sizes a
-     * record differently` is the mutant that holds them together. */
+     * two copies can drift -- a record sized differently by the two forms puts
+     * a key or value pointer into the wrong bytes. */
     size_t total;
     if (big) {
         size_t body;
@@ -1356,9 +1341,9 @@ struct zsi_file {
     /* Who is using this object.  The lifetime that matters is the MAPPING's,
      * not the snapshot's: a snapshot is just one user, and a transaction or
      * cursor holding pointers into these bytes is another (A-4a).  Tracking it
-     * on the snapshot instead meant every consumer reasoned about the
-     * snapshot's OTHER holders rather than about the bytes it was using, which
-     * is how two lifetime bugs shipped in one week.
+     * on the snapshot instead makes every consumer reason about the snapshot's
+     * OTHER holders rather than about the bytes it is using, which is where
+     * lifetime bugs come from.
      *
      * A file is shared between snapshots when it is immutable (C-4c), so a
      * rebuild reuses it rather than re-opening, re-mapping and re-indexing it. */
@@ -1573,13 +1558,11 @@ static int zsi_file_open(const char *dir, const char *name,
  * grows underneath the map for the rest of its life, instead of being unmapped
  * and remapped on every commit.
  *
- * That is not a micro-optimisation.  A sole writer takes this branch at every
- * commit (the refcount is 1 whenever nobody is reading), so per-record commits
- * meant an munmap plus an mmap each -- and the active file grows toward
- * rollover_size, so by the end each one was tearing down and refaulting
- * hundreds of pages.  On an EPYC server under `perf record -e cache-misses`,
- * find_vmap_area alone was 12% of the profile and the whole mmap path about
- * 20%, against a merge loop that did not appear at all.
+ * That matters because a sole writer takes this branch at every commit (the
+ * refcount is 1 whenever no one is reading).  Remapping instead would cost an
+ * munmap plus an mmap each time, and since the active file grows toward
+ * rollover_size, each one tears down and refaults progressively more pages --
+ * enough for the kernel's mapping machinery to dominate a write profile.
  *
  * Reading past EOF in an over-sized mapping is SIGBUS, which is exactly why
  * this is safe HERE and would not be everywhere: zsi_file_at is the single
@@ -3637,23 +3620,18 @@ static int zsi_fcur_find(struct zsi_fcur *fc, const char *key, size_t keylen,
         /* Seek a scratch cursor and check for an exact hit, so the transaction's
          * lookup shares the ordering logic rather than duplicating it.
          *
-         * The scratch is a COPY, and since D-14j-a a transaction arm owns its
-         * position key -- so the copy owns one too, and it has to be released on
-         * every exit from here.  A struct that was trivially copyable and then
-         * grows an owned pointer is exactly where this goes wrong; `make leaks`
-         * is what caught it.
+         * The scratch is a COPY.  If an arm ever owns an allocation again, the
+         * copy owns one too and it must be released on every exit from here.
          *
-         * The match is tested against the pending set's own inlined key
-         * prefix, and the record is decoded only once it is going to be
-         * returned.  Loading
-         * first and comparing the decoded key -- which is what this did until
-         * 2026-08-14 -- makes a MISS cost a write(2): the seek lands on the
-         * neighbouring pending record, materialising it flushes the writer's
-         * chunk (zsi_txn_at), and the record is then discarded as not equal.
-         * A caller probing for keys it is about to insert misses every time,
-         * which is how a bulk load in ONE transaction came to issue 300k
-         * write() against 10 fdatasync.  ZS_EPHEMERAL (A-4b) covers the other
-         * half, where the read HITS and the bytes really are wanted. */
+         * The match is tested against the pending set's own inlined key prefix,
+         * and the record is decoded only once it is going to be returned.
+         * Loading first and comparing the decoded key would make a MISS cost a
+         * write(2): the seek lands on the neighbouring pending record,
+         * materialising it flushes the writer's chunk (zsi_txn_at), and the
+         * record is then discarded as not equal -- and a caller probing for
+         * keys it is about to insert misses every time.  ZS_EPHEMERAL (A-4b)
+         * covers the other half, where the read HITS and the bytes are
+         * wanted. */
         struct zsi_fcur scratch = *fc;
         int cmp = 0;
         int r = ZS_NOTFOUND;
@@ -3778,9 +3756,9 @@ static int zsi_fileset_scan_dh(DIR *d, const zsi_uuid_t *want_uuid,
          *
          * Copied with an EXPLICIT length rather than snprintf'd, because the
          * compiler cannot see that reasoning: `d_name` is NAME_MAX-sized, so
-         * -Wformat-truncation flags the snprintf, and Cyrus builds -Werror.
-         * Suppressing the warning would leave the bound implicit; this states
-         * it where it is relied on.  The check is unreachable for the same
+         * -Wformat-truncation flags the snprintf, and a consumer may build with
+         * -Werror.  Suppressing the warning would leave the bound implicit;
+         * this states it where it is relied on.  The check is unreachable for the same
          * reason it is here, in the manner of F-29's progress checks. */
         size_t nlen = strlen(de->d_name);
         if (nlen >= ZSI_NAME_MAX) continue;
@@ -3967,14 +3945,9 @@ static int zsi_fileset_resolve(struct zsi_fileset *fs)
     if (!fs->resolved) return ZS_INTERNAL;
 
     /* D-5a's order, imposed on the ENTRIES rather than inherited from the
-     * names.  It used to come free from name collation, because the active
-     * file was named for its generation and its name was a strict prefix of
-     * the in-order name covering it -- so it sorted first and "take the last"
-     * picked the in-order file.
-     *
-     * D-1b broke that: `.current` carries no generation, so where it collates
-     * says nothing about which generation it holds, and a plain name sort puts
-     * it after EVERY in-order file.  In the conversion window -- output renamed
+     * names.  A name sort cannot serve: under D-1b `.current` carries no
+     * generation, so where it collates says nothing about which generation it
+     * holds, and a plain name sort puts it after EVERY in-order file.  In the conversion window -- output renamed
      * in, input not yet removed (D-5) -- that would make "take the last" pick
      * the superseded active file over the in-order file that just replaced it,
      * and the snapshot would carry an active file the writer is about to
@@ -4264,9 +4237,8 @@ static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
  *   4. build a private index for each unordered file by replaying its spans,
  *      taking its snapshot boundary to be the end of its last valid span.
  *
- * NO LOCK IS TAKEN AT ANY POINT (C-2).  That is the single most surprising
- * property of this design and the place someone will later be tempted to add one.
- * What makes it safe:
+ * NO LOCK IS TAKEN AT ANY POINT (C-2), which is the most surprising property of
+ * this design.  What makes it safe:
  *
  *   - step 2's tiling check IS the completeness proof (C-4a).  Every generation
  *     in the interval is covered exactly once, so no committed data is missing,
@@ -5009,10 +4981,10 @@ static int zsi_db_freshen(struct zs_db *db)
      * fails with ENOENT, and C-4b's retry rescans and converges.  Detection is
      * lazy exactly where laziness is free.
      *
-     * This replaces a getdents sweep of the whole directory on every operation.
-     * That was equally exact and, on a network or ZFS mount, cost about what
-     * the fdatasyncs beside it cost -- measured against the sqlite extension,
-     * where it was why turning sync off bought nothing. */
+     * The alternative, a getdents sweep of the whole directory on every
+     * operation, is equally exact and far more expensive: on a network or ZFS
+     * mount it costs about what the fdatasyncs beside it do, which is enough to
+     * make relaxed durability buy nothing at all. */
     zsi_name_current(name, db->uuid);
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
 
@@ -5143,13 +5115,10 @@ struct zs_cursor {
     char             *skiproot_key;
     size_t            skiproot_keylen;
 
-    /* Every flag together.
-     *
-     * Spread among the pointers these seven bools cost 29 bytes of padding, and
-     * a cursor allocates this struct alongside a zs_txn -- whose size turned out
-     * to be worth 6.3% on a scan, through nothing but heap layout (CLAUDE.md).
-     * Grouping changes no instructions, and no on-disk layout depends on field
-     * order: G-0 keeps that in explicit memcpy at literal offsets.
+    /* Every flag together: spread among the pointers they cost 29 bytes of
+     * padding, and a cursor allocates this struct on every open.  No on-disk
+     * layout depends on field order -- G-0 keeps that in explicit memcpy at
+     * literal offsets.
      *
      * reverse is fixed at open (D-14k).  rev_succ_none means the prefix was all
      * 0xFF -- no successor, so seek from the end.  handle_live is whether this
@@ -5230,24 +5199,13 @@ struct zs_cursor {
 /* Order two per-file cursors: exhausted last, then key ascending, then generation
  * descending.  D-14g gives the transaction ZSI_GEN_TXN so its records win equal
  * keys with no special case here. */
-/* `static inline`, and it is a measurement rather than a style.
- *
- * This and zsi_ptrs_at / zsi_ptrs_rec are small enough that clang inlines them
- * into the merge loop at -O2 and GCC does not: GCC's -O2 auto-inline budget
- * (max-inline-insns-auto) is far tighter, and all three are called from more
- * than one site.  A GCC profile of a full scan therefore shows call frames
- * clang's has no symbol for at all -- zsi_cur_order 3.6%, zsi_ptrs_rec 2.1%,
- * zsi_ptrs_at 1.9%, alongside zsi_cursor_refresh below -- about 12% of the
- * samples, per record, for calls whose bodies are a comparison and two loads.
- * Saying `inline` moves them to max-inline-insns-single and GCC takes them:
- * measured at +8.8% on a four-file scan and +8.0% compacted, and flat on
- * clang, which was already doing it.
- *
- * It has to be said in the SOURCE.  zeroskip.c is vendored, so it is built with
- * the host project's flags, not ours; an inlining decision that matters cannot
- * live in our CFLAGS.  (Nothing here depends on it for correctness -- deleting
- * the keyword is a silent 8% on GCC builds and no test can see it, which is why
- * it is written down here.) */
+/* `inline` is required here, not decorative.  This and zsi_ptrs_at /
+ * zsi_ptrs_rec are called once per record from the merge loop and are small
+ * enough that clang inlines them at -O2 while GCC, whose auto-inline budget is
+ * much tighter, does not; the keyword brings them into its reach.  It has to be
+ * said in the source rather than in CFLAGS, because zeroskip.c is vendored and
+ * is built with the host project's flags.  Nothing depends on it for
+ * correctness, so nothing reports its loss. */
 static inline int zsi_cur_order(struct zs_cursor *c, const struct zsi_fcur *a,
                                 const struct zsi_fcur *b)
 {
@@ -5271,17 +5229,12 @@ static void zsi_cur_sort(struct zs_cursor *c)
      * low), and it is almost always already sorted.
      *
      * The guard is D-14i-a's shortcut one level up, and for the same reason:
-     * without it an element already in place is still lifted into a local and
-     * put back, which is 320 bytes of struct zsi_fcur to move nothing.  It is
-     * free when the element DOES move, because that comparison is the while
-     * loop's first iteration either way.
-     *
-     * It matters because step 3 calls this on EVERY step of a scan whose keys
-     * are duplicated across files -- an ordinary database after updates, and
-     * `full scan, shadowed` in zsbench, where zsi_cur_sort was 10.3% of an EPYC
-     * profile before the guard.  Nothing measured that shape until the
-     * shadowed fixture existed, which is why resort_head got this in 2026-08-15
-     * and the sort did not. */
+     * without it an element already in place is lifted into a local and put
+     * back, moving a whole struct zsi_fcur to achieve nothing.  It is free when
+     * the element DOES move, since that comparison is the while loop's first
+     * iteration either way.  Step 3 calls this on every step of a scan whose
+     * keys are duplicated across files, which is an ordinary database after
+     * updates. */
     for (size_t i = 1; i < c->ncur; i++) {
         if (zsi_cur_order(c, &c->cur[i - 1], &c->cur[i]) <= 0) continue;
 
@@ -5354,7 +5307,8 @@ static void zsi_cursor_free(struct zs_cursor *c)
  * what C callers expect of a flags argument; internally the flag space is one
  * 32-bit set of bits and unsigned is the honest type for it.  Every public flag
  * value fits well inside 30 bits, so the conversion is value-preserving -- but it
- * is written out rather than left implicit, because Cyrus builds -Wconversion. */
+ * is written out rather than left implicit, for consumers built with
+ * -Wconversion. */
 /* D-14k step 1, one arm.  Forward: lower bound of the start key, or the
  * beginning.  Reverse: the largest key <= the start key; under
  * ZS_CURSOR_PREFIX the start key IS the prefix and the scan begins at the
@@ -5394,10 +5348,9 @@ static int zsi_cursor_open(struct zs_db *db, struct zs_txn *txn,
     c->reverse = (flags & ZS_REVERSE) != 0;
 
     /* The cursor takes its OWN reference rather than borrowing the
-     * transaction's.  It used to borrow, which was fine while a cursor's
-     * snapshot never changed -- but D-14j lets a handle-live cursor swap to a
-     * newer one, and releasing a borrowed reference frees a snapshot the
-     * transaction is still pointing at. */
+     * transaction's: D-14j lets a handle-live cursor swap to a newer snapshot,
+     * and releasing a borrowed reference would free one the transaction is
+     * still pointing at. */
     c->snap = snap;
     c->snap->refcount++;
 
@@ -5574,8 +5527,8 @@ static int zsi_cursor_step(struct zs_cursor *c, struct zsi_rec *out, bool *emit)
  * merge: an arm that was exhausted at open has consumed nothing at all.
  * Re-positioning an arm from its own state therefore resurfaces any key written
  * into the gap between the two, and the merge hands it out BEHIND the last key
- * yielded (found downstream: a store made mid-walk at a key already passed was
- * yielded out of order, shifting the rest of the traversal by one). */
+ * yielded: a store made mid-walk at a key already passed comes out of order,
+ * shifting the rest of the traversal by one. */
 static int zsi_cursor_reseek_arm(struct zs_cursor *c, struct zsi_fcur *fc)
 {
     int r;
@@ -5638,17 +5591,14 @@ static int zsi_cursor_reseek_txn(struct zs_cursor *c)
 /* The half of D-14j's refresh that runs when something HAS changed.
  *
  * Split out so the common answer -- nothing has -- is a few loads inlined into
- * the merge loop instead of a call into this, which GCC will not inline because
- * of the snapshot rebuild below (4.7% of a scan profile, per record, to learn
- * that nothing happened).  See zsi_cur_order for the general point.
+ * the merge loop, rather than a call into this, which GCC will not inline
+ * because of the snapshot rebuild below.  See zsi_cur_order.
  *
  * BOTH conditions are decided by the fast path and passed in, and this function
  * re-derives neither.  The hazard of a split like this is the two halves
  * disagreeing about when there is work to do -- a fast path that wrongly says
  * "nothing" is a cursor that silently stops refreshing (G-4) -- so each question
- * is asked in exactly one place.  That is also what keeps the D-14j mutants
- * pointed at something reachable: a mutation of a test the gate has already
- * decided would be dead code behind it. */
+ * is asked in exactly one place. */
 static int zsi_cursor_refresh_slow(struct zs_cursor *c, bool txn_moved,
                                    bool look)
 {
@@ -5810,79 +5760,46 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
  * record becomes a shadowed version in the span, exactly like a shadowed
  * version across spans, and vanishes at the file's next conversion.
  *
- * A SKIPLIST, since 2026-08-16.  It was a single sorted array, which splices a
- * new key in with a memmove -- and the cost of that depends entirely on the
- * order the keys arrive in.  Ascending keys land at the end and move nothing;
- * a key arriving anywhere else moves half the array, so a transaction cost
- * O(n^2) in the number of DISTINCT keys it held.  Measured at 0.19s ascending
- * against 4.99s random for 200 000 records in one transaction, four times the
- * time for twice the keys, and no benchmark could see it because every store
- * workload wrote ascending keys (`store, all in one txn, random` exists now).
- * The file already said so in ZSI_DELTA_MAX's comment, about the read-side
- * index: "a single sorted array with no delta would memmove the entire index
- * per commit".  The pending set was that array.
- *
- * The base+delta shape that comment describes was the other candidate.  A
- * skiplist was chosen over it for a reason that is not performance: **a node
- * never moves**, so a cursor's position can be a POINTER.  D-14j-a exists
- * entirely because an array index stops referring to its record when an insert
- * shifts the array -- the arm had to hold a key and re-resolve it by binary
- * search on every step, with a cached index behind two guards that no test
- * could reach through a cursor.  All of that is gone: `struct zsi_fcur`'s
- * transaction half is one pointer, a step is `node->next[0]`, and the arm
- * cannot be invalidated by a write at all.  What remains of D-14j-a is the
- * cursor-level rule that a refresh re-seeks from the CURSOR's resume key
- * (D-14j-b), which was always the part that mattered.
+ * A SKIPLIST, for two reasons.  A sorted array splices a new key in with a
+ * memmove, so its cost depends on the order the keys arrive in: ascending keys
+ * land at the end and move nothing, while a key arriving anywhere else moves
+ * half the array, making a transaction O(n^2) in its distinct keys.  And a
+ * node NEVER MOVES, so a cursor's position can be a pointer -- an array index
+ * stops referring to its record the moment an insert shifts the array, which is
+ * what D-14j-a had to work around by holding a key and re-resolving it on every
+ * step.  Here `struct zsi_fcur`'s transaction half is one pointer, a step is
+ * `node->next[0]`, and no write can invalidate an arm.  What remains of D-14j-a
+ * is the cursor-level rule that a refresh re-seeks from the CURSOR's resume key
+ * (D-14j-b).
  *
  * Level 0 is doubly linked because D-14k walks backwards and a skiplist is
  * otherwise forward-only; `prev` is what makes a reverse step O(1) rather than
  * a fresh search per record. */
 #define ZSI_PEND_MAXLEVEL 16     /* 4^16 nodes at p = 1/4, far past any txn */
 
-/* Nodes live in ONE arena and refer to each other by OFFSET, the way Cyrus's
- * skiplist file does -- and for the same reason it works on disk: an offset
- * survives the arena moving.  The arena doubles by realloc, which relocates
- * every node at once, and not one link needs fixing up.
- *
- * That is what makes this representation compatible with the property the
- * skiplist was chosen for.  A raw pointer would have been invalidated by the
- * realloc; an offset is not, so a cursor's position is still stable across any
- * write (see struct zsi_fcur).
- *
- * It also removes two allocations per distinct key -- the node and its key copy
- * -- which is the whole cost the skiplist added over the sorted array it
- * replaced: an array append wrote into a slot that already existed.
+/* Nodes live in ONE arena and refer to each other by OFFSET.  The arena doubles
+ * by realloc, which relocates every node at once and leaves every link correct:
+ * a raw pointer would not survive that, an offset does, so a cursor's position
+ * stays stable across any write (see struct zsi_fcur).  It also keeps a node
+ * and its key to a single allocation.
  *
  * Offset 0 is the null link, so the arena's first 8 bytes are never used.
  *
  * A BOUNDED PREFIX of the key is inlined after the level array -- the whole key
- * when it fits -- so the bytes a descent compares are beside the links it
- * followed to reach them.  The record itself holds the key too, and deriving it
- * through zsi_txn_at instead would store nothing at all; measured, that costs a
- * decode and a second cache line per comparison, which is 23% of a bulk load at
- * 11-byte keys and 7.6% at 500-byte ones.  Inlining the WHOLE key instead is
- * what those figures beat, but it makes an entry O(keylen): a million 500-byte
- * keys is 552MB of pending set against 43MB, and since values live in the file
- * that is the transaction's whole footprint.
+ * when it fits -- so the bytes a descent compares sit beside the links it
+ * followed to reach them.  The record holds the key too, but reading it through
+ * zsi_txn_at costs a decode and a second cache line per comparison; inlining
+ * the whole key instead would make an entry O(keylen), and since values live in
+ * the file the pending set is a transaction's entire footprint.  The bound gets
+ * both: an entry is at most 112 bytes, and a comparison is decided from the
+ * inlined bytes unless BOTH keys are longer than the bound AND equal within it,
+ * which is the only case that reads a record.
  *
- * The bound gets both.  An entry is O(1) -- at most 112 bytes -- and a
- * comparison is decided from the inlined bytes unless BOTH keys are longer than
- * the bound AND equal within it, which is the case where inlining the whole key
- * would have cost the most memory anyway.  Only then is the record read.
- *
- * 64 rather than 32, and the difference is not subtle: a key at or under the
- * bound is inlined WHOLE, so it is decided without ever reading a record, and 64
- * covers the shapes that matter -- sqlite's 12-byte rowid keys and 30-60 byte
- * text index keys, a conversations.db G<40 random chars>, most mailbox names.
- * At 32 those all still fit or discriminate, except the ones with a structured
- * head: "Ndomain!user.foo" runs agree past 32 and were measured 40% slower for
- * it.  Above 64 the prefix still discriminates for anything that varies early,
- * which is what a message-id does even at 1200 bytes.
- *
- * The inline is VARIABLE-LENGTH, not a slot: a 12-byte key costs 12 bytes, not
- * 64.  Reported from the sqlite integration, where the distribution is sharply
- * bimodal and a fixed slot would have been 5x the payload for the commonest
- * record in any database.
+ * 64 rather than something smaller because a key at or under the bound is
+ * inlined WHOLE and never reads a record at all, and 64 covers the common
+ * shapes: 12-byte rowid keys, 30-60 byte index keys, most mailbox names.  Keys
+ * with a long structured head are the ones that fall through to the record.
+ * The inline is VARIABLE-LENGTH, not a slot: a 12-byte key costs 12 bytes.
  *
  * The inlined bytes MOVE with the arena, which is safe because every borrow is
  * read inside the call that took it.  Nothing holds a pending key across a
@@ -5911,14 +5828,11 @@ struct zs_txn {
     struct zs_db        *db;
     struct zsi_snapshot *snap;        /* the transaction's fixed snapshot */
 
-    /* Every flag and small counter, together.
-     *
-     * Scattered among the pointers they cost 20 bytes of padding, and struct
-     * zs_txn's SIZE is on the read path: zs_db_begin_cursor makes an implicit
-     * transaction, so every cursor allocates one, and growing this struct by
-     * 160 bytes once cost 6.3% on a scan that reads none of it (CLAUDE.md).
-     * Grouping is free -- no instruction changes, and nothing here is on-disk
-     * layout, which G-0 keeps in explicit memcpy at literal offsets. */
+    /* Every flag and small counter together: scattered among the pointers they
+     * cost 20 bytes of padding, and this struct's SIZE is on the read path --
+     * zs_db_begin_cursor makes an implicit transaction, so every cursor
+     * allocates one.  Nothing here is on-disk layout, which G-0 keeps in
+     * explicit memcpy at literal offsets. */
     bool                 readonly;
     bool                 holds_write_lock;
 
@@ -5936,12 +5850,10 @@ struct zs_txn {
     /* The pending set (see struct zsi_pnode): a skiplist in one arena, and
      * every reference to a node is an OFFSET into it.
      *
-     * The LEVEL HEADS live at the head of the arena rather than here, which is
-     * the flat-file layout again -- a skiplist file keeps them in its header.
-     * Inline they were 128 bytes in every transaction, and a READ transaction
-     * never stores, so every cursor was allocating and zeroing a pending set it
-     * could not use.  With the arena allocated on first store, a read
-     * transaction now has none at all. */
+     * The LEVEL HEADS live at the head of the arena rather than here: inline
+     * they are 128 bytes in every transaction, and a READ transaction never
+     * stores.  The arena is allocated on the first store, so a read transaction
+     * has no pending set at all. */
     char                *parena;
     size_t               pused, pcap;
     size_t               ptail;       /* for a reverse walk's start (D-14k) */
@@ -6034,10 +5946,8 @@ static void zsi_pend_key(struct zs_txn *txn, size_t o, const char **kp,
  * inferred from a prefix for it -- it takes the full key, every time.  Same
  * split as zsi_cmp, and the same reason. */
 /* The long half, split out so the common one inlines into the descent: a
- * comparison happens ~log n times per store and GCC will not inline a function
- * carrying the derivation below, so leaving them together put a call on every
- * one of them -- 10% of a bulk load at 12-byte keys, for a branch.  Same shape
- * and same reason as zsi_cursor_refresh's gate.
+ * comparison happens ~log n times per store, and GCC will not inline a function
+ * carrying the derivation below.  Same shape as zsi_cursor_refresh's gate.
  *
  * Longer than the bound, so only a prefix is on hand.  F-11a is memcmp over
      * the common prefix and then shorter-key-first, so a difference inside the
@@ -6401,11 +6311,9 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
      * A-4a: the outgoing snapshot is RETIRED, not released.  A caller that
      * read before its first write -- read-modify-write, the ordinary shape --
      * holds pointers into its mappings, and A-4 promised them for the whole
-     * transaction.  Releasing here unmapped them, and it fired whenever the
-     * first store started a new generation: after a seal there is no active
-     * file at all, so the very next transaction takes that path.  Reported
-     * from the sqlite integration as crashes with the library nowhere in the
-     * backtrace. */
+     * transaction.  Releasing here would unmap them, on every first store that
+     * starts a new generation -- and after a seal there is no active file at
+     * all, so the very next transaction takes that path. */
     /* Only when it actually MOVED.  zsi_writer_active refreshes just on the
      * new-generation path, so the ordinary append leaves db->snap exactly where
      * this transaction already is -- and retiring that would hand our own
@@ -6563,8 +6471,7 @@ static bool zsi_txn_cur_at(struct zsi_fcur *fc, struct zsi_pnode **np)
  * zsi_txn_at, and a record still in the writer's chunk buffer gets flushed to
  * the file just to be looked at -- so a lookup that misses would pay a write(2)
  * for a record it then discards, and a bulk load probing for keys it is about to
- * insert misses on nearly every one.  Reported from the sqlite integration as
- * 300k write() against 10 fdatasync over 100k rows in ONE transaction. */
+ * insert misses on nearly every one. */
 static bool zsi_txn_cur_cmp(struct zsi_fcur *fc, const char *key, size_t keylen,
                             int *cmp)
 {
@@ -7014,10 +6921,8 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
          * what an unconditional rebuild adds is a replay of the active file
          * on every begin -- the sole writer's commit already left db->snap
          * current via the D-13b fold, so it re-derives a snapshot it already
-         * holds, at O(active file) per commit.  Found downstream as a
-         * throughput sawtooth against rollover_size: single-record commits
-         * decayed from 6000/s on a fresh active file to 800/s near 2MB, then
-         * snapped back at rollover. */
+         * holds, at O(active file) per commit -- so single-record commits decay
+         * as the active file grows and snap back at every rollover. */
         r = zsi_db_freshen(db);
         if (r != ZS_OK) {
             zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
@@ -7025,12 +6930,11 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
             return r;
         }
     } else {
-        /* C-4i: freshness is a property of BEGIN, not of open.  Without this
-         * a long-lived handle reads the world as of its own last write --
-         * found downstream, where one process created a mailbox and another,
-         * holding the database open since before that commit, answered that
-         * it did not exist.  Snapshot isolation (G-4) starts here and holds
-         * for the transaction's lifetime, never the handle's. */
+        /* C-4i: freshness is a property of BEGIN, not of open.  Without it a
+         * long-lived handle reads the world as of its own last write: another
+         * process's commit stays invisible for as long as the handle is held
+         * open.  Snapshot isolation (G-4) starts here and holds for the
+         * transaction's lifetime, never the handle's. */
         r = zsi_db_freshen(db);
         if (r != ZS_OK) { free(txn); return r; }
     }
@@ -7779,15 +7683,12 @@ static bool zsi_should_repack(struct zsi_snapshot *snap)
  *   2. within one unordered file, by increasing offset among committed spans;
  *   3. an in-order file holds one record per key, so there is nothing to order.
  *
- * V1 is the first version in that order and V3 the last.  The emitted record takes
- * V3's VALUE and V1's ANCESTOR -- from those records specifically, and by no other
- * route.  Getting this wrong silently emits the wrong value or the wrong ancestor,
- * which is why T-7 tests the ordering directly rather than only its consequences. */
+ * V1 is the first version in that order and V3 the last; the emitted record takes
+ * V3's value.  Getting the order wrong silently emits the wrong value, which is
+ * why T-7 tests it directly rather than only through its consequences. */
 /* The newest version of one key across the inputs, under D-17b's total order.
- *
- * V1 -- the oldest version -- used to be carried here too, because D-17 emitted
- * V1's ancestor alongside V3's value.  With F-18 there is no ancestor, so only
- * the newest version is ever needed and the oldest is not tracked at all. */
+ * Records carry no ancestor (F-18), so the newest version is the only one a
+ * merge ever needs. */
 struct zsi_merge_key {
     struct zsi_rec v3;          /* newest version: its value is emitted */
     bool           have;

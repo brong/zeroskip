@@ -1501,7 +1501,7 @@ mutant "scan: infers the active generation instead of reading it" catch \
 # a throughput sawtooth against rollover_size.  The anchor is the comment's
 # closing line, because the shared-begin path calls zsi_db_freshen too.
 mutant "write begin: rebuilds the snapshot unconditionally" catch \
-  's/         \* snapped back at rollover\. \*\/\n        r = zsi_db_freshen\(db\);/         * snapped back at rollover. *\/\n        r = zsi_db_refresh(db);/'
+  's/        r = zsi_db_freshen\(db\);\n        if \(r != ZS_OK\) \{\n            zsi_lock_release\(&db->locks, ZSI_LOCK_WRITE\);/        r = zsi_db_refresh(db);\n        if (r != ZS_OK) {\n            zsi_lock_release(\&db->locks, ZSI_LOCK_WRITE);/'
 
 echo
 echo "same-process exclusion (C-1j)"

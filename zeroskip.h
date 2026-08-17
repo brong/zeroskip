@@ -97,8 +97,7 @@ enum zs_flagspec {
     ZS_FETCHNEXT     = 1<<13,  /* fetch:   return the record with the smallest
                                   key >= the given key; with ZS_SKIPROOT,
                                   strictly > (A-12).  Exclusive with
-                                  ZS_FETCHPREV.  (Bare FETCHNEXT was the
-                                  strict bound until 2026-08-13.) */
+                                  ZS_FETCHPREV. */
     ZS_SKIPROOT      = 1<<14,  /* foreach,cursor: skip an exact match on the start key */
     ZS_FETCHPREV     = 1<<15,  /* fetch:   return the record with the largest key
                                   <= the given key; with ZS_SKIPROOT, strictly <
@@ -177,7 +176,7 @@ struct zs_open_data {
      * -- that would let a read-only handle write into the database, which is
      * exactly what R-3 forbids. */
     const char  *index_dir;        /* A-8 */
-    size_t       index_threshold;  /* A-9: 0 = a measured default, 32KB */
+    size_t       index_threshold;  /* A-9: 0 = the default, 32KB */
 };
 
 #define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, NULL, NULL, 0 }

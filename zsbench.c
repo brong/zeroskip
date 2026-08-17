@@ -47,9 +47,9 @@ static const char *csum_name = "xxh64";
  * therefore a property of the workload, not a detail.  "head" puts the digits
  * first and pads after them -- a message-id or a G<40 random chars> key, which
  * two comparisons settle.  "shared" pads first, so every key agrees for its
- * first --keysize-11 bytes: Cyrus mailboxes.db's "Ndomain!user.foo" runs.  At
- * the default --keysize 11 there is no padding and the two are identical, so
- * every figure recorded before this option existed is a "head" figure. */
+ * first --keysize-11 bytes, the shape of a structured name like
+ * "Ndomain!user.foo" repeated over a long run.  At the default --keysize 11
+ * there is no padding and the two are identical. */
 static const char *keyshape = "head";
 static int selftest = 0;
 static const char *filter = NULL;
@@ -80,9 +80,7 @@ static enum phase phase = PHASE_ALL;
 /* Repetition timing.
  *
  * Every workload runs `reps` times and reports the median, which is what makes
- * a number worth comparing against another machine or another library.  Until
- * 2026-08-14 only `store, one txn each` did: the other nine timed a single run
- * while the banner printed "%d reps" over the whole report.
+ * a number worth comparing against another machine or another library.
  *
  * Each workload owns its own repetition loop rather than being driven by a
  * registry, because what must be rebuilt between repetitions differs and only
@@ -241,11 +239,9 @@ static void makekey(char *buf, size_t bufsz, long i)
     buf[want] = '\0';
 }
 
-/* Every workload builds its keys in a buffer of this size.  It was 64, which
- * silently TRUNCATED --keysize above 63: makekey clamps to the buffer and the
- * run then reported the keysize it was asked for while measuring 63-byte keys.
- * The figures that matters for are the ones comparing key handling at realistic
- * mailbox-key lengths, which is exactly where it lied. */
+/* Every workload builds its keys in a buffer of this size.  makekey clamps to
+ * the buffer it is given, so a buffer smaller than --keysize would silently
+ * measure shorter keys than the run claims to be measuring. */
 #define ZSB_KEYMAX 1024
 
 /* Key i of a strided PERMUTATION of [0, nrecs), for the workloads whose subject
@@ -257,10 +253,10 @@ static void makekey(char *buf, size_t bufsz, long i)
  * n above 10^12.
  *
  * Two workloads want it, for the same reason from opposite ends: ascending keys
- * are the best case for the sorted structures on both sides of the library, and
- * every workload here used to write them.  On the read side that made a file set
- * whose ranges never overlap (`full scan`); on the write side it makes every
- * insert into a transaction's pending array land at the end. */
+ * are the best case for the sorted structures on both sides of the library.  On
+ * the read side they build a file set whose ranges never overlap, so the merge
+ * never merges; on the write side every insert into a transaction's pending set
+ * lands at the end. */
 static long long strided(long long i)
 {
     long long p = (nrecs % 1000003 == 0) ? 999983 : 1000003;
@@ -289,13 +285,12 @@ static void cleanup(const char *dir)
 
 /* A second fixture in a different state, without a second build.
  *
- * `fetch, repacked` and `full scan, compacted` used to repack and compact the
- * fixture they had just timed, IN PLACE -- which is fine when one process does
- * both lines in order, and wrong the moment the fixture is reused: a --run
- * invocation would find the compacted database under the plain scan's name and
- * time it twice.  Each timed line gets its own directory instead, copied from
- * the first rather than stored again, since the copy is a fraction of the cost
- * of nrecs commits. */
+ * `fetch, repacked` and `full scan, compacted` must not repack or compact the
+ * fixture they have just timed IN PLACE: that works only while one process runs
+ * both lines in order, and a reused fixture would then be found already
+ * transformed, timing the same database twice.  Each timed line gets its own
+ * directory, copied from the first rather than stored again, since the copy is
+ * a fraction of the cost of nrecs commits. */
 static void copydir(const char *src, const char *dst)
 {
     char cmd[4096];
@@ -335,14 +330,13 @@ static void fixture_require(const char *dir)
  * time.  That is the failure --selftest exists to prevent, arriving by a
  * different door, so the pairing is checked rather than trusted.
  *
- * A --run therefore ADOPTS whatever it was not told, rather than defaulting.
- * Requiring the parameters to be repeated makes the common invocation --
- * `perf record ./zsbench --path=DIR --run scan` -- refuse to run at any -n but
- * the default, which is a fixture size nobody profiling would have built; and
- * the refusal costs a whole profiling session, because `perf record` reports it
- * as 12 samples of the dynamic linker rather than as a benchmark that never
- * started.  A parameter that IS given still has to match: adopting it silently
- * would answer a question the caller asked about a different database. */
+ * A --run therefore ADOPTS whatever it was not told, rather than defaulting:
+ * requiring the parameters to be repeated would make the common invocation --
+ * `perf record ./zsbench --path=DIR --run scan` -- refuse at any -n but the
+ * default, and under a profiler a refusal looks like a benchmark that ran
+ * rather than one that never started.  A parameter that IS given still has to
+ * match: adopting it silently would answer a question the caller asked about a
+ * different database. */
 #define STAMP_NAME "zsbench.setup"
 
 static int nrecs_given = 0, keysize_given = 0, valsize_given = 0,
@@ -1254,8 +1248,7 @@ static void bench_txn_scan(void)
      * This half splits PARTLY: the committed database is a fixture, and the
      * handful of pending overwrites (nrecs/16) are re-done in the run phase,
      * because a live transaction cannot cross a process boundary.  Built with
-     * FIXTURE_FLAGS now that it is one -- it was ZS_CREATE, paying C-7's two
-     * gates per record for a database nothing measures the writing of.
+     * FIXTURE_FLAGS, since nothing here measures the writing of it.
      *
      * PHASE_SETUP ignores the filter, for the reason main() gives. */
     if (phase == PHASE_SETUP || selected("scan in a write txn, few pending")) {
@@ -1853,10 +1846,10 @@ int main(int argc, char **argv)
     snprintf(workdir, sizeof(workdir), "%s/zsbench.%d", tmp, (int)getpid());
 
     for (int i = 1; i < argc; i++) {
-        /* --opt=value and --opt value are both accepted.  The `=` spelling is
-         * what anyone types by reflex, and it used to fall through to the
-         * usage dump -- which, run under `perf stat`, looks like a benchmark
-         * that completed in a millisecond rather than one that never ran. */
+        /* --opt=value and --opt value are both accepted.  An unrecognised
+         * spelling must be a usage error rather than a silent default: under a
+         * profiler, a usage dump looks like a benchmark that completed
+         * instantly rather than one that never ran. */
         char opt[64];
         const char *inl = NULL, *val = NULL;
         const char *eq = strchr(argv[i], '=');
