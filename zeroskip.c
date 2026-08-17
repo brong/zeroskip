@@ -6166,15 +6166,6 @@ static size_t zsi_pend_lb(struct zs_txn *txn, const char *key,
     return n;               /* level 0's candidate, or 0 for an empty list */
 }
 
-static size_t zsi_pend_find(struct zs_txn *txn, const char *key, size_t keylen)
-{
-    size_t n = zsi_pend_lb(txn, key, keylen, NULL);
-
-    if (!n) return 0;
-    if (zsi_pend_cmp(txn, n, key, keylen) == 0) return n;
-    return 0;
-}
-
 /* The largest key <= (inclusive) or < (exclusive) the given one: a reverse
  * seek's landing point (D-14k).  The lower bound's PREDECESSOR is the strictly
  * smaller answer, and it is already linked at level 0. */
@@ -6221,18 +6212,25 @@ static size_t zsi_pend_nodelen(int lv, size_t keylen)
     return zsi_roundup8(n);
 }
 
-/* Splice a node for a key the caller has established is absent.  One walk: the
- * descent path IS the set of links to rewrite.  Cannot fail -- the arena was
- * reserved before the record was streamed. */
+/* Splice a node for a key the caller has established is absent, at the descent
+ * path the caller's own lower-bound walk produced.  Cannot fail -- the arena was
+ * reserved before the record was streamed.
+ *
+ * `update` comes from the caller because the walk that found the key ABSENT is
+ * the same walk that says where to splice it, and a store used to do both: one
+ * descent to look the key up and a second one here.  What makes handing the path
+ * over safe is the property the arena was built for -- a link is an OFFSET, so
+ * the realloc that the reservation may perform in between moves every node and
+ * invalidates none of the path.
+ *
+ * The path must be ZSI_PEND_MAXLEVEL entries with 0 for "from the head": a walk
+ * only fills levels below plevel, and this node's level may be above it. */
 static size_t zsi_pend_link(struct zs_txn *txn, const char *key, size_t keylen,
-                            int lv, size_t off, size_t len)
+                            int lv, size_t off, size_t len,
+                            const size_t *update)
 {
-    size_t update[ZSI_PEND_MAXLEVEL];
     size_t at = txn->pused;
     struct zsi_pnode *n;
-
-    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = 0;
-    zsi_pend_lb(txn, key, keylen, update);
 
     txn->pused += zsi_pend_nodelen(lv, keylen);
 
@@ -6460,7 +6458,23 @@ static int zsi_txn_stream_begin(struct zs_txn *txn)
 static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
                         const char *val, size_t vallen)
 {
-    size_t found = zsi_pend_find(txn, key, keylen);
+    /* ONE descent, whichever way it turns out: it answers "is this key already
+     * pending" and, if it is not, where to splice it.  Those were a descent each
+     * until 2026-08-17, and the second was invisible in every store benchmark's
+     * shape -- once the D-13b fold stopped dominating a bulk load, zsi_pend_lb
+     * and the memcmp under it were its largest cost that is not a syscall, at
+     * about 19% of a profile between them.
+     *
+     * Worth 2.92M to 4.18M records/s on 200k records in one transaction, and
+     * about 15% at 1000 records per transaction: the descent is O(log n) in the
+     * transaction's keys, so the saving grows with the batch and is largest for
+     * keys that do not arrive in order, where a descent walks furthest. */
+    size_t update[ZSI_PEND_MAXLEVEL];
+    size_t found;
+
+    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = 0;
+    found = zsi_pend_lb(txn, key, keylen, update);
+    if (found && zsi_pend_cmp(txn, found, key, keylen) != 0) found = 0;
 
     /* Bumped up front so every early return below still counts as a change:
      * an over-count costs one wasted reload, an under-count costs a cursor that
@@ -6515,7 +6529,7 @@ static int zsi_pend_set(struct zs_txn *txn, const char *key, size_t keylen,
         return ZS_OK;
     }
 
-    zsi_pend_link(txn, key, keylen, lv, off, n);
+    zsi_pend_link(txn, key, keylen, lv, off, n, update);
 
     return ZS_OK;
 }

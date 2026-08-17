@@ -10,6 +10,9 @@ behaviour, PATCH for fixes.
   inserting each record. 21% at 1000 records per transaction, 95% with 200k in
   one. See D-13b in the spec.
 
+- Storing is faster: one walk of the pending set per store rather than two.
+  About 15% at 1000 records per transaction, 42% with 200k in one.
+
 ## 2.1.1 — 2026-08-17
 
 - New `zs_open_data.repack_max_size` (default 512MB) bounds what one repack

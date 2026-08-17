@@ -1159,6 +1159,18 @@ mutant "sort: shortcut taken unconditionally" catch \
 echo
 echo "the pending set (a skiplist since 2026-08-16)"
 
+# A store does ONE descent, and takes two answers from it: whether the key is
+# already pending, and where to splice it if it is not.  The lower bound is the
+# first node at or ABOVE the key, so taking it as a hit without the equality
+# check overwrites the neighbouring key instead of inserting.
+mutant "pend: lower bound taken as a hit" catch \
+  's/    if \(found && zsi_pend_cmp\(txn, found, key, keylen\) != 0\) found = 0;/    \/* equality not checked *\//'
+
+# The path only gets filled for levels below plevel, so the rest must MEAN "from
+# the head".  A non-zero fill splices a tall node off a node that is not there.
+mutant "pend: descent path not zeroed above plevel" catch \
+  's/    for \(int i = 0; i < ZSI_PEND_MAXLEVEL; i\+\+\) update\[i\] = 0;\n    found = zsi_pend_lb/    for (int i = 0; i < ZSI_PEND_MAXLEVEL; i++) update[i] = 4;\n    found = zsi_pend_lb/'
+
 # Level 0 is doubly linked for one reason: D-14k walks backwards.  Dropping the
 # back-link leaves a reverse traversal starting at the tail and stopping after
 # one record, which reads as an empty result rather than as a crash.
