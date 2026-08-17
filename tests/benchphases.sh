@@ -35,7 +35,7 @@ trap cleanup EXIT
 # The workloads that can be split.  Everything else in zsbench either measures
 # its own setup (the store rows) or has setup that cannot cross a process
 # boundary (a live write transaction), so the run phase skips it.
-SPLIT="fetch fetch_repacked scan scan_compacted scan_interleaved scan_shadowed txn_scan_mixed"
+SPLIT="fetch fetch_repacked scan scan_compacted scan_noverify scan_interleaved scan_shadowed txn_scan_mixed"
 
 # slug,ops for the splittable rows only, sorted, so two CSVs can be diffed
 # whatever order they were produced in.
