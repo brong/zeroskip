@@ -91,6 +91,19 @@ The sibling library [`twom`](https://github.com/brong/twom) is a mutable
 single-file skiplist. zeroskip suits workloads that are append-heavy, want
 readers that never take a lock, and tolerate compaction happening out of band.
 
+## Known costs
+
+Two things a caller should size for:
+
+- **A repack cascade is unbounded in duration.** It rewrites whatever it
+  selects, and a writer that trips it wears the pause. `ZS_NOAUTOREPACK` leaves
+  the schedule to you, and `zs_db_seal` is the bounded alternative — at most
+  `rollover_size` of work.
+- **Record checksums are a real fraction of a scan** — around a quarter of one,
+  since every record is verified as it is yielded. `ZS_NOCSUM` skips that check
+  and nothing else; `zsbench`'s `full scan, no verify` prices it on your
+  hardware.
+
 ## Non-goals
 
 Multi-writer concurrency, cross-database transactions, secondary indexes,
