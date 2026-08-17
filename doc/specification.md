@@ -911,6 +911,29 @@ own index, in private memory, for each unordered file in its snapshot.
   incrementally.** It already knows every record it appends, so it folds them in
   at commit and discards them on rollback, and never rescans a file it is
   writing.
+
+  What it folds is a **sorted run**, not a sequence of insertions. A transaction
+  must already hold its pending records in key order to answer a read of its own
+  writes (A-1a) and to traverse them (D-14e), so the set of records a commit is
+  about to fold is available in the index's own order, one entry per key, for
+  nothing. Folding it as a run makes the fold a linear merge; folding record by
+  record makes each one a search, and a comparison in that search decodes a
+  record in the file, so an implementation that discards the order it already has
+  pays O(n log n) record decodes per commit for it.
+
+  This is a cost note rather than a requirement — nothing on disk changes and no
+  peer can observe it — but the cost is not a constant factor. The search is
+  against a structure that grows with the transaction, so it makes a *larger*
+  transaction slower per record, which is the opposite of what a caller batching
+  its writes expects and is invisible to any benchmark that commits at one size.
+  Measured on the reference implementation, 200k records with 100-byte values:
+  2.15M to 2.62M records/s at 1000 records per transaction, and 953k to 2.88M
+  with all of them in one.
+
+  A reader seeded by a pointer table (P-12) folds a run too, but its records come
+  from a **replay**, which yields them in offset order with a key possibly
+  repeated — so that path must sort and deduplicate before folding, keeping the
+  newest record for each key (D-13a). Both paths then share one fold.
 - **D-13c** No shared state is mutated in place anywhere in the design: files are
   append-only, a new file is published by `rename`, and superseded files are
   reclaimed by the kernel when the last reader closes.
