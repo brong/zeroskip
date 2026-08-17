@@ -7652,11 +7652,11 @@ static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
     while (lo > 0) {
         size_t next = snap->files[lo - 1]->size;
 
-        /* At least as large, NOT strictly larger (D-16d).  Rollover produces files
-         * of near-identical size, so equality is the common case: with a strict
-         * comparison neither the include rule nor the stop rule fires, nothing ever
-         * merges, and the file count grows without bound -- which defeats the
-         * policy entirely.  Merging equals is also what produces the geometric
+        /* At least as large, NOT strictly larger.  Rollover produces files of
+         * near-identical size, so equality is the common case rather than a
+         * boundary: with a strict comparison neither the include rule nor the
+         * stop rule fires, nothing ever merges, and the file count grows
+         * without bound.  Merging equals is also what produces the geometric
          * progression, two files of size s becoming one of 2s. */
         if (total < next) break;
         lo--;

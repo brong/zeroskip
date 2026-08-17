@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 268 |
-| With an enforcing test | 258 |
+| Requirements | 270 |
+| With an enforcing test | 260 |
 | Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -161,7 +161,6 @@ a spec label is missing here.
 | `D-16b` | A cascade writes one output for the whole selected set, not one per | `repack_selection`, `zsbench` |
 | `D-16c` | Because D-12b keeps in-order files as a contiguous prefix, the | `convert_only_one_unordered_file` |
 | `D-16e` | **Who runs it.** A writer SHOULD run the cascade itself, at the start of | `autorepack_bounds_the_file_count`, `autorepack_only_at_a_new_generation`, `noautorepack_leaves_the_files` |
-| `D-16d` | Step 2's comparison MUST include equality. Rollover produces files of | `repack_selection` |
 | `D-17` | The output holds **exactly one record per key**, built from the live | `check_out_of_order_pointers`, `fcur_no_duplicate_keys`, `repack_one_record_per_key` |
 | `D-17b` | A repack MUST consider the versions of a key in a **total order**, | `repack_version_order` |
 | `D-18` | Per key, where **below** means "in a file whose range lies entirely | `repack_d18_table` |

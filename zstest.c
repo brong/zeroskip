@@ -8562,7 +8562,7 @@ static void test_repack_selection(void)
     struct zs_db *db;
     size_t first, count;
 
-    /* Two files of EQUAL size are selected, per D-16d.  This is the case a strict
+    /* Two files of EQUAL size are selected.  This is the case a strict
      * comparison gets wrong: rollover produces near-identical sizes, so equality is
      * the common case, and with a strict test neither the include rule nor the stop
      * rule fires -- nothing ever merges and the file count grows without bound. */

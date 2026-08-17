@@ -1095,15 +1095,23 @@ The per-file cursors are held in an array kept sorted by:
   unordered file at all (D-16). It runs periodically, or whenever D-24 reports
   work.
 - **D-16** The repacker works **only on in-order files**; converting unordered
-  files is the writer's job (D-12). Input selection:
-  1. Start from the newest in-order file.
-  2. If the result would be **at least as large as** the next lowest in-order
-     file, include that file too and repeat.
-  3. Stop when every file is included or the next lowest in-order file is
-     strictly larger.
+  files is the writer's job (D-12). Its inputs MUST be **adjacent**: a
+  contiguous run of in-order files in generation order.
 
-  This yields geometrically sized in-order files and amortised O(log n)
-  rewrites per record.
+  **Which run to merge is not normative.** Any contiguous run is a valid
+  repack, and an implementation that never repacks at all is conforming — a
+  reader merges across whatever files exist, so the cost of not repacking is
+  performance (D-14d) and never correctness. Two implementations sharing a
+  database may use entirely different selection policies, and neither can
+  observe the other's.
+
+  What is normative is what a merge PRODUCES (D-17 to D-23) and adjacency,
+  which both D-19's tombstone test and D-6's tiling depend on: merging a
+  non-contiguous set would publish a file whose range overlaps one outside the
+  merge.
+
+  *Non-normative.* This implementation selects by size, so that in-order files
+  end up geometrically sized and each record is rewritten O(log n) times.
 - **D-16e Who runs it.** A writer SHOULD run the cascade itself, at the start of
   a write transaction that is about to **start a new generation** — the D-9a
   condition: no clean active file, or one already past `rollover_size`. That is
@@ -1130,21 +1138,15 @@ The per-file cursors are held in an array kept sorted by:
   across every file, so the read path degrades **linearly in the file count**
   while the database merely looks slow. `ZS_NOAUTOREPACK` (A-14) is for callers
   who would rather schedule the cascade themselves.
-- **D-16d** Step 2's comparison MUST include equality. Rollover produces files of
-  near-identical size, so equal sizes are the common case rather than a boundary:
-  with a strict comparison neither step 2 nor step 3 fires, no merge ever happens,
-  and the file count grows without bound — which defeats the policy whose whole
-  purpose is keeping that count low. Merging equals is also what produces the
-  geometric progression, since two files of size *s* become one of size 2*s*.
 - **D-16a** The two jobs divide by whether a file has an `end`, which is what
   makes them independent (C-1a): a writer's conversion is bounded by
   `rollover_size` and runs inline (D-12d), the repacker's cascade is unbounded and
   runs out of band.
 - **D-16b** A cascade writes one output for the whole selected set, not one per
   pair. A single invocation is therefore unbounded in duration (see open items).
-- **D-16c** Because D-12b keeps in-order files as a contiguous prefix, the
-  repacker's inputs are always adjacent (D-19) and the cascade is never blocked
-  by an unordered file sitting between two candidates.
+- **D-16c** Because D-12b keeps in-order files as a contiguous prefix, D-16's
+  adjacency requirement is satisfiable at all times: the cascade is never
+  blocked by an unordered file sitting between two candidates.
 - **D-17** The output holds **exactly one record per key**, built from the live
   records of all inputs, skipping rolled-back spans. Where the inputs hold
   versions V1, V2, V3 of a key from oldest to newest, the emitted record
@@ -1284,10 +1286,10 @@ The per-file cursors are held in an array kept sorted by:
   one file. The order is normative: seal (D-25), then convert every remaining
   unordered file (D-12), then merge in-order files until no two adjacent ones
   remain.
-- **D-26a** D-16's geometric selection does NOT apply to compaction. That rule
-  exists to keep a repack amortised, and compaction is explicitly the
-  unamortised case. Every other repack rule applies unchanged, D-17 through
-  D-23 — **including adjacency** (D-19).
+- **D-26a** A repacker's size-based selection does NOT apply to compaction: any
+  such policy exists to keep a repack amortised, and compaction is explicitly
+  the unamortised case. Every other repack rule applies unchanged, D-17 through
+  D-23 — **including adjacency** (D-16, D-19).
 - **D-26b** Adjacency is why compaction merges every maximal **run** of adjacent
   in-order files rather than the in-order prefix. A file that can be neither
   converted nor merged (D-28) splits the set into runs, and each must be merged
