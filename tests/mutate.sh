@@ -1693,6 +1693,16 @@ mutant "retire: leaves without referencing the files" catch \
 mutant "hold: references never released" catch \
   's/    for \(size_t i = 0; i < h->n; i\+\+\)\n        zsi_file_release\(&h->f\[i\]\);/    \/* leaked *\//'
 
+# A-4's two lifetimes are INDEPENDENT: a fetch borrow lasts the transaction and
+# outlives any cursor on it.  This is the bug the requirement warns about, in the
+# shape the code can have it -- the end of a cursor taking the TRANSACTION's claim
+# on the files down with it, which leaves a caller that never opened a cursor
+# holding freed bytes.  The downstream SQLite engine's savepoint undo log depends
+# on this exact case: before-images fetched in a transaction, cursors opened and
+# finalised per statement around them.
+mutant "hold: a cursor's end releases the transaction's claim" catch \
+  's/    if \(!curp \|\| !\*curp\) return;\n\n    if \(\(\*curp\)->owns_txn && \(\*curp\)->txn\) \{/    if (!curp \|\| !*curp) return;\n\n    if ((*curp)->txn) zsi_hold_fini(\&(*curp)->txn->hold);\n\n    if ((*curp)->owns_txn \&\& (*curp)->txn) {/'
+
 # EQUIVALENT, and the claim it used to carry -- "a G-4 violation a data test
 # can see" -- was aspirational: no test ever saw it, at any commit.  Both of the
 # jobs it does are covered by something else in every configuration a caller can

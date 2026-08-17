@@ -2103,6 +2103,24 @@ different calls, though not every flag is meaningful everywhere:
 - **A-4** Returned key and value pointers remain valid for the lifetime of the
   transaction or cursor that produced them; for the non-transactional
   `zs_db_*` calls, until the next call on that `struct zs_db`.
+
+  **The producer is the one that matters, and the two lifetimes are
+  independent.** A result from `zs_txn_fetch` lives as long as the transaction,
+  and MUST survive the end of any cursor on that transaction — including a cursor
+  opened after the fetch, and including one whose own yielded pointers die at that
+  moment (A-4a). A caller may therefore finalise cursors freely, on every insert,
+  delete or re-seek, while holding fetch results across all of it.
+
+  Stated because the mechanism argues the other way and an implementation can get
+  this right by accident. A cursor's end **is** the first moment a mapping it
+  yielded out of may be released, so an implementation that reference-counts per
+  borrower (A-4a) really does drop references there; what keeps the fetch's bytes
+  alive is that the transaction holds a claim of its own on the same files. An
+  implementation whose transactions borrow their cursors' references, or which
+  releases a file when the most recent borrower ends, passes every
+  single-borrower test and hands back dangling pointers to a caller whose
+  statement-per-cursor pattern is otherwise entirely ordinary — which is what a
+  layered consumer keeping before-images for rollback does.
 - **A-4a** A-4 binds across a **snapshot swap**. A transaction or cursor may
   move to a newer snapshot while it is alive — a write transaction resolves its
   active file at its first store (D-9), and a `ZS_CURSOR_LIVE` cursor follows

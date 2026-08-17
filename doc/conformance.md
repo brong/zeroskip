@@ -293,7 +293,7 @@ a spec label is missing here.
 | `A-1c` | A transaction supports **any number of cursors open at once**, and | `txn_many_cursors`, `txn_insert_select_self` |
 | `A-2` | There is no `yield` call and no yield flags: readers hold no lock, so | `no_yield_and_no_mvcc` |
 | `A-3` | There is no MVCC flag. Snapshot isolation is the only read mode, | `no_yield_and_no_mvcc` |
-| `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime`, `txn_fetch_survives_overwrite`, `reverse_a4_lifetime` |
+| `A-4` | Returned key and value pointers remain valid for the lifetime of the | `api_pointer_lifetime`, `txn_fetch_survives_overwrite`, `reverse_a4_lifetime`, `fetch_borrow_survives_cursor_free` |
 | `A-4a` | A-4 binds across a **snapshot swap**. A transaction or cursor may | `a4_borrow_survives_new_generation`, `a4_borrow_survives_cursor_swap`, `a4_borrow_survives_shared_snapshot_swap` |
 | `A-4b` | `ZS_EPHEMERAL` on a fetch **weakens A-4 for that result**: the key and | `ephemeral_matches_durable`, `ephemeral_avoids_the_flush`, `ephemeral_rejected_on_cursor` |
 | `A-5` | `ZS_SHARED` is read-only and MUST NOT write (R-3). | `api_readonly`, `open_readonly_no_side_effects` |

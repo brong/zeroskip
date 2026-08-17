@@ -15401,6 +15401,79 @@ static void test_hold_releases_its_references(void)
     zs_db_close(&db);
 }
 
+/* A-4 is per PRODUCER: a fetch borrow survives the end of an unrelated CURSOR on
+ * the same transaction.
+ *
+ * "The lifetime of the transaction or cursor that produced them" says this, but
+ * only if you read the two halves as independent -- and the mechanism does not
+ * make it obvious, because a cursor's end IS the first moment a mapping it
+ * yielded from may go (A-4a), and `zsi_cursor_free` really does release per-file
+ * references there.  What keeps the fetch's bytes alive is that the transaction
+ * has its own claim on the same files: a read transaction holds one per file
+ * directly, and a write transaction pins the snapshot that does.
+ *
+ * The values come from a FILE rather than the pending set, so an unmap is a real
+ * possibility rather than a formality, and both transaction kinds are covered
+ * because only one of them takes A-4a's per-file references (a write transaction
+ * deliberately does not).  Worth pinning because the downstream SQLite engine
+ * depends on it for its savepoint undo log: before-images fetched inside a
+ * transaction outlive the cursors that statement opens and closes.
+ *
+ * It is NOT the unique catcher for any mutation available, and that is recorded
+ * rather than glossed: both mutants aimed at this property -- a cursor's end
+ * releasing the transaction's claim, and a borrower's references released twice --
+ * die in the A-4a swap tests a few lines above, which reach the same
+ * reference-counting from a different direction.  What this adds is localisation.
+ * A regression here reports as "a fetch borrow did not survive a cursor" against
+ * the requirement a consumer reads, instead of as a segfault in a snapshot-swap
+ * test whose subject is something else. */
+static void test_fetch_borrow_survives_cursor_free(void)
+{
+    struct zs_db *db;
+    char key[16];
+
+    db = fresh_db_noautorepack();
+    ASSERT_NOT_NULL(db);
+    for (int i = 0; i < 50; i++) {
+        snprintf(key, sizeof(key), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), "value-here", 10, 0));
+    }
+    /* Reopened, so every record is in a file and every borrow is into a mapping
+     * rather than into a transaction's own chunk buffer. */
+    ASSERT_OK(zs_db_close(&db));
+
+    for (int shared = 0; shared <= 1; shared++) {
+        struct zs_txn *txn = NULL;
+        struct zs_cursor *c = NULL;
+        const char *v = NULL, *ck = NULL, *cv = NULL;
+        size_t vl = 0, ckl = 0, cvl = 0;
+
+        db = open_db(ZS_NOAUTOREPACK);
+        ASSERT_NOT_NULL(db);
+        ASSERT_OK(zs_db_begin_txn(db, shared, &txn));
+
+        /* The borrow whose lifetime is the TRANSACTION's. */
+        ASSERT_OK(zs_txn_fetch(txn, "k007", 4, NULL, NULL, &v, &vl, 0));
+        ASSERT_EQU(vl, 10u);
+
+        /* An unrelated cursor, opened, advanced far enough to have mapped and
+         * held files of its own, and then ended. */
+        ASSERT_OK(zs_txn_begin_cursor(txn, NULL, 0, &c, 0));
+        for (int i = 0; i < 20; i++)
+            ASSERT_OK(zs_cursor_next(c, &ck, &ckl, &cv, &cvl));
+        zs_cursor_fini(&c);
+        ASSERT_NULL(c);
+
+        /* The fetch's bytes are still there.  Under ASan this is where a
+         * use-after-unmap would be reported rather than silently comparing equal
+         * against pages the kernel has not yet reclaimed. */
+        ASSERT_MEM_EQ(v, "value-here", 10);
+
+        ASSERT_OK(zs_txn_commit(&txn));
+        ASSERT_OK(zs_db_close(&db));
+    }
+}
+
 static void test_read_txn_view_is_fixed_without_a_cursor(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -17546,6 +17619,8 @@ static struct test_entry tests[] = {
                                         test_txn_cursor_no_duplicate_on_write },
     { "test_hold_releases_its_references",
                                     test_hold_releases_its_references },
+    { "test_fetch_borrow_survives_cursor_free",
+                                        test_fetch_borrow_survives_cursor_free },
     { "test_read_txn_view_is_fixed_without_a_cursor",
                                     test_read_txn_view_is_fixed_without_a_cursor },
     { "test_txn_cursor_view_is_fixed",  test_txn_cursor_view_is_fixed },
