@@ -2277,6 +2277,32 @@ different calls, though not every flag is meaningful everywhere:
   the pause and raises the file count; raising it does the reverse. It is a
   knob rather than a constant because only the caller knows which of the two it
   can afford.
+- **A-17** `zs_db_stats` reports what **this handle has rewritten** since it was
+  opened: for repacks (D-16, and D-26's compaction, which is a merge of
+  everything) and for conversions (D-12) separately, the number performed, the
+  records and bytes written, and the time spent. Counters are monotonic, and
+  MUST count only work this handle performed — a repack another process did is
+  not reportable, and cannot be, since no on-disk state records who rewrote what
+  (D-3: there is no manifest).
+
+  This is observability, not policy, and it is in the API for a reason a knob
+  would not serve. A caller cannot otherwise tell how much of a write's cost went
+  on rewriting records it had already written: a store appends each record once,
+  a conversion then rewrites its generation in key order, and a repack rewrites
+  whatever it merges, so the bytes a bulk load writes are a multiple of the bytes
+  it stored. Measured on the reference implementation at 2M records in 1000-record
+  transactions, that multiple is about 5, of which one pass is the append, one the
+  conversion, and the rest the cascade.
+
+  **The two are counted apart because their remedies differ.** A conversion is
+  structural — every generation becomes an in-order file exactly once (D-5a), and
+  no policy setting affects it — while the cascade's extent is policy a caller can
+  choose (`ZS_NOAUTOREPACK`, `repack_max_size`) and can therefore act on. A single
+  figure for "rewriting" would leave a caller tuning the half that does not move.
+
+  An implementation that never repacks reports zeros for the repack half and is
+  conforming, since selection is not normative (D-16). Time MAY be zero where no
+  monotonic clock is available. Nothing here is on disk or observable by a peer.
 
 ## 11. Conformance suite
 

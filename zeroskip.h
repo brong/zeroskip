@@ -196,6 +196,28 @@ struct zs_open_data {
 
 #define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, 0 }
 
+/* What this handle has REWRITTEN, since it was opened (A-17).
+ *
+ * Counts of work, not of state: a caller cannot otherwise tell how much of a
+ * write's cost went on rewriting records it had already written.  A store
+ * appends each record once; a conversion then rewrites its generation in key
+ * order, and a repack rewrites whatever it merges, so the bytes a bulk load
+ * actually writes are several times the bytes it stored -- and the two causes
+ * have different remedies, which is why they are counted apart.
+ *
+ * Monotonic and per handle: another process's repacks are not visible here.
+ * `*_ns` is zero on a platform without a monotonic clock. */
+struct zs_db_stats {
+    uint64_t repacks;            /* merges performed (D-16, and D-26's) */
+    uint64_t repack_records;     /* records written by them */
+    uint64_t repack_bytes;       /* bytes written by them, whole files */
+    uint64_t repack_ns;          /* nanoseconds spent in them */
+    uint64_t conversions;        /* unordered -> in-order conversions (D-12) */
+    uint64_t convert_records;
+    uint64_t convert_bytes;
+    uint64_t convert_ns;
+};
+
 /* database operations
  *
  * Locks are ordered within one database, but the library cannot see across
@@ -260,6 +282,9 @@ void zs_cursor_fini(struct zs_cursor **curp);
 /* utility */
 int  zs_db_repack(struct zs_db *db);
 bool zs_db_should_repack(struct zs_db *db);
+
+/* This handle's rewrite counters (A-17).  Takes no lock and reads no file. */
+int  zs_db_stats(struct zs_db *db, struct zs_db_stats *out);
 
 /* Convert the active generation, so every file in the database has a pointer
  * section and no reader has to replay a span chain (D-25).  Bounded by

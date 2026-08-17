@@ -309,6 +309,7 @@ a spec label is missing here.
 | `A-14` | `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only | `noautorepack_leaves_the_files` |
 | `A-15` | `rollover_txns` is D-9d's span bound. Zero selects an | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
 | `A-16` | `repack_max_size` is the size above which an in-order file stops | `repack_max_size` |
+| `A-17` | `zs_db_stats` reports what **this handle has rewritten** since it was | `db_stats_separates_repack_from_conversion` |
 
 ## Conformance suite (`T-n`)
 

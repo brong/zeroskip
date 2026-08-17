@@ -1294,6 +1294,29 @@ mutant "repack select: should_repack ignores the cap" catch \
   's/    return zsi_repack_select\(snap, cap, &first\) >= 2;/    return zsi_repack_select(snap, (size_t)-1, \&first) >= 2;/'
 
 echo
+echo "rewrite counters (A-17)"
+
+# The whole point of A-17 is which BUCKET the work lands in.  A conversion counted
+# as a repack reads as a cascade a caller could tune away, when the rewriting is
+# structural and no setting touches it -- and it is the mistake a single
+# "bytes rewritten" figure would institutionalise.
+mutant "stats: a conversion counted as a repack" catch \
+  's/    db->stats.convert_records \+= \(uint64_t\)n;\n    db->stats.convert_bytes \+= \(uint64_t\)ZSI_HEADER_LEN \+ recslen \+ seclen;/    db->stats.repack_records += (uint64_t)n;\n    db->stats.repack_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;/'
+
+mutant "stats: repacks not counted" catch \
+  's/    db->stats.repacks\+\+;/    \/* not counted *\//'
+
+mutant "stats: conversions not counted" catch \
+  's/    db->stats.conversions\+\+;/    \/* not counted *\//'
+
+mutant "stats: bytes never accumulated" catch \
+  's/    db->stats.repack_bytes \+= \(uint64_t\)ZSI_HEADER_LEN \+ recslen \+ seclen;/    \/* not accumulated *\//'
+
+# Time is the one field A-17 allows to read zero, so it needs its own mutant
+# rather than riding on the counts.
+mutant "stats: time never accumulated" catch \
+  's/    db->stats.repack_ns \+= zsi_since_ns\(t0\);\n    return r;/    return r;/'
+
 echo "repack: what is emitted and what is dropped (D-17b, D-18, D-19)"
 
 # D-17b.  The emitted value comes from V3 under the total order -- oldest to

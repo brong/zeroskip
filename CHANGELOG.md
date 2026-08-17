@@ -3,7 +3,13 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
-## 2.1.2 — 2026-08-17
+## 2.2.0 — 2026-08-17
+
+- New `zs_db_stats(db, struct zs_db_stats *)` reports what this handle has
+  rewritten since it was opened — repacks and conversions counted separately,
+  with records, bytes and time for each. It answers "how much of my write cost
+  went on rewriting what I had already written", which a caller could not
+  previously tell from outside. Observability only; no policy changes. See A-17.
 
 - Committing is faster, and no longer slower per record for a larger
   transaction: the commit fold merges the span as a sorted run rather than

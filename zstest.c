@@ -8862,6 +8862,89 @@ static void test_repack_selection(void)
     zs_db_close(&db);
 }
 
+/* A-17: the counters separate what a conversion rewrote from what the cascade did.
+ *
+ * A single "bytes rewritten" figure would be satisfied by counting either one
+ * twice, so the assertion that matters is the SEPARATION: the same workload run
+ * with the cascade disarmed must still report conversions, and must report zero
+ * repacks.  Anything that folded the two together, or attributed a conversion to
+ * the repack bucket, passes a "did it count something" test and fails this one.
+ *
+ * Small generations so a few hundred records produce several conversions and
+ * enough files for the cascade to select from. */
+static void test_db_stats_separates_repack_from_conversion(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db_stats armed, disarmed, again;
+    struct zs_db *db = NULL;
+    char key[32], val[128];
+
+    memset(val, 'v', sizeof(val));
+
+    /* A fresh handle reports nothing, before it has done anything. */
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_size = 8 * 1024;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_stats(db, &disarmed));
+    ASSERT_EQU(disarmed.repacks, 0u);
+    ASSERT_EQU(disarmed.conversions, 0u);
+    ASSERT_EQU(disarmed.repack_bytes, 0u);
+    ASSERT_EQU(disarmed.convert_bytes, 0u);
+
+    for (int i = 0; i < 400; i++) {
+        snprintf(key, sizeof(key), "k%05d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+    }
+    ASSERT_OK(zs_db_stats(db, &disarmed));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* With the cascade disarmed: conversions happened, repacks did not.  This is
+     * the pair that proves the attribution rather than the counting. */
+    ASSERT(disarmed.conversions > 0);
+    ASSERT(disarmed.convert_records > 0);
+    ASSERT(disarmed.convert_bytes > disarmed.convert_records);   /* whole files */
+    ASSERT_EQU(disarmed.repacks, 0u);
+    ASSERT_EQU(disarmed.repack_records, 0u);
+    ASSERT_EQU(disarmed.repack_bytes, 0u);
+    ASSERT_EQU(disarmed.repack_ns, 0u);
+
+    /* The same workload with the cascade armed: both halves move. */
+    clear_db();
+    setup.flags = ZS_CREATE;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 400; i++) {
+        snprintf(key, sizeof(key), "k%05d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+    }
+    ASSERT_OK(zs_db_stats(db, &armed));
+
+    ASSERT(armed.conversions > 0);
+    ASSERT(armed.repacks > 0);
+    ASSERT(armed.repack_records > 0);
+    ASSERT(armed.repack_bytes > armed.repack_records);
+#ifdef CLOCK_MONOTONIC
+    /* A merge of hundreds of records cannot take zero nanoseconds.  Guarded
+     * because A-17 permits zero where there is no monotonic clock. */
+    ASSERT(armed.repack_ns > 0);
+    ASSERT(armed.convert_ns > 0);
+#endif
+
+    /* Monotonic: more work never lowers a counter. */
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_OK(zs_db_stats(db, &again));
+    ASSERT(again.repacks >= armed.repacks);
+    ASSERT(again.repack_bytes >= armed.repack_bytes);
+    ASSERT(again.conversions >= armed.conversions);
+
+    /* And a compaction is a merge, so it lands in the repack half (A-17). */
+    ASSERT(again.repacks > armed.repacks);
+
+    ASSERT_EQ(zs_db_stats(NULL, &again), ZS_BADUSAGE);
+    ASSERT_EQ(zs_db_stats(db, NULL), ZS_BADUSAGE);
+    ASSERT_OK(zs_db_close(&db));
+}
+
 static void test_repack_max_size(void)
 {
     /* A-16/D-16: repack_max_size skips LEADING in-order files too big to be
@@ -17466,6 +17549,8 @@ static struct test_entry tests[] = {
     { "test_convert_readonly_does_nothing", test_convert_readonly_does_nothing },
 
     { "test_repack_selection",          test_repack_selection },
+    { "test_db_stats_separates_repack_from_conversion",
+                                        test_db_stats_separates_repack_from_conversion },
     { "test_repack_max_size",           test_repack_max_size },
     { "test_repack_one_record_per_key", test_repack_one_record_per_key },
     { "test_repack_version_order",       test_repack_version_order },

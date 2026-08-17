@@ -367,6 +367,32 @@ static size_t zsi_roundup8(size_t n)
     return (n + 7) & ~(size_t)7;
 }
 
+/* A monotonic nanosecond reading, for A-17's counters and nothing else.
+ *
+ * Zero where there is no monotonic clock, which the stats document -- a counter
+ * that reads zero is better than a build that fails, since this file is vendored
+ * and CLOCK_MONOTONIC is the one thing here that a very old libc may lack while
+ * having everything else.  Never used for correctness: nothing in the format, the
+ * protocol or a decision depends on a duration. */
+static uint64_t zsi_now_ns(void)
+{
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+
+/* Elapsed since `t0`, or zero if either reading failed -- so a caller adds a
+ * duration that is never negative and never absurd. */
+static uint64_t zsi_since_ns(uint64_t t0)
+{
+    uint64_t now = zsi_now_ns();
+    return (t0 && now > t0) ? now - t0 : 0;
+}
+
 /********** COMPARATORS *************/
 
 /* The default comparator (F-11a).
@@ -4847,6 +4873,10 @@ struct zs_db {
     size_t       repack_max_size;    /* D-16, A-16 */
     void       (*error)(const char *msg, const char *fmt, ...);
 
+    /* A-17.  Plain arithmetic, no atomics: a handle is not thread-safe anyway
+     * (G-5), and these are counters rather than anything a decision reads. */
+    struct zs_db_stats stats;
+
     /* Pointer table cache (spec section 8).  index_dir NULL disables it.
      * Resolved at open to the PER-DATABASE directory: <root>/<uuid> for a
      * configured root (P-2a), <dbdir>/zeroskip.cache under ZS_INDEX_LOCAL
@@ -7519,6 +7549,12 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
     snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
     if (ZS_RENAME(spath, fpath) < 0) { ZS_UNLINK(spath); r = ZS_IOERROR; goto fail; }
 
+    /* A-17, at the publish for the same reason the merge counts there.  Its only
+     * caller is a conversion, which is why this lands in convert_* -- a second
+     * caller would have to say which bucket it belongs in. */
+    db->stats.convert_records += (uint64_t)n;
+    db->stats.convert_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;
+
     /* C-6: fdatasync the DIRECTORY after renaming an output into place, otherwise
      * the name may be absent after a crash even though the contents are durable.
      * Reported rather than fatal: a lost name leaves the inputs in place, which
@@ -7550,6 +7586,7 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
     struct zsi_index_cur ic;
     struct zsi_rec rec;
     size_t *offs = NULL, n = 0, alloc = 0;
+    uint64_t t0 = zsi_now_ns();       /* A-17 */
     int r;
 
     if (!f->index) return ZS_INTERNAL;
@@ -7597,9 +7634,10 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
         zsi_index_cur_next(f->index, db->compar, &ic);
     }
 
+    db->stats.conversions++;
     r = zsi_write_inorder(db, f, offs, n, f->hdr.start, f->hdr.start);
     free(offs);
-    if (r != ZS_OK) return r;
+    if (r != ZS_OK) { db->stats.convert_ns += zsi_since_ns(t0); return r; }
 
     /* Retire the input under the remove lock (D-23).  D-12c: conversion never
      * takes the repack lock -- it renames its output in without any lock and holds
@@ -7613,6 +7651,7 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
      * later pass removes it, so this is not fatal. */
     if (r == ZS_AGAIN) r = ZS_OK;
 
+    db->stats.convert_ns += zsi_since_ns(t0);
     return r;
 }
 
@@ -8058,6 +8097,13 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     snprintf(fpath, sizeof(fpath), "%s/%s", db->dir, fname);
     if (ZS_RENAME(spath, fpath) < 0) { ZS_UNLINK(spath); r = ZS_IOERROR; goto out; }
 
+    /* A-17, counted at the PUBLISH rather than at the write: a staged output that
+     * never got renamed cost the disk the same bytes, but it is not what a caller
+     * asking "how much did I rewrite" means, and counting it would make the
+     * numbers move on failures that changed nothing. */
+    db->stats.repack_records += (uint64_t)nptrs;
+    db->stats.repack_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;
+
     {                                           /* C-6, every mode (C-6b) */
         int dfd = open(db->dir, O_RDONLY);
         if (dfd >= 0) {
@@ -8092,22 +8138,31 @@ out:
  * The caller holds the repack lock and has refreshed under it. */
 static int zsi_repack_run(struct zs_db *db, size_t first, size_t count)
 {
+    /* A-17's timing spans the WHOLE merge, not just the write: the refresh and
+     * the input removals are part of what a caller's begin waits for, and a
+     * duration that excluded them would understate exactly what the counter
+     * exists to expose.  Counted here rather than in the two callers because
+     * this is the single merge entry point, so D-26's compaction lands in the
+     * same bucket -- deliberately, since a compaction IS a repack of everything,
+     * and a caller that wants them apart brackets its own zs_db_compact call. */
+    uint64_t t0 = zsi_now_ns();
     int r;
 
     /* Remember the input names before the merge: the snapshot is replaced by the
      * refresh below, and the names are what D-23 needs. */
     char (*names)[ZSI_NAME_MAX] = malloc(count * sizeof(*names));
     if (!names) return ZS_INTERNAL;
+    db->stats.repacks++;
     for (size_t i = 0; i < count; i++)
         zsi_name_format(names[i], db->uuid,     /* in-order only (D-16) */
                         db->snap->files[first + i]->hdr.start,
                         db->snap->files[first + i]->hdr.end);
 
     r = zsi_repack_merge(db, db->snap, first, count);
-    if (r != ZS_OK) { free(names); return r; }
+    if (r != ZS_OK) { free(names); db->stats.repack_ns += zsi_since_ns(t0); return r; }
 
     r = zsi_db_refresh(db);
-    if (r != ZS_OK) { free(names); return r; }
+    if (r != ZS_OK) { free(names); db->stats.repack_ns += zsi_since_ns(t0); return r; }
 
     /* Retire the inputs (D-23).  Each is now superseded by the output, so each
      * verification succeeds -- but a failure is not fatal: a leaked file costs
@@ -8118,7 +8173,9 @@ static int zsi_repack_run(struct zs_db *db, size_t first, size_t count)
     }
 
     free(names);
-    return zsi_db_refresh(db);
+    r = zsi_db_refresh(db);
+    db->stats.repack_ns += zsi_since_ns(t0);
+    return r;
 }
 
 static int zsi_repack(struct zs_db *db)
@@ -8250,6 +8307,20 @@ bool zs_db_should_repack(struct zs_db *db)
 {
     if (!db) return false;
     return zsi_should_repack(db->snap, db->repack_max_size);
+}
+
+/* A-17.  A copy of counters this handle has been keeping, so a caller can
+ * attribute a write's cost to the rewriting that D-12 and D-16 do behind it.
+ *
+ * Takes no lock, opens nothing and reads no file: everything here was counted as
+ * this handle did the work, which is also the limit of what it can report -- a
+ * repack another process performed is invisible, and has to be, since nothing on
+ * disk records who rewrote what (D-3: there is no manifest). */
+int zs_db_stats(struct zs_db *db, struct zs_db_stats *out)
+{
+    if (!db || !out) return ZS_BADUSAGE;
+    *out = db->stats;
+    return ZS_OK;
 }
 
 /********** CONSISTENCY *************/
