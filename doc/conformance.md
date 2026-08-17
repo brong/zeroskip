@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 270 |
-| With an enforcing test | 260 |
+| Requirements | 271 |
+| With an enforcing test | 261 |
 | Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -308,6 +308,7 @@ a spec label is missing here.
 | `A-13` | `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor` | `cursor_reverse_seek_and_skiproot`, `reverse_a4_lifetime`, `reverse_rejected_compositions` |
 | `A-14` | `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only | `noautorepack_leaves_the_files` |
 | `A-15` | `rollover_txns` is D-9d's span bound. Zero selects an | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
+| `A-16` | `repack_max_size` is the size above which an in-order file stops | `repack_max_size` |
 
 ## Conformance suite (`T-n`)
 

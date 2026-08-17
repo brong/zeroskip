@@ -162,6 +162,21 @@ struct zs_open_data {
      * index_dir set is already bounded by P-13 and will not reach this. */
     size_t       rollover_txns;
 
+    /* A-16/D-16: the size above which an in-order file stops being a candidate
+     * to START a repack, so one merge rewrites about twice this rather than the
+     * whole database.  0 = default 512MB, a no-op for any database that never
+     * reaches it; a value above the largest file disables the cap and gives the
+     * uncapped geometric policy.  Selection is not normative, so this changes
+     * nothing another implementation can observe.
+     *
+     * It buys a shorter pause and costs read speed: a file above the cap is
+     * never selected again, so the file count grows with the database and the
+     * read path degrades linearly in it.  That is bounded rather than
+     * unbounded -- once too many files have been skipped the cap yields for
+     * that selection -- but the trade is real, and only the caller knows which
+     * end it can afford. */
+    size_t       repack_max_size;
+
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* Pointer table cache (spec section 8).  Names the cache ROOT: tables for
@@ -179,7 +194,7 @@ struct zs_open_data {
     size_t       index_threshold;  /* A-9: 0 = the default, 32KB */
 };
 
-#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, NULL, NULL, 0 }
+#define ZS_OPEN_DATA_INITIALIZER { 0, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, 0 }
 
 /* database operations
  *

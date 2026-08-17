@@ -1214,6 +1214,44 @@ mutant "repack select: compares the neighbour, not the sum" catch \
 mutant "repack select: merges on equality" catch \
   's/        if \(tail > here\) \{ \*first = i; return nio - i; \}/        if (tail >= here) { *first = i; return nio - i; }/'
 
+# A-16.  Without the skip, one merge rewrites the whole database again -- which
+# is the behaviour every OTHER selection test asserts, because 512MB is a no-op
+# at any size a test can build.  Only test_repack_max_size sets a cap it can
+# reach, so only it can tell the two apart.
+mutant "repack select: the cap skips nothing" catch \
+  's/    while \(base < nio && snap->files\[base\]->size > cap\) base\+\+;/    (void)cap;/'
+
+# The LEADING run only.  Skipping every oversized file wherever it sits looks
+# like the same intent and breaks adjacency: the inputs stop being contiguous,
+# which D-19's tombstone rule and D-6's tiling both rest on.  Written as "take
+# the last oversized file" because that is what a scan of the whole prefix
+# leaves behind.
+mutant "repack select: skips oversized files anywhere, not just leading" catch \
+  's/    while \(base < nio && snap->files\[base\]->size > cap\) base\+\+;/    for (size_t j = 0; j < nio; j++)\n        if (snap->files[j]->size > cap) base = j + 1;/'
+
+# The cap must YIELD once it has skipped too many, or the files it froze
+# accumulate forever and the read path degrades linearly in the count -- the
+# file-count bound the whole geometric policy exists to provide.
+mutant "repack select: the cap never yields" catch \
+  's/    if \(base > ZSI_REPACK_MAX_FROZEN\) base = 0;/    \/* the cap always wins *\//'
+
+# Off by one in the budget, which fires one file early and so gives up the cap
+# on a database still inside its allowance.
+mutant "repack select: the frozen budget is one too small" catch \
+  's/    if \(base > ZSI_REPACK_MAX_FROZEN\) base = 0;/    if (base >= ZSI_REPACK_MAX_FROZEN) base = 0;/'
+
+# The sum is taken over the SURVIVING range.  Weighing the skipped files as if
+# they sat above the candidate merges files the rule should have left alone --
+# and it is invisible on any layout where the skipped side is small, which is
+# most of them.
+mutant "repack select: the sum spans the skipped files too" catch \
+  's/    for \(size_t i = base; i < nio; i\+\+\) total \+= snap->files\[i\]->size;/    for (size_t i = 0; i < nio; i++) total += snap->files[i]->size;/'
+
+# D-24 must answer under the same policy the repack will use, or a writer takes
+# the repack lock for work zsi_repack then declines to do.
+mutant "repack select: should_repack ignores the cap" catch \
+  's/    return zsi_repack_select\(snap, cap, &first\) >= 2;/    return zsi_repack_select(snap, (size_t)-1, \&first) >= 2;/'
+
 echo
 echo "repack: what is emitted and what is dropped (D-17b, D-18, D-19)"
 
@@ -1645,7 +1683,7 @@ echo "the writer runs the cascade (D-16e)"
 # D-16e: without the trigger nothing merges unless the caller remembers, which
 # is the field failure -- 103 files, none merged, reads 17.5x slower.
 mutant "autorepack: trigger removed" catch \
-  's/            if \(new_gen && zsi_should_repack\(db->snap\)\)\n                \(void\)zsi_repack\(db\);/            \/* no cascade *\//'
+  's/            if \(new_gen && zsi_should_repack\(db->snap, db->repack_max_size\)\)\n                \(void\)zsi_repack\(db\);/            \/* no cascade *\//'
 
 # The trigger is the NEW-GENERATION condition (D-9a).  This looks like it
 # should be equivalent -- probing more often can only find work that is

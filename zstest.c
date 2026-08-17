@@ -5750,6 +5750,20 @@ static struct zs_db *open_db(uint32_t flags)
     return db;
 }
 
+/* A-16's cap, at a size a test can actually build files around.  The default is
+ * 512MB and so a no-op for every test in this file, which is the point of the
+ * default and the reason this helper exists. */
+static struct zs_db *open_db_repack_max(uint32_t flags, size_t max)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    setup.flags = flags;
+    setup.csum = TEST_EXTERNAL_CSUM;
+    setup.repack_max_size = max;
+    if (zs_db_open(dbdir, &setup, &db) != ZS_OK) return NULL;
+    return db;
+}
+
 /* Scan the whole database, joining "key=value" with '|'.  Deletions do not
  * appear, because the merge consumes them (D-14e step 4). */
 static void db_scan(struct zs_db *db, uint32_t flags,
@@ -5844,6 +5858,24 @@ static void put_inorder_kv(uint32_t start, uint32_t end, const struct kv *kvs)
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
+}
+
+/* An in-order file of n records with 30-byte values, so a test controls file
+ * SIZE by record count -- which is what repack selection reads. */
+static void put_inorder_n(uint32_t start, uint32_t end, const char *prefix,
+                          int n)
+{
+    struct kv kvs[64];
+    char keys[64][16], vals[64][32];
+
+    assert(n > 0 && n < 63);
+    for (int i = 0; i < n; i++) {
+        snprintf(keys[i], sizeof keys[i], "%s%03d", prefix, i);
+        memset(vals[i], 'v', 30); vals[i][30] = '\0';
+        kvs[i].k = keys[i]; kvs[i].v = vals[i];
+    }
+    kvs[n].k = NULL; kvs[n].v = NULL;
+    put_inorder_kv(start, end, kvs);
 }
 
 static void test_read_d14f_duplicate_across_three_files(void)
@@ -8571,7 +8603,7 @@ static void test_repack_selection(void)
     db = open_db(0);
     ASSERT_NOT_NULL(db);
     ASSERT_EQU(db->snap->files[0]->size, db->snap->files[1]->size);
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT_EQU(count, 0u);
     ASSERT(!zs_db_should_repack(db));
     zs_db_close(&db);
@@ -8584,7 +8616,7 @@ static void test_repack_selection(void)
     put_unordered_kv(4, (const struct kv[]){ {"d","4"}, {NULL,NULL} });
     db = open_db(0);
     ASSERT_NOT_NULL(db);
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT_EQU(count, 3u);
     ASSERT_EQU(first, 0u);
     ASSERT(zs_db_should_repack(db));
@@ -8626,7 +8658,7 @@ static void test_repack_selection(void)
     /* ... but together they exceed it. */
     ASSERT(db->snap->files[1]->size + db->snap->files[2]->size
            > db->snap->files[0]->size);
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT_EQU(count, 3u);
     ASSERT_EQU(first, 0u);
     zs_db_close(&db);
@@ -8650,7 +8682,7 @@ static void test_repack_selection(void)
     db = open_db(0);
     ASSERT_NOT_NULL(db);
     ASSERT(db->snap->files[0]->size > db->snap->files[1]->size);
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT(count < 2);
     ASSERT(!zs_db_should_repack(db));
     zs_db_close(&db);
@@ -8672,7 +8704,7 @@ static void test_repack_selection(void)
     put_unordered_kv(3, (const struct kv[]){ {"z","3"}, {NULL,NULL} });
     db = open_db(0);
     ASSERT_NOT_NULL(db);
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT_EQU(count, 2u);
     ASSERT_EQU(first, 0u);
     ASSERT(zs_db_should_repack(db));
@@ -8689,6 +8721,124 @@ static void test_repack_selection(void)
     ASSERT_NULL(file_with_range(db, 2, 2));
     ASSERT(!zs_db_should_repack(db));
 
+    zs_db_close(&db);
+}
+
+static void test_repack_max_size(void)
+{
+    /* A-16/D-16: repack_max_size skips LEADING in-order files too big to be
+     * worth re-merging, so one merge rewrites about twice the cap rather than
+     * the whole database.  The skipped files never merge again, so the file
+     * count would grow without bound -- which is the read path degrading
+     * linearly (D-14d) -- and the cap therefore yields once it has skipped more
+     * than ZSI_REPACK_MAX_FROZEN of them. */
+    struct zs_db *db;
+    size_t first, count, cap;
+
+    /* Four in-order files, the oldest much the largest.  The newer three
+     * together outweigh it, so the uncapped rule merges all four -- and so does
+     * the DEFAULT cap, 512MB being a no-op at any size a test can build. */
+    clear_db();
+    put_inorder_n(1, 1, "k", 23);
+    put_inorder_n(2, 2, "m", 15);
+    put_inorder_n(3, 3, "p", 15);
+    put_inorder_n(4, 4, "r", 15);
+    put_unordered_kv(5, (const struct kv[]){ {"z","5"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT(db->snap->files[0]->size > db->snap->files[1]->size);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, 4u);
+    ASSERT_EQU(first, 0u);
+
+    /* A cap above every file but the oldest. */
+    cap = db->snap->files[0]->size - 1;
+    ASSERT(cap > db->snap->files[1]->size);
+    zs_db_close(&db);
+
+    /* The oldest is skipped and the walk starts at the first file at or under
+     * the cap, where the sum rule still fires among the three above it. */
+    db = open_db_repack_max(0, cap);
+    ASSERT_NOT_NULL(db);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, 3u);
+    ASSERT_EQU(first, 1u);
+    ASSERT(zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* An oversized file INSIDE the chosen range is merged like any other:
+     * only the leading run is skipped, because excluding a file in the middle
+     * would break adjacency (D-16). */
+    clear_db();
+    put_inorder_n(1, 1, "a", 1);
+    put_inorder_n(2, 2, "k", 40);
+    put_unordered_kv(3, (const struct kv[]){ {"z","3"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    cap = db->snap->files[0]->size;             /* oldest fits, newest does not */
+    ASSERT(cap < db->snap->files[1]->size);
+    zs_db_close(&db);
+
+    db = open_db_repack_max(0, cap);
+    ASSERT_NOT_NULL(db);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, 2u);
+    ASSERT_EQU(first, 0u);
+    zs_db_close(&db);
+
+    /* The sum that decides is taken over the SURVIVING range, not the whole
+     * in-order prefix.  A skipped file is not merge work, so counting its bytes
+     * as weight above the candidate merges files the rule should have left
+     * alone: here the only file above the candidate is far smaller than it, and
+     * nothing but the skipped file's bytes could make the sum win. */
+    clear_db();
+    put_inorder_n(1, 1, "a", 40);
+    put_inorder_n(2, 2, "k", 20);
+    put_inorder_n(3, 3, "p", 5);
+    put_unordered_kv(4, (const struct kv[]){ {"z","4"}, {NULL,NULL} });
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    cap = db->snap->files[1]->size;             /* skips the oldest, and only it */
+    ASSERT(cap < db->snap->files[0]->size);
+    ASSERT(db->snap->files[2]->size < cap);
+    ASSERT(db->snap->files[0]->size + db->snap->files[2]->size > cap);
+    zs_db_close(&db);
+
+    db = open_db_repack_max(0, cap);
+    ASSERT_NOT_NULL(db);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, 0u);
+    ASSERT(!zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* The budget.  A cap of one byte makes every file oversized, so the skip
+     * consumes the whole in-order prefix and nothing is selected ... */
+    clear_db();
+    for (uint32_t g = 1; g <= ZSI_REPACK_MAX_FROZEN; g++)
+        put_inorder_n(g, g, "a", 1);
+
+    db = open_db_repack_max(0, 1);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->nfiles, (size_t)ZSI_REPACK_MAX_FROZEN);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, 0u);
+    ASSERT(!zs_db_should_repack(db));
+    zs_db_close(&db);
+
+    /* ... until one more file takes the skipped count PAST the budget, when the
+     * cap yields and the uncapped walk merges the pile. */
+    put_inorder_n(ZSI_REPACK_MAX_FROZEN + 1, ZSI_REPACK_MAX_FROZEN + 1, "a", 1);
+
+    db = open_db_repack_max(0, 1);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->nfiles, (size_t)ZSI_REPACK_MAX_FROZEN + 1);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
+    ASSERT_EQU(count, (size_t)ZSI_REPACK_MAX_FROZEN + 1);
+    ASSERT_EQU(first, 0u);
+    ASSERT(zs_db_should_repack(db));
     zs_db_close(&db);
 }
 
@@ -9515,7 +9665,7 @@ static void test_repack_never_touches_unordered(void)
     ASSERT_NOT_NULL(db);
 
     size_t first, count;
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     ASSERT(count < 2);              /* only one in-order file: nothing to merge */
     ASSERT(!zs_db_should_repack(db));
 
@@ -17019,6 +17169,7 @@ static struct test_entry tests[] = {
     { "test_convert_readonly_does_nothing", test_convert_readonly_does_nothing },
 
     { "test_repack_selection",          test_repack_selection },
+    { "test_repack_max_size",           test_repack_max_size },
     { "test_repack_one_record_per_key", test_repack_one_record_per_key },
     { "test_repack_version_order",       test_repack_version_order },
     { "test_repack_d19_newer_file_recreates",

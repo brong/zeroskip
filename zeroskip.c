@@ -105,6 +105,39 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * fires, which is the correct outcome rather than a missed one. */
 #define ZSI_DEFAULT_ROLLOVER_TXNS 1024
 
+/* The size above which an in-order file stops being a candidate to START a
+ * repack (D-16, A-16), so an ordinary merge rewrites about twice this rather
+ * than the whole database.
+ *
+ * 512MB is chosen to be a NO-OP for essentially every database that exists
+ * today, and to bound the one that grows past it without the caller having to
+ * know the failure mode.  That is ZS_NOAUTOREPACK's reasoning: forgetting is
+ * expensive and hard to attribute, because a database that merely accumulates
+ * files just looks slow. */
+#define ZSI_DEFAULT_REPACK_MAX (512 * 1024 * 1024)
+
+/* How many files the cap above may skip before it yields for one selection.
+ *
+ * The cap costs the file-count bound the geometric policy exists to provide: a
+ * skipped file is never selected again, so the count grows linearly in total
+ * size and the read path degrades linearly in the count (D-14d).  So the cap is
+ * itself bounded -- past this many skipped files the uncapped walk runs and
+ * merges the pile, which is the same doubling-amortised work the uncapped
+ * policy would have done anyway.  The steady state is therefore the uncapped
+ * one, with cheaper repacks in between.
+ *
+ * It counts SKIPPED files, not all in-order files.  The natural ladder is
+ * log(total / rollover_size) deep -- about 15 files at 100GB -- so a budget
+ * over the total would hold a large database permanently in the uncapped case
+ * and the cap would never act at all.
+ *
+ * A constant rather than a knob: it decides how much read degradation is
+ * tolerated before paying for a big merge, and unlike the cap itself there is
+ * no unit a caller could reason in.  8 is a guess, not a measurement -- zsbench
+ * has no workload that builds a file set this deep at these sizes -- and is the
+ * number here most likely to be wrong. */
+#define ZSI_REPACK_MAX_FROZEN 8
+
 /* How far past the last published pointer table the active file may grow before
  * another is published (P-13).  Chosen from measurement rather than taste --
  * zsbench's "publish threshold" table, and doc/benchmarking.md for the curve.
@@ -4753,6 +4786,7 @@ struct zs_db {
     unsigned     create_csum_id;    /* engine for files THIS handle creates */
     size_t       rollover_size;
     size_t       rollover_txns;      /* D-9d, A-15 */
+    size_t       repack_max_size;    /* D-16, A-16 */
     void       (*error)(const char *msg, const char *fmt, ...);
 
     /* Pointer table cache (spec section 8).  index_dir NULL disables it.
@@ -6560,7 +6594,7 @@ static int zsi_convert_pending(struct zs_db *db);
 
 /* D-16e: a write transaction runs the repack cascade before it takes the write
  * lock.  Declared here because the REPACK section is below this one. */
-static bool zsi_should_repack(struct zsi_snapshot *snap);
+static bool zsi_should_repack(struct zsi_snapshot *snap, size_t cap);
 static int  zsi_repack(struct zs_db *db);
 
 /* D-12b/D-10: the writer frees the active-file name before reusing it. */
@@ -6886,7 +6920,7 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
             bool new_gen = !(act && zsi_unordered_is_clean(act)
                              && !zsi_active_full(db, act));
 
-            if (new_gen && zsi_should_repack(db->snap))
+            if (new_gen && zsi_should_repack(db->snap, db->repack_max_size))
                 (void)zsi_repack(db);
         }
     }
@@ -7636,9 +7670,12 @@ out:
  * prefix, the inputs are always adjacent and the cascade is never blocked by an
  * unordered file sitting between two candidates.
  *
+ * `cap` is A-16's repack_max_size, bounding what one merge rewrites.
+ *
  * Returns the number selected, filling *first with the index of the lowest.  The
  * selection is always a contiguous run ending at the newest in-order file. */
-static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
+static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t cap,
+                                size_t *first)
 {
     /* The in-order prefix: files [0, nio). */
     size_t nio = 0;
@@ -7646,7 +7683,29 @@ static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
 
     if (nio < 2) { *first = 0; return 0; }      /* nothing to merge */
 
-    /* Walk from the OLDEST file and merge from the first one the files above it
+    /* A-16: skip the LEADING files above the cap, so the walk starts at the
+     * oldest file still worth re-merging and one merge rewrites about twice the
+     * cap rather than the whole database.
+     *
+     * The leading run only.  An oversized file INSIDE the range that ends up
+     * selected is merged like any other, because leaving it out would make the
+     * inputs non-contiguous, which D-19's tombstone rule and D-6's tiling both
+     * depend on not happening (D-16).
+     *
+     * The cap costs the file-count bound this policy exists to provide: a
+     * skipped file is never selected again, so it is frozen and the count grows
+     * linearly in total size.  Past ZSI_REPACK_MAX_FROZEN skipped files the cap
+     * therefore YIELDS -- base drops back to 0 and the uncapped walk merges the
+     * pile, the same doubling-amortised work the uncapped policy would have
+     * done anyway.  Which is why the steady state is unchanged and only the
+     * repacks in between get cheaper. */
+    size_t base = 0;
+    while (base < nio && snap->files[base]->size > cap) base++;
+    if (base > ZSI_REPACK_MAX_FROZEN) base = 0;
+    if (nio - base < 2) { *first = 0; return 0; }
+
+    /* Walk from the OLDEST candidate file and merge from the first one the files
+     * above it
      * collectively outweigh.
      *
      * The invariant this leaves behind is that every file is at least as large
@@ -7667,10 +7726,10 @@ static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
      * large files would overflow the sum, and reporting a too-small tail merges
      * less rather than more, so it would fail quietly. */
     uint64_t total = 0;
-    for (size_t i = 0; i < nio; i++) total += snap->files[i]->size;
+    for (size_t i = base; i < nio; i++) total += snap->files[i]->size;
 
     uint64_t tail = total;
-    for (size_t i = 0; i + 1 < nio; i++) {
+    for (size_t i = base; i + 1 < nio; i++) {
         uint64_t here = snap->files[i]->size;
 
         tail -= here;                   /* now the sum of everything above i */
@@ -7682,10 +7741,10 @@ static size_t zsi_repack_select(struct zsi_snapshot *snap, size_t *first)
 }
 
 /* D-24: whether D-16 currently has work. */
-static bool zsi_should_repack(struct zsi_snapshot *snap)
+static bool zsi_should_repack(struct zsi_snapshot *snap, size_t cap)
 {
     size_t first;
-    return zsi_repack_select(snap, &first) >= 2;
+    return zsi_repack_select(snap, cap, &first) >= 2;
 }
 
 /* One key's versions, gathered across the inputs in D-17b's total order.
@@ -8003,7 +8062,7 @@ static int zsi_repack(struct zs_db *db)
     if (r != ZS_OK) goto out;
 
     size_t first, count;
-    count = zsi_repack_select(db->snap, &first);
+    count = zsi_repack_select(db->snap, db->repack_max_size, &first);
     if (count < 2) { r = ZS_OK; goto out; }     /* nothing to do */
 
     r = zsi_repack_run(db, first, count);
@@ -8117,7 +8176,7 @@ int zs_db_compact(struct zs_db *db)
 bool zs_db_should_repack(struct zs_db *db)
 {
     if (!db) return false;
-    return zsi_should_repack(db->snap);
+    return zsi_should_repack(db->snap, db->repack_max_size);
 }
 
 /********** CONSISTENCY *************/
@@ -8549,6 +8608,8 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
                                              : ZSI_DEFAULT_ROLLOVER;
     db->rollover_txns = setup->rollover_txns ? setup->rollover_txns
                                              : ZSI_DEFAULT_ROLLOVER_TXNS;
+    db->repack_max_size = setup->repack_max_size ? setup->repack_max_size
+                                                 : ZSI_DEFAULT_REPACK_MAX;
     db->error = setup->error ? setup->error : zsi_default_error;
     db->external_csum = setup->csum;
     db->create_csum_id = zsi_csum_id_for_flags(setup->flags);

@@ -3,6 +3,15 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.1.1 — 2026-08-17
+
+- New `zs_open_data.repack_max_size` (default 512MB) bounds what one repack
+  rewrites: a file above it no longer starts a merge. A no-op below that size.
+  See A-16 and D-16 in the spec for the trade and the file-count bound.
+
+- `struct zs_open_data` grows a field — rebuild anything that links
+  `libzeroskip` rather than vendoring `zeroskip.c`.
+
 ## 2.1.0 — 2026-08-17
 
 - **Repack behaviour has changed**: it merges sooner and leaves fewer files. A
