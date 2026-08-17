@@ -40,6 +40,16 @@
 #define PATH_MAX 4096
 #endif
 
+/* A path to a file INSIDE the database: dbdir, a '/', a file name and the NUL.
+ *
+ * Sized from those parts rather than PATH_MAX alone, because gcc checks snprintf
+ * against the DECLARED bounds of its arguments -- dbdir is PATH_MAX and a name is
+ * up to ZSI_NAME_MAX, so "%s/%s" into a PATH_MAX buffer is a -Wformat-truncation
+ * warning even though no real dbdir comes close.  Stating the bound where it is
+ * relied on is the same choice the fileset scan makes for the same reason, and
+ * Cyrus builds -Werror. */
+#define DBPATH_MAX (PATH_MAX + ZSI_NAME_MAX + 2)
+
 static int total = 0, passed = 0, failed = 0;
 static char *basedir;
 static char dbdir[PATH_MAX];
@@ -789,7 +799,7 @@ static void test_crash_leaves_unaligned_length(void)
     zsi_name_current(name, db->uuid);
     zs_db_close(&db);
 
-    char path[PATH_MAX];
+    char path[DBPATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", dbdir, name);
 
     for (int extra = 1; extra < 8; extra++) {
@@ -839,7 +849,7 @@ static void test_crash_after_invalid_terminator(void)
     zs_db_close(&db);
 
     /* Append something that LOOKS like a terminator but does not validate. */
-    char path[PATH_MAX];
+    char path[DBPATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", dbdir, name);
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0, "append");
@@ -881,10 +891,10 @@ static void test_crash_after_invalid_terminator(void)
  * ------------------------------------------------------------------------- */
 
 static int gap_removals;        /* files unlinked inside the gap */
-static char gap_victim[PATH_MAX];   /* a RESOLVED file, so step 3 hits ENOENT */
-static char gap_victim2[PATH_MAX];
-static char gap_staged[PATH_MAX];   /* the superseding output, pre-built */
-static char gap_published[PATH_MAX];
+static char gap_victim[DBPATH_MAX];   /* a RESOLVED file, so step 3 hits ENOENT */
+static char gap_victim2[DBPATH_MAX];
+static char gap_staged[DBPATH_MAX];   /* the superseding output, pre-built */
+static char gap_published[DBPATH_MAX];
 
 static void snapshot_gap(const char *dir)
 {
@@ -1018,7 +1028,7 @@ static void test_snapshot_gap_retry(void)
         CHECK(zs_db_store(db, k, strlen(k), "v", 1, 0) == ZS_OK, "store %s", k);
 
         if (i < 2) {
-            char name[ZSI_NAME_MAX], path[PATH_MAX];
+            char name[ZSI_NAME_MAX], path[DBPATH_MAX];
             zsi_name_current(name, uuid);
             snprintf(path, sizeof(path), "%s/%s", dbdir, name);
             int fd = open(path, O_WRONLY | O_APPEND);
@@ -1115,7 +1125,7 @@ static void test_snapshot_gap_retry(void)
 int main(int argc, char **argv)
 {
     const char *filter = argc > 1 ? argv[1] : NULL;
-    char path[PATH_MAX];
+    char path[DBPATH_MAX];
     const char *tmp = getenv("TMPDIR");
     if (!tmp) tmp = "/tmp";
 

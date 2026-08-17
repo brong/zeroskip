@@ -6940,6 +6940,11 @@ static void test_write_abort(void)
     /* An empty transaction commits and aborts cleanly, leaving no trace. */
     long before = 0;
     char name[ZSI_NAME_MAX];
+    /* The only place a test reaches into the handle after a REOPEN, which is why
+     * this assertion is here and not everywhere: gcc cannot prove open_db
+     * returned non-null, so `db->uuid` alone is "reading 16 bytes from a region
+     * of size 0" under -Wstringop-overread, and Cyrus builds -Werror. */
+    ASSERT_NOT_NULL(db);
     zsi_name_current(name, db->uuid);
     before = filesize(name);
     ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
