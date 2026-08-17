@@ -1111,7 +1111,28 @@ The per-file cursors are held in an array kept sorted by:
   merge.
 
   *Non-normative.* This implementation selects by size, so that in-order files
-  end up geometrically sized and each record is rewritten O(log n) times.
+  end up geometrically sized and each record is rewritten O(log n) times: it
+  merges from the oldest file that the newer ones collectively outweigh, which
+  leaves every file at least as large as the sum of all newer ones.
+
+  It then caps that. Files larger than `repack_max_size` (A-16) at the **head**
+  of the in-order prefix are skipped, and the walk starts at the first file at
+  or under the cap — so one merge rewrites about twice the cap rather than the
+  whole database. The leading run only: an oversized file *inside* the chosen
+  range is merged like any other, because excluding it would break adjacency.
+
+  The cap trades away the file-count bound — a skipped file is never selected
+  again, so the count grows linearly in total size — so the cap is itself
+  bounded. Once more than an implementation-defined number of files have been
+  skipped, the cap is ignored for that selection and the uncapped walk runs
+  over the whole in-order prefix. The skipped pile is then merged by the same
+  doubling-amortised work the uncapped policy would have done anyway, so the
+  steady state is the uncapped one with cheaper repacks in between.
+
+  That budget counts **skipped** files, not all in-order files. The natural
+  ladder is log(total / `rollover_size`) deep — about 15 files at 100GB — so a
+  budget over the total would put a large database permanently in the uncapped
+  case and the cap would never act at all.
 - **D-16e Who runs it.** A writer SHOULD run the cascade itself, at the start of
   a write transaction that is about to **start a new generation** — the D-9a
   condition: no clean active file, or one already past `rollover_size`. That is
@@ -2198,6 +2219,23 @@ different calls, though not every flag is meaningful everywhere:
   divided. It is a knob rather than a constant for `rollover_size`'s reason: a
   caller that knows its transaction sizes, or that has configured a pointer
   table cache and would rather let P-13 do this work, can say so.
+- **A-16** `repack_max_size` is the size above which an in-order file stops
+  being a candidate to **start** a repack, bounding what one merge rewrites
+  (D-16). Zero selects an implementation-defined default, 512MB in the
+  reference implementation — a no-op for any database that never reaches it. A
+  value above the largest file disables the cap and gives the uncapped
+  geometric policy; there is no separate spelling for that, because "no file is
+  ever too big" already says it. Selection is not normative, so like
+  `ZS_NOAUTOREPACK` and `rollover_txns` this changes no on-disk state and
+  nothing another implementation can observe — a database repacked under any
+  value of it is indistinguishable from any other, only differently divided.
+
+  What it costs is read cost. Skipped files accumulate and the read path
+  degrades linearly in the file count (D-14d), which is why D-16 bounds the
+  skipped count rather than letting the cap run unchecked. Lowering it bounds
+  the pause and raises the file count; raising it does the reverse. It is a
+  knob rather than a constant because only the caller knows which of the two it
+  can afford.
 
 ## 11. Conformance suite
 
@@ -2541,6 +2579,14 @@ backend is a thin separate adapter, out of scope.
    If it ever needs bounding, two mitigations preserve the same steady state:
    merge pairwise, one step per invocation, or cap the cascade at a projected
    output size and resume next time.
+
+   D-16's `repack_max_size` (A-16) is a partial form of the second, and
+   *partial* is the word. It bounds the repacks that happen **between**
+   doublings, and not the one that happens **at** a doubling: when the skipped
+   pile exceeds its budget the uncapped walk runs and may rewrite everything.
+   Nor does it make a repack interruptible or resumable, which is the half of
+   the mitigation that would actually close this item. What it buys is that the
+   unbounded case is rare rather than routine.
 
    Compaction (D-26) makes this unboundedness a **deliberate API entry point**
    rather than an emergent property of D-16's cascade — a caller asks for the
