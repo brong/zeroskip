@@ -10,7 +10,7 @@
 #   Bump MINOR for new features (backward compatible)
 #   Bump PATCH for bug fixes
 VERSION_MAJOR = 2
-VERSION_MINOR = 4
+VERSION_MINOR = 5
 VERSION_PATCH = 0
 VERSION = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 

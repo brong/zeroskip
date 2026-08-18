@@ -1321,10 +1321,12 @@ The per-file cursors are held in an array kept sorted by:
   oversized unordered one. A failure to seal MUST NOT fail the commit: the
   records are already durable, and D-9a's rollover recovers the layout at the
   next commit. A writer that relies on D-9a alone remains conforming.
-- **D-25e** A writer sealing under D-25d SHOULD NOT publish a pointer table
-  for that file in the same commit (P-13). A table covers only unordered
-  files (P-1), so it would be created already stale and removed at the next
-  sweep (P-16). A table published by a concurrent reader that took its
+- **D-25e** A writer sealing under D-25d publishes no pointer table for that file,
+  which P-13 now gives for free: a commit publishes nothing at all, since it never
+  replays. The reasoning is worth keeping because it is the sharpest case for
+  P-13's rule rather than a special case of it — a table for a file being sealed
+  covers only unordered files (P-1), so it is created already stale and removed at
+  the next sweep (P-16). A table published by a concurrent reader that took its
   snapshot before the seal is harmless for the same reason.
 - **D-26 Compaction.** An implementation MAY merge the **entire** database into
   one file. The order is normative: seal (D-25), then convert every remaining
@@ -1785,11 +1787,30 @@ unreadable one.
   ordered base and replays spans from `valid_upto` onwards, folding the results
   in (D-13b). Beginning a replay at a span boundary is sound because a span is
   self-delimiting and self-validating (F-23, F-19).
-- **P-13** After building or extending an index over an unordered file, a
+- **P-13** After building an index over an unordered file **by replaying it**, a
   process SHOULD publish a table covering that file's complete point when the
   distance from the loaded table's `valid_upto` — or from `H`, if no table was
-  loaded — reaches an implementation-defined threshold. Readers and writers
-  apply the same rule: whoever builds the pointers publishes them.
+  loaded — reaches an implementation-defined threshold.
+
+  **Publishing amortises a replay, so only a replay earns it.** A process that
+  replayed has already paid for the offsets and writes them out once; a writer
+  maintaining its index incrementally (D-13b) never replays at all, so a table it
+  publishes is pure additional cost on the write path with no local benefit. An
+  earlier version of this requirement had readers and writers publish on the same
+  rule, which read as pleasing symmetry and was not: measured on the reference
+  implementation, publishing from the commit path was 22% of a cached 2M-record
+  load, and 38% at a 64MB `rollover_size`.
+
+  It was also mostly waste. At a 2MB `rollover_size` that load creates a
+  generation every 2MB and publishes many tables into each before D-25d seals it —
+  and a sealed generation is an in-order file with a pointer *section* (F-26), so
+  every table published for it is irrelevant before anything opens the database.
+
+  The tables still appear, because a writer replays too: at its own open, and at
+  any begin whose C-4i inspection found another process's commit. What is given up
+  is the speculative half — a table for a file this process never needed to read —
+  and with it the case where nothing can publish at all, a database on a read-only
+  mount whose writer never replayed. That consumer replays at every open.
 
   The threshold is required rather than advisory, and **both ends of it
   cost** — paid by different parties.

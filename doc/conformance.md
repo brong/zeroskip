@@ -183,7 +183,7 @@ a spec label is missing here.
 | `D-14k` | **Reverse iteration.** A cursor MAY traverse in descending key order. | `cursor_reverse_walks_everything`, `cursor_reverse_prefix`, `cursor_reverse_own_writes` |
 | `D-14l` | **Predecessor lookup.** The record with the largest key ≤ K (or | `cursor_reverse_tombstones`, `fetchprev_basic` |
 | `D-25d` | A writer SHOULD seal at the end of any commit that leaves the | `commit_seals_oversized_active`, `commit_below_rollover_stays_unordered` |
-| `D-25e` | A writer sealing under D-25d SHOULD NOT publish a pointer table | `seal_at_commit_skips_table_publish` |
+| `D-25e` | A writer sealing under D-25d publishes no pointer table for that file, | `commit_publishes_no_table` |
 | `D-26` | **Compaction.** An implementation MAY merge the **entire** database into | `compact_to_one_file` |
 | `D-26a` | D-16's geometric selection does NOT apply to compaction. That rule | `compact_ignores_geometric_selection` |
 | `D-26b` | Adjacency is why compaction merges every maximal **run** of adjacent | `compact_reports_and_fails_on_bad_file` |
@@ -257,7 +257,7 @@ a spec label is missing here.
 | `P-10` | `term_off` is the offset of the terminator immediately below | `idxcache_rejects_bad_term_binding` |
 | `P-11` | A reader MUST use a table only if **all** of the following hold, and | `idxcache_rejection_rules` |
 | `P-12` | Having accepted a table, a reader takes its offsets as the index's | `idxcache_open_agrees`, `idxcache_valid_upto_is_span_boundary` |
-| `P-13` | After building or extending an index over an unordered file, a | `idxcache_threshold` |
+| `P-13` | After building an index over an unordered file **by replaying it**, a | `idxcache_threshold`, `idxcache_threshold_scales_with_the_file`, `commit_publishes_no_table` |
 | `P-14` | A table MUST NOT be `fsync`ed before publication. It is rebuildable, | `crash/idxcache_no_fsync_on_publish` |
 | `P-15` | A failure to publish MUST NOT fail the operation that triggered it. | `idxcache_publish_failure_is_not_fatal` |
 | `P-16` | A process MAY unlink tables in the cache directory whose uuid matches | `idxcache_sweeps_dead_generations` |

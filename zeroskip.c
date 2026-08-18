@@ -4966,7 +4966,6 @@ struct zs_db {
     char        *index_dir;          /* owned */
     size_t       index_threshold;    /* P-13 */
     bool         index_local;        /* A-8a */
-    bool         idx_publish_warned; /* P-15: report the first failure only */
 
     bool         readonly;          /* ZS_SHARED (A-5) */
     bool         no_auto_repack;    /* ZS_NOAUTOREPACK (A-14, D-16e) */
@@ -7287,27 +7286,22 @@ static int zsi_txn_commit(struct zs_txn *txn)
          * durable.  Fall back to a rebuild so this handle's view is correct. */
         if (r != ZS_OK) r = zsi_db_refresh(db);
 
-        /* P-13, P-15.  The writer publishes on the same threshold rule a reader
-         * uses, and a failure never fails the commit: the records are already
-         * durable, and a cache is not something a caller can act on.  Reported
-         * once per handle so a broken cache directory is visible without
-         * becoming noise on every commit.
+        /* P-13: a commit publishes NOTHING, and used to publish here.
          *
-         * D-25e: no table for a file this commit is about to seal.  A table
-         * covers only unordered files (P-1), so it would be born stale and
-         * swept at the next opportunity (P-16). */
-        bool sealing = zsi_active_full(db, act);
-        if (r == ZS_OK && db->index_dir && !sealing) {
-            struct zsi_idxcfg cfg = { db->index_dir, db->index_threshold,
-                                      db->index_local };
-            int pr = zsi_idx_publish(act, &cfg, db->compar);
-
-            if (pr != ZS_OK && pr != ZS_DONE && !db->idx_publish_warned) {
-                db->idx_publish_warned = true;
-                db->error("could not publish a pointer table; continuing "
-                          "without the index cache", "dir=<%s>", db->index_dir);
-            }
-        }
+         * Publishing amortises a REPLAY, and this path never replays -- D-13b's
+         * fold maintains the index incrementally, so a table written here is pure
+         * cost to the writer with no local benefit at all.  At the default
+         * rollover_size it is also waste rather than merely unbalanced: a load
+         * publishes about 17 tables into each generation before D-25d seals it,
+         * and a sealed generation is an in-order file with a pointer SECTION, so
+         * every one of them is irrelevant before anybody opens the database.
+         * Measured at 22% of a cached 2M-record load, and 38% at a 64MB rollover.
+         *
+         * The tables still appear.  A handle that built its index by replaying
+         * publishes, at the one place that does that (zsi_snapshot_take) -- which
+         * includes this same writer at its own open, and any reader.  What is gone
+         * is only the speculative half: writing a table for a file this handle
+         * never needed to read. */
     } else {
         r = zsi_db_refresh(db);
     }

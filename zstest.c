@@ -12150,6 +12150,37 @@ static void idxcache_mkdir(char *out, size_t outlen)
     }
 }
 
+/* Tables in a cache directory, by name (P-3).  Counted rather than stat'd for a
+ * single path, because "how many" is what the publishing rules are about. */
+static int idxcache_count_tables(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    int n = 0;
+
+    if (!d) return -1;
+    while ((de = readdir(d)) != NULL)
+        if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
+                     strlen(ZSI_IDX_NAME_PREFIX))) n++;
+    closedir(d);
+    return n;
+}
+
+/* Force a publication.
+ *
+ * P-13 publishes where an index is BUILT BY REPLAY, and a commit never is --
+ * D-13b's fold maintains the index incrementally, so the writer has nothing to
+ * amortise and publishes nothing.  A test that wants a table on disk therefore has
+ * to reopen: the open replays whatever the previous handle appended and publishes
+ * the result.  Every test below that used to store-and-expect goes through here,
+ * which is also the shape a caller now has to use. */
+static int idxcache_republish(struct zs_db **dbp, struct zs_open_data *setup)
+{
+    int r = zs_db_close(dbp);
+    if (r != ZS_OK) return r;
+    return zs_db_open(dbdir, setup, dbp);
+}
+
 /* P-2a: a handle's tables live under <root>/<uuid>/, which open resolves and
  * creates.  Tests that plant or inspect tables need the same path. */
 static void idxcache_dbdir(struct zs_db *db, const char *root,
@@ -12568,6 +12599,10 @@ static void test_idxcache_rejection_rules(void)
         ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
     }
 
+    /* P-13: the commit published nothing, so reopen to make it happen. */
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));
+
     ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
     tab = idxcache_slurp(tabpath, &tablen);
     ASSERT_NOT_NULL(tab);
@@ -12861,6 +12896,8 @@ static void test_idxcache_rejects_bad_term_binding(void)
         snprintf(key, sizeof(key), "key%02d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), "value", 5, 0));
     }
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* P-13 */
 
     ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
     tab = idxcache_slurp(tabpath, &tablen);
@@ -13086,16 +13123,19 @@ static void test_idxcache_threshold(void)
 /* A-9: the DEFAULT threshold is a fraction of the file it describes, and both ends
  * of that matter for a different reason.
  *
- * A small file must publish often, because every open replays from the last
+ * A small file must publish readily, because every open replays from the last
  * published point and most databases are small.  A large one must not publish
  * often, because each publication rewrites the whole table: hold the byte gap
- * fixed and the total cost is quadratic in the file's size, which is how a 64MB
- * generation came to write 4.7GB of tables on a 2M-record load.
+ * fixed and the total cost is quadratic in the file's size.
  *
- * Both halves are asserted against the rule rather than against a constant, and
- * each is the other's counter-example: an absolute threshold passes the first and
- * fails the second, a fraction of rollover_size passes the second and fails the
- * first. */
+ * Driven by REOPENS, since P-13 publishes where an index was built by replay and a
+ * commit never is.  That makes the test read the way a caller experiences it: grow
+ * a little and reopen, and no table is written; grow past the threshold and reopen,
+ * and one is.
+ *
+ * Both halves are the other's counter-example: an absolute threshold passes the
+ * first and fails the second, a fraction of rollover_size passes the second and
+ * fails the first. */
 static void test_idxcache_threshold_scales_with_the_file(void)
 {
     char cachedir[PATH_MAX];
@@ -13103,7 +13143,7 @@ static void test_idxcache_threshold_scales_with_the_file(void)
     struct zs_db *db = NULL;
     struct zsi_file *f;
     char key[32], val[512];
-    size_t before, grew;
+    size_t published, complete;
     int i;
 
     memset(val, 'v', sizeof(val));
@@ -13114,57 +13154,71 @@ static void test_idxcache_threshold_scales_with_the_file(void)
     setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
     setup.index_dir = cachedir;
     setup.rollover_size = 512 * 1024 * 1024;
+    setup.rollover_txns = 1u << 30;              /* D-9d must not seal instead */
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
 
-    /* SMALL: the floor applies, so a few KB of growth is enough to publish. If the
-     * threshold tracked rollover_size this would be 8MB away from publishing and
+    /* SMALL: ~20KB, which is over the floor, so a reopen publishes.  If the
+     * threshold tracked rollover_size this would be 8MB short of publishing and
      * every open would replay the whole file. */
     for (i = 0; i < 40; i++) {
         snprintf(key, sizeof(key), "s%05d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
     }
+    setup.flags = ZS_NOAUTOREPACK;
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* second open loads it */
     f = zsi_snapshot_active(db->snap);
     ASSERT_NOT_NULL(f);
-    ASSERT(f->complete > 16u * 1024u);          /* it really did grow */
-    ASSERT(f->cached_upto > ZSI_HEADER_LEN);    /* ... and it published */
-    ASSERT(f->complete - f->cached_upto < 8u * 1024u);
+    ASSERT(f->complete > 16u * 1024u);
+    ASSERT(f->cached_upto > ZSI_HEADER_LEN);      /* it published */
+    published = f->cached_upto;
 
-    /* The FLOOR, which is the other half of "small": a fraction of a small file is
-     * a few hundred bytes, so without a floor this publishes on nearly every
-     * commit -- the churn P-13 exists to bound.  One 512-byte record must not be
-     * enough to publish when the last one was this recent. */
-    before = f->cached_upto;
-    snprintf(key, sizeof(key), "s%05d", i + 1);
+    /* The FLOOR: one more record is a few hundred bytes, far under it, so a reopen
+     * must NOT publish again.  Without a floor the threshold here would be a few
+     * hundred bytes and this would publish on nearly every commit -- the churn
+     * P-13 exists to bound, and invisible to any assertion that only checks a
+     * table exists. */
+    snprintf(key, sizeof(key), "s%05d", i);
     ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_OK(idxcache_republish(&db, &setup));
     f = zsi_snapshot_active(db->snap);
     ASSERT_NOT_NULL(f);
-    ASSERT(f->complete - before < 4u * 1024u);  /* the gap really is under the floor */
-    ASSERT_EQU(f->cached_upto, (unsigned long long)before);
+    ASSERT_EQU(f->cached_upto, (unsigned long long)published);
 
-    /* LARGE: grow the same file past 4MB, then find the next publication. The gap
-     * it waits for has to exceed the old absolute 32KB, or nothing has changed. */
-    for (i = 0; f->complete < 4u * 1024u * 1024u && i < 200000; i++) {
+    /* LARGE: grow the same file past 4MB and let it publish there. */
+    for (i = 0; ; i++) {
         snprintf(key, sizeof(key), "L%08d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
         f = zsi_snapshot_active(db->snap);
         ASSERT_NOT_NULL(f);
+        if (f->complete >= 4u * 1024u * 1024u) break;
+        ASSERT(i < 200000);
     }
-    ASSERT(f->complete >= 4u * 1024u * 1024u);
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    published = f->cached_upto;
+    complete = f->complete;
+    ASSERT(published > 3u * 1024u * 1024u);
 
-    before = f->cached_upto;
-    for (i = 0; i < 200000; i++) {
+    /* Grow by 40KB -- more than the 32KB an absolute threshold would have used,
+     * less than this file's 64KB share -- and a reopen must NOT publish. */
+    for (i = 0; ; i++) {
         snprintf(key, sizeof(key), "M%08d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
         f = zsi_snapshot_active(db->snap);
         ASSERT_NOT_NULL(f);
-        if (f->cached_upto != before) break;
+        if (f->complete - complete > 40u * 1024u) break;
+        ASSERT(i < 200000);
     }
-    grew = f->cached_upto - before;
-
-    /* It waited for more than the 32KB an absolute threshold would have used, and
-     * for no more than the rule allows plus the record that crossed it. */
-    ASSERT(grew > 32u * 1024u);
-    ASSERT(grew < f->complete / 64u + 4096u);
+    ASSERT(f->complete - complete < complete / 64u);   /* under this file's share */
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQU(f->cached_upto, (unsigned long long)published);
 
     ASSERT_OK(zs_db_close(&db));
 }
@@ -13254,10 +13308,13 @@ static void test_idxcache_publishes_by_rename(void)
 
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));
     ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
     ASSERT_EQ(stat(tabpath, &a), 0);
 
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    ASSERT_OK(idxcache_republish(&db, &setup));
     ASSERT_EQ(stat(tabpath, &b), 0);
     ASSERT(a.st_ino != b.st_ino);
 
@@ -13435,6 +13492,8 @@ static void test_idxcache_sweeps_dead_generations(void)
 
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* P-13 */
     gen = idxcache_table_path(db, cachedir, live, sizeof(live));
     ASSERT(gen != 0);
     ASSERT_EQ(stat(live, &sb), 0);
@@ -13489,6 +13548,8 @@ static void test_index_local_publishes(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    setup.flags = ZS_INDEX_LOCAL;
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* P-13 */
 
     /* Tables live DIRECTLY in zeroskip.cache -- one database per directory,
      * so P-2a's uuid level would be redundant (P-2b). */
@@ -13824,6 +13885,8 @@ static void test_idxcache_uses_file_engine(void)
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_EQ(db->create_csum_id, ZSI_CSUM_XXHASH);
     ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* P-13 */
 
     idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
     cfg.dir = resolved;
@@ -13894,6 +13957,8 @@ static void test_idxcache_valid_upto_is_span_boundary(void)
         snprintf(key, sizeof(key), "key%02d", i);
         ASSERT_OK(zs_db_store(db, key, strlen(key), "v", 1, 0));
     }
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));   /* P-13 */
 
     ASSERT(idxcache_table_path(db, cachedir, tabpath, sizeof(tabpath)) != 0);
     tab = idxcache_slurp(tabpath, &tablen);
@@ -14081,15 +14146,30 @@ static void test_commit_below_rollover_stays_unordered(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
-/* D-25e: the sealing commit publishes no pointer table for the file it
- * seals.  A table covers only unordered files (P-1), so it would be born
- * stale and merely wait for a sweep. */
-static void test_seal_at_commit_skips_table_publish(void)
+/* P-13, and D-25e as its sharpest case: a COMMIT publishes no table, whether or
+ * not it seals.
+ *
+ * Publishing amortises a replay and a commit never replays -- D-13b's fold
+ * maintains the index incrementally -- so there is nothing to amortise.  The
+ * sealing case is the one where it was obviously wrong even under the old
+ * symmetric rule, since a sealed generation is an in-order file with a pointer
+ * section and any table for it is born stale (P-1, P-16); the non-sealing case is
+ * the one that cost 22% of a cached bulk load.
+ *
+ * Both are asserted, because the sealing half alone passes under either rule.
+ *
+ * And it counts tables in the RESOLVED per-database directory, not in the cache
+ * root.  The test this replaces counted in the root, where tables never live
+ * (P-2a puts them under <root>/<uuid>/), so its "no table was published"
+ * assertion was true unconditionally and D-25e had no coverage at all.  The final
+ * assertion here -- that a reopen DOES publish -- is what makes that impossible to
+ * reintroduce: it fails if the counter is looking in the wrong place. */
+static void test_commit_publishes_no_table(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     struct zs_txn *txn = NULL;
-    char cachedir[PATH_MAX];
+    char cachedir[PATH_MAX], resolved[PATH_MAX];
     char pad[512];
 
     memset(pad, 'x', sizeof(pad));
@@ -14098,9 +14178,11 @@ static void test_seal_at_commit_skips_table_publish(void)
     setup.flags = ZS_CREATE;
     setup.rollover_size = 4096;
     setup.index_dir = cachedir;
-    setup.index_threshold = 1;
+    setup.index_threshold = 1;      /* would publish on every commit if it could */
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
 
+    /* A commit large enough to SEAL (D-25d). */
     ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
     for (int i = 0; i < 32; i++) {
         char k[16];
@@ -14108,21 +14190,28 @@ static void test_seal_at_commit_skips_table_publish(void)
         ASSERT_OK(zs_txn_store(txn, k, strlen(k), pad, sizeof(pad), 0));
     }
     ASSERT_OK(zs_txn_commit(&txn));
+    ASSERT_NULL(zsi_snapshot_active(db->snap));      /* it sealed */
+    ASSERT_EQ(idxcache_count_tables(resolved), 0);
 
-    /* The commit sealed, and left no table behind. */
-    ASSERT_NULL(zsi_snapshot_active(db->snap));
-    {
-        DIR *d = opendir(cachedir);
-        struct dirent *de;
-        int ntables = 0;
-
-        ASSERT_NOT_NULL(d);
-        while ((de = readdir(d)) != NULL)
-            if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
-                         strlen(ZSI_IDX_NAME_PREFIX))) ntables++;
-        closedir(d);
-        ASSERT_EQ(ntables, 0);
+    /* And commits that do NOT seal: well under rollover_size, threshold 1, so the
+     * old symmetric rule would have published on every one of them. */
+    for (int i = 0; i < 6; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "small%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
     }
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT(zsi_file_is_unordered(act));         /* did not seal */
+        ASSERT_EQU(act->cached_upto, (unsigned long long)ZSI_HEADER_LEN);
+    }
+    ASSERT_EQ(idxcache_count_tables(resolved), 0);
+
+    /* A reopen, which DOES replay, publishes -- so the cache is not simply off. */
+    setup.flags = 0;
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT(idxcache_count_tables(resolved) > 0);
 
     ASSERT_OK(zs_db_close(&db));
 }
@@ -17439,18 +17528,22 @@ static void test_rollover_txns_seals_on_span_count(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
-/* D-9d: the count is over the REPLAY WINDOW, not over the file.  A published
- * pointer table moves the window's base, so a reader seeded from it replays
- * only what came after -- and a writer counting the file instead would seal
- * files whose rebuild was already cheap.
+/* D-9d: the count is over the REPLAY WINDOW, not over the file.
  *
- * With a threshold small enough to publish constantly, the window keeps
- * resetting and the same 8-span bound is never reached, though the file
- * accumulates far more than 8 spans. */
+ * What moves the window's base is being SEEDED from a published table (P-12), so
+ * a reader that loads one replays only the suffix -- and a writer counting the
+ * whole file instead would seal files whose rebuild was already cheap.
+ *
+ * Since P-13 stopped a commit from publishing, a writer no longer moves its own
+ * base mid-load: the base moves at the open that loaded the table.  So the shape
+ * of this test is now "publish, reopen seeded, append, and count" -- which is the
+ * configuration the distinction was always about, since it is a rebuilding reader
+ * that pays for a long window. */
 static void test_rollover_txns_counts_the_replay_window(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
+    struct zsi_file *act;
     char cachedir[PATH_MAX];
 
     clear_db();
@@ -17459,22 +17552,49 @@ static void test_rollover_txns_counts_the_replay_window(void)
     setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
     setup.rollover_txns = 8;
     setup.index_dir = cachedir;
-    setup.index_threshold = 64;      /* publish about every other commit */
+    setup.index_threshold = 64;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
 
-    for (int i = 0; i < 40; i++) {
+    /* Six commits: under the bound, so nothing seals and nothing is published. */
+    for (int i = 0; i < 6; i++) {
         char k[16];
         size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i);
         ASSERT_OK(zs_db_store(db, k, kl, "v", 1, 0));
     }
+    act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    ASSERT_EQU(act->cached_upto, (unsigned long long)ZSI_HEADER_LEN);
+    ASSERT_EQU(act->nspans, 6u);
 
-    /* Still unordered after 40 commits: the window never held 8 at once. */
-    struct zsi_file *act = zsi_snapshot_active(db->snap);
+    /* Reopen: the open replays, publishes, and the next open is seeded. */
+    setup.flags = ZS_NOAUTOREPACK;
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    ASSERT(act->cached_upto > ZSI_HEADER_LEN);   /* seeded from the table */
+
+    /* Six more commits.  The FILE now holds twelve spans, well over the bound of
+     * eight, but the window holds only the six above the table -- so nothing
+     * seals.  A writer counting the file would have sealed here. */
+    for (int i = 6; i < 12; i++) {
+        char k[16];
+        size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, kl, "v", 1, 0));
+    }
+    act = zsi_snapshot_active(db->snap);
     ASSERT_NOT_NULL(act);
     ASSERT(zsi_file_is_unordered(act));
     ASSERT(act->nspans < 8u);
-    ASSERT(act->cached_upto > ZSI_HEADER_LEN);   /* a table really did publish */
 
+    /* Every record survived, and the file really does hold more than the bound. */
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        const char *v = NULL;
+        size_t kl = (size_t)snprintf(k, sizeof(k), "k%03d", i), vl = 0;
+        ASSERT_OK(zs_db_fetch(db, k, kl, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "v", 1);
+    }
     ASSERT_OK(zs_db_check_consistency(db));
     ASSERT_OK(zs_db_close(&db));
 }
@@ -17809,8 +17929,7 @@ static struct test_entry tests[] = {
                                         test_commit_seals_oversized_active },
     { "test_commit_below_rollover_stays_unordered",
                                         test_commit_below_rollover_stays_unordered },
-    { "test_seal_at_commit_skips_table_publish",
-                                        test_seal_at_commit_skips_table_publish },
+    { "test_commit_publishes_no_table", test_commit_publishes_no_table },
     { "test_seal_noop_cases",           test_seal_noop_cases },
     { "test_seal_readonly",             test_seal_readonly },
     { "test_seal_unclean_active_file",  test_seal_unclean_active_file },

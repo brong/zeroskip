@@ -3,6 +3,23 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.5.0 — 2026-08-18
+
+- **A commit no longer publishes a pointer table.** Publishing amortises a replay,
+  and the commit path never replays — it folds (D-13b) — so a table written there
+  cost the writer with no benefit to it, and at the default `rollover_size` was
+  mostly waste besides: a load publishes many tables into each generation before
+  sealing it, and a sealed generation needs none. Worth 22% of a cached
+  2M-record load, 38% at a 64MB rollover. The tables still appear, published by
+  whoever built an index by replaying — including the same writer at its own open.
+  What is given up is a consumer that can never publish, such as a read-only
+  mount whose writer never replayed: it replays at every open. See P-13.
+
+- Note for callers with a cache configured and small transactions: because a
+  writer no longer moves its own replay window, `rollover_txns` (D-9d) now governs
+  as it does without a cache, so such a load seals more often. Measured faster
+  overall regardless (200k records one per transaction: 9.82s to 9.15s).
+
 ## 2.4.0 — 2026-08-18
 
 - A **read-only handle now creates the `ZS_INDEX_LOCAL` cache directory** instead

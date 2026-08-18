@@ -1116,13 +1116,13 @@ mutant "commit: oversized active never sealed" catch \
 mutant "commit: seal threshold inverted" catch \
   's/            && zsi_active_full\(db, full\)\n            && full->complete > ZSI_HEADER_LEN/            \&\& !zsi_active_full(db, full)\n            \&\& full->complete > ZSI_HEADER_LEN/'
 
-# D-25e.  A table published for a file the same commit seals is born stale --
-# but the seal's own refresh sweeps it (P-16) before the commit returns, so the
-# mutant's only effect is a whole table written and immediately unlinked: real
-# wasted I/O, no observable state.  Listed so nobody writes a bogus test
-# chasing it; the skip stays because a bulk-load table is megabytes.
-mutant "commit: publishes a table for the file it seals" equivalent \
-  's/        if \(r == ZS_OK && db->index_dir && !sealing\) \{/        if (r == ZS_OK \&\& db->index_dir) {/'
+# P-13 since 2026-08-18: a commit publishes NOTHING, because publishing amortises
+# a replay and the fold path never replays.  This mutant is the old behaviour, and
+# it is observable rather than merely wasteful: publishing moves cached_upto, which
+# is the base of D-9d's replay window, so a writer that publishes silently shrinks
+# its own window and stops sealing on the span bound.
+mutant "commit: publishes a table" catch \
+  's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
 
 # D-26.  Skipping the seal leaves the active generation out of the result, so the
 # database never reaches one file.
