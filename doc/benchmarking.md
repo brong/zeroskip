@@ -197,6 +197,69 @@ point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
 bounded half — at most `rollover_size` of work — and is what to reach for if the
 goal is only to stop readers replaying the active file.
 
+## Publishing during a load is the writer's cost, and it is nearly all waste
+
+Making the publish threshold a fraction of the file bounded its growth with
+generation size but did not make it cheap. Downstream on ZFS, a 2M-record load with
+the cache on still costs +9% at a 2MB `rollover_size` and +44% at 64MB. Locally,
+splitting that cost by who pays it:
+
+| 2M records, 1000 per txn, cache on | 2 MB rollover | 64 MB rollover |
+|---|---|---|
+| threshold = file/64 (shipped) | 1.66s | 2.44s |
+| writer publishes at file/8 | 1.55s | 1.88s |
+| **writer never publishes** | **1.30s** | **1.90s** |
+| no cache configured at all | 1.25s | 1.77s |
+
+**Almost all of the remaining cost is the writer's publications, and almost all of
+those are wasted.** At the 2 MB default this load creates 117 generations, each
+publishing about 17 times before D-25d seals it — and a sealed generation is an
+in-order file with a pointer *section*, so every one of those tables becomes
+irrelevant the moment it is sealed. The writer is writing tables for a file that
+will not exist in that form by the time anyone opens it.
+
+There is an asymmetry here that P-13's "readers and writers apply the same rule"
+does not account for. A **reader** that publishes has just replayed the file to
+build its index, so publishing amortises work it already did. A **writer** never
+replays at all — D-13b's fold maintains its index incrementally — so for the
+writer, publishing is pure additional cost with no local benefit whatsoever.
+
+What keeps the symmetry defensible is the one case a reader cannot cover: a
+database on a **read-only mount**, or any consumer that cannot write to the cache
+directory. Nothing there can publish, so if the writer did not, every open replays.
+That is a real deployment (replicas, forensic copies), and it is the reason this is
+recorded as a measurement rather than acted on.
+
+A caller can already choose either strategy without a library change: configure
+`index_dir`/`ZS_INDEX_LOCAL` on the handles that read and not on the one doing a
+bulk import, and the tables appear on the first read (P-13 — a reader publishes on
+the same rule, and since 2.4.0 a read-only handle will also create the directory).
+Measured downstream, that strategy costs the import nothing and beats no-table from
+the first open, where publishing during the import only overtakes it past roughly
+9,400 opens per import.
+
+## Why zeroskip beats a btree at small transactions and loses at large ones on ZFS
+
+From the downstream engine's `strace -c`, same 2M-record load, and it explains the
+whole shape of their matrix rather than one row of it:
+
+| | zeroskip | stock SQLite btree |
+|---|---|---|
+| syscall time, 1 record per txn | 0.91s | 4.20s |
+| syscall time, 1000 per txn | 3.09s | 0.79s |
+| syscalls per commit | 9 | 33 |
+| `unlink` | 41 in a whole run | one per commit (its journal) |
+| `fdatasync`, 1 record per txn | 11.8 µs | ~20 µs |
+| `fdatasync`, 1000 per txn | **302 µs** | ~20 µs |
+
+The crossover is where two curves meet, and neither is a defect. **Our advantage at
+small transactions is per-commit syscall count** — nine against thirty-three, and no
+journal to create and unlink. **Our deficit at large ones is per-byte sync cost**:
+one `fdatasync` of a 111 KB append makes the ZIL commit 111 KB, where a btree
+syncing a 111-byte journal record pays the same ~20 µs whatever the transaction
+size. Appending a span and syncing it once is the design (C-7, C-8); on a
+raidz2 pool with no SLOG, that sync is priced by its bytes.
+
 ## What an idle unordered file costs, and what D-9d already saves you
 
 A database written and then left alone keeps its spans: nothing below
