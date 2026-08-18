@@ -222,16 +222,55 @@ armed run rather than more.
 
 On a laptop the totals are close (1.29s against 1.20s), because a write into page
 cache is nearly free and the single big merge still costs its CPU. On a filesystem
-where writes are expensive the arithmetic is completely different: the downstream
-ZFS deployment measures 830 MB of merges at 3696 ms and `unlink` at 1.8 ms a call,
-so a third of the bytes and 152 fewer intermediate files to unlink is most of a
-34-38% reduction in bulk-load wall time.
+where writes are expensive the arithmetic is different: the downstream ZFS
+deployment measures 830 MB of merges at 3696 ms, so a third of the bytes is most
+of a ~34% reduction in bulk-load wall time.
+
+**The saving is bytes, not files.** Counted rather than reasoned about: `unlink`
+goes 269 to 234 and `rename` 156 to 118, because every generation file is unlinked
+either way and deferring skips only the intermediate merge *outputs*. `readdir`
+goes the other way, 6378 to 37579, since the load runs with up to 118 files in the
+directory. If per-file cost is what dominates, `rollover_size` is the knob, not
+this.
 
 **What it costs is read latency during the window.** 118 files is D-14d's linear
 degradation in full effect, so this is a shape for a load with no concurrent
 readers, or a maintenance window, and not a permanent mode. And the catch-up has
 to actually be driven: `zs_db_should_repack` is the predicate, and a caller that
 disarms without scheduling it is choosing the pathology A-14's note describes.
+
+## `rollover_size` sets how many files exist at all
+
+It is documented as bounding bytes, the index replay and one conversion. The
+quantity it really sets is the number of generations, and each generation is a file
+created, converted, unlinked, and read by every directory scan until a merge
+absorbs it. 2M records at 1000 per transaction, cascade armed, laptop:
+
+| `rollover_size` | load | files left | conversions | merges | unlink | rename | readdir |
+|---|---|---|---|---|---|---|---|
+| 2 MB (default) | 1.40s | 5 | 117 (250 MB) | 39 (796 MB) | 269 | 156 | 6378 |
+| 16 MB | **1.26s** | 3 | 15 (249 MB) | 5 (449 MB) | **33** | 20 | 680 |
+| 64 MB | 1.91s | 2 | 3 (198 MB) | 1 (198 MB) | **6** | 4 | 120 |
+
+Three things to read from it:
+
+- **The lifecycle count falls with the square-ish of the size**, because a larger
+  generation means both fewer files and a shallower repack ladder — 45x fewer
+  unlinks and a quarter of the merge bytes between the first row and the last.
+- **There is a knee, so this is not bigger-is-better.** 64 MB is slower than the
+  2 MB default on this machine: past some size the active file's private index, and
+  the D-13b delta flush that is O(index) once per `ZSI_DELTA_MAX` inserts, cost
+  more than the file churn saved. Measure it on the target filesystem.
+- **It matters most where per-file cost is high.** The downstream ZFS deployment
+  measures `unlink` at 1.8 ms a call — 17% of syscall time on a 2M-record load,
+  against 25 µs for a btree's on the same pool — because each one frees a large
+  repacked-away generation through zstd and raidz2 parity. 269 unlinks to 33 is
+  ~0.4s there before counting the bytes saved.
+
+What a larger value costs is everything already documented as bounded by it: a
+longer conversion pause, a larger replay for a snapshot rebuild, which writers
+alternating across processes pay at every begin (C-4i), and more memory per
+snapshot for the private index.
 
 ## The machines these numbers came from
 
