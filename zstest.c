@@ -12210,11 +12210,15 @@ static void test_idxcache_threshold_defaults(void)
     setup.flags = ZS_CREATE;
     setup.index_dir = cachedir;
 
-    /* The plain default: an absolute byte count, because the knee is set by how
-     * much data a replay walks and not by how large a generation may grow. */
+    /* The default is DERIVED PER FILE at the publish site, so it stays zero here:
+     * it bounds the number of publications over a file's life rather than the
+     * bytes between them, because each one rewrites a table proportional to the
+     * file.  A fixed byte gap makes the total quadratic in generation size; a
+     * fraction of rollover_size makes a small database with a large rollover
+     * publish almost never and pay at every open. */
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_NOT_NULL(db);
-    ASSERT_EQU(db->index_threshold, (unsigned long long)ZSI_DEFAULT_INDEX_THRESHOLD);
+    ASSERT_EQU(db->index_threshold, 0u);
     {
         /* A-8/P-2a: the handle resolves the root to its per-uuid child. */
         char want[PATH_MAX];
@@ -12226,12 +12230,14 @@ static void test_idxcache_threshold_defaults(void)
     }
     ASSERT_OK(zs_db_close(&db));
 
-    /* Capped at a quarter of rollover_size, so small generations still publish
-     * several times within one instead of never. */
-    setup.rollover_size = 8192;
+    /* rollover_size does not enter into it either way, which is the point: the
+     * threshold scales with the file, so the same handle publishes often while its
+     * active file is small and rarely once it is large. */
+    setup.rollover_size = 64 * 1024 * 1024;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-    ASSERT_EQU(db->index_threshold, 8192u / 4u);
+    ASSERT_EQU(db->index_threshold, 0u);
     ASSERT_OK(zs_db_close(&db));
+    setup.rollover_size = 0;
 
     /* An explicit value wins, and the cache stays off when index_dir is NULL. */
     setup.index_threshold = 4321;
@@ -13074,6 +13080,92 @@ static void test_idxcache_threshold(void)
     ASSERT_OK(zs_db_store(db, "another", 7, "value", 5, 0));
     ASSERT_EQ(stat(tabpath, &sb), 0);
     ASSERT(sb.st_size > ZSI_IDX_HEADER_LEN);
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* A-9: the DEFAULT threshold is a fraction of the file it describes, and both ends
+ * of that matter for a different reason.
+ *
+ * A small file must publish often, because every open replays from the last
+ * published point and most databases are small.  A large one must not publish
+ * often, because each publication rewrites the whole table: hold the byte gap
+ * fixed and the total cost is quadratic in the file's size, which is how a 64MB
+ * generation came to write 4.7GB of tables on a 2M-record load.
+ *
+ * Both halves are asserted against the rule rather than against a constant, and
+ * each is the other's counter-example: an absolute threshold passes the first and
+ * fails the second, a fraction of rollover_size passes the second and fails the
+ * first. */
+static void test_idxcache_threshold_scales_with_the_file(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *f;
+    char key[32], val[512];
+    size_t before, grew;
+    int i;
+
+    memset(val, 'v', sizeof(val));
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    /* rollover far above anything written, so this is all ONE unordered file and
+     * rollover_size cannot be what the threshold tracks. */
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.index_dir = cachedir;
+    setup.rollover_size = 512 * 1024 * 1024;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    /* SMALL: the floor applies, so a few KB of growth is enough to publish. If the
+     * threshold tracked rollover_size this would be 8MB away from publishing and
+     * every open would replay the whole file. */
+    for (i = 0; i < 40; i++) {
+        snprintf(key, sizeof(key), "s%05d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+    }
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    ASSERT(f->complete > 16u * 1024u);          /* it really did grow */
+    ASSERT(f->cached_upto > ZSI_HEADER_LEN);    /* ... and it published */
+    ASSERT(f->complete - f->cached_upto < 8u * 1024u);
+
+    /* The FLOOR, which is the other half of "small": a fraction of a small file is
+     * a few hundred bytes, so without a floor this publishes on nearly every
+     * commit -- the churn P-13 exists to bound.  One 512-byte record must not be
+     * enough to publish when the last one was this recent. */
+    before = f->cached_upto;
+    snprintf(key, sizeof(key), "s%05d", i + 1);
+    ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+    f = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(f);
+    ASSERT(f->complete - before < 4u * 1024u);  /* the gap really is under the floor */
+    ASSERT_EQU(f->cached_upto, (unsigned long long)before);
+
+    /* LARGE: grow the same file past 4MB, then find the next publication. The gap
+     * it waits for has to exceed the old absolute 32KB, or nothing has changed. */
+    for (i = 0; f->complete < 4u * 1024u * 1024u && i < 200000; i++) {
+        snprintf(key, sizeof(key), "L%08d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+        f = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(f);
+    }
+    ASSERT(f->complete >= 4u * 1024u * 1024u);
+
+    before = f->cached_upto;
+    for (i = 0; i < 200000; i++) {
+        snprintf(key, sizeof(key), "M%08d", i);
+        ASSERT_OK(zs_db_store(db, key, strlen(key), val, sizeof(val), 0));
+        f = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(f);
+        if (f->cached_upto != before) break;
+    }
+    grew = f->cached_upto - before;
+
+    /* It waited for more than the 32KB an absolute threshold would have used, and
+     * for no more than the rule allows plus the record that crossed it. */
+    ASSERT(grew > 32u * 1024u);
+    ASSERT(grew < f->complete / 64u + 4096u);
+
     ASSERT_OK(zs_db_close(&db));
 }
 
@@ -17624,6 +17716,8 @@ static struct test_entry tests[] = {
     { "test_idxcache_seeded_suffix_folds_in_order",
                                         test_idxcache_seeded_suffix_folds_in_order },
     { "test_idxcache_threshold",        test_idxcache_threshold },
+    { "test_idxcache_threshold_scales_with_the_file",
+                                        test_idxcache_threshold_scales_with_the_file },
     { "test_idxcache_open_agrees",      test_idxcache_open_agrees },
     { "test_idxcache_publishes_by_rename",
                                         test_idxcache_publishes_by_rename },

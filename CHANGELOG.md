@@ -3,6 +3,17 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.3.0 — 2026-08-18
+
+- **The default pointer-table publish threshold now scales with the file** it
+  describes rather than being an absolute 32KB, which it still works out to at the
+  default `rollover_size`. It fixes two opposite problems: a large generation
+  published ~2000 times whatever its size, each rewriting the whole table, so the
+  cost was quadratic in generation size (4.70GB of writes and 4.69s against 1.91s
+  on a 2M-record load at a 64MB rollover); and a small database with a large
+  rollover configured barely published at all and paid for it at every open. A
+  caller passing a non-zero `index_threshold` is unaffected. See A-9.
+
 ## 2.2.1 — 2026-08-18
 
 - Fixes a regression in 2.2.0: single-record transactions were about 20% slower

@@ -986,6 +986,20 @@ mutant "idx: magic same as a data file's" catch \
 
 # P-7.  Using the handle's engine produces tables a conforming peer must reject:
 # the failure is silent, and the cache does nothing while appearing to work.
+# A-9's default threshold, and its two failure modes are opposite.  An absolute
+# figure publishes a large file thousands of times, each rewriting the whole table,
+# so the total is quadratic in the file's size; a fraction of rollover_size leaves
+# a SMALL database publishing almost never, and every open replays what was not
+# published.  Both mutants exist because either rule alone looks reasonable.
+mutant "idx: threshold absolute instead of per-file" catch \
+  's/            threshold = f->complete \/ ZSI_INDEX_PUBLISHES_PER_GEN;/            threshold = 32 * 1024;/'
+
+mutant "idx: threshold tracks rollover, not the file" catch \
+  's/            threshold = f->complete \/ ZSI_INDEX_PUBLISHES_PER_GEN;/            threshold = 512 * 1024 * 1024 \/ ZSI_INDEX_PUBLISHES_PER_GEN;/'
+
+mutant "idx: threshold floor removed" catch \
+  's/            if \(threshold < ZSI_INDEX_MIN_THRESHOLD\)\n                threshold = ZSI_INDEX_MIN_THRESHOLD;/            \/* no floor *\//'
+
 mutant "idx: publishes under the handle's engine" catch \
   's/    h\.flags = \(uint16_t\)\(f->csum_id & ZSI_CSUM_MASK\);/    h.flags = (uint16_t)ZSI_CSUM_XXHASH;/'
 
@@ -998,7 +1012,7 @@ mutant "idx: publishes in place, no rename" catch \
 # makes a bulk load quadratic.  The test asserts the absence of a table below the
 # threshold, so this is observable rather than merely slow.
 mutant "idx: publishes on every commit" catch \
-  's/    if \(f->complete - f->cached_upto < cfg->threshold\) return ZS_DONE;/    \/* P-13 threshold removed *\//'
+  's/        if \(f->complete - f->cached_upto < threshold\) return ZS_DONE;/        \/* P-13 threshold removed *\//'
 
 # P-14.  A synced table is still CORRECT, so only the sync count can object --
 # which is why test_idxcache_no_fsync_on_publish counts rather than times.

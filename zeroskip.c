@@ -138,21 +138,51 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
  * number here most likely to be wrong. */
 #define ZSI_REPACK_MAX_FROZEN 8
 
-/* How far past the last published pointer table the active file may grow before
- * another is published (P-13).  Chosen from measurement rather than taste --
- * zsbench's "publish threshold" table, and doc/benchmarking.md for the curve.
+/* How many pointer tables a generation publishes over its life, which is what
+ * sets the default threshold (P-13, A-9): rollover_size / this.
  *
- * BOTH ends cost, and the expensive one is the high end.  A write transaction
- * refreshes its snapshot at begin (C-4), and that refresh replays from the last
- * published point -- so a threshold that publishes too rarely leaves the replay
- * unbounded and a one-store-per-transaction load quadratic.  Publishing too
- * often costs an O(records) merge and rewrite per commit, which is real but
- * cheaper, because those writes are never synced (P-14).
+ * BOTH ends cost, and neither is the one to fix first.  A write transaction
+ * refreshes its snapshot at begin (C-4), replaying from the last published
+ * point, so publishing too rarely leaves that replay unbounded and a
+ * one-store-per-transaction load quadratic.  Publishing too often costs an
+ * O(records) rewrite of the whole table each time -- never synced (P-14), so
+ * cheaper per event, but the events are what this bounds.
  *
- * An absolute byte count rather than a fraction of rollover_size, because the
- * knee is set by how much data a replay has to walk, which has nothing to do
- * with how large the caller lets a generation grow. */
-#define ZSI_DEFAULT_INDEX_THRESHOLD (32 * 1024)
+ * PROPORTIONAL, and it took a downstream report to see why.  This was an absolute
+ * 32KB, on the reasoning that the knee is set by how much data a replay walks and
+ * not by how large a generation may grow.  The replay half of that is true; the
+ * publish half is not, because one publication rewrites the whole table and a
+ * table is proportional to its generation.  Hold the byte gap fixed and a bigger
+ * generation publishes just as often while each publication costs more, so the
+ * total is QUADRATIC in generation size: measured on a 2M-record load with a cache
+ * configured, 1.48GB written at a 2MB rollover, 2.03GB at 16MB and 4.70GB at 64MB,
+ * for about 2000 publications in every case -- and 4.69s against 1.91s for the
+ * same load with no cache.  Bounding the COUNT per generation is what keeps it
+ * linear, and that means a fraction.
+ *
+ * A fraction of THE FILE IT DESCRIBES, not of rollover_size, and not an absolute
+ * count.  All three were tried and the file is the only one that gets both ends
+ * right at once:
+ *
+ *   - absolute (32KB, what this was) bounds the replay but not the publishing, so
+ *     the total is quadratic in generation size as above;
+ *   - a fraction of rollover_size bounds the publishing, but a SMALL database with
+ *     a large rollover configured then publishes a handful of times or never, and
+ *     pays for it at every open -- measured at +63% on open-plus-first-read for a
+ *     1MB database at a 16MB rollover (0.093ms to 0.152ms).  Most databases are
+ *     small and Cyrus opens them from short-lived processes, so that is the wrong
+ *     end to lose;
+ *   - a fraction of the file scales with the thing that actually sets both costs.
+ *     A 2MB generation gets the 32KB that was measured as the knee, so this is a
+ *     no-op for the default; a 64MB one publishes 64 times instead of 2000; a 1MB
+ *     one publishes every 16KB and its opens stay cheap whatever rollover_size
+ *     says.
+ *
+ * The floor stops a tiny file publishing on every commit.  It can be small,
+ * because the cost of publishing is O(records in the file) and that is what is
+ * small here -- the bound protects against churn, not against volume. */
+#define ZSI_INDEX_PUBLISHES_PER_GEN 64
+#define ZSI_INDEX_MIN_THRESHOLD     (4 * 1024)
 
 /* The streaming writer's append buffer (C-8): stores batch into it, so a
  * store is a memcpy rather than a syscall, and it flushes whenever a read
@@ -3298,7 +3328,18 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
      * what would make a bulk load quadratic: a table is rewritten whole, so one
      * publication per commit costs O(records in the file) of I/O per commit. */
     if (f->complete < f->cached_upto) return ZS_DONE;
-    if (f->complete - f->cached_upto < cfg->threshold) return ZS_DONE;
+    {
+        /* A zero threshold means DERIVE it from this file (A-9), which is the
+         * default and cannot be resolved at open: the quantity it scales with is
+         * the file's own size, and that changes as the file grows. */
+        size_t threshold = cfg->threshold;
+        if (!threshold) {
+            threshold = f->complete / ZSI_INDEX_PUBLISHES_PER_GEN;
+            if (threshold < ZSI_INDEX_MIN_THRESHOLD)
+                threshold = ZSI_INDEX_MIN_THRESHOLD;
+        }
+        if (f->complete - f->cached_upto < threshold) return ZS_DONE;
+    }
 
     if (zsi_index_flatten(f->index, compar, &offs, &n) != ZS_OK)
         return ZS_INTERNAL;
@@ -8851,25 +8892,11 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
     }
 
     if (setup->index_dir || db->index_local) {
-        /* A-9.  Zero means the measured default, so a caller that sets index_dir
-         * and nothing else still gets bounded publishing.
-         *
-         * Capped at a quarter of rollover_size, so a caller using small
-         * generations still publishes several times within one rather than
-         * never -- the default is an absolute figure, and a rollover smaller
-         * than it would otherwise make the cache useless exactly where opens are
-         * most frequent.
-         *
-         * Never zero in the end: a threshold of zero publishes on every commit,
-         * which P-13 exists to bound. */
-        if (setup->index_threshold) {
-            db->index_threshold = setup->index_threshold;
-        } else {
-            size_t quarter = db->rollover_size / 4;
-            db->index_threshold = quarter < ZSI_DEFAULT_INDEX_THRESHOLD
-                                ? quarter : (size_t)ZSI_DEFAULT_INDEX_THRESHOLD;
-        }
-        if (db->index_threshold == 0) db->index_threshold = 1;
+        /* A-9.  Zero is kept as zero, and means "derive it from the file" at the
+         * publish site -- see ZSI_INDEX_PUBLISHES_PER_GEN.  It cannot be resolved
+         * here, because the quantity it scales with is the active file's own size
+         * and that changes as the file grows. */
+        db->index_threshold = setup->index_threshold;
     }
 
     /* Is there anything here?  A directory that does not exist, or holds no data

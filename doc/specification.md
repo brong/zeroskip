@@ -2210,9 +2210,32 @@ different calls, though not every flag is meaningful everywhere:
   tables.
 - **A-9** `index_threshold` is P-13's threshold in bytes. Zero selects an
   implementation-defined default, so a caller that sets `index_dir` and nothing
-  else still gets bounded publishing. That default SHOULD be capped below
-  `rollover_size` so a caller using small generations still publishes within
-  one rather than never.
+  else still gets bounded publishing.
+
+  That default SHOULD be **a fraction of the file the table describes**, with a
+  small floor — not an absolute byte count, and not a fraction of
+  `rollover_size`. The two costs it sits between scale with different things, and
+  only the file's own size bounds both:
+
+  - a **small** file must publish often, because every open replays from the last
+    published point and the replay is what the cache exists to remove. Most
+    databases are small, and a caller opening them from short-lived processes pays
+    this on every open.
+  - a **large** file must not, because a publication rewrites the table whole and
+    a table is proportional to its file. Hold the gap fixed and the number of
+    publications per generation stays constant while each one costs more, so the
+    total is **quadratic in generation size**.
+
+  Measured on the reference implementation, a 2M-record load with a cache
+  configured and an absolute 32KB threshold: 1.48GB of writes at a 2MB
+  `rollover_size`, 2.03GB at 16MB and 4.70GB at 64MB, for about 2000 publications
+  in every case — and 4.69s against 1.91s for the same load with no cache at all.
+  Making the threshold a fraction of `rollover_size` fixes that end and breaks the
+  other: a 1MB database with a 16MB `rollover_size` then publishes a handful of
+  times, and its open-plus-first-read went from 0.093ms to 0.152ms.
+
+  A caller that supplies a non-zero value gets exactly it, unscaled, since the
+  point of the knob is control.
 - **A-10** `zs_db_seal` performs D-25. It returns `ZS_OK` for each of D-25b's
   no-op cases, and `ZS_READONLY` on a read-only handle (R-3).
 - **A-11** `zs_db_compact` performs D-26, returning `ZS_OK` only when the
