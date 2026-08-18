@@ -618,14 +618,28 @@ mutant "commit: folds even while a reader holds the file" catch \
 # the delta here and against the base at the flush.  Lose that and a rewritten key
 # keeps its old record, which is a stale value read back.
 mutant "fold: delta wins ties against the run" catch \
-  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = run\[ri\+\+\]; di\+\+; needr = needd = true; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; ri++; needr = needd = true; }/'
+  's/        if \(cmp == 0\)      \{ ix->delta\[--w\] = run\[--ri\]; di--; dropped\+\+;/        if (cmp == 0)      { ix->delta[--w] = ix->delta[di - 1]; di--; ri--; dropped++;/'
 
 mutant "fold: keeps the tied delta entry too" catch \
-  's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = run\[ri\+\+\]; di\+\+; needr = needd = true; \}/        if (cmp == 0)      { merged[w++] = run[ri++]; needr = needd = true; }/'
+  's/        if \(cmp == 0\)      \{ ix->delta\[--w\] = run\[--ri\]; di--; dropped\+\+;\n                             needr = needd = true; \}/        if (cmp == 0)      { ix->delta[--w] = run[--ri]; needr = needd = true; }/'
 
 # The run arrives SORTED, from the pending skiplist's level 0.  Merging it against
 # the delta in the other direction is what a caller handing over an unsorted run
 # would produce, and it leaves the delta mis-ordered rather than merely stale.
+# The early exit is only sound when NOTHING was dropped: the remaining delta
+# entries are in place only if no tie shortened the output.  Taking it whenever
+# the run is exhausted leaves the tail of the delta unshifted, so the array holds
+# a stale duplicate and the entries above it are off by the number of ties.
+mutant "fold: early exit taken even after a tie" catch \
+  's/            if \(w == di\) break;         \/\* the rest is already in place \*\//            break;/'
+
+# ... and the gap must be COUNTED, not read off the write cursor.  They agree only
+# when the loop runs to the end; after the early exit `w` is the untouched delta's
+# height, so this shifts a correct array down by it and truncates.  This is the bug
+# the first version of the in-place merge had, and 46 tests caught it.
+mutant "fold: gap read off the write cursor" catch \
+  's/    if \(dropped\)\n        memmove\(ix->delta, ix->delta \+ dropped,\n                \(want - dropped\) \* sizeof\(\*ix->delta\)\);\n    ix->ndelta = want - dropped;/    if (w) memmove(ix->delta, ix->delta + w, (want - w) * sizeof(*ix->delta));\n    ix->ndelta = want - w;/'
+
 mutant "fold: run merged in the wrong direction" catch \
   's/        int cmp = zsi_cmp\(compar, kr, lr, kd, ld\);/        int cmp = zsi_cmp(compar, kd, ld, kr, lr);/'
 
@@ -637,7 +651,7 @@ mutant "fold: delta never merges" catch \
 # one's key, which mis-orders the output -- the hazard the caching introduced, in
 # both merges.
 mutant "fold: stale key after the run side advances" catch \
-  's/        else if \(cmp < 0\)  \{ merged\[w\+\+\] = run\[ri\+\+\]; needr = true; \}/        else if (cmp < 0)  { merged[w++] = run[ri++]; }/'
+  's/        else if \(cmp > 0\)  \{ ix->delta\[--w\] = run\[--ri\]; needr = true; \}/        else if (cmp > 0)  { ix->delta[--w] = run[--ri]; }/'
 
 mutant "flush: stale key after the base side advances" catch \
   's/        else               \{ merged\[w\+\+\] = ix->base\[bi\+\+\]; needb = true; \}/        else               { merged[w++] = ix->base[bi++]; }/'

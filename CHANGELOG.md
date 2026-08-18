@@ -3,6 +3,15 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.2.1 — 2026-08-18
+
+- Fixes a regression in 2.2.0: single-record transactions were about 20% slower
+  (144k to 121k stores/s at 20k records under `ZS_NOSYNC`), because the commit
+  fold allocated and copied the whole delta per commit. It now merges in place,
+  which is faster than 2.2.0 at every transaction size and than 2.1.1 at all of
+  them. Reported from the SQLite engine's `nosync` row, where the two commit
+  gates do not hide it.
+
 ## 2.2.0 — 2026-08-17
 
 - New `zs_db_stats(db, struct zs_db_stats *)` reports what this handle has

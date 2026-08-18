@@ -2252,7 +2252,7 @@ static int zsi_ptrs_build(const uint64_t *offs, size_t n, size_t records_end,
 struct zsi_index {
     struct zsi_file *file;
     size_t *base;   size_t nbase;
-    size_t *delta;  size_t ndelta;
+    size_t *delta;  size_t ndelta, adelta;
 };
 
 static void zsi_index_free(struct zsi_index **ip)
@@ -2765,10 +2765,10 @@ static int zsi_index_flush_delta(struct zsi_index *ix, zs_compar *compar)
  * search into the delta plus a memmove -- and a comparison in that search is a
  * record DECODE in the mapped file, so a bulk load paid O(n log delta) decodes
  * for order it was handed for nothing.  Measured on 200k records, 100-byte
- * values: 2.15M to 2.62M records/s at 1000 records per transaction, and 953k to
- * 2.88M with all 200k in ONE transaction -- because the old cost grew with the
+ * values: 2.11M to 3.16M records/s at 1000 records per transaction, and 1.04M to
+ * 4.18M with all 200k in ONE transaction -- because the old cost grew with the
  * transaction's size, so batching harder made a load SLOWER past about 10k
- * records and the curve is now flat.  `zsbench`'s store lines move 21% to 95%.
+ * records and the curve is now flat.  `zsbench`'s store lines move 10% to 300%.
  *
  * What remains is this flush and the base merge under it, which is decodes and
  * nothing else -- the thing to measure a key or key-prefix cached beside each
@@ -2787,34 +2787,75 @@ static int zsi_index_fold_run(struct zsi_index *ix, zs_compar *compar,
     /* Merge into the delta first, then let it flush on its own bound.  A single
      * three-way merge of run, delta and base would save this pass over the run,
      * which is the smaller side; two two-way merges keep one statement of who
-     * wins a tie, and that rule is the part nobody would notice diverging. */
-    size_t *merged = malloc((ix->ndelta + n) * sizeof(*merged));
-    if (!merged) return ZS_INTERNAL;
+     * wins a tie, and that rule is the part nobody would notice diverging.
+     *
+     * IN PLACE and BACKWARDS, which is not a micro-optimisation -- it is what
+     * makes a one-record transaction affordable.  Merging forwards needs somewhere
+     * to write, so it allocates and copies the whole delta per commit: O(delta)
+     * work and a malloc/free for a run of one, where the per-record insert this
+     * replaced did a bounded memmove and no allocation.  That regressed
+     * single-record commits by about 20% (144k to 121k stores/s at 20k records,
+     * ZS_NOSYNC, so the two gates do not hide it), which is invisible on any
+     * durable row and was reported from a NOSYNC one downstream.
+     *
+     * Backwards is what allows in place.  The write cursor starts above both read
+     * cursors and each step consumes at least as much as it emits, so it can never
+     * overtake the delta entry it has yet to read -- and when the run is exhausted
+     * with the write cursor level with the read cursor, everything below is already
+     * where it belongs, which is the loop's exit.  An ASCENDING run -- a bulk load,
+     * or any caller with ordered keys -- takes that exit immediately after placing
+     * its own entries, so the merge is O(n) rather than O(delta). */
+    size_t want;
+    if (!zsi_add_sz(ix->ndelta, n, &want)) return ZS_INTERNAL;
+    if (want > ix->adelta) {
+        size_t cap = ix->adelta ? ix->adelta : 64;
+        while (cap < want) {
+            if (cap > SIZE_MAX / 2) return ZS_INTERNAL;
+            cap *= 2;
+        }
+        size_t *p = realloc(ix->delta, cap * sizeof(*p));
+        if (!p) return ZS_INTERNAL;
+        ix->delta = p;
+        ix->adelta = cap;
+    }
 
-    size_t ri = 0, di = 0, w = 0;
+    size_t di = ix->ndelta, ri = n, w = want, dropped = 0;
     const char *kr = NULL, *kd = NULL;
     size_t lr = 0, ld = 0;
     bool needr = true, needd = true;
 
-    while (ri < n || di < ix->ndelta) {
-        if (di >= ix->ndelta) { merged[w++] = run[ri++]; continue; }
-        if (ri >= n) { merged[w++] = ix->delta[di++]; continue; }
+    while (di || ri) {
+        if (!di) { ix->delta[--w] = run[--ri]; continue; }
+        if (!ri) {
+            if (w == di) break;         /* the rest is already in place */
+            ix->delta[--w] = ix->delta[--di];
+            continue;
+        }
 
-        if (needr) { zsi_index_key_at(ix->file, run[ri], &kr, &lr); needr = false; }
-        if (needd) { zsi_index_key_at(ix->file, ix->delta[di], &kd, &ld); needd = false; }
+        if (needr) { zsi_index_key_at(ix->file, run[ri - 1], &kr, &lr); needr = false; }
+        if (needd) { zsi_index_key_at(ix->file, ix->delta[di - 1], &kd, &ld); needd = false; }
         int cmp = zsi_cmp(compar, kr, lr, kd, ld);
 
-        /* An equal key drops the delta's entry: the run is newer, and keeping one
-         * entry per key is what bounds the delta at ZSI_DELTA_MAX however often a
-         * single key is rewritten. */
-        if (cmp == 0)      { merged[w++] = run[ri++]; di++; needr = needd = true; }
-        else if (cmp < 0)  { merged[w++] = run[ri++]; needr = true; }
-        else               { merged[w++] = ix->delta[di++]; needd = true; }
+        /* Descending, so the LARGER key is placed first.  An equal key drops the
+         * delta's entry: the run is newer, and keeping one entry per key is what
+         * bounds the delta at ZSI_DELTA_MAX however often a single key is
+         * rewritten. */
+        if (cmp == 0)      { ix->delta[--w] = run[--ri]; di--; dropped++;
+                             needr = needd = true; }
+        else if (cmp > 0)  { ix->delta[--w] = run[--ri]; needr = true; }
+        else               { ix->delta[--w] = ix->delta[--di]; needd = true; }
     }
 
-    free(ix->delta);
-    ix->delta = merged;
-    ix->ndelta = w;
+    /* Every tie emitted one entry for two inputs, leaving that many unused slots
+     * at the BOTTOM, since the merge wrote downwards from the top.
+     *
+     * Counted rather than read off `w`, which is only the gap when the loop ran to
+     * the end: the early exit above leaves `w` at the untouched delta's height,
+     * and it can only be taken when nothing was dropped at all. */
+    if (dropped)
+        memmove(ix->delta, ix->delta + dropped,
+                (want - dropped) * sizeof(*ix->delta));
+    ix->ndelta = want - dropped;
 
     if (ix->ndelta > ZSI_DELTA_MAX) return zsi_index_flush_delta(ix, compar);
     return ZS_OK;
