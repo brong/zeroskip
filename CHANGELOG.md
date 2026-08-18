@@ -3,6 +3,15 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.4.0 — 2026-08-18
+
+- A **read-only handle now creates the `ZS_INDEX_LOCAL` cache directory** instead
+  of running without a cache when it is absent. It could always publish tables
+  into that directory, so refusing only the directory creation meant enabling the
+  flag on a read-mostly database did nothing until an unrelated write came along.
+  A read-only mount is unaffected — the creation fails and the handle continues
+  uncached. See P-2b and R-3.
+
 ## 2.3.0 — 2026-08-18
 
 - **The default pointer-table publish threshold now scales with the file** it

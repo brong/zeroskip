@@ -1624,10 +1624,18 @@ Opening is recovery; there is no separate pass.
   active file, no removal. There is no shared index inside the database for it
   to update (D-13c); `zeroskip.cache` (P-2b), when present, is outside the
   file set — nothing in it parses as a data file (D-2, P-3). Publishing a
-  pointer table (§8) is therefore not a write to the database, and a
-  read-only handle MAY publish into an existing cache directory — but MUST
-  NOT create `zeroskip.cache`, because creating a directory inside the
-  database is a visible side effect.
+  pointer table (§8) is therefore not a write to the database, and a read-only
+  handle MAY both publish into the cache directory and **create it** (P-2b).
+
+  Creating it used to be forbidden, on the grounds that a directory inside the
+  database is a visible side effect. That drew the line in the wrong place: a
+  read-only handle was already permitted to create *files* in that directory,
+  which is what makes the cache work for readers at all, so the rule refused only
+  the directory holding them. It also cost the case the cache exists for — a
+  read-mostly database with the flag set got no cache until an unrelated write
+  arrived, giving bimodal open latency with nothing to indicate which mode was in
+  effect. A read-only **mount** is still side-effect-free by construction: the
+  creation fails and the handle continues without a cache.
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
@@ -1679,10 +1687,10 @@ unreadable one.
   structural rather than a filename filter.
 - **P-2b** With A-8a's flag, the cache directory is `zeroskip.cache` inside
   the database directory, holding tables directly — it serves exactly one
-  database, so P-2a's uuid level would be redundant. Only a writable handle
-  creates it; a read-only handle uses it if present and is otherwise simply
-  without a cache, because creating a directory inside the database is a
-  visible side effect R-3 forbids. The cache then shares the database's
+  database, so P-2a's uuid level would be redundant. **Any** handle may create
+  it, including a read-only one (R-3): a handle that may publish tables into a
+  directory may create that directory, and the flag is opt-in, so the caller has
+  asked for it. The cache then shares the database's
   lifetime: deleting the database directory deletes its tables, which a
   shared root cannot offer — P-16's sweep runs only for databases that get
   opened, so a deleted database's tables under a shared root are nobody's to

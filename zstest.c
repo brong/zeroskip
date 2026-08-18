@@ -13525,47 +13525,109 @@ static void test_index_local_publishes(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
-/* P-2b/R-3: a read-only open never creates the directory -- creating anything
- * inside the database is a visible side effect -- but uses one if present. */
-static void test_index_local_readonly_creates_nothing(void)
+/* P-2b/R-3: a read-only open CREATES the local cache directory and publishes into
+ * it, and a read-only MOUNT still gets no cache.
+ *
+ * The two halves are the whole rule.  A handle that may create files in that
+ * directory -- which a read-only handle always could, since that is what makes
+ * the cache work for readers -- may create the directory holding them; refusing
+ * only the mkdir left a read-mostly database with the flag set uncached until some
+ * unrelated write arrived.  And R-3's actual concern, a database that must not be
+ * touched, is preserved by the filesystem rather than by a rule: an unwritable
+ * directory fails the creation and the handle continues without a cache.
+ *
+ * The second half is what makes this more than a flipped assertion.  Without it
+ * the change reads as "R-3 no longer applies", and the mount case is the one a
+ * forensic copy actually relies on. */
+static void test_index_local_readonly_creates_the_cache(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     char cache[PATH_MAX];
     struct stat sb;
 
-    /* Create the database with NO cache. */
+    /* Create the database with NO cache, so nothing has published yet. */
     setup.flags = ZS_CREATE;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-    ASSERT_OK(zs_db_store(db, "a", 1, "1", 1, 0));
-    ASSERT_OK(zs_db_close(&db));
-
-    /* Read-only with the flag: works, creates nothing, cache disabled. */
-    setup.flags = ZS_SHARED | ZS_INDEX_LOCAL;
-    setup.index_threshold = 1;
-    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-    ASSERT_NULL(db->index_dir);
-    {
-        const char *v = NULL;
-        size_t vl = 0;
-        ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    for (int i = 0; i < 40; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%03d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "value", 5, 0));
     }
     ASSERT_OK(zs_db_close(&db));
 
     snprintf(cache, sizeof(cache), "%s/%s", dbdir, ZSI_CACHE_DIR_NAME);
     ASSERT_EQ(stat(cache, &sb), -1);
 
-    /* A writable handle creates it; a read-only one then USES it. */
-    setup.flags = ZS_INDEX_LOCAL;
-    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-    ASSERT_OK(zs_db_store(db, "b", 1, "2", 1, 0));
-    ASSERT_OK(zs_db_close(&db));
-    ASSERT_EQ(stat(cache, &sb), 0);
-
+    /* A READ-ONLY handle with the flag: creates the directory, enables the cache,
+     * and publishes -- no writable open involved anywhere. */
     setup.flags = ZS_SHARED | ZS_INDEX_LOCAL;
+    setup.index_threshold = 1;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
     ASSERT_NOT_NULL(db->index_dir);
+    {
+        const char *v = NULL;
+        size_t vl = 0;
+        ASSERT_OK(zs_db_fetch(db, "k000", 4, NULL, NULL, &v, &vl, 0));
+    }
     ASSERT_OK(zs_db_close(&db));
+    ASSERT_EQ(stat(cache, &sb), 0);
+    ASSERT(S_ISDIR(sb.st_mode));
+
+    /* And a table really landed, so the read-only handle did the publishing. */
+    {
+        char cmd[PATH_MAX + 64];
+        snprintf(cmd, sizeof(cmd),
+                 "ls '%s' 2>/dev/null | grep -c '^zeroskip.index-'", cache);
+        FILE *fp = popen(cmd, "r");
+        int n = 0;
+        ASSERT_NOT_NULL(fp);
+        if (fscanf(fp, "%d", &n) != 1) n = 0;
+        pclose(fp);
+        ASSERT(n > 0);
+    }
+
+    /* R-3's real case: a directory that cannot be written gets no cache, and the
+     * open still succeeds.  Skipped for root, which ignores the mode bits. */
+    if (geteuid() != 0) {
+        char roding[PATH_MAX];
+        struct zs_open_data ro = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *rodb = NULL;
+
+        snprintf(roding, sizeof(roding), "%s/rodb", basedir);
+        {
+            /* Copy, then remove the cache the copy brought with it -- the subject
+             * is CREATING one -- and only then make the directory unwritable.
+             * The other order leaves a directory teardown cannot remove.
+             *
+             * Three commands rather than one, because gcc checks snprintf against
+             * the DECLARED bounds and four PATH_MAX substitutions in one buffer is
+             * a -Wformat-truncation error under -Werror, which Cyrus builds with. */
+            char cmd[PATH_MAX * 2 + 32];
+            snprintf(cmd, sizeof(cmd), "cp -R '%s' '%s'", dbdir, roding);
+            ASSERT_EQ(system(cmd), 0);
+            snprintf(cmd, sizeof(cmd), "rm -rf '%s/%s'", roding,
+                     ZSI_CACHE_DIR_NAME);
+            ASSERT_EQ(system(cmd), 0);
+            snprintf(cmd, sizeof(cmd), "chmod a-w '%s'", roding);
+            ASSERT_EQ(system(cmd), 0);
+        }
+        ro.flags = ZS_SHARED | ZS_INDEX_LOCAL;
+        ASSERT_OK(zs_db_open(roding, &ro, &rodb));
+        ASSERT_NULL(rodb->index_dir);           /* no cache, and no failure */
+        {
+            const char *v = NULL;
+            size_t vl = 0;
+            ASSERT_OK(zs_db_fetch(rodb, "k000", 4, NULL, NULL, &v, &vl, 0));
+        }
+        ASSERT_OK(zs_db_close(&rodb));
+        {
+            /* Writable again, or teardown's rm -rf leaves the temp tree behind. */
+            char cmd[PATH_MAX + 64];
+            snprintf(cmd, sizeof(cmd), "chmod u+w '%s'", roding);
+            if (system(cmd)) {}
+        }
+    }
 }
 
 /* A-8a: naming both locations is ambiguous, not a preference order. */
@@ -17732,8 +17794,8 @@ static struct test_entry tests[] = {
     { "test_idxcache_valid_upto_is_span_boundary",
                                         test_idxcache_valid_upto_is_span_boundary },
     { "test_index_local_publishes",     test_index_local_publishes },
-    { "test_index_local_readonly_creates_nothing",
-                                        test_index_local_readonly_creates_nothing },
+    { "test_index_local_readonly_creates_the_cache",
+                                        test_index_local_readonly_creates_the_cache },
     { "test_index_local_and_dir_is_badusage",
                                         test_index_local_and_dir_is_badusage },
     { "test_index_local_sweeps_foreign_uuid",

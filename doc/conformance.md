@@ -246,7 +246,7 @@ a spec label is missing here.
 | `P-1` | A pointer table covers exactly one **unordered** file, identified by | `idxcache_only_unordered_files` |
 | `P-2` | Tables live in a **cache root** named by the caller, or — when the | `idxcache_rejects_db_dir` |
 | `P-2a` | Under a configured root, the tables for a database live in the | `idxcache_threshold_defaults`, `corpus_index_table` |
-| `P-2b` | With A-8a's flag, the cache directory is `zeroskip.cache` inside | `index_local_publishes`, `index_local_readonly_creates_nothing`, `index_local_sweeps_foreign_uuid` |
+| `P-2b` | With A-8a's flag, the cache directory is `zeroskip.cache` inside | `index_local_publishes`, `index_local_readonly_creates_the_cache`, `index_local_sweeps_foreign_uuid` |
 | `P-3` | A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using | `idxcache_published_name` |
 | `P-4` | A table is published by writing a complete file under a staging name | `idxcache_publishes_by_rename` |
 | `P-5` | A table is a 96-byte header, then `nptrs` 8-byte little-endian record | `idxcache_header_byte_layout` |

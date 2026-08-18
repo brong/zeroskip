@@ -1041,10 +1041,13 @@ mutant "idx: sweeps live generations too" catch \
 mutant "cache: uuid subdirectory dropped" catch \
   's/        if \(\(size_t\)snprintf\(path, sizeof\(path\), "%s\/%s",\n                             setup->index_dir, uu\) < sizeof\(path\)\) \{/        if ((size_t)snprintf(path, sizeof(path), "%s", setup->index_dir) < sizeof(path)) {/'
 
-# P-2b/R-3.  A read-only handle creating a directory inside the database is a
-# visible side effect on a forensic copy or a read-only mount.
-mutant "cache: read-only handle creates zeroskip.cache" catch \
-  's/            if \(!db->readonly && mkdir\(path, 0700\) != 0 && errno != EEXIST\)/            if (mkdir(path, 0700) != 0 \&\& errno != EEXIST)/'
+# P-2b/R-3, the other way round since 2026-08-18: a read-only handle DOES create
+# it, because it was always allowed to publish tables into it and refusing only
+# the mkdir left a read-mostly database uncached until an unrelated write arrived.
+# R-3's real case is a directory that cannot be written, which the filesystem
+# enforces without a rule.
+mutant "cache: read-only handle creates nothing" catch \
+  's/            if \(mkdir\(path, 0700\) != 0 && errno != EEXIST\)/            if (db->readonly \|\| (mkdir(path, 0700) != 0 \&\& errno != EEXIST))/'
 
 # A-8a.  The two name different locations for the same tables; accepting both
 # silently picks one and hides the misconfiguration.

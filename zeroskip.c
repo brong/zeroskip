@@ -8973,11 +8973,28 @@ static int zsi_db_open(const char *dir, struct zs_open_data *setup,
                              dir, ZSI_CACHE_DIR_NAME) >= sizeof(path)) {
             db->index_local = false;
         } else {
-            /* P-2b/R-3: only a writable handle creates it.  A read-only
-             * handle uses it if present and is otherwise simply without a
-             * cache -- creating a directory inside the database is a visible
-             * side effect R-3 forbids. */
-            if (!db->readonly && mkdir(path, 0700) != 0 && errno != EEXIST)
+            /* P-2b/R-3: ANY handle creates it, a read-only one included, and the
+             * reason is that the alternative was inconsistent rather than safe.
+             * A read-only handle has always been allowed to PUBLISH a table into
+             * this directory -- that is what makes the cache work for readers at
+             * all -- so forbidding only the mkdir permitted creating files inside
+             * the database while refusing to create the directory holding them.
+             *
+             * What made it look principled is that R-3 is about the DATABASE, and
+             * nothing here is: no name in this directory parses as a data file
+             * (D-2, P-3), a table is self-validating and every failure means
+             * "replay instead" (P-11), so nothing in it can turn a readable
+             * database into an unreadable one.  And the caller asked: the cache is
+             * opt-in (A-8a).
+             *
+             * What it cost was the case that matters most.  Enabling the flag on a
+             * read-mostly database did nothing at all until some unrelated write
+             * happened to come along, so every read-only open silently replayed
+             * from the top -- bimodal open latency with no way to tell which mode
+             * you were in.  A read-only MOUNT still gets no cache: the mkdir fails
+             * and the handle continues without one, which is the case R-3's
+             * side-effect concern was really about. */
+            if (mkdir(path, 0700) != 0 && errno != EEXIST)
                 db->error("could not create the cache directory; continuing "
                           "without the index cache", "dir=<%s>", path);
             if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
