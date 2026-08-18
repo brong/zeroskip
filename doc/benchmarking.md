@@ -197,6 +197,42 @@ point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
 bounded half — at most `rollover_size` of work — and is what to reach for if the
 goal is only to stop readers replaying the active file.
 
+## Deferring the cascade does not move the cost, it removes most of it
+
+`ZS_NOAUTOREPACK` (A-14) plus a caller driving `zs_db_repack` on a schedule is
+"disarm and call", and it is worth measuring separately from "disarm and forget",
+which is the 103-file field pathology and is never the answer. 2M records at 1000
+per transaction, 100-byte values, laptop:
+
+| | load | maintenance | total | files | merge output |
+|---|---|---|---|---|---|
+| cascade armed (default) | 1.20s | — | 1.20s | 5 | 39 merges, 796 MB |
+| disarmed, never caught up | 0.69s | — | 0.69s | 118 | none |
+| disarmed, then `while (zs_db_should_repack(db)) zs_db_repack(db);` | 0.67s | 0.62s | 1.29s | **2** | **1 merge, 250 MB** |
+
+Conversions are identical in all three rows — 117 of them, 250 MB — because they
+are structural (D-5a) and no policy setting touches them.
+
+**The bytes are the point.** Merging once at the end rewrites 250 MB where the
+cascade rewrites 796 MB, because the geometric ladder re-merges the same bytes
+about three times on the way up: every intermediate output is written, then read
+back and written again by the next merge that absorbs it. Deferring skips the
+intermediates entirely, which is also why it ends with *fewer* files than the
+armed run rather than more.
+
+On a laptop the totals are close (1.29s against 1.20s), because a write into page
+cache is nearly free and the single big merge still costs its CPU. On a filesystem
+where writes are expensive the arithmetic is completely different: the downstream
+ZFS deployment measures 830 MB of merges at 3696 ms and `unlink` at 1.8 ms a call,
+so a third of the bytes and 152 fewer intermediate files to unlink is most of a
+34-38% reduction in bulk-load wall time.
+
+**What it costs is read latency during the window.** 118 files is D-14d's linear
+degradation in full effect, so this is a shape for a load with no concurrent
+readers, or a maintenance window, and not a permanent mode. And the catch-up has
+to actually be driven: `zs_db_should_repack` is the predicate, and a caller that
+disarms without scheduling it is choosing the pathology A-14's note describes.
+
 ## The machines these numbers came from
 
 An ops/sec figure means little without one, and the two used here differ by
