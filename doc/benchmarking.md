@@ -197,6 +197,33 @@ point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
 bounded half — at most `rollover_size` of work — and is what to reach for if the
 goal is only to stop readers replaying the active file.
 
+## What an idle unordered file costs, and what D-9d already saves you
+
+A database written and then left alone keeps its spans: nothing below
+`rollover_size` and `rollover_txns` triggers a rollover, so every reader replays
+them at every open, forever. This prices that against the same data after
+`zs_db_seal`, which is the one action that fixes it. Open plus first read, best of
+15, one store per transaction:
+
+| spans | unsealed | sealed | ratio | one seal | pays back after |
+|---|---|---|---|---|---|
+| 100 | 0.051 ms | 0.045 ms | 1.1x | 0.35 ms | 59 opens |
+| 1 000 | 0.111 ms | 0.046 ms | 2.4x | 0.47 ms | 7 opens |
+| 10 000 | 0.825 ms | 0.052 ms | **15.9x** | 1.71 ms | 2 opens |
+| 50 000 | 4.446 ms | 0.084 ms | **52.9x** | 8.49 ms | 2 opens |
+
+**The bottom two rows need `rollover_txns` disabled to produce**, which is how they
+were built here. D-9d's default bound is 1024 spans and D-25d seals at the commit
+that crosses it, so a database left alone under stock settings holds at most 1023
+spans and sits on the second row. That is the number to reason from: **2.4x on
+open, recovered by a seal that pays for itself in seven opens.**
+
+Two things follow. The dramatic ratios are an argument for D-9d existing, not for
+anything new — they are what the span bound already prevents. And a caller who
+opens far more often than it writes can have most of the rest by *lowering*
+`rollover_txns`, which costs a generation more often; the knob is already there and
+needs no policy to interpret it.
+
 ## Deferring the cascade does not move the cost, it removes most of it
 
 `ZS_NOAUTOREPACK` (A-14) plus a caller driving `zs_db_repack` on a schedule is
