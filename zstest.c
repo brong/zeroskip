@@ -17098,40 +17098,106 @@ static void test_index_cur_reverse_base_delta(void)
  * ROLLBACK terminator is the only thing keeping a later commit's span from
  * enclosing them.  Both ways of getting it wrong are fatal: no terminator
  * corrupts or resurrects, a COMMIT terminator resurrects outright. */
-static void test_stream_abort_writes_rollback(void)
+/* C-8b: an abort whose span never left the buffer writes NOTHING -- the file is
+ * byte-identical to what it was before the transaction began.
+ *
+ * The size check is what makes this more than a repeat of test_write_abort: the
+ * records being invisible was already true when a ROLLBACK was appended, so only
+ * the byte count tells the two behaviours apart. */
+static void test_stream_abort_discards_unflushed_span(void)
 {
     struct zs_db *db = NULL;
     struct zs_txn *txn = NULL;
     const char *v = NULL;
     size_t vl = 0;
+    char name[ZSI_NAME_MAX];
+    long before, after;
 
     db = open_db(ZS_CREATE);
     ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "first", 5, "1", 1, 0));
+
+    zsi_name_current(name, db->uuid);
+    before = filesize(name);
+    ASSERT(before > 0);
 
     ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
     ASSERT_OK(zs_txn_store(txn, "dead1", 5, "x", 1, 0));
     ASSERT_OK(zs_txn_store(txn, "dead2", 5, "y", 1, 0));
     ASSERT_OK(zs_txn_abort(&txn));
 
-    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0),
-              ZS_NOTFOUND);
+    after = filesize(name);
+    ASSERT_EQ(after, before);           /* not one byte, not a ROLLBACK */
 
-    /* A later commit into the same file: its span begins after the rolled-
-     * back one and must not disturb or be disturbed by it. */
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* A later commit into the same file: it starts exactly where the aborted
+     * span would have, and nothing enclosed anything (F-21). */
     ASSERT_OK(zs_db_store(db, "live", 4, "z", 1, 0));
     ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
-    ASSERT_EQ(zs_db_fetch(db, "dead2", 5, NULL, NULL, &v, &vl, 0),
-              ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_fetch(db, "dead2", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     ASSERT_OK(zs_db_check_consistency(db));
     ASSERT_OK(zs_db_close(&db));
 
-    /* And through a fresh replay (F-25 skipping the ROLLBACK span). */
     db = open_db(0);
     ASSERT_NOT_NULL(db);
     ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "z", 1);
-    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0),
-              ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* The other half of C-8b: once the span HAS reached the file, the ROLLBACK is
+ * mandatory again (F-21), because a later commit's span would otherwise enclose
+ * the aborted records and make them live.
+ *
+ * The flush is forced by reading a record back WITHOUT ZS_EPHEMERAL: that needs a
+ * stable mapping, so zsi_txn_at flushes the chunk (A-4 versus A-4b).  Cheaper and
+ * more precise than storing enough bytes to overflow ZSI_TXN_CHUNK, which since
+ * the buffer grows would now mean megabytes. */
+static void test_stream_abort_rollback_when_flushed(void)
+{
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+    char name[ZSI_NAME_MAX];
+    long before, after;
+
+    db = open_db(ZS_CREATE);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "first", 5, "1", 1, 0));
+
+    zsi_name_current(name, db->uuid);
+    before = filesize(name);
+    ASSERT(before > 0);
+
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    ASSERT_OK(zs_txn_store(txn, "dead1", 5, "x", 1, 0));
+    /* No ZS_EPHEMERAL: this is the flush. */
+    ASSERT_OK(zs_txn_fetch(txn, "dead1", 5, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "x", 1);
+    ASSERT_OK(zs_txn_store(txn, "dead2", 5, "y", 1, 0));
+    ASSERT_OK(zs_txn_abort(&txn));
+
+    /* The span is in the file, so it must be terminated. */
+    after = filesize(name);
+    ASSERT(after > before);
+
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_store(db, "live", 4, "z", 1, 0));
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And through a fresh replay: the ROLLBACK is what keeps the aborted
+     * records void and the later commit visible (F-25). */
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "live", 4, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "z", 1);
+    ASSERT_EQ(zs_db_fetch(db, "dead1", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_fetch(db, "dead2", 5, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     ASSERT_OK(zs_db_check_consistency(db));
     ASSERT_OK(zs_db_close(&db));
 }
@@ -18012,8 +18078,10 @@ static struct test_entry tests[] = {
     { "test_txn_insert_select_self",    test_txn_insert_select_self },
     { "test_index_cur_reverse_base_delta",
                                         test_index_cur_reverse_base_delta },
-    { "test_stream_abort_writes_rollback",
-                                        test_stream_abort_writes_rollback },
+    { "test_stream_abort_discards_unflushed_span",
+                                  test_stream_abort_discards_unflushed_span },
+    { "test_stream_abort_rollback_when_flushed",
+                                  test_stream_abort_rollback_when_flushed },
     { "test_stream_bounded_memory",     test_stream_bounded_memory },
     { "test_txn_fetch_survives_overwrite",
                                         test_txn_fetch_survives_overwrite },

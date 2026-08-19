@@ -160,20 +160,39 @@ fi
 # ---------------------------------------------------------------------------
 # 3a. rolled-back-span: an aborted transaction between two commits (C-8, F-25).
 # ---------------------------------------------------------------------------
-# Only a streaming writer generates this natively -- the records were on disk
-# before the abort, and the ROLLBACK terminator is what voids them.  A peer
-# validates READING it: the middle span's keys must be invisible while the
-# spans on either side stay live, which is exactly F-25's per-span visibility.
+# INJECTED, not aborted, and the reason is C-8b.  A writer whose aborted span
+# never left its buffer writes nothing -- there is no record in the file to void
+# -- so whether an abort leaves a rolled-back span depends on the writer's buffer
+# size, and no conforming writer can be required to produce one.  Aborting a
+# two-record transaction here would compare our buffering against a peer's rather
+# than the format, and would produce nothing at all on this implementation since
+# ZSI_TXN_CHUNK grew.
+#
+# What is normative is the READER's side, which is what the case tests: the middle
+# span's keys must be invisible while the spans on either side stay live, which is
+# exactly F-25's per-span visibility.  The bytes below are one such span -- two
+# records and a ROLLBACK terminator, engine 1 -- and every implementation's driver
+# reproduces them through `op garbage`.
+ROLLED_BACK_SPAN=0101020062003032000000004cfa0bf8010102006300303300000000d1c95fe612200000c1ab777a
 begin_case rolled-back-span
 if [ "$SKIP" -eq 0 ]; then
-    hdr "A rolled-back span sitting between two committed ones (C-8, F-25)." 1
+    hdr "A rolled-back span sitting between two committed ones (C-8, F-25).
+#
+# The span is INJECTED as raw bytes rather than produced by aborting a
+# transaction.  Since C-8b a writer whose aborted span never left its buffer
+# writes nothing -- no record reached the file, so there is nothing to void --
+# and whether an abort leaves a rolled-back span on disk therefore depends on
+# the writer's buffer size.  No conforming writer can be required to produce
+# one, so a case that aborted a two-record transaction would be comparing this
+# implementation's buffering against a peer's rather than comparing the format.
+#
+# What IS normative is the reader's side, and it is what this case tests: a
+# rolled-back span may sit between two committed ones (F-25) and its records
+# are void (F-21)." 1
     TOOL "$DB" create --uuid "$UUID"
     TOOL "$DB" store 61 3031; emit "op store 61 3031"
-    emit "op batch"
-    emit "store 62 3032"
-    emit "store 63 3033"
-    emit "abort"
-    printf 'store 62 3032\nstore 63 3033\nabort\n' | TOOL "$DB" batch
+    printf "$(echo "$ROLLED_BACK_SPAN" | sed 's/../\\x&/g')" >> "$DB/$(newest_file "$DB")"
+    emit "op garbage $ROLLED_BACK_SPAN"
     TOOL "$DB" store 64 3034; emit "op store 64 3034"
     finish_case
 fi

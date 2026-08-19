@@ -6401,7 +6401,19 @@ static int zsi_txn_flush(struct zs_txn *txn)
 {
     if (!txn->chunklen) return ZS_OK;
     int r = zsi_write_all(txn->wfd, txn->chunk, txn->chunklen);
-    if (r != ZS_OK) return r;
+    if (r != ZS_OK) {
+        /* A partial write leaves bytes in the file that `flushed` does not
+         * count, so from here on nothing may reason from `flushed` about what
+         * the file holds.  POISON the span: commit must refuse (C-8), and
+         * C-8b's discard must not conclude the span never reached the file.
+         *
+         * Set here rather than at the call sites because there are three, and
+         * the one that read a record (zsi_txn_at) used to drop this on the
+         * floor -- it returns NULL on a failed flush and left the transaction
+         * committable over a possibly-torn span. */
+        txn->broken = true;
+        return r;
+    }
     txn->flushed += txn->chunklen;
     txn->chunklen = 0;
     return ZS_OK;
@@ -6991,6 +7003,43 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
      * rolled-back span completes the file early (F-24) and costs everything
      * after it. */
     bool in_chunk = (txn->flushed == txn->span_base);
+
+    /* C-8b: an abort whose span NEVER REACHED THE FILE writes nothing at all.
+     *
+     * F-21 needs a ROLLBACK to stop a later commit's span enclosing the aborted
+     * records and making them live.  If no byte of the span left the buffer there
+     * are no such records: the file is byte-identical to what it was before the
+     * transaction began, and the next span starts exactly where this one would
+     * have.  So there is nothing to void, and the cheapest correct ROLLBACK is
+     * the one never written.
+     *
+     * Three things make `in_chunk` mean what it has to mean here.  The writer
+     * holds the write lock for the transaction's whole life, so nobody else
+     * appended.  Every byte of the span goes through the buffer, so `flushed ==
+     * span_base` really does say none of it was written.  And a FAILED flush
+     * poisons the transaction, so `broken` covers the one case where bytes could
+     * be in the file without `flushed` counting them.
+     *
+     * That third check is NOT what keeps the data safe, and the mutants for it are
+     * `equivalent` because of it: a file left with orphan bytes is unclean, so the
+     * next write transaction's C-4i probe rebuilds, sees the last valid span below
+     * them and rolls over to a new generation (D-9a, R-4) instead of appending
+     * past bytes its own size no longer describes.  The check is here so the
+     * discard's precondition is one the writer can actually establish rather than
+     * one the backstop happens to rescue -- `test_torn_flush_then_abort` is the
+     * case, and it passes either way, which is the point.
+     *
+     * The interop consequence is in C-8b: a rolled-back span is no longer
+     * something a conforming writer can be required to produce, because whether
+     * one appears depends on the writer's buffering. */
+    if (rollback && in_chunk && !txn->broken) {
+        txn->chunklen = 0;
+        txn->wsize = txn->span_base;
+        if (term_off_out) *term_off_out = txn->span_base;
+        if (term_csum_out) *term_csum_out = 0;
+        return ZS_OK;
+    }
+
     const char *span;
     if (in_chunk) {
         span = txn->chunk;                  /* chunklen == spanlen here */

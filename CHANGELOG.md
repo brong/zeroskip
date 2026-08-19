@@ -3,6 +3,23 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.7.0 — 2026-08-19
+
+- **An abort whose records never left the writer's buffer now writes nothing at
+  all** — no records, no `ROLLBACK`. With nothing in the file there is nothing for
+  a `ROLLBACK` to void, so probe-then-abort callers stop paying a write and stop
+  leaving dead bytes in the active file. See C-8b.
+
+- Consequence for anyone comparing bytes across implementations: **a rolled-back
+  span is no longer something a conforming writer can be required to produce**,
+  since whether one appears depends on how much the writer buffers. Reading them
+  is unchanged and still mandatory (F-21, F-25). `tests/corpus/rolled-back-span`
+  now injects the span rather than aborting a transaction; no golden byte changed.
+
+- Fixes a latent bug found while doing the above: a failed buffer flush during a
+  read inside a transaction (`zsi_txn_at`) left the transaction committable over a
+  possibly-torn span. A failed flush now poisons the span, so commit refuses.
+
 ## 2.6.0 — 2026-08-18
 
 - **A commit now syncs once, not twice.** The sync between a span's records and

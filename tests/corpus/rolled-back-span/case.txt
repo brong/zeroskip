@@ -1,13 +1,22 @@
 # A rolled-back span sitting between two committed ones (C-8, F-25).
+#
+# The span is INJECTED as raw bytes rather than produced by aborting a
+# transaction.  Since C-8b a writer whose aborted span never left its buffer
+# writes nothing -- no record reached the file, so there is nothing to void --
+# and whether an abort leaves a rolled-back span on disk therefore depends on
+# the writer's buffer size.  No conforming writer can be required to produce
+# one, so a case that aborted a two-record transaction would be comparing this
+# implementation's buffering against a peer's rather than comparing the format.
+#
+# What IS normative is the reader's side, and it is what this case tests: a
+# rolled-back span may sit between two committed ones (F-25) and its records
+# are void (F-21).
 uuid 4941da54-9406-4faa-a457-c4b65beae3eb
 engine 1
 comparator memcmp
 
 op store 61 3031
-op batch
-store 62 3032
-store 63 3033
-abort
+op garbage 0101020062003032000000004cfa0bf8010102006300303300000000d1c95fe612200000c1ab777a
 op store 64 3034
 
 expect files

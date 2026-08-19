@@ -76,6 +76,13 @@ static void quiet_error(const char *msg, const char *fmt, ...)
 static long call_count;         /* syscalls seen so far */
 static long crash_at;           /* _exit when call_count reaches this; -1 = never */
 static long fail_sync_at;       /* make the Nth fdatasync fail; -1 = never */
+/* Tear the Nth write: write half its bytes and report half, then fail the NEXT
+ * write outright.  That is a partial write followed by a failure, which is the
+ * one state in which `flushed` stops describing what the file holds -- and so
+ * the state C-8b's discard must refuse to reason from. */
+static long tear_write_at;
+static long write_calls;
+static bool torn_yet;
 static long sync_calls;         /* fdatasyncs seen */
 /* Syncs attempted after one failed, WITHIN the same library call.
  *
@@ -102,6 +109,12 @@ static void tick(void)
 static ssize_t hook_write(int fd, const void *buf, size_t n)
 {
     tick();
+    write_calls++;
+    if (tear_write_at >= 0 && write_calls == tear_write_at && n > 1) {
+        torn_yet = true;
+        return write(fd, buf, n / 2);          /* short: write_all loops */
+    }
+    if (torn_yet) { errno = EIO; return -1; }  /* ... and the loop's next call fails */
     return write(fd, buf, n);
 }
 
@@ -158,6 +171,9 @@ static void hooks_reset(void)
     call_count = 0;
     crash_at = -1;
     fail_sync_at = -1;
+    tear_write_at = -1;
+    write_calls = 0;
+    torn_yet = false;
     sync_calls = 0;
     syncs_after_failure = 0;
     a_sync_failed = false;
@@ -653,6 +669,72 @@ static void test_txn_buffer_grows_to_one_write(void)
 
     passed++;
     fprintf(stderr, "  a grown buffer commits in one write       ok\n");
+}
+
+static void test_torn_flush_then_abort(void)
+{
+    /* The one state C-8b's discard must refuse to reason from: a flush that wrote
+     * SOME bytes and then failed.  `flushed` did not advance, so the transaction's
+     * own accounting says the span never reached the file -- while it partly did.
+     *
+     * What this asserts is that an acknowledged commit either side of it survives.
+     * The mechanism that delivers that is NOT C-8b's poison check: the next write
+     * transaction's C-4i probe sees the file has grown, rebuilds, finds the last
+     * valid span below the orphan bytes, judges the file UNCLEAN and rolls over to
+     * a new generation (D-9a, R-4).  The poison check keeps the discard's stated
+     * precondition honest -- it stops the writer concluding "nothing was written"
+     * from an accounting value it cannot trust -- but the rollover is the backstop,
+     * which is why the two mutants aiming at the check are `equivalent`.
+     *
+     * Nothing tested this path before, in either direction. */
+    struct zs_db *db;
+    struct zs_txn *txn = NULL;
+    const char *v = NULL;
+    size_t vl = 0;
+    char state[512];
+
+    total++;
+
+    fresh_dir();
+    hooks_reset();
+    hooks_on();
+
+    db = open_db(ZS_CREATE);
+    CHECK(db != NULL, "open failed");
+    CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
+
+    /* Store, then read it back WITHOUT ZS_EPHEMERAL, which forces the flush --
+     * and tear that flush's write. */
+    CHECK(zs_db_begin_txn(db, 0, &txn) == ZS_OK, "begin");
+    CHECK(zs_txn_store(txn, "torn", 4, "xyz", 3, 0) == ZS_OK, "store");
+    tear_write_at = write_calls + 1;
+    (void)zs_txn_fetch(txn, "torn", 4, NULL, NULL, &v, &vl, 0);
+    tear_write_at = -1;
+    torn_yet = false;
+
+    CHECK(zs_txn_abort(&txn) == ZS_OK, "abort");
+
+    /* A later commit must land somewhere safe and must not be lost. */
+    CHECK(zs_db_store(db, "after", 5, "3", 1, 0) == ZS_OK, "later store");
+    zs_db_close(&db);
+    hooks_reset();
+
+    CHECK(read_state(state, sizeof(state)), "reopen after a torn flush");
+    CHECK(strstr(state, "before=1") != NULL,
+          "the earlier commit was lost: '%s'", state);
+    CHECK(strstr(state, "after=3") != NULL,
+          "the later commit was lost: '%s'", state);
+    CHECK(strstr(state, "torn") == NULL,
+          "the aborted record is visible: '%s'", state);
+
+    /* And a writer can still continue. */
+    db = open_db(0);
+    CHECK(db != NULL, "cannot reopen");
+    CHECK(zs_db_store(db, "more", 4, "4", 1, 0) == ZS_OK, "cannot continue");
+    zs_db_close(&db);
+
+    passed++;
+    fprintf(stderr, "  a torn flush then an abort (C-8b)        ok\n");
 }
 
 static void test_sync_failure_gate(void)
@@ -1224,6 +1306,7 @@ int main(int argc, char **argv)
         { "dirsync_justifies_c6",           test_dirsync_justifies_c6 },
         { "commit_has_one_gate",            test_commit_has_one_gate },
         { "txn_buffer_grows",               test_txn_buffer_grows_to_one_write },
+        { "torn_flush_then_abort",          test_torn_flush_then_abort },
         { "sync_failure_gate",              test_sync_failure_gate },
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },

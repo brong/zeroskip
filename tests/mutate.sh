@@ -1124,6 +1124,30 @@ mutant "commit: seal threshold inverted" catch \
 mutant "commit: publishes a table" catch \
   's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
 
+# C-8b: an abort whose span never reached the file writes nothing.  This mutant is
+# the old behaviour -- always append a ROLLBACK -- which is CORRECT but writes
+# bytes nobody needs, so only a size assertion can see it.
+mutant "abort: writes a ROLLBACK for an unflushed span" catch \
+  's/    if \(rollback && in_chunk && !txn->broken\) \{/    if (false) {/'
+
+# equivalent, and the investigation is the point.  Both of these drop C-8b's
+# poison check, so an abort after a PARTIAL write failure discards a span that
+# partly reached the file, leaving orphan bytes with no terminator.  I expected
+# both to be caught and wrote test_torn_flush_then_abort to catch them; it passes
+# either way, because a file in that state is UNCLEAN, so the next write
+# transaction's C-4i probe rebuilds, finds the last valid span below the orphan
+# bytes and rolls over to a new generation (D-9a, R-4) rather than appending past
+# bytes its own size no longer describes.  So the data is safe by the backstop and
+# the check is what keeps the discard's precondition establishable rather than
+# rescued.  Listed as equivalent so nobody writes a third test chasing them --
+# and NOT deleted, because an implementation without that rollover would lose the
+# later commit, which is why C-8b states the MUST NOT.
+mutant "abort: discards even when a flush failed" equivalent \
+  's/    if \(rollback && in_chunk && !txn->broken\) \{/    if (rollback \&\& in_chunk) {/'
+
+mutant "flush: a failed write does not poison the span" equivalent \
+  's/        txn->broken = true;\n        return r;\n    \}\n    txn->flushed \+= txn->chunklen;/        return r;\n    }\n    txn->flushed += txn->chunklen;/'
+
 # C-8's buffer grows instead of flushing, so a span over the initial chunk still
 # commits in one write.  Flushing instead is the old behaviour and costs a write
 # per overflow -- invisible to every data assertion, since the bytes are
