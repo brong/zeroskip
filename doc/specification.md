@@ -465,9 +465,10 @@ long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
   enclose the aborted records and make them live.
 - **F-22** Because the checksum covers the span **and** the terminator, a
   terminator that reaches disk without its data fails validation and reads as
-  absent. A torn tail is therefore always detectable, which recovery (F-24) and
-  concurrent reading (C-4f) both depend on. Durability is separate, and requires
-  the two gates of C-7.
+  absent. A torn tail is therefore always detectable, which recovery (F-24),
+  concurrent reading (C-4f) and the single gate of C-7 all depend on — C-7 orders
+  nothing within a commit, so detection is the whole of what makes a partial one
+  safe. Durability is separate, and is what the gate provides.
 
 ### 4.8 The span chain
 
@@ -1564,33 +1565,47 @@ any point.
   data's only complete copy. An output-sync failure fails the conversion or
   repack; a directory-sync failure is reported and tolerated (C-6), because a
   lost name merely un-happens a publication the inputs still cover.
-- **C-7 Two gates per commit.** Under default durability a commit is:
+- **C-7 One gate per commit.** Under default durability a commit is:
 
-  1. append the span's data records, then **`fdatasync`**;
-  2. append the terminator, then **`fdatasync`** again.
+  1. append the span's data records and then the terminator — in one write where
+     the implementation can, since nothing orders them;
+  2. **`fdatasync`**.
 
   `fdatasync` rather than `fsync` because appending changes only the metadata
   needed to read the data back, which `fdatasync` is required to flush.
-- **C-7a** Together the gates make "a valid terminator implies its data is
-  durable" a guarantee of the filesystem. Handling for each failure:
 
-  | Failure | State | Required behaviour |
-  |---|---|---|
-  | gate 1 fails | no terminator was written | report the error; the transaction did not happen |
-  | gate 2 fails | terminator may or may not be durable | either outcome is correct, so report the error and do nothing else |
+  This was two gates until 2026-08-18 — a sync between the records and the
+  terminator, and a second after it — so that a valid terminator implied durable
+  data. F-22 already implies it a different way: the terminator's checksum covers
+  the span, so a terminator that reaches disk without its data fails validation
+  and the span reads as absent. Ordering the writes made that class of event
+  impossible rather than merely detectable, at the cost of a second sync on every
+  commit; detecting it is enough, and the second sync was measured at **+81% on
+  one-record transactions** and +11% at a thousand (§ `doc/benchmarking.md`).
+- **C-7a** A commit that reports an error MUST be treated as having an **unknown**
+  outcome: the terminator may or may not be durable, and either way the database
+  is correct — a valid terminator means the commit is visible with durable data,
+  and an invalid one means the span reads as absent. An implementation reports the
+  error and does nothing else.
 
-  An implementation MUST NOT retry a failed sync and treat success as evidence the
-  data survived: a second call can succeed after the dirty pages were discarded.
-- **C-7b** The cost is two syncs per commit rather than one. It is paid per
-  *transaction*, not per record, so a caller that batches many operations into one
-  transaction amortises it — which is the reason `zs_txn_*` exists alongside the
-  single-operation `zs_db_*` calls.
-- **C-7c** `ZS_NOSYNC` omits **both** gates — and nothing else. The structural
+  In particular an implementation MUST NOT retry a failed sync and treat success as
+  evidence the data survived: a second call can succeed after the dirty pages were
+  discarded.
+
+  Under the two-gate protocol a first-gate failure additionally guaranteed the
+  transaction had *not* happened, since no terminator had been written yet. That
+  guarantee is not recoverable under C-7 and was never observable through this
+  API: both gates reported the same error, so a caller could not tell which had
+  failed and had to treat the outcome as unknown regardless.
+- **C-7b** The cost is one sync per commit. It is paid per *transaction*, not per
+  record, so a caller that batches many operations into one transaction amortises
+  it — which is the reason `zs_txn_*` exists alongside the single-operation
+  `zs_db_*` calls.
+- **C-7c** `ZS_NOSYNC` omits the gate — and nothing else. The structural
   syncs stay in every mode: C-6's directory syncs and C-6b's output syncs are
-  integrity, and only the two per-commit gates were ever durability. Atomicity
-  survives, because a torn tail is still detectable (F-22); C-7a's ordering
-  guarantee does not — a valid terminator no longer implies durable data — and
-  per-commit durability becomes the caller's affair (`zs_db_sync` is the
+  integrity, and only the per-commit gate was ever durability. Atomicity
+  survives, because a torn tail is still detectable (F-22); per-commit
+  durability becomes the caller's affair (`zs_db_sync` is the
   on-demand gate). What a crash leaves is a valid **prefix** of the active
   generation, possibly empty, on top of every generation a conversion or
   repack already published: the loss bound is the active file's unconverted
@@ -1599,17 +1614,21 @@ any point.
   publish a torn in-order file and entitle the retirement of the inputs that
   were its records' only complete copy (C-6b), so a crash would cost converted
   generations, which no caller asking to skip *commit* syncs agreed to.
-- **C-8** An aborted transaction appends a `ROLLBACK` and syncs **neither** gate.
+- **C-8** An aborted transaction appends a `ROLLBACK` and does **not** sync.
   If a crash loses it, the active file is simply no longer clean, so the next
   writer moves to a new file (D-9) and reaches the same state. Nothing is being
   promised to a caller, so there is nothing to make durable.
-- **C-8a** The unsynced `ROLLBACK` is still **ordered** ahead of any later
-  commit, without costing a sync of its own: F-21 needs the `ROLLBACK` on disk
-  before the next `COMMIT` terminator, and the next commit's first gate — the
-  fdatasync before its own terminator (C-7) — flushes everything before it,
-  the `ROLLBACK` included. A writer that streams records as they are stored
-  therefore aborts for free, and a crash that loses the tail leaves a torn
-  span F-22 already discards.
+- **C-8a** The unsynced `ROLLBACK` costs no sync of its own and still cannot
+  strand a later commit. F-21 needs the `ROLLBACK` on disk before the next
+  `COMMIT` terminator is *believed*, and the next commit's gate (C-7) flushes
+  everything before it, the `ROLLBACK` included — so any commit whose sync
+  returned has both. The gate no longer *orders* them, since it now follows the
+  terminator, and it does not need to: if a crash leaves the `COMMIT` durable and
+  the `ROLLBACK` not, replay scanning forward (F-20) from the aborted span finds
+  a terminator whose `spanlen` does not reach it, so the span fails validation and
+  the file completes there (F-24). Both spans are discarded, which is correct —
+  that commit's sync never returned, so nothing was acknowledged. A writer that
+  streams records as they are stored therefore aborts for free.
 
 ## 7. Open and recovery
 
@@ -2540,13 +2559,13 @@ still written (D-22).
 
 **T-8 Crash injection.** A test build interposes `write`, `fdatasync`, `rename`
 and `unlink`, counts calls, and aborts at call *N* for every *N* over a scripted
-workload. Both durability gates are therefore crash points in their own right
-(C-7), including the window between them — the state a single-gate design could
-not distinguish. Each case asserts reopen terminates within a timeout, exactly a
-prefix of committed transactions is visible, nothing acknowledged is lost under
-default durability, and a writer can then continue. Targeted: crash between the
-records and the first gate; between the two gates; after the terminator but
-before the second gate; mid-publish rename;
+workload. The durability gate is therefore a crash point in its own right (C-7),
+as is the window between the terminator and it — the state that makes F-22's
+detection load-bearing rather than belt-and-braces. Each case asserts reopen
+terminates within a timeout, exactly a prefix of committed transactions is
+visible, nothing acknowledged is lost under default durability, and a writer can
+then continue. Targeted: crash between the records and the terminator; between
+the terminator and the gate; mid-publish rename;
 mid-repack; after the pointer section but before the trailer; leaving a non-8-aligned file
 length; and after an invalid terminator, asserting the writer moves to a new
 generation rather than appending (R-4, D-9). Both durability modes. Separately,
@@ -2554,13 +2573,13 @@ with directory syncs suppressed, that a crash can lose a *name* — the test tha
 justifies C-6.
 
 **T-8a Sync failure.** The case C-7a exists for, which no crash test reaches:
-`fdatasync` made to fail. On gate 1 failing, assert no terminator was written and
-the error reached the caller, so the transaction plainly did not happen. On gate 2
-failing, assert the database is correct whichever way the terminator landed —
-either the commit is visible with durable data, or the span reads as absent — and
-in particular that the implementation does **not** retry the sync and treat
-success as proof the data survived, since a second `fdatasync` can succeed after
-the dirty pages have already been discarded.
+`fdatasync` made to fail. Assert the error reached the caller, and that the
+database is correct whichever way the terminator landed — either the commit is
+visible with durable data, or the span reads as absent — and in particular that
+the implementation does **not** retry the sync and treat success as proof the
+data survived, since a second `fdatasync` can succeed after the dirty pages have
+already been discarded. Assert also that a writer can continue afterwards, since
+an unknown outcome must not be a wedged database.
 
 **T-9 File set discovery.** That the set and every range are derived from
 filenames alone, without opening a file. Overlap resolution (D-5) driven by a

@@ -222,12 +222,12 @@ a spec label is missing here.
 | `C-6` | Directory durability. After creating a **data file** (a new active | `crash/dirsync_justifies_c6` |
 | `C-6a` | A directory sync is **not** required after `unlink`. If a removed name | `crash/dirsync_justifies_c6` |
 | `C-6b` | Output durability. A conversion or repack output MUST be | `crash/nosync_structural_syncs`, `crash/sync_failure_every_point` |
-| `C-7` | Two gates per commit. Under default durability a commit is: | `crash/crash_at_every_call`, `mp_reader_sees_torn_span`, `zsbench` |
-| `C-7a` | Together the gates make "a valid terminator implies its data is | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
-| `C-7b` | The cost is two syncs per commit rather than one. It is paid per | `zsbench (store, N per txn)` |
-| `C-7c` | `ZS_NOSYNC` omits **both** gates — and nothing else. The structural | `crash/crash_nosync_mode`, `crash/nosync_structural_syncs` |
-| `C-8` | An aborted transaction appends a `ROLLBACK` and syncs **neither** gate. | `write_abort`, `stream_abort_writes_rollback` |
-| `C-8a` | The unsynced `ROLLBACK` is still **ordered** ahead of any later | `stream_abort_writes_rollback`, `crash/sync_failure_gate1` |
+| `C-7` | One gate per commit. Under default durability a commit is: | `crash/crash_at_every_call`, `mp_reader_sees_torn_span`, `zsbench` |
+| `C-7a` | A commit that reports an error MUST be treated as having an | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
+| `C-7b` | The cost is one sync per commit. It is paid per | `zsbench (store, N per txn)` |
+| `C-7c` | `ZS_NOSYNC` omits the gate — and nothing else. The structural | `crash/crash_nosync_mode`, `crash/nosync_structural_syncs` |
+| `C-8` | An aborted transaction appends a `ROLLBACK` and does **not** sync. | `write_abort`, `stream_abort_writes_rollback` |
+| `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_writes_rollback`, `crash/sync_failure_gate1` |
 
 ## Open and recovery (`R-n`)
 
