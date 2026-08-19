@@ -353,44 +353,92 @@ the first open, where publishing during the import only overtakes it past roughl
 
 ## Why zeroskip beats a btree at small transactions and loses at large ones on ZFS
 
-From the downstream engine, same 2M-record load, and it explains the whole shape of
-their matrix rather than one row of it:
+From the downstream engine, same 2M-record load. **This section has been wrong
+twice, in the same way both times**, so read the warning before the numbers.
 
 | | zeroskip | stock SQLite btree |
 |---|---|---|
 | syscalls per commit | 9 | 33 |
+| `fdatasync` per commit | 1 | 4 |
 | `unlink` | 41 in a whole run | one per commit (its journal) |
-| `fdatasync` wall, 111-byte span | 86 µs | ~20 µs |
-| `fdatasync` wall, 111 KB span | **420 µs** | ~20 µs |
-| of which CPU | 14% at 111 B, **74%** at 111 KB | — |
+| `fdatasync` wall, 111-byte span | 86 µs | — |
+| `fdatasync` wall, 111 KB span | 420 µs | — |
+| µs per synced KB, wall | 3.74 | 2.82 |
+| cost per `fdatasync` vs the btree | 3.95x cheaper at 1 rec/txn → 1.30x at 1000 | — |
 
-**Read the wall column, and beware where these numbers come from.** An earlier
-version of this table quoted 11.8 µs and 302 µs for those two syncs, from
-`strace -c`, which summarises **system** time unless you pass `-w`. A blocking
-`fdatasync` sleeps, and sleeping is not system time, so a 86 µs gate was being
-reported as a 12 µs one. The wall figures above come from paired
-durable/`ZS_NOSYNC` rows instead, which are wall time by construction: 98.0 − 12.3
-= 85.7 µs, and (182.3 − 12.3)/2 = 85.0 µs from the same load under the old
-two-gate protocol. One 86 µs gate then predicts all four transaction sizes and both
-ZFS recordsizes to within 30%.
+**Two retracted mechanisms, and the pattern is the lesson.** The first version of
+this table came from `strace -c`, which summarises **system** time unless you pass
+`-w`; a blocking `fdatasync` sleeps, and sleeping is not system time, so an 86 µs
+gate was reported as 12 µs. The second version — corrected to wall time — then
+attributed the large-span cost to ZFS compressing and encrypting the span inline in
+the committing thread, on the strength of a top stack frame. A call graph killed
+that too: `zio_compress_select` is 0.03% of the whole profile and zstd, aes and gcm
+are **absent**. `ZIO_STAGE_ISSUE_ASYNC` precedes `ZIO_STAGE_WRITE_COMPRESS`, and
+`zio_nowait` → `zio_issue_async` → `taskq_dispatch_ent` is right there in the data
+at 1.70% — the committing thread dispatches and never runs the compress or encrypt
+stage. Both engines' crypto is on a `z_wr_iss` taskq.
 
-The crossover is where two curves meet, and neither is a defect. **Our advantage at
-small transactions is per-commit syscall count** — nine against thirty-three, and no
-journal to create and unlink. **Our deficit at large ones is per-byte sync cost**,
-and the correction above is what identified the mechanism: at a 111 KB span 74% of
-the sync is CPU, in `zil_commit_impl` → `zil_lwb_write_issue` → `zfs_get_data` →
-`dmu_sync` → `arc_write` → `zio_write` — ZFS compressing and encrypting the whole
-span inline in the committing thread, at 2.05 µs/KB, which is about 490 MB/s or one
-core's compress-then-encrypt rate. Stock SQLite's profile does not land there:
-`pwrite64` → `vfs_write` → `zfs_write` → `dmu_assign_arcbuf_by_dnode`, buffered,
-with the crypto deferred to a transaction group on another thread.
+What the sync actually spends its 8.59% of cycles on is **per-block bookkeeping**:
+`zio_create` (kmem alloc plus `memset`) 24% of it, `taskq_dispatch_ent` → wakeup
+20%, `zfs_zget` 12%, `zfs_rangelock_enter_impl` 10%, `dmu_buf_hold_noread` 7%.
+Allocate a zio and zero it, take a rangelock, look up the znode, dispatch, wake.
+That predicts the per-KB slope mostly flattens at `recordsize=128K`, where a 130 KB
+span is one or two blocks instead of ~32 — a prediction the original 4K-only sweep
+could not have tested.
 
-So the per-synced-byte gap is not storage and not a ZIL mode: **a large synchronous
-append pays for its own compression and encryption inline, where small overwrites of
-an already-allocated file hand that work to the pool.** Appending a span and syncing
-it once is the design (C-7, C-8), so on an encrypting, compressing pool the price of
-a commit is set by how many bytes it appends — which is the caller's transaction
-size, and nothing the library can move.
+**And there is no per-synced-byte deficit at all.** In wall time the slopes are
+3.74 µs/KB against the btree's 2.82, but the ~125 µs ZIL floor is shared and the
+btree pays it four times per commit against our one, so zeroskip is *cheaper per
+`fdatasync` at every transaction size* — 3.95x at one record, still 1.30x at a
+thousand. The earlier "9x per synced byte" was system time on both sides.
+
+So **the advantage at small transactions is per-commit syscall count** — nine
+against thirty-three, one sync against four, and no journal to create and unlink.
+The remaining deficit at large transactions is *not* the sync: it is the merge
+path, and specifically faulting merge inputs back in (see the next section) plus
+`unlink` at ~1 ms a call on that pool. Both are file-lifecycle costs that
+`rollover_size` and the repack policy control, not properties of committing.
+
+**The pattern worth carrying, since it has now cost four rounds:** each error was
+either arithmetic on a number whose units were not what they looked like, or a top
+stack frame treated as a mechanism. `zsi_rec_decode` and `memset` cost us the same
+way locally. Walk the call graph, and check the units.
+
+## Faulting merge inputs is the largest item in a bulk load's profile
+
+A call graph of the same load puts `XXH3_hashLong_64b_internal` at 14.05% of
+cycles — and **83% of that is page faults, not hashing**:
+
+```
+XXH3_hashLong_64b_internal                          14.05%
+  asm_exc_page_fault → filemap_fault → zpl_read_folio
+    → zfs_getpage → zfs_fillpage → dmu_read           5.41%
+        dmu_buf_hold_array_by_dnode 3.05%
+        memcpy_orig                 1.55%
+    → __filemap_get_folio                             2.32%
+        folio_alloc → alloc_pages → clear_page_rep    0.98%
+```
+
+Actual hashing is about 2.4%. XXH3 is simply the function whose dereference faults
+the mapped file in, and on ZFS a fault is expensive in a way it is not elsewhere:
+the page cache is not the ARC, so `zfs_fillpage` → `dmu_read` **copies** out of the
+ARC into a freshly allocated, freshly zeroed page, one synchronous fault at a time.
+
+Both merge paths begin with a pass that hashes a whole input — a conversion's D-20b
+verify replay, a repack's `zsi_ptrs_verify_records` — so that is where the faults
+land, and it is where the library now hints the kernel (`POSIX_MADV_WILLNEED`,
+`zsi_file_prefetch`). See that function for why WILLNEED and not `MADV_SEQUENTIAL`:
+C-4c shares an immutable file's mapping between snapshots, so an eviction-policy
+hint would degrade a concurrent reader, and a conversion copies in key order, which
+for an unordered input is not offset order anyway.
+
+**Unmeasurable on a laptop, in either direction.** On APFS the input pages are
+already resident from having just been written, so the hint is a no-op; five paired
+runs of `repack cascade` drift 15% while the machine cools and show no consistent
+sign. What bounds its cost is arithmetic rather than a benchmark: a 200k-record
+cascade issues on the order of 60–120 `posix_madvise` calls in a 0.8 s run, which
+at ~1 µs each is ~0.03%. This one is banked on the downstream call graph and on the
+mechanism, not on a local number.
 
 ## What an idle unordered file costs, and what D-9d already saves you
 

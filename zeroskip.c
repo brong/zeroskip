@@ -1508,6 +1508,34 @@ static const char *zsi_file_at(const struct zsi_file *f, size_t off, size_t len)
     return f->base + off;
 }
 
+/* "I am about to read all of this file, now."
+ *
+ * Called only by the merge paths, immediately before the pass that hashes a whole
+ * input (a conversion's D-20b replay, a repack's records-checksum verify).  On a
+ * filesystem whose page cache is not the same memory as its own cache -- ZFS,
+ * where a fault runs zpl_read_folio -> zfs_fillpage -> dmu_read and COPIES out of
+ * the ARC -- that pass otherwise takes one synchronous fault per page, plus a page
+ * allocation and a zeroing to service each one.  Measured downstream at 14% of a
+ * 2M-record load's cycles, 83% of it fault servicing rather than hashing, which is
+ * the largest single item in that profile.
+ *
+ * POSIX_MADV_WILLNEED specifically, not MADV_SEQUENTIAL, and the reason is C-4c:
+ * an immutable file's mapping is SHARED between snapshots within the process, so a
+ * concurrent reader may be doing point lookups through the very same VMA.
+ * WILLNEED is additive -- it starts readahead and returns -- while SEQUENTIAL
+ * changes the eviction policy for the whole mapping and would evict pages that
+ * reader wants.  A conversion is also the wrong shape for SEQUENTIAL in its own
+ * right: it copies in KEY order, which for an unordered input is not offset order.
+ *
+ * Advisory and non-blocking, so a failure costs nothing but the speed; the return
+ * is deliberately discarded.  posix_madvise rather than madvise because it is
+ * POSIX.1-2001 and needs no feature macro -- the same papercut as _GNU_SOURCE. */
+static void zsi_file_prefetch(const struct zsi_file *f)
+{
+    if (!f || !f->base || !f->size) return;
+    (void)posix_madvise((void *)(uintptr_t)f->base, f->size, POSIX_MADV_WILLNEED);
+}
+
 /* Forward declaration, and the one place this file's strict downward layering is
  * broken.  A struct zsi_file owns its private index, so closing the file must
  * free it -- but the index is defined further down, since building one needs span
@@ -7813,6 +7841,7 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
      * this handle admitted fails its checksum. */
     {
         struct zsi_file scratch = *f;
+        zsi_file_prefetch(f);
         r = zsi_unordered_replay(&scratch, ZSI_HEADER_LEN, NULL, NULL);
         if (r != ZS_OK) return r;
         if (scratch.complete < f->complete) {
@@ -8169,6 +8198,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * while destroying the only evidence.  Failing here costs nothing: the
      * inputs stay, the database still reads, salvage still works. */
     for (size_t i = 0; i < count; i++) {
+        zsi_file_prefetch(snap->files[first + i]);
         r = zsi_ptrs_verify_records(snap->files[first + i]);
         if (r != ZS_OK) {
             db->error("repack input fails its records checksum; not merged",

@@ -3,6 +3,25 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.9.0 — 2026-08-19
+
+- **The merge path now tells the kernel it is about to read an input.** Both a
+  conversion and a repack open with a pass that hashes a whole input file, and on a
+  filesystem whose page cache is separate from its own cache — ZFS — that pass is
+  dominated by servicing one synchronous fault per page rather than by hashing.
+  A `posix_madvise(POSIX_MADV_WILLNEED)` per input, which downstream's call graph
+  makes the largest single item in a bulk-load profile. Advisory: no behaviour
+  change, and unmeasurable where the pages are already resident.
+
+- **Thread safety is now documented** in `zeroskip.h`, which said nothing about it.
+  The answer was already in the spec (G-5) but not where a caller would look: a
+  handle is not thread-safe, and a second thread with its **own** handle is
+  supported and excludes the first exactly as a second process would (C-1j).
+
+- `zs_db_seal` documents that it is the latency lever for conversions, which
+  `ZS_NOAUTOREPACK` is not: a conversion is unavoidable per generation and by
+  default lands on the commit that crosses `rollover_size`.
+
 ## 2.8.0 — 2026-08-19
 
 - **A large `rollover_size` is no longer punished by the private index.** The

@@ -1124,6 +1124,14 @@ mutant "commit: seal threshold inverted" catch \
 mutant "commit: publishes a table" catch \
   's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
 
+# equivalent: the prefetch hint is advisory and unobservable -- it changes no byte,
+# no syscall the tests count, and no return value.  Listed so nobody writes a
+# bogus test chasing it; what it is worth is 83% of a 14% profile item on ZFS,
+# where a fault copies out of the ARC, and it cannot be seen on a filesystem whose
+# page cache the pages are already in.
+mutant "merge: no prefetch hint before hashing an input" equivalent \
+  's/    \(void\)posix_madvise\(\(void \*\)\(uintptr_t\)f->base, f->size, POSIX_MADV_WILLNEED\);/    (void)f;/'
+
 # The delta bound is proportional to the base, floored at ZSI_DELTA_MAX.  A fixed
 # bound makes the delta->base merge quadratic in generation size -- 8.45M entries
 # merged at a 2MB rollover_size against 251.9M at 64MB, over the same 2M records --
@@ -1458,7 +1466,7 @@ mutant "repack: inputs not verified before merge" catch \
 # certifies in-place damage the C-4i probe cannot see (size unchanged) into an
 # output that validates while D-23 removes the evidence.
 mutant "convert: the D-20b re-verify removed" catch \
-  's/    \{\n        struct zsi_file scratch = \*f;\n        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, NULL, NULL\);\n        if \(r != ZS_OK\) return r;\n        if \(scratch\.complete < f->complete\) \{/    if (0) {\n        struct zsi_file scratch = *f;\n        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, NULL, NULL);\n        if (r != ZS_OK) return r;\n        if (scratch.complete < f->complete) {/'
+  's/    \{\n        struct zsi_file scratch = \*f;\n        zsi_file_prefetch\(f\);\n        r = zsi_unordered_replay\(&scratch, ZSI_HEADER_LEN, NULL, NULL\);\n        if \(r != ZS_OK\) return r;\n        if \(scratch\.complete < f->complete\) \{/    if (0) {\n        struct zsi_file scratch = *f;\n        zsi_file_prefetch(f);\n        r = zsi_unordered_replay(\&scratch, ZSI_HEADER_LEN, NULL, NULL);\n        if (r != ZS_OK) return r;\n        if (scratch.complete < f->complete) {/'
 
 # F-32a.  Skipping verification at the yield is the headline gap the whole
 # format change exists to close: corrupt bytes served without a word.

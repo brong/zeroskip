@@ -14,6 +14,29 @@
  * doc/specification.md, and are normative for
  * every implementation.  This header is one binding: its *semantics* are
  * normative, its spelling is not.
+ *
+ * THREADS.  A `struct zs_db` handle, and every transaction and cursor made from
+ * it, is NOT thread-safe: two threads touching one handle concurrently is a
+ * caller error, and there is no internal mutex to make it otherwise.
+ *
+ * A second thread with its OWN handle is supported, and is the way to run a
+ * background repack or a concurrent reader in-process.  Two handles on the same
+ * database exclude each other exactly as two processes would: the same `fcntl`
+ * locks a peer implementation sees, plus a same-process mechanism so the
+ * exclusion holds within one process too (C-1j, G-5).  A thread that opens its
+ * own handle and calls zs_db_repack therefore serialises against the writer,
+ * blocking or returning ZS_LOCKED rather than corrupting, and needs nothing from
+ * the caller beyond not sharing the handle.  The library links no thread library
+ * and contains no mutex; what makes this safe is that it keeps no unguarded
+ * global mutable state -- the one global, the C-1j lock registry, is guarded by
+ * an atomic, and every index, snapshot and buffer belongs to a handle.
+ *
+ * Two consequences worth knowing before choosing a thread over a helper process.
+ * A cursor from zs_db_begin_cursor WITHOUT ZS_SHARED opens an implicit write
+ * transaction and so holds the write lock for its whole life, which will now
+ * block a second thread's writer: a read-only traversal wants ZS_SHARED.  And
+ * locks are ordered within one database, so a caller holding locks on several
+ * databases at once must impose its own consistent order (C-1h).
  */
 
 #ifndef INCLUDED_ZEROSKIP_H
@@ -289,7 +312,16 @@ int  zs_db_stats(struct zs_db *db, struct zs_db_stats *out);
 /* Convert the active generation, so every file in the database has a pointer
  * section and no reader has to replay a span chain (D-25).  Bounded by
  * rollover_size, so cheap enough to call routinely.  A no-op, not an error,
- * when there is nothing to seal. */
+ * when there is nothing to seal.
+ *
+ * It is also the LATENCY LEVER for conversions, which is what ZS_NOAUTOREPACK is
+ * not.  A conversion is unavoidable once per generation, and by default it lands
+ * on whichever commit grows the active file past rollover_size (D-25d) -- so a
+ * caller measuring commit latency sees it as a rare tall outlier that disarming
+ * the repack cascade does not remove.  Calling this from an idle moment converts
+ * the generation early, and the commit that would have done it then has nothing
+ * to do.  The outlier's SIZE is bounded by rollover_size (D-12d), so that knob
+ * sets how tall it can be; this call sets when it happens. */
 int  zs_db_seal(struct zs_db *db);
 
 /* Merge the entire database into a single file (D-26), reclaiming the tombstones
