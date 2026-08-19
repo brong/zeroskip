@@ -574,7 +574,11 @@ side linear: 32 passes over a generation however large it grows.
 | 64 MB rollover | 7.44 / 7.07 / 7.18s | **1.99 / 2.19 / 1.91s** |
 
 Three paired runs each: overlapping at the default, **3.5x** at 64 MB with no
-overlap. The divisor is the measured part. The other side of the trade is the D-13b
+overlap. **Confirmed in production on ZFS**, same 2M-record load at a 64 MB
+rollover: 8.07s before the change against 5.16s after, which flipped that setting
+from the worst available to a 44% win over the 2 MB default — and retired a
+downstream principle ("minimising rewritten bytes is not the objective function")
+that had survived four libraries while being this bug the whole time. The divisor is the measured part. The other side of the trade is the D-13b
 fold, which merges a commit's run into the delta in place and so costs O(`ndelta`)
 per commit for a run that is not ascending, so a bigger delta is paid per
 transaction. At `nbase/8` the bound starts moving at a 1 MB generation, which the

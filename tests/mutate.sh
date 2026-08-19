@@ -1730,6 +1730,15 @@ mutant "write begin: rebuilds the snapshot unconditionally" catch \
 echo
 echo "same-process exclusion (C-1j)"
 
+# C-1j's spinlock, which guards the registry list and the `held` words.  No
+# SINGLE-THREADED test can reach this -- two_handles_are_excluded never contends
+# on it -- so it is the one thing test_lock_two_threads_two_handles covers that
+# the older exclusion test does not.  Removing the acquire leaves two threads
+# racing on the list and on `held`, which the non-atomic counter in that test
+# detects as a lost increment.
+mutant "lock: registry spinlock never acquired" catch \
+  's/    while \(__atomic_test_and_set\(&zsi_lockreg_spin, __ATOMIC_ACQUIRE\)\)\n        ;/    ;/'
+
 # C-1j: the registry must not be dropped -- on a platform without OFD locks
 # that is the whole of the guarantee, and on one with them this is what T-14's
 # second run exercises.

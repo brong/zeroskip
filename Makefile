@@ -35,6 +35,15 @@ ifeq ($(UNAME_S),Darwin)
 CFLAGS += -D_DARWIN_C_SOURCE
 endif
 
+# pthreads, for the two-thread lock test in zstest and NOWHERE else.  Deliberately
+# not in LDLIBS: that string is written into zeroskip.pc, and the library links no
+# thread library at all -- C-1j's registry uses a compiler builtin, which
+# test_lock_no_thread_machinery enforces by grepping zeroskip.c.  glibc before
+# 2.34 needs the flag; macOS and the BSDs have pthreads in libc.
+ifeq ($(UNAME_S),Linux)
+PTHREAD_CFLAGS = -pthread
+endif
+
 # Appended last, so a caller (or the asan target) can add flags without having
 # to restate the platform defines above -- restating them is how a sanitiser
 # build quietly ends up compiling different code from the one being shipped.
@@ -106,7 +115,7 @@ zstool: zstool.c zeroskip.h libzeroskip.a
 # public API where a compensating pair of bugs would cancel out.  It therefore
 # must NOT also link libzeroskip.a.
 zstest: zstest.c zeroskip.c zeroskip.h xxhash.h
-	$(CC) $(CFLAGS) -o $@ zstest.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) -o $@ zstest.c $(LDLIBS)
 
 zsbench: zsbench.c zeroskip.h libzeroskip.a
 	$(CC) $(CFLAGS) -o $@ zsbench.c libzeroskip.a $(LDLIBS)

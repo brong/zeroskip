@@ -40,6 +40,8 @@
  * bytes wrongly and a pointer section written in that same wrong order -- pass
  * every round-trip test while producing files no other implementation can read.
  */
+#include <pthread.h>
+
 #include "zeroskip.c"
 
 #ifndef PATH_MAX
@@ -5411,6 +5413,218 @@ static void two_handles_are_excluded(void)
 
     zsi_lock_close(&a);
     zsi_lock_close(&b);
+}
+
+/* T-14, C-1j, and the contract zeroskip.h now states: a second THREAD with its
+ * OWN handle is supported, and excludes the first exactly as a second process
+ * would.  test_lock_two_handles_one_process already proves the exclusion, but it
+ * proves it in one thread -- so it cannot exercise the only genuinely concurrent
+ * code in the library, the C-1j registry's spinlock and its list.
+ *
+ * The falsifiable part is the COUNTER, which is deliberately not atomic.  Each
+ * thread increments it inside a write transaction, so if the exclusion ever fails
+ * two increments overlap, one is lost, and the total comes out short.  A test that
+ * only asserted "both threads finished" would pass with no locking at all.
+ *
+ * Non-blocking with a bounded retry rather than a blocking begin: a lock bug
+ * should fail this test, not hang a CI run.
+ *
+ * Forces the registry on.  The OFD path is the kernel's and needs no stress; the
+ * registry is ours, and on every platform anyone develops on it is otherwise dead
+ * code (see test_lock_two_handles_one_process for the same reasoning). */
+#define THR_ITERS 150
+#define THR_HAMMER 4000
+
+struct thr_ctx {
+    int   id;
+    long *counter;          /* NOT atomic, on purpose: see above */
+    int   failed;
+    int   contended;        /* times the peer held the lock, for the sanity check */
+    int   where, rc;        /* where a failure happened, printed on failure:
+                             * a threaded test that only says "failed" is
+                             * miserable to debug months later */
+};
+
+static void *thr_writer(void *arg)
+{
+    struct thr_ctx *c = arg;
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    /* NOSYNC because the subject is locking, not durability; NONBLOCKING so a
+     * contended begin reports ZS_LOCKED rather than waiting -- it is an OPEN
+     * flag, and zs_db_begin_txn's second argument is `shared`, not flags. */
+    setup.flags = ZS_NOSYNC | ZS_NONBLOCKING;
+    int orc = zs_db_open(dbdir, &setup, &db);
+    if (orc != ZS_OK) { c->failed = 1; c->where = 1; c->rc = orc; return NULL; }
+
+    for (int i = 0; i < THR_ITERS; i++) {
+        struct zs_txn *txn = NULL;
+        int tries = 0, r;
+        char k[32];
+
+        for (;;) {
+            r = zs_db_begin_txn(db, 0, &txn);
+            if (r == ZS_OK) break;
+            if (r != ZS_LOCKED) { c->failed = 1; c->where = 2; c->rc = r; goto done; }
+            c->contended++;
+            if (++tries > 200000) { c->failed = 1; c->where = 3; goto done; }  /* never hang */
+        }
+
+        snprintf(k, sizeof(k), "t%d-%06d", c->id, i);
+        int sr = zs_txn_store(txn, k, strlen(k), "v", 1, 0);
+        if (sr != ZS_OK) {
+            zs_txn_abort(&txn);
+            c->failed = 1; c->where = 4; c->rc = sr;
+            goto done;
+        }
+
+        /* Inside the write transaction, so the write lock is what serialises it. */
+        (*c->counter)++;
+
+        int cr = zs_txn_commit(&txn);
+        if (cr != ZS_OK) { c->failed = 1; c->where = 5; c->rc = cr; goto done; }
+    }
+
+done:
+    zs_db_close(&db);
+    return NULL;
+}
+
+/* Phase 2's body: hammer the lock itself, with nothing between acquire and
+ * release.
+ *
+ * Phase 1 exercises the documented contract end to end, but its threads spend
+ * nearly all their time in store and commit, so they almost never collide INSIDE
+ * the registry's critical section: the mutant "lock: registry spinlock never
+ * acquired" went NOT CAUGHT against phase 1 alone, which is how I learned that
+ * phase 1's assertions were already covered by the single-threaded exclusion
+ * test.  This loop removes the I/O so the collision window is most of the
+ * runtime.
+ *
+ * And the detector is an OCCUPANCY check, not a lost increment.  Losing a `++`
+ * needs two threads to interleave within a few nanoseconds, which 20 000 tight
+ * iterations still did not reliably hit.  Claiming the section by id and holding
+ * it across a deliberately widened window makes "two threads were inside at once"
+ * almost certain to be seen instead. */
+static volatile int thr_occupant = -1;
+
+static void *thr_hammer(void *arg)
+{
+    struct thr_ctx *c = arg;
+    struct zsi_locks lk;
+
+    if (zsi_lock_open(&lk, dbdir) != ZS_OK) { c->failed = 1; c->where = 6; return NULL; }
+
+    for (int i = 0; i < THR_HAMMER; i++) {
+        int tries = 0, r;
+        for (;;) {
+            r = zsi_lock_take(&lk, ZSI_LOCK_WRITE, ZS_NONBLOCKING);
+            if (r == ZS_OK) break;
+            if (r != ZS_LOCKED) { c->failed = 1; c->where = 7; c->rc = r; goto done; }
+            c->contended++;
+            if (++tries > 2000000) { c->failed = 1; c->where = 8; goto done; }
+        }
+
+        thr_occupant = c->id;
+        for (volatile int d = 0; d < 500; d++) { }
+        if (thr_occupant != c->id) { c->failed = 1; c->where = 10; goto done; }
+        (*c->counter)++;
+        thr_occupant = -1;
+
+        if (zsi_lock_release(&lk, ZSI_LOCK_WRITE) != ZS_OK) {
+            c->failed = 1; c->where = 9; goto done;
+        }
+    }
+
+done:
+    zsi_lock_close(&lk);
+    return NULL;
+}
+
+static void test_lock_two_threads_two_handles(void)
+{
+    bool saved = zsi_lock_registry;
+    pthread_t ta, tb;
+    long counter = 0;
+    struct thr_ctx ca = { 0, &counter, 0, 0, 0, 0 }, cb = { 1, &counter, 0, 0, 0, 0 };
+    struct zs_db *db = NULL;
+    struct zs_cursor *cur = NULL;
+    const char *k = NULL, *v = NULL;
+    size_t kl = 0, vl = 0, seen = 0;
+
+    ASSERT_EQ(mkdbdir(), 0);
+
+    /* One handle creates the database, so neither thread races on ZS_CREATE --
+     * a different question (D-3b) with its own tests. */
+    {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        setup.flags = ZS_CREATE | ZS_NOSYNC;
+        ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    }
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Both C-1j mechanisms in both phases, for test_lock_two_handles_one_process's
+     * reason: the registry is dead code wherever F_OFD_SETLK exists, so a threaded
+     * bug in it would surface only on the platform that depends on it. */
+    for (int phase = 0; phase < 2; phase++) {
+        void *(*body)(void *) = phase == 0 ? thr_writer : thr_hammer;
+        size_t want = phase == 0 ? (size_t)(THR_ITERS * 2)
+                                 : (size_t)(THR_HAMMER * 2);
+
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 0) {
+#if ZSI_HAVE_OFD_LOCKS
+                zsi_lock_registry = false;      /* the kernel excludes them */
+#else
+                continue;
+#endif
+            } else {
+                zsi_lock_registry = true;       /* the registry excludes them */
+            }
+
+            counter = 0;
+            thr_occupant = -1;
+            ca.failed = cb.failed = 0;
+            ca.contended = cb.contended = 0;
+
+            ASSERT_EQ(pthread_create(&ta, NULL, body, &ca), 0);
+            ASSERT_EQ(pthread_create(&tb, NULL, body, &cb), 0);
+            ASSERT_EQ(pthread_join(ta, NULL), 0);
+            ASSERT_EQ(pthread_join(tb, NULL), 0);
+
+            if (ca.failed || cb.failed)
+                fprintf(stderr,
+                        "\n      phase %d pass %d  a: where=%d rc=%d  b: where=%d rc=%d\n",
+                        phase, pass, ca.where, ca.rc, cb.where, cb.rc);
+            ASSERT_EQ(ca.failed, 0);
+            ASSERT_EQ(cb.failed, 0);
+
+            /* Mutual exclusion held. */
+            ASSERT_EQU((size_t)counter, want);
+
+            /* And they really did contend, or the assertion above proves
+             * nothing at all. */
+            ASSERT(ca.contended + cb.contended > 0);
+        }
+    }
+
+    zsi_lock_registry = saved;
+
+    /* Every record phase 1 committed is there, in order, through one merge.
+     * Both passes write the same keys, so the distinct count is one pass worth. */
+    {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    }
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &cur, ZS_SHARED));
+    while (zs_cursor_next(cur, &k, &kl, &v, &vl) == ZS_OK) seen++;
+    zs_cursor_fini(&cur);
+    ASSERT_EQU(seen, (size_t)(THR_ITERS * 2));
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
 }
 
 /* T-14, C-1j: two handles on one database within one process exclude each
@@ -17908,6 +18122,8 @@ static struct test_entry tests[] = {
     { "test_lock_excludes_other_process", test_lock_excludes_other_process },
     { "test_lock_dies_with_process",    test_lock_dies_with_process },
     { "test_lock_two_handles_one_process", test_lock_two_handles_one_process },
+    { "test_lock_two_threads_two_handles",
+                                    test_lock_two_threads_two_handles },
     { "test_lock_registry_keys_on_inode", test_lock_registry_keys_on_inode },
     { "test_lock_registry_is_per_database", test_lock_registry_is_per_database },
     { "test_lock_no_thread_machinery",  test_lock_no_thread_machinery },

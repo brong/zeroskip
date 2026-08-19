@@ -181,8 +181,18 @@ struct zs_open_data {
      * many spans, however few bytes they are.  0 = default 1024.
      * rollover_size bounds BYTES; what that is standing in for is the index
      * rebuild, which is linear in SPANS -- so many small transactions slip
-     * under it and leave a rebuild that grows without limit.  A handle with
-     * index_dir set is already bounded by P-13 and will not reach this. */
+     * under it and leave a rebuild that grows without limit.
+     *
+     * THIS, not rollover_size, is what ends a generation for a caller committing
+     * one record at a time: 20 000 such commits produce about 19 generations by
+     * this bound, where rollover_size would have produced one or two.  So it is
+     * also what sets how often a conversion happens, which is what a caller
+     * driving zs_db_seal has to pace against -- see that function.
+     *
+     * A handle with index_dir set is NOT exempt.  It was until P-13: a commit
+     * published a pointer table, and a successful publication reset the window
+     * this counts, so a cached writer never reached the bound.  A commit
+     * publishes nothing now, so a cache changes nothing here. */
     size_t       rollover_txns;
 
     /* A-16/D-16: the size above which an in-order file stops being a candidate
@@ -316,12 +326,29 @@ int  zs_db_stats(struct zs_db *db, struct zs_db_stats *out);
  *
  * It is also the LATENCY LEVER for conversions, which is what ZS_NOAUTOREPACK is
  * not.  A conversion is unavoidable once per generation, and by default it lands
- * on whichever commit grows the active file past rollover_size (D-25d) -- so a
- * caller measuring commit latency sees it as a rare tall outlier that disarming
- * the repack cascade does not remove.  Calling this from an idle moment converts
- * the generation early, and the commit that would have done it then has nothing
- * to do.  The outlier's SIZE is bounded by rollover_size (D-12d), so that knob
- * sets how tall it can be; this call sets when it happens. */
+ * on whichever commit ends one (D-25d) -- so a caller measuring commit latency
+ * sees it as a rare tall outlier that disarming the repack cascade does not
+ * remove.  Calling this from an idle moment converts the generation early, and
+ * the commit that would have done it then has nothing to do.  Measured
+ * downstream over 20 000 single-record commits: p99.9 improved 42% against the
+ * default, and NO commit did file-lifecycle work at all.
+ *
+ * Two things to get right, both found by a downstream sweep rather than by
+ * reasoning:
+ *
+ * CADENCE MUST BEAT WHICHEVER BOUND IS ENDING GENERATIONS, and for small
+ * transactions that is rollover_txns, not rollover_size.  A generation ends at
+ * min(rollover_size bytes, rollover_txns spans), so 20 000 one-record commits
+ * end about 19 generations by the span bound while barely troubling the byte
+ * one.  Sealing every 500 commits removed every merging commit; every 4000 left
+ * 15 of them, because the span bound had already fired.  D-12d bounds how TALL
+ * the outlier can be; this sets how often you pre-empt it.
+ *
+ * DO NOT SEAL FREQUENTLY WITH THE REPACK CASCADE ARMED.  Sealing early makes
+ * more and smaller generations, and the cascade then has more to merge: measured
+ * 3.2x to 4.3x of stored bytes rewritten.  The combination that works is all
+ * three together -- ZS_NOAUTOREPACK, this call from idle, and a bounded
+ * zs_db_repack catch-up from idle too. */
 int  zs_db_seal(struct zs_db *db);
 
 /* Merge the entire database into a single file (D-26), reclaiming the tombstones

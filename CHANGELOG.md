@@ -3,6 +3,18 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.9.1 — 2026-08-19
+
+- Documentation fixes, no behaviour change. `rollover_txns` said a handle with
+  `index_dir` set would never reach the span bound; that stopped being true at
+  P-13, and it is the bound that ends generations for a caller committing one
+  record at a time — so it is also what a `zs_db_seal` cadence has to pace
+  against. `zs_db_seal` now documents that cadence, and that sealing frequently
+  with the repack cascade armed *raises* write amplification.
+
+- `test_lock_two_threads_two_handles` verifies the thread-safety contract 2.9.0
+  documented, including C-1j's spinlock under contention.
+
 ## 2.9.0 — 2026-08-19
 
 - **The merge path now tells the kernel it is about to read an input.** Both a
