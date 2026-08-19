@@ -422,6 +422,16 @@ static uint32_t csum_flag(void)
                                           : (uint32_t)ZS_CSUM_XXHASH;
 }
 
+/* D-9d's span bound seals the active file every `rollover_txns` commits, and for
+ * a one-store-per-transaction load that -- not `rollover_size` -- is what caps
+ * what an opener replays.  The open-cost fixtures below plot open cost AGAINST
+ * the number of records in the active file, so they have to pin the span bound
+ * out of the way or the x-axis stops being the thing they vary.  It cost this
+ * document two wrong tables: with the bound at its default the fixtures sealed
+ * mid-load, and every "plain open" figure was of a 670-record tail rather than
+ * of the file named in the row.  Zero leaves the library default. */
+static size_t rollover_txns_override;
+
 static struct zs_db *open_at(const char *dir, uint32_t flags, size_t rollover)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -430,6 +440,7 @@ static struct zs_db *open_at(const char *dir, uint32_t flags, size_t rollover)
     flags |= csum_flag();
     setup.flags = flags;
     setup.rollover_size = rollover;
+    setup.rollover_txns = rollover_txns_override;
     setup.error = quiet_error;
     if (zs_db_open(dir, &setup, &db) != ZS_OK) {
         fprintf(stderr, "zsbench: cannot open %s\n", dir);
@@ -464,6 +475,7 @@ static struct zs_db *open_cached(const char *dir, uint32_t flags, size_t rollove
     flags |= csum_flag();
     setup.flags = flags;
     setup.rollover_size = rollover;
+    setup.rollover_txns = rollover_txns_override;
     setup.error = quiet_error;
     setup.index_dir = idxdir;
     setup.index_threshold = threshold;
@@ -1414,10 +1426,13 @@ static void bench_snapshot_open(void)
      * built "before there is a number".  This is the number.
      *
      * Measured as open cost against the number of records in the active file, at a
-     * rollover large enough that nothing converts during the run. */
+     * rollover large enough that nothing converts during the run -- which since
+     * D-9d means pinning the SPAN bound too, not only the byte one. */
     char dir[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
+
+    rollover_txns_override = (size_t)1 << 40;
 
     printf("\n  snapshot open cost vs active-file size (open item 2)\n");
     printf("    %-12s %-12s %-12s %s\n",
@@ -1464,6 +1479,7 @@ static void bench_snapshot_open(void)
 
     printf("    (linear us/record means the replay dominates; the pointer table\n"
            "     cache removes both the scan and the sort -- see spec section 8)\n");
+    rollover_txns_override = 0;
     free(val);
 }
 
@@ -1485,10 +1501,18 @@ static void bench_cached_open(void)
      * A cold row is reported too.  The warm number flatters the cache: with the
      * data file already in page cache the replay it avoids is cheap, while the
      * whole reason the cache is worth having is a process that would otherwise
-     * fault the entire active file in. */
+     * fault the entire active file in.
+     *
+     * The span bound is pinned for the same reason as in `snapshot open`, and
+     * here it is what the whole table is FOR: at the default it seals mid-load,
+     * so both columns measure a small tail and the speedup reads as 1.0x for
+     * reasons that have nothing to do with the cache.  The second table below
+     * measures exactly that effect, on purpose, at the default. */
     char dir[1200], idx[1200];
     char *val = malloc(valsize);
     memset(val, 'v', valsize);
+
+    rollover_txns_override = (size_t)1 << 40;
 
     printf("\n  open cost with and without a pointer table (spec section 8)\n");
     printf("    %-12s %-12s %-12s %-12s %s\n",
@@ -1544,6 +1568,73 @@ static void bench_cached_open(void)
         cleanup(idx);
     }
 
+    rollover_txns_override = 0;
+
+    /* WHAT THE CACHE IS WORTH AT THE DEFAULTS, which is a different question and
+     * has a cliff in it.
+     *
+     * The table above pins D-9d's span bound so that its x-axis means something.
+     * Unpinned -- which is what a caller gets -- the active file is capped by
+     * min(rollover_size, rollover_txns spans), so how much an opener replays is
+     * set by the TRANSACTION SIZE and not by the record count: the same 16 000
+     * records are one 2 MB file in few large transactions and a ~670-record tail
+     * in one-store transactions, because 16 000 spans trips the 1024-span bound
+     * fifteen times and each seal converts the file away.
+     *
+     * So the cache's open-side value is whatever is left inside that bound, and
+     * for the smallest transactions D-9d has already collected it.  This is the
+     * row that says which regime a caller is in; it is also the fixture whose
+     * absence let this document quote a 17.7x speedup that its own default
+     * configuration could not reach. */
+    printf("\n  open cost vs transaction size, at the default span bound (D-9d)\n");
+    printf("    %-14s %-12s %-12s %-12s %s\n",
+           "records/txn", "spans", "plain ms", "cached ms", "speedup");
+
+    for (int batch = 1; batch <= 16000; batch *= 40) {
+        snprintf(dir, sizeof(dir), "%s/cachedopen", workdir);
+        snprintf(idx, sizeof(idx), "%s/cachedopen-idx", workdir);
+        cleanup(dir);
+        cleanup(idx);
+        if (mkdir(idx, 0700) && errno != EEXIST) { perror(idx); exit(1); }
+
+        struct zs_db *db = open_cached(dir, ZS_CREATE, 512 * 1024 * 1024, idx, 1);
+        struct zs_txn *txn = NULL;
+        for (int i = 0; i < 16000; i++) {
+            char k[ZSB_KEYMAX];
+            if (i % batch == 0 && zs_db_begin_txn(db, 0, &txn) != ZS_OK) exit(1);
+            makekey(k, sizeof(k), i);
+            zs_txn_store(txn, k, strlen(k), val, valsize, 0);
+            if ((i + 1) % batch == 0 && zs_txn_commit(&txn) != ZS_OK) exit(1);
+        }
+        if (txn && zs_txn_commit(&txn) != ZS_OK) exit(1);
+        zs_db_close(&db);
+
+        struct reptimes pt = { {0}, 0 }, ct = { {0}, 0 };
+        for (int r = 0; r < reps; r++) {
+            double t0 = now();
+            db = open_at(dir, 0, 512 * 1024 * 1024);
+            rep_add(&pt, now() - t0);
+            zs_db_close(&db);
+        }
+        for (int r = 0; r < reps; r++) {
+            double t0 = now();
+            db = open_cached(dir, 0, 512 * 1024 * 1024, idx, 1);
+            rep_add(&ct, now() - t0);
+            zs_db_close(&db);
+        }
+        double plain = rep_median(&pt), cached = rep_median(&ct);
+
+        printf("    %-14d %-12d %-12.3f %-12.3f %.1fx\n",
+               batch, 16000 / batch, plain * 1000.0, cached * 1000.0,
+               cached > 0 ? plain / cached : 0.0);
+
+        cleanup(dir);
+        cleanup(idx);
+    }
+
+    printf("    (the cache buys an open only where the span bound has not\n"
+           "     already sealed the file -- see doc/benchmarking.md)\n");
+
     free(val);
 }
 
@@ -1556,16 +1647,27 @@ static void bench_index_threshold(void)
 
     /* What P-13's threshold trades.
      *
-     * Low: a table is republished often, so every commit carries an O(records)
-     * merge and an O(records) write, and a bulk load goes quadratic.
+     * Low: a table is republished often, so whoever publishes carries an
+     * O(records) merge and an O(records) write.
      * High: publishing is rare, so the next reader replays further.
      *
      * Both costs are reported against the same workload, which is what makes the
-     * default a measurement rather than a guess. */
+     * default a measurement rather than a guess.
+     *
+     * EXPECT THE STORE COLUMN TO BE FLAT, and do not read that as the threshold
+     * not working: since P-13 a commit publishes nothing, so this sole writer
+     * publishes only at its own open and the threshold cannot reach its store
+     * cost.  The end that still moves is the open, and the shape that pays the
+     * low end is a REBUILDING one -- writers alternating across processes -- which
+     * this single-process harness cannot produce.  The span bound is pinned so
+     * that the threshold is exercised over a full generation rather than over the
+     * ~1024-span tail D-9d would otherwise leave. */
     char dir[1200], idx[1200];
     char *val = malloc(valsize);
     static const size_t thresholds[] = { 1, 512, 4096, 32768, 262144, 1048576 };
     memset(val, 'v', valsize);
+
+    rollover_txns_override = (size_t)1 << 40;
 
     printf("\n  publish threshold: write cost vs open cost (P-13)\n");
     printf("    %-14s %-14s %-14s %s\n",
@@ -1675,6 +1777,7 @@ static void bench_index_threshold(void)
         cleanup(idx);
     }
 
+    rollover_txns_override = 0;
     free(val);
 }
 
