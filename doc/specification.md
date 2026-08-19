@@ -461,8 +461,10 @@ long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
   half.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
   that says "ignore the records in this span", voiding them. An aborted
-  transaction appends a `ROLLBACK`; without one, a later commit's span would
-  enclose the aborted records and make them live.
+  transaction whose records reached the file appends a `ROLLBACK`; without one, a
+  later commit's span would enclose the aborted records and make them live. An
+  abort with no records in the file has nothing to void and appends nothing
+  (C-8b).
 - **F-22** Because the checksum covers the span **and** the terminator, a
   terminator that reaches disk without its data fails validation and reads as
   absent. A torn tail is therefore always detectable, which recovery (F-24),
@@ -1614,7 +1616,8 @@ any point.
   publish a torn in-order file and entitle the retirement of the inputs that
   were its records' only complete copy (C-6b), so a crash would cost converted
   generations, which no caller asking to skip *commit* syncs agreed to.
-- **C-8** An aborted transaction appends a `ROLLBACK` and does **not** sync.
+- **C-8** An aborted transaction whose records reached the file appends a
+  `ROLLBACK` and does **not** sync.
   If a crash loses it, the active file is simply no longer clean, so the next
   writer moves to a new file (D-9) and reaches the same state. Nothing is being
   promised to a caller, so there is nothing to make durable.
@@ -1629,6 +1632,32 @@ any point.
   the file completes there (F-24). Both spans are discarded, which is correct —
   that commit's sync never returned, so nothing was acknowledged. A writer that
   streams records as they are stored therefore aborts for free.
+- **C-8b** An abort whose span never reached the file writes **nothing at all** —
+  no records, no `ROLLBACK`. F-21 needs a `ROLLBACK` to stop a later commit's span
+  enclosing the aborted records; with no records in the file there are none to
+  enclose, the file is byte-identical to what it was before the transaction began,
+  and the next span starts exactly where this one would have.
+
+  An implementation MUST NOT take this path when it cannot establish that no byte
+  of the span was written. In particular a **failed** write leaves an unknown
+  number of bytes in the file, so a writer whose buffer-flush has failed MUST
+  treat the span as having reached the file whatever its own accounting says —
+  that accounting is exactly what the failure invalidated. Discarding there leaves
+  records with no terminator after them, and a writer that then appended a further
+  span into the same file would put it beyond bytes its own size no longer
+  describes, so F-24 would complete the file below a commit that *was*
+  acknowledged. An implementation is not required to rely on recovery noticing:
+  a file left in that state is unclean, so R-4 and D-9a move the next writer to a
+  new generation, but that is a backstop and not the licence to reason from a
+  value a failed write has invalidated.
+
+  **This makes a rolled-back span writer-optional, which is an interoperability
+  statement.** Whether an abort leaves one on disk depends on how much the writer
+  buffers, so no conforming writer can be required to produce one and no
+  byte-comparison test may abort a transaction and expect a `ROLLBACK`. A writer
+  that buffers nothing appends one for every abort and is equally conforming;
+  reading them remains mandatory (F-21, F-25), and the golden corpus tests that
+  side by injecting the bytes rather than by aborting.
 
 ## 7. Open and recovery
 

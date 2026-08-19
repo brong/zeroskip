@@ -226,8 +226,9 @@ a spec label is missing here.
 | `C-7a` | A commit that reports an error MUST be treated as having an | `crash/crash_nosync_mode`, `crash/dirsync_justifies_c6`, `crash/sync_failure_every_point`, +2 more |
 | `C-7b` | The cost is one sync per commit. It is paid per | `zsbench (store, N per txn)` |
 | `C-7c` | `ZS_NOSYNC` omits the gate — and nothing else. The structural | `crash/crash_nosync_mode`, `crash/nosync_structural_syncs` |
-| `C-8` | An aborted transaction appends a `ROLLBACK` and does **not** sync. | `write_abort`, `stream_abort_writes_rollback` |
-| `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_writes_rollback`, `crash/sync_failure_gate` |
+| `C-8` | An aborted transaction whose records reached the file appends a | `write_abort`, `stream_abort_rollback_when_flushed` |
+| `C-8b` | An abort whose span never reached the file writes **nothing at all** — | `stream_abort_discards_unflushed_span`, `corpus` |
+| `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_rollback_when_flushed`, `crash/sync_failure_gate` |
 
 ## Open and recovery (`R-n`)
 
