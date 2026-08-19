@@ -117,18 +117,30 @@ chooses. A nominated scratch root gives each database its own subdirectory
 there, so one database's housekeeping never wades through another's tables.
 Or, by flag, the tables live in a `zeroskip.cache` directory inside the
 database itself — same trust boundary as the data, deleted with it, carried
-along by a backup — though a read-only handle will never create that
-directory, only use one already present. Either way the location must be one
+along by a backup. A read-only handle creates that directory like any other
+handle: it could always publish tables into it, so refusing only the creation
+meant the flag did nothing on a read-mostly database until an unrelated write
+came along. On a genuinely unwritable mount the creation simply fails and the
+handle runs without a cache. Either way the location must be one
 the caller controls: a table planted by someone else would produce wrong
 answers rather than obvious failure. A scratch-root cache must be discarded
 whenever the database directory is restored from a backup, since a table
 there can outlive the file it describes; the in-database cache is restored
 with its files and validates against them.
 
-In exchange, opening a database with a large active file goes from around 1.5 ms
-to under 0.1 ms, and a workload committing one record at a time gets about ten
-times faster — the second effect being the larger one, and not the one it was
-built for. Below a few hundred records it is marginally slower than not having it.
+In exchange, opening a database whose active file is large goes from around
+1.4 ms to about 0.1 ms. **Large is the condition, and what sets it is how a
+caller commits rather than how much it has stored.** The active file is capped by
+whichever comes first, a byte size or a number of transactions, and reaching
+either one seals the file — which leaves the next opener nothing to replay. So a
+caller committing one record at a time already has most of this from the
+transaction bound alone, and should expect the cache to be worth a few percent on
+its opens; a caller committing in batches, whose transactions are too few to
+reach that bound, gets the full order of magnitude. The write-side effect is real
+but belongs to a third shape: writers alternating across processes rebuild a
+snapshot at every begin and go about six times faster with a table, while a sole
+writer rebuilds nothing in steady state and is fastest with no cache at all.
+Below a few hundred records it is marginally slower than not having it.
 
 ## Salvaging a damaged database
 

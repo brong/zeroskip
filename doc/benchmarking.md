@@ -65,8 +65,8 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 | `store, rollover Nk` | whether a writer's inline conversion really is bounded by `rollover_size` (D-12d) |
 | `repack cascade` | one unbounded cascade (D-16b, open item 1) |
 | `snapshot open` | the per-open replay cost, without a pointer table |
-| `open (cached)` | the same open with one — what spec section 8 buys |
-| `publish threshold` | what P-13's threshold trades, in both directions |
+| `open (cached)` | the same open with one — what spec section 8 buys, against records replayed and against transaction size |
+| `publish threshold` | what P-13's threshold trades — only the open end is reachable from one process |
 | `compaction` | what compacting costs and what it reclaims (D-26, D-27) |
 
 The `store, one txn each` figure is dominated by `fdatasync` and therefore measures
@@ -82,21 +82,56 @@ removing, and by more than the question implied.
 ### Opening
 
 Without a table, open cost is linear in the number of records in the active file
-— roughly **1.5 ms** at the 2 MB default `rollover_size`, flat at about
-0.1 µs/record. With one it is flat in absolute terms, because the replay is
+— roughly **1.4 ms** at the 2 MB default `rollover_size`, flat at about
+0.09 µs/record. With one it is flat in absolute terms, because the replay is
 bounded by the threshold rather than by the file:
 
 | records in the active file | active file | plain open | cached open | speedup |
 |---|---|---|---|---|
-| 250 | 31 KB | 0.06 ms | 0.08 ms | 0.8× |
-| 1 000 | 125 KB | 0.13 ms | 0.08 ms | 1.6× |
-| 4 000 | 500 KB | 0.41 ms | 0.08 ms | 4.9× |
-| 16 000 | 2 000 KB | 1.56 ms | 0.09 ms | **17.7×** |
+| 250 | 33 KB | 0.07 ms | 0.09 ms | 0.7× |
+| 1 000 | 133 KB | 0.12 ms | 0.09 ms | 1.3× |
+| 4 000 | 531 KB | 0.35 ms | 0.09 ms | 3.8× |
+| 16 000 | 2 125 KB | 1.38 ms | 0.11 ms | **12.8×** |
 
 **Note the first row.** Below about 500 records the cache is a small *loss*:
 opening a table, reading it and validating it costs more than the replay it
 saves. That is the honest shape of the trade, and it is why the feature is
 opt-in rather than on by default.
+
+**That table pins D-9d's span bound, and the last row is unreachable without
+doing so.** What caps the replay is `min(rollover_size, rollover_txns spans)`,
+so the x-axis above — records in the active file — is only under the fixture's
+control once the span bound is out of the way. At its default of 1024 spans the
+quantity a caller actually varies is the **transaction size**, and the same
+16 000 records give a full 2 MB file in large transactions and a ~670-record
+tail in one-store ones, because 16 000 spans trips the bound fifteen times and
+each seal converts the file away:
+
+| records per txn | spans | plain open | cached open | speedup |
+|---|---|---|---|---|
+| 1 | 16 000 | 0.16 ms | 0.13 ms | 1.2× |
+| 40 | 400 | 1.30 ms | 0.10 ms | **13.0×** |
+| 1 600 | 10 | 1.31 ms | 0.10 ms | 13.2× |
+
+So the cache's open-side value is whatever replay is left *inside* the span
+bound, and there is a cliff rather than a curve: one transaction either side of
+1024 spans is the difference between 1.2× and 13×. For the smallest
+transactions D-9d has already collected the whole saving, which is why a
+downstream integration measuring one-row commits sees the cache do nothing for
+its opens and is not misconfigured.
+
+**The 17.7× this section used to claim was an artifact, and the mechanism is
+worth keeping.** The fixture built its database through a writer with the cache
+configured at threshold 1 — and before P-13 a commit published a table, while a
+successful publication *resets* the replay window `nspans` counts (D-9d). So the
+span bound never fired, the file never sealed, and all 16 000 records sat in one
+unordered file: the cache was manufacturing the replay it was then credited with
+removing. The proof is a byte-identical control — since P-13, the same load's
+on-disk layout is the same three files with a cache configured and without it,
+where at 2.3.0 the cached build left a single 2 176 072-byte active file and the
+uncached build left two sealed generations and an 87 KB tail. Numbers here are
+the pinned fixture, which measures the replay a table removes; numbers for what
+a *default* configuration replays are the transaction-size table above.
 
 ### Writing: who pays the replay
 
@@ -113,7 +148,9 @@ a sawtooth against `rollover_size`, found by a downstream benchmark.)
 16 000 single-store transactions over a 2 MB active file, in both shapes —
 "rebuild per begin" is measured with the pre-probe writer, which is what an
 alternation of one-store transactions across processes still pays, since every
-begin there follows another process's commit:
+begin there follows another process's commit. **This table is pre-P-13**, from
+when a commit published: that is what put the sole writer's threshold-1 cost at
+5.0 s, and it no longer exists.
 
 | threshold | sole writer | rebuild per begin | open | steady-state table |
 |---|---|---|---|---|
@@ -128,6 +165,24 @@ So for the alternating shape the cache is still a **6× improvement on
 writes**, not only on opens. For the sole writer it is no longer a write-side
 effect at all — no cache is its fastest configuration, because the only
 replays left in that run are a handful of opens.
+
+Since P-13 the sole writer's half of that is **flat by construction**, and the
+current measurement says so — 20 000 single stores, span bound pinned so the
+threshold governs a full generation:
+
+| threshold | store | open | steady-state table |
+|---|---|---|---|
+| no cache | 0.91 s | 1.77 ms | — |
+| 1 byte | 0.94 s | 0.15 ms | 156 KB |
+| 4 KB | 0.97 s | 0.14 ms | 156 KB |
+| 32 KB | 0.84 s | 0.14 ms | 156 KB |
+| 1 MB | 0.87 s | 0.13 ms | 156 KB |
+
+A sole writer publishes only at its own open now, so the threshold cannot reach
+its store cost at all: the whole spread is run-to-run noise, and the "too low
+costs the writer" end below is a statement about **whoever rebuilds**, which a
+single-process benchmark cannot produce. Read a flat store column as P-13
+working, not as the threshold being inert.
 
 ### Reading the threshold curve
 
@@ -145,13 +200,19 @@ serve both:
   measured with a rebuild forced per begin: the shape that pays it is not the
   one a single-process benchmark runs.
 
-The default is **32 KB**, from the region both shapes tolerate, capped at a
-quarter of `rollover_size` so a caller using small generations still publishes
-within one. It is an absolute byte count rather than a fraction of
-`rollover_size`, because the knee is set by how much data a replay walks —
-which has nothing to do with how large a caller lets a generation grow. An
-earlier `rollover_size / 8` put the default at 256 KB, squarely on the wrong
-side of the rebuilding shape's knee.
+The default is a **sixty-fourth of the file** being described, with a floor for
+churn — which works out to the 32 KB measured above at the default
+`rollover_size`, in the region both shapes tolerate. It was an absolute 32 KB
+until A-9, on the reasoning that the knee is set by how much data a replay walks
+and not by how large a caller lets a generation grow. The replay half of that is
+right and the publish half is not: a publication rewrites the whole table, so a
+fixed byte gap means the same ~2000 publications whatever the generation's size,
+each one costing more — quadratic in generation size, and measured at 4.70 GB of
+writes on a 2M-record load at a 64 MB rollover. A fraction of `rollover_size`
+fixes that end and breaks the other, since a small database under a large
+rollover then barely publishes and pays at every open; a fraction of the file
+bounds both and needs no knob. An earlier `rollover_size / 8` put the default at
+256 KB, squarely on the wrong side of the rebuilding shape's knee.
 
 ### What it costs
 
