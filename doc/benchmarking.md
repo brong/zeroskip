@@ -353,25 +353,44 @@ the first open, where publishing during the import only overtakes it past roughl
 
 ## Why zeroskip beats a btree at small transactions and loses at large ones on ZFS
 
-From the downstream engine's `strace -c`, same 2M-record load, and it explains the
-whole shape of their matrix rather than one row of it:
+From the downstream engine, same 2M-record load, and it explains the whole shape of
+their matrix rather than one row of it:
 
 | | zeroskip | stock SQLite btree |
 |---|---|---|
-| syscall time, 1 record per txn | 0.91s | 4.20s |
-| syscall time, 1000 per txn | 3.09s | 0.79s |
 | syscalls per commit | 9 | 33 |
 | `unlink` | 41 in a whole run | one per commit (its journal) |
-| `fdatasync`, 1 record per txn | 11.8 µs | ~20 µs |
-| `fdatasync`, 1000 per txn | **302 µs** | ~20 µs |
+| `fdatasync` wall, 111-byte span | 86 µs | ~20 µs |
+| `fdatasync` wall, 111 KB span | **420 µs** | ~20 µs |
+| of which CPU | 14% at 111 B, **74%** at 111 KB | — |
+
+**Read the wall column, and beware where these numbers come from.** An earlier
+version of this table quoted 11.8 µs and 302 µs for those two syncs, from
+`strace -c`, which summarises **system** time unless you pass `-w`. A blocking
+`fdatasync` sleeps, and sleeping is not system time, so a 86 µs gate was being
+reported as a 12 µs one. The wall figures above come from paired
+durable/`ZS_NOSYNC` rows instead, which are wall time by construction: 98.0 − 12.3
+= 85.7 µs, and (182.3 − 12.3)/2 = 85.0 µs from the same load under the old
+two-gate protocol. One 86 µs gate then predicts all four transaction sizes and both
+ZFS recordsizes to within 30%.
 
 The crossover is where two curves meet, and neither is a defect. **Our advantage at
 small transactions is per-commit syscall count** — nine against thirty-three, and no
-journal to create and unlink. **Our deficit at large ones is per-byte sync cost**:
-one `fdatasync` of a 111 KB append makes the ZIL commit 111 KB, where a btree
-syncing a 111-byte journal record pays the same ~20 µs whatever the transaction
-size. Appending a span and syncing it once is the design (C-7, C-8); on a
-raidz2 pool with no SLOG, that sync is priced by its bytes.
+journal to create and unlink. **Our deficit at large ones is per-byte sync cost**,
+and the correction above is what identified the mechanism: at a 111 KB span 74% of
+the sync is CPU, in `zil_commit_impl` → `zil_lwb_write_issue` → `zfs_get_data` →
+`dmu_sync` → `arc_write` → `zio_write` — ZFS compressing and encrypting the whole
+span inline in the committing thread, at 2.05 µs/KB, which is about 490 MB/s or one
+core's compress-then-encrypt rate. Stock SQLite's profile does not land there:
+`pwrite64` → `vfs_write` → `zfs_write` → `dmu_assign_arcbuf_by_dnode`, buffered,
+with the crypto deferred to a transaction group on another thread.
+
+So the per-synced-byte gap is not storage and not a ZIL mode: **a large synchronous
+append pays for its own compression and encryption inline, where small overwrites of
+an already-allocated file hand that work to the pool.** Appending a span and syncing
+it once is the design (C-7, C-8), so on an encrypting, compressing pool the price of
+a commit is set by how many bytes it appends — which is the caller's transaction
+size, and nothing the library can move.
 
 ## What an idle unordered file costs, and what D-9d already saves you
 
@@ -460,10 +479,9 @@ Three things to read from it:
 - **The lifecycle count falls with the square-ish of the size**, because a larger
   generation means both fewer files and a shallower repack ladder — 45x fewer
   unlinks and a quarter of the merge bytes between the first row and the last.
-- **There is a knee, so this is not bigger-is-better.** 64 MB is slower than the
-  2 MB default on this machine: past some size the active file's private index, and
-  the D-13b delta flush that is O(index) once per `ZSI_DELTA_MAX` inserts, cost
-  more than the file churn saved. Measure it on the target filesystem.
+- **There was a knee, and it was the index, not the files** — see the section
+  below. It is much shallower since the delta bound became proportional to the
+  index, but measure it on the target filesystem rather than assuming.
 - **It matters most where per-file cost is high.** The downstream ZFS deployment
   measures `unlink` at 1.8 ms a call — 17% of syscall time on a 2M-record load,
   against 25 µs for a btree's on the same pool — because each one frees a large
@@ -474,6 +492,54 @@ What a larger value costs is everything already documented as bounded by it: a
 longer conversion pause, a larger replay for a snapshot rebuild, which writers
 alternating across processes pay at every begin (C-4i), and more memory per
 snapshot for the private index.
+
+## Why a big `rollover_size` was slow, and it was not bytes rewritten
+
+The row above where 64 MB is slower than 2 MB *despite* rewriting a quarter of the
+bytes was an open question for a while: the downstream deployment could see it from
+outside only as "the biggest rollover is the worst setting, and write amplification
+says it shouldn't be" (1.9x against 4.9x). It was the private index.
+
+Each delta→base merge is O(`nbase`), and — because an index entry is an offset and
+the key lives in the file — it costs a **record decode per comparison**
+(`zsi_index_key_at`, a random access into the mapped file). With a fixed
+`ZSI_DELTA_MAX` that merge ran once per 1024 inserts, so a generation of N records
+cost N/1024 merges of O(N): **quadratic in generation size**, and `rollover_size` is
+what sets generation size. Counted exactly, 2M records at 1000 per transaction:
+
+| `rollover_size` | delta merges | entries merged | ascending | random keys |
+|---|---|---|---|---|
+| 2 MB | 941 | 8.45M | 1.36s | 1.32s |
+| 16 MB | 1000 | 66.4M | 1.15s | 1.74s |
+| 64 MB | 998 | **251.9M** | 2.04s | **6.45s** |
+
+The merge *count* is flat and the work per merge scales with the generation, which
+is the signature. Random keys are far worse than ascending because those decodes are
+then genuinely random access into a 64 MB file.
+
+Making the bound proportional — `max(ZSI_DELTA_MAX, nbase/32)` — makes the merge
+side linear: 32 passes over a generation however large it grows.
+
+| 2M records, random keys | fixed 1024 | proportional |
+|---|---|---|
+| 2 MB rollover | 1.28 / 1.47 / 1.45s | 1.36 / 1.53 / 1.41s |
+| 64 MB rollover | 7.44 / 7.07 / 7.18s | **1.99 / 2.19 / 1.91s** |
+
+Three paired runs each: overlapping at the default, **3.5x** at 64 MB with no
+overlap. The divisor is the measured part. The other side of the trade is the D-13b
+fold, which merges a commit's run into the delta in place and so costs O(`ndelta`)
+per commit for a run that is not ascending, so a bigger delta is paid per
+transaction. At `nbase/8` the bound starts moving at a 1 MB generation, which the
+2 MB default reaches, and it cost **11-15% across every default-sized shape** while
+winning 3-5x at 64 MB. At `nbase/32` nothing moves below about a 4 MB generation, so
+the merge counts at the default are *identical* to the fixed bound's — inert, not
+merely close.
+
+What keeps the fold side safe once the bound does move is a coupling worth knowing:
+a large generation implies large transactions, because D-9d bounds a generation at
+1024 spans, so a generation big enough to raise the bound cannot have been built
+from one-record commits. The fold's per-record cost is therefore bounded by
+`rollover_txns/32` whatever `rollover_size` is.
 
 ## The machines these numbers came from
 

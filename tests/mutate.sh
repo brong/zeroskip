@@ -644,7 +644,7 @@ mutant "fold: run merged in the wrong direction" catch \
   's/        int cmp = zsi_cmp\(compar, kr, lr, kd, ld\);/        int cmp = zsi_cmp(compar, kd, ld, kr, lr);/'
 
 mutant "fold: delta never merges" catch \
-  's/    if \(ix->ndelta > ZSI_DELTA_MAX\) return zsi_index_flush_delta\(ix, compar\);/    if (ix->ndelta > SIZE_MAX) return zsi_index_flush_delta(ix, compar);/'
+  's/    if \(ix->ndelta > zsi_index_delta_max\(ix\)\)/    if (ix->ndelta > SIZE_MAX)/'
 
 # Each merge decodes a side's key ONCE and holds it until that side advances.
 # Failing to invalidate the held key compares the new entry against the previous
@@ -1123,6 +1123,20 @@ mutant "commit: seal threshold inverted" catch \
 # its own window and stops sealing on the span bound.
 mutant "commit: publishes a table" catch \
   's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
+
+# The delta bound is proportional to the base, floored at ZSI_DELTA_MAX.  A fixed
+# bound makes the delta->base merge quadratic in generation size -- 8.45M entries
+# merged at a 2MB rollover_size against 251.9M at 64MB, over the same 2M records --
+# which cost the downstream deployment 3.5x on a 64MB generation and is invisible
+# from outside as anything but "the biggest rollover is the slowest setting".
+# Caught by the rule assertions rather than by a timing test.
+mutant "index: delta bound is a fixed constant" catch \
+  's/    size_t prop = ix->nbase \/ ZSI_DELTA_DIV;/    size_t prop = 0;/'
+
+# The floor removed: a small index merges its delta on nearly every insert, which
+# is the O(n)-per-commit memmove the delta exists to avoid.
+mutant "index: delta bound loses its floor" catch \
+  's/    return prop > ZSI_DELTA_MAX \? prop : ZSI_DELTA_MAX;/    return prop;/'
 
 # C-8b: an abort whose span never reached the file writes nothing.  This mutant is
 # the old behaviour -- always append a ROLLBACK -- which is CORRECT but writes

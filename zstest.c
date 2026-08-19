@@ -3121,6 +3121,110 @@ static void test_index_ordered_traversal(void)
     sb_free(&s);
 }
 
+/* The delta bound is PROPORTIONAL to the base, floored at ZSI_DELTA_MAX.
+ *
+ * A fixed floor made the merge quadratic in generation size: every merge is
+ * O(nbase) with a record decode per comparison, and it ran once per
+ * ZSI_DELTA_MAX inserts, so 2M records cost 8.45M merged entries at a 2MB
+ * rollover_size and 251.9M at 64MB.  Proportional makes it 32 passes over the
+ * generation however large it grows -- measured 7.07-7.44s to 1.91-2.19s on 2M
+ * random keys at a 64MB rollover.
+ *
+ * Two halves, because either alone is weak.  The RULE is checked directly, since
+ * reaching a million-entry base through the public API would mean writing 128MB
+ * in a unit test; a constant bound cannot survive it.  Then the REGIME is
+ * exercised for real: a generation large enough that the bound moves off its
+ * floor, asserting the delta really does exceed ZSI_DELTA_MAX -- a state no test
+ * could reach before -- and that lookups and ordered traversal are still correct
+ * there, which is what every base+delta path now has to handle. */
+static void test_index_delta_bound_scales(void)
+{
+    struct zsi_index probe;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    const size_t N = 60000;             /* > 32768, so the bound leaves its floor */
+    size_t maxdelta = 0;
+
+    memset(&probe, 0, sizeof(probe));
+
+    /* The rule.  Below the crossover the floor wins; above it, nbase/32. */
+    probe.nbase = 0;
+    ASSERT_EQU(zsi_index_delta_max(&probe), (size_t)ZSI_DELTA_MAX);
+    probe.nbase = ZSI_DELTA_MAX * ZSI_DELTA_DIV;         /* exactly the crossover */
+    ASSERT_EQU(zsi_index_delta_max(&probe), (size_t)ZSI_DELTA_MAX);
+    probe.nbase = ZSI_DELTA_MAX * ZSI_DELTA_DIV * 4;
+    ASSERT_EQU(zsi_index_delta_max(&probe), (size_t)ZSI_DELTA_MAX * 4);
+    probe.nbase = (size_t)1 << 20;
+    ASSERT_EQU(zsi_index_delta_max(&probe), ((size_t)1 << 20) / ZSI_DELTA_DIV);
+
+    /* The regime.  One generation holding N records, committed in runs so the
+     * D-13b fold drives the delta rather than a replay. */
+    {
+        struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+        setup.flags = ZS_CREATE | ZS_NOSYNC;
+        /* Both generation bounds pinned out of the way: the subject is what the
+         * index does as ONE generation grows, so neither rollover_size nor
+         * D-9d's span bound may seal it mid-test. */
+        setup.rollover_size = (size_t)512 * 1024 * 1024;
+        setup.rollover_txns = (size_t)1 << 40;
+        ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    }
+    ASSERT_NOT_NULL(db);
+
+    /* Runs of 200, not 2000: a run larger than the bound flushes the delta on
+     * every commit, so ndelta sampled after a commit is always ~0 and the test
+     * proves nothing.  The delta has to ACCUMULATE across commits to be observed
+     * above the old fixed bound. */
+    for (size_t i = 0; i < N; i += 200) {
+        ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+        for (size_t j = i; j < i + 200 && j < N; j++) {
+            char k[32];
+            /* Not ascending: an ascending run exits the fold early, which is the
+             * cheap path and not the one a bigger delta has to survive. */
+            snprintf(k, sizeof(k), "k%06zu", (j * 48271u) % N);
+            ASSERT_OK(zs_txn_store(txn, k, strlen(k), "v", 1, 0));
+        }
+        ASSERT_OK(zs_txn_commit(&txn));
+
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        if (act && act->index && act->index->ndelta > maxdelta)
+            maxdelta = act->index->ndelta;
+    }
+
+    /* The point of the test: a delta bigger than the old fixed bound really
+     * happened.  Without this the proportional rule could be dead code. */
+    ASSERT(maxdelta > (size_t)ZSI_DELTA_MAX);
+
+    /* And the index is still right in that regime: every key present once, in
+     * order, through the public read path. */
+    {
+        struct zsi_file *act = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(act);
+        ASSERT_NOT_NULL(act->index);
+        ASSERT(act->index->ndelta <= zsi_index_delta_max(act->index));
+    }
+
+    struct zs_cursor *cur = NULL;
+    const char *k = NULL, *v = NULL;
+    size_t kl = 0, vl = 0;
+    char prev[32];
+    size_t seen = 0, prevlen = 0;
+
+    ASSERT_OK(zs_db_begin_cursor(db, NULL, 0, &cur, ZS_SHARED));
+    while (zs_cursor_next(cur, &k, &kl, &v, &vl) == ZS_OK) {
+        if (seen) ASSERT(zsi_cmp(zsi_compar_default, prev, prevlen, k, kl) < 0);
+        ASSERT(kl < sizeof(prev));
+        memcpy(prev, k, kl);
+        prevlen = kl;
+        seen++;
+    }
+    zs_cursor_fini(&cur);
+    ASSERT_EQU(seen, N);
+
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_OK(zs_db_close(&db));
+}
+
 static void test_index_delta(void)
 {
     struct sb s;
@@ -3191,7 +3295,10 @@ static void test_index_delta(void)
 
     /* The delta really did overflow into the base at least once. */
     ASSERT(merged_at_least_once);
-    ASSERT(f->index->ndelta <= ZSI_DELTA_MAX);
+    /* The bound is proportional to the base with ZSI_DELTA_MAX as a floor, so
+     * this asserts the rule rather than the floor -- with a small index they are
+     * the same number, and above about 32768 entries they are not. */
+    ASSERT(f->index->ndelta <= zsi_index_delta_max(f->index));
 
     /* And traversal yields every key exactly once, in order, across the merge
      * boundary. */
@@ -17761,6 +17868,7 @@ static struct test_entry tests[] = {
     { "test_index_committed_only",      test_index_committed_only },
     { "test_index_ordered_traversal",   test_index_ordered_traversal },
     { "test_index_delta",               test_index_delta },
+    { "test_index_delta_bound_scales",  test_index_delta_bound_scales },
     { "test_index_delta_shadows_base",  test_index_delta_shadows_base },
     { "test_index_delta_merge_with_duplicates",
                                         test_index_delta_merge_with_duplicates },

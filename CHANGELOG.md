@@ -3,6 +3,17 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.8.0 — 2026-08-19
+
+- **A large `rollover_size` is no longer punished by the private index.** The
+  index's delta was merged into its base once per fixed number of inserts, and each
+  merge is proportional to the whole index, so the merging was quadratic in
+  generation size — which is why a 64MB `rollover_size` was slower than the 2MB
+  default while rewriting a quarter of the bytes. The bound is now proportional to
+  the index, making it linear: 2M records with random keys at a 64MB rollover went
+  from 7.1–7.4s to 1.9–2.2s. Behaviour at the default is unchanged — measured
+  identical merge counts, not merely similar. No API or format change.
+
 ## 2.7.0 — 2026-08-19
 
 - **An abort whose records never left the writer's buffer now writes nothing at

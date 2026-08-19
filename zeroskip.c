@@ -2272,15 +2272,43 @@ static int zsi_ptrs_build(const uint64_t *offs, size_t n, size_t records_end,
  * The full rationale, and the build and lookup paths, are in the task that
  * implements them.  Only the shape and the destructor live here, because
  * zsi_file_release must be able to free an index without the caller remembering to. */
-/* Above ZSI_DELTA_MAX entries the delta is merged into the base and cleared.
+/* The delta is merged into the base and cleared once it exceeds a bound.
  *
  * The bound is what makes insertion amortised O(1) rather than O(n): a splice
  * into an array of at most this many entries is a bounded memmove, and the merge
- * that empties it is linear in the whole index but happens once per
- * ZSI_DELTA_MAX inserts.  A single sorted array with no delta would memmove the
+ * that empties it is linear in the whole index but happens once per bound's
+ * worth of inserts.  A single sorted array with no delta would memmove the
  * entire index per commit, which for a 2MB active file under bulk load is
- * megabytes of copying per transaction. */
+ * megabytes of copying per transaction.
+ *
+ * ZSI_DELTA_MAX is the FLOOR, and a fixed floor is what made the whole thing
+ * quadratic in generation size.  Each merge is O(nbase) -- with a record decode
+ * per comparison, since an entry is an offset and the key lives in the file
+ * (zsi_index_key_at) -- and it happens every ZSI_DELTA_MAX inserts, so a
+ * generation of N records costs N/ZSI_DELTA_MAX merges of O(N): measured at 2M
+ * records, 8.45M entries merged at a 2MB rollover_size, 66.4M at 16MB and 251.9M
+ * at 64MB.  That is the cost the downstream deployment could see from outside
+ * only as "64MB is the worst setting despite the lowest write amplification".
+ *
+ * Making the bound proportional to the base makes the merge side LINEAR: a merge
+ * every nbase/32 inserts is 32 passes over the generation however large it grows.
+ * The divisor is the interesting number, and 32 rather than 8 is a measurement.
+ * The other side of the trade is the D-13b fold, which merges a commit's run into
+ * the delta IN PLACE and so costs O(ndelta) per commit for a run that is not
+ * ascending -- so a bigger delta is paid per transaction.  At /8 the bound starts
+ * moving at nbase > 8192, which a 2MB generation reaches, and it cost 11-15%
+ * across every default-sized shape while winning 3-5x at 64MB.  At /32 nothing
+ * moves below nbase > 32768 -- about a 4MB generation -- so the flush counts at
+ * the 2MB default are *identical* to the fixed bound's, and 2M records at 64MB
+ * with random keys went 7.07-7.44s to 1.91-2.19s.
+ *
+ * What keeps the fold side safe once the bound does move: a large generation
+ * implies large transactions, because D-9d's rollover_txns bounds a generation at
+ * 1024 spans, so a generation big enough to raise the bound cannot have been
+ * built from one-record commits.  The fold's per-record cost is therefore bounded
+ * by rollover_txns/32 whatever rollover_size is. */
 #define ZSI_DELTA_MAX 1024
+#define ZSI_DELTA_DIV 32
 
 /* Record offsets are size_t rather than uint32_t.
  *
@@ -2759,6 +2787,15 @@ static void zsi_index_cur_prev(struct zsi_index *ix, zs_compar *compar,
  * both every iteration is the obvious loop and doubles the work in the place
  * that does most of it: a comparison here is a random-access decode in the
  * mapped file, and this merge runs over the whole index. */
+/* The bound the delta is merged at: proportional to the base, floored at
+ * ZSI_DELTA_MAX.  See ZSI_DELTA_MAX for why proportional, and why the divisor
+ * is what it is. */
+static size_t zsi_index_delta_max(const struct zsi_index *ix)
+{
+    size_t prop = ix->nbase / ZSI_DELTA_DIV;
+    return prop > ZSI_DELTA_MAX ? prop : ZSI_DELTA_MAX;
+}
+
 static int zsi_index_flush_delta(struct zsi_index *ix, zs_compar *compar)
 {
     size_t *merged = malloc((ix->nbase + ix->ndelta) * sizeof(*merged));
@@ -2899,7 +2936,8 @@ static int zsi_index_fold_run(struct zsi_index *ix, zs_compar *compar,
                 (want - dropped) * sizeof(*ix->delta));
     ix->ndelta = want - dropped;
 
-    if (ix->ndelta > ZSI_DELTA_MAX) return zsi_index_flush_delta(ix, compar);
+    if (ix->ndelta > zsi_index_delta_max(ix))
+        return zsi_index_flush_delta(ix, compar);
     return ZS_OK;
 }
 
