@@ -1733,9 +1733,11 @@ typedef int zsi_replay_cb(void *rock, const struct zsi_rec *rec, size_t off);
  * The span checksum is verified in EVERY mode -- verification rides indexing
  * (F-5e), and this replay is where spans are indexed.  ZS_NOCSUM does not
  * reach it: skipping here would accept, on the strength of its length field
- * alone, a terminator whose data never landed -- the state a crash under
- * relaxed durability (C-7c) really leaves, since gate 1 is what ordered data
- * before terminator on the DISK.  F-22 and C-4f hold for every reader.
+ * alone, a terminator whose data never landed.  Nothing orders data before
+ * terminator on the DISK in any mode since C-7 went to a single gate, so that
+ * is the state a crash really leaves -- under relaxed durability (C-7c) and,
+ * inside the commit window, under the default too.  F-22 and C-4f hold for
+ * every reader, and this is where they are enforced.
  *
  * Two passes per span, deliberately.  Pass one finds the terminator and validates
  * the whole span; pass two replays its records.  Records are therefore decoded
@@ -6911,22 +6913,29 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
     return ZS_OK;
 }
 
-/* Commit: two gates (C-7).
+/* Commit: one gate (C-7).
  *
- *   1. append the span's data records, then fdatasync;
- *   2. append the terminator, then fdatasync again.
+ *   1. append the span's data records and then the terminator -- in ONE write
+ *      where the span is still buffered, since nothing orders them;
+ *   2. fdatasync.
  *
  * fdatasync rather than fsync because appending changes only the metadata needed
- * to read the data back, which fdatasync is required to flush.
+ * to read the data back, which fdatasync is required to flush.  The cost is one
+ * sync per TRANSACTION, not per record, which is the reason zs_txn_* exists
+ * alongside the single-operation zs_db_* calls (C-7b).
  *
- * Together the gates make "a valid terminator implies its data is durable" a
- * guarantee of the filesystem (C-7a).  The cost is two syncs per TRANSACTION, not
- * per record, which is the reason zs_txn_* exists alongside the single-operation
- * zs_db_* calls (C-7b).
+ * This was TWO gates until 2026-08-18, with a sync between the records and the
+ * terminator so that a valid terminator implied durable data.  F-22 already
+ * implies that a different way: the terminator's checksum covers the span, so a
+ * terminator that reaches disk without its data fails validation and the span
+ * reads as absent.  The ordering made that impossible rather than merely
+ * detectable, and cost +81% on one-record transactions.  What went with it is
+ * the first gate's extra promise -- that a commit reporting an error definitely
+ * did not happen -- which was never observable here anyway, since both gates
+ * returned the same ZS_IOERROR (C-7a).
  *
- * C-7c: ZS_NOSYNC omits BOTH gates.  Atomicity survives, because a torn tail is
- * still detectable (F-22); durability does not, and neither does C-7a's ordering
- * guarantee. */
+ * C-7c: ZS_NOSYNC omits the gate.  Atomicity survives, because a torn tail is
+ * still detectable (F-22); durability does not. */
 static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
                              size_t *term_off_out, uint32_t *term_csum_out)
 {
@@ -6966,14 +6975,18 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
     zsi_term_encode(term, (uint64_t)spanlen, rollback, span,
                     txn->wcs, txn->wcsum_id);
 
-    bool gated = !db->nosync && !rollback;
-
-    /* With no gate between them, the span and its terminator may leave in
-     * ONE write: nothing orders them for the ungated cases (C-7c, C-8), and
-     * the terminator checksum already makes any torn interleaving read as
-     * absent (F-22).  Under default durability the merge is FORBIDDEN --
-     * gate 1 exists precisely to order the data before the terminator. */
-    if (!gated && in_chunk && txn->chunklen + termlen <= txn->chunkcap) {
+    /* The span and its terminator leave in ONE write whenever the span is still
+     * buffered: nothing orders them in ANY durability mode since C-7 went to a
+     * single gate, and the terminator checksum makes a torn interleaving read as
+     * absent (F-22).  That detection is now load-bearing rather than a second
+     * line of defence, which is why F-22 says so.
+     *
+     * The condition is about RESIDENCE, not size: a span that already flushed
+     * cannot be merged with its terminator because its head is in the file
+     * already.  So how much of the commit traffic takes this path is set by the
+     * chunk buffer (ZSI_TXN_CHUNK), and a transaction larger than it pays a
+     * second write -- never a second sync. */
+    if (in_chunk && txn->chunklen + termlen <= txn->chunkcap) {
         memcpy(txn->chunk + txn->chunklen, term, termlen);
         txn->chunklen += termlen;
         txn->wsize += termlen;
@@ -6983,22 +6996,20 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
         r = zsi_txn_flush(txn);
         if (r != ZS_OK) return r;
 
-        /* Gate 1: the data records, then a sync.  If this fails, no
-         * terminator was written, so the transaction plainly did not happen
-         * (C-7a).  C-8: an abort syncs NEITHER gate -- the next commit's own
-         * gate 1 is what orders the ROLLBACK ahead of the next COMMIT
-         * terminator (C-8a). */
-        if (gated && ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
-
+        /* No sync here.  The span's head is already in the file and the
+         * terminator follows it; the gate below covers both, and a crash
+         * between them leaves a terminator F-22 rejects. */
         r = zsi_write_all(txn->wfd, term, termlen);
         if (r != ZS_OK) return r;
         txn->flushed += termlen;
         txn->wsize += termlen;
     }
 
-    /* Gate 2: the terminator, then a sync.  If THIS fails the terminator may
-     * or may not be durable -- and either outcome is correct, so the error is
-     * reported and nothing else is done.
+    /* The gate: everything is written, now sync it.  If this fails the
+     * terminator may or may not be durable -- and either outcome is correct, so
+     * the error is reported and nothing else is done.  A caller must treat a
+     * failed commit as an UNKNOWN outcome and go and look (C-7a); it cannot be
+     * told the transaction did not happen, because it may have.
      *
      * An implementation MUST NOT retry a failed sync and treat success as
      * evidence the data survived: a second call can succeed after the dirty

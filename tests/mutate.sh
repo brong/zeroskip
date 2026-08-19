@@ -1124,6 +1124,27 @@ mutant "commit: seal threshold inverted" catch \
 mutant "commit: publishes a table" catch \
   's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
 
+# C-7 since 2026-08-18: ONE gate, not two.  This mutant restores the old first
+# gate -- a sync between the span and its terminator.  It is not a correctness
+# regression (it is strictly more ordering) but it doubles the syncs on every
+# commit, which was measured at -45% on one-record transactions, so the count is
+# asserted rather than left to a benchmark nobody runs.
+mutant "commit: syncs before the terminator too" catch \
+  's/        \/\* No sync here\.  The span.s head is already in the file and the/        if (!db->nosync \&\& !rollback \&\& ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;\n        \/* No sync here.  The spans head is already in the file and the/'
+
+# C-7's gate removed entirely: every commit becomes ZS_NOSYNC, which no data
+# assertion can see -- the bytes are identical and only a crash tells the
+# difference -- so the sync COUNT is what catches it.
+mutant "commit: no gate at all" catch \
+  's/    if \(!db->nosync && !rollback\) \{\n        if \(ZS_FDATASYNC\(txn->wfd\) < 0\) return ZS_IOERROR;\n    \}/    if (false) { }/'
+
+# equivalent: merging the terminator into the chunk saves a write(2) and changes
+# no byte on disk, so nothing observable distinguishes the two paths.  Listed so
+# that the comment above the merge -- which explains why the condition is about
+# RESIDENCE rather than size -- does not read as an untested claim.
+mutant "commit: never merges the terminator into the chunk" equivalent \
+  's/    if \(in_chunk && txn->chunklen \+ termlen <= txn->chunkcap\) \{/    if (false) {/'
+
 # D-26.  Skipping the seal leaves the active generation out of the result, so the
 # database never reaches one file.
 mutant "compact: skips the seal" catch \

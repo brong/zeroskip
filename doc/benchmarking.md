@@ -54,8 +54,8 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 
 | Workload | What it measures |
 |---|---|
-| `store, one txn each` | the worst case: two `fdatasync` calls per record (C-7) |
-| `store, N per txn` | how much batching amortises those two syncs (C-7b) |
+| `store, one txn each` | the worst case: one `fdatasync` per record (C-7) |
+| `store, N per txn` | how much batching amortises that sync (C-7b) |
 | `store, all in one txn, random` | the same bulk load with keys arriving in a different ORDER — the pending set's insertion cost, which was quadratic until it became a skiplist |
 | `fetch (N files)` | lookup cost, before and after a repack — it is proportional to the **number of files** (D-14d) |
 | `full scan` | the merge cursor over whatever file set exists — but see below: its files do not overlap, so the merge never merges |
@@ -72,6 +72,32 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 The `store, one txn each` figure is dominated by `fdatasync` and therefore measures
 the *filesystem*, not zeroskip. Compare it against `store, 1000 per txn` on the same
 machine: the ratio is the cost of durability, not of this library.
+
+### What the second gate cost (C-7)
+
+A commit synced twice until 2026-08-18 — once between the span's records and its
+terminator, to make a valid terminator imply durable data, and once after the
+terminator. F-22's checksum already detects that case, so the ordering bought
+impossibility rather than detection. Removing the first sync, same machine, 20 000
+records × 100-byte values, medians of paired runs:
+
+| records per txn | two gates | one gate | change |
+|---|---|---|---|
+| 1 | 22.2k/s | 40.3k/s | **+81%** |
+| 10 | 204k/s | 347k/s | +70% |
+| 100 | 975k/s | 1.24M/s | +27% |
+| 1 000 | 2.96M/s | 3.29M/s | +11% |
+| all 20 000 | 3.77M/s | 4.06M/s | +8% |
+
+The curve is C-7b restated: the gate is per *transaction*, so the smaller the
+transaction the larger the share of it that was sync. **This is an APFS laptop,
+where `fdatasync` is not a full barrier** — the figures understate a filesystem
+that really commits, which is where the change was aimed.
+
+It also makes the chunk buffer matter in a way it did not before. A span still
+buffered leaves in ONE write together with its terminator; a span already flushed
+pays a second write, never a second sync. So `ZSI_TXN_CHUNK` now sets how much
+commit traffic takes the single-write path.
 
 ## The pointer table cache (spec section 8)
 
@@ -465,7 +491,7 @@ clang against GCC without saying so.
 
 A read-only workload's database is setup, not measurement, so `bench_fetch`,
 `bench_scan` and the pre-existing database `store into N files` writes into are
-all built with `ZS_NOSYNC` (`FIXTURE_FLAGS`). That skips C-7's two commit gates
+all built with `ZS_NOSYNC` (`FIXTURE_FLAGS`). That skips C-7's commit gate
 and **nothing else** (C-6b), so the fixture is byte-for-byte the file set a
 durable build produces — still one span per record, which is the fragmented
 shape those workloads exist to read. Only the durability of writing it differs,

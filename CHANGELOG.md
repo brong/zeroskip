@@ -3,6 +3,22 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.6.0 — 2026-08-18
+
+- **A commit now syncs once, not twice.** The sync between a span's records and
+  its terminator is gone; the terminator's checksum already makes a terminator
+  that reaches disk without its data read as absent (F-22), so ordering the
+  writes made that case impossible rather than merely detectable. Worth +81% on
+  one-record transactions and +11% at a thousand. See C-7.
+
+- Behaviour change for callers handling a commit error: a failed commit is now an
+  **unknown** outcome, never "it did not happen". Under two gates a first-gate
+  failure guaranteed no terminator had been written, but both gates returned the
+  same error, so no caller could tell them apart. Check rather than assume. See
+  C-7a.
+
+- No format change: same records, same terminators, same checksums.
+
 ## 2.5.0 — 2026-08-18
 
 - **A commit no longer publishes a pointer table.** Publishing amortises a replay,

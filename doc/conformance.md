@@ -33,7 +33,7 @@ a spec label is missing here.
 | `G-0a` | Every integer in every structure is little-endian (F-1), including | `interop_constants_uuid` |
 | `G-0b` | Any arithmetic on a length, count or offset **read from a file** MUST | `file_bounds`, `interop_constants_uuid`, `overflow_guards`, +1 more |
 | `G-1` | Append-only. No committed byte is ever mutated and no file is ever | `crash/crash_at_every_call` |
-| `G-2` | Commit atomicity. Once `zs_txn_commit` returns `ZS_OK`, the whole | `crash/crash_at_every_call, crash/sync_failure_gate1, crash/sync_failure_gate2` |
+| `G-2` | Commit atomicity. Once `zs_txn_commit` returns `ZS_OK`, the whole | `crash/crash_at_every_call, crash/sync_failure_gate` |
 | `G-3` | Always reopens. Any state a crash can produce MUST open in bounded | `check_noncanonical`, `open_bad_nonactive`, `record_canonical`, +2 more |
 | `G-4` | Snapshot isolation, lock-free reads. A read transaction sees a fixed | `mp_writer_and_readers`, `write_txn_isolation` |
 | `G-5` | One writer. At most one writer per database, enforced by an `fcntl` | `lock_dies_with_process`, `lock_two_handles_one_process`, `mp_killed_writer` |
@@ -227,7 +227,7 @@ a spec label is missing here.
 | `C-7b` | The cost is one sync per commit. It is paid per | `zsbench (store, N per txn)` |
 | `C-7c` | `ZS_NOSYNC` omits the gate — and nothing else. The structural | `crash/crash_nosync_mode`, `crash/nosync_structural_syncs` |
 | `C-8` | An aborted transaction appends a `ROLLBACK` and does **not** sync. | `write_abort`, `stream_abort_writes_rollback` |
-| `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_writes_rollback`, `crash/sync_failure_gate1` |
+| `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_writes_rollback`, `crash/sync_failure_gate` |
 
 ## Open and recovery (`R-n`)
 

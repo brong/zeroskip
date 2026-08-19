@@ -599,12 +599,21 @@ static void test_dirsync_justifies_c6(void)
  * T-8a: a FAILING fdatasync -- the case C-7a exists for
  * ------------------------------------------------------------------------- */
 
-static void test_sync_failure_gate1(void)
+static void test_sync_failure_gate(void)
 {
-    /* Gate 1 failing: no terminator was written, so the transaction plainly did not
-     * happen.  Assert the error reached the caller AND that the file holds no
-     * terminator for that span -- which is what makes "did not happen" true rather
-     * than merely reported. */
+    /* The commit's only sync (C-7) made to fail.  The terminator is already
+     * written by then, so the outcome is UNKNOWN: the commit may be visible with
+     * durable data, or the span may read as absent, and either is correct.  What
+     * is NOT allowed is a third state -- a torn or invented one -- or losing an
+     * earlier commit, or wedging the database.
+     *
+     * This was two tests until 2026-08-18, one per gate.  The first asserted the
+     * stronger thing C-7a used to promise: a gate-1 failure meant no terminator
+     * had been written, so the transaction plainly did not happen.  One gate
+     * cannot offer that -- writing the terminator only after a successful sync IS
+     * the second gate -- and the promise was never reachable through this API,
+     * since both gates returned the same ZS_IOERROR.  Losing the assertion is the
+     * real cost of the change, recorded here rather than quietly dropped. */
     total++;
 
     hooks_reset();
@@ -615,12 +624,12 @@ static void test_sync_failure_gate1(void)
     CHECK(db != NULL, "open failed");
     CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
 
-    /* The next commit's FIRST sync is gate 1. */
+    /* The next commit's only sync is the gate. */
     long before_syncs = sync_calls;
     fail_sync_at = before_syncs + 1;
 
-    int r = zs_db_store(db, "doomed", 6, "2", 1, 0);
-    CHECK(r != ZS_OK, "gate 1 failure was not reported (got %s)", zs_strerror(r));
+    int r = zs_db_store(db, "maybe", 5, "2", 1, 0);
+    CHECK(r != ZS_OK, "the gate failure was not reported (got %s)", zs_strerror(r));
 
     /* MUST NOT retry the sync (C-7a): a second call can succeed after the dirty
      * pages were discarded, so treating success as proof the data survived is
@@ -632,56 +641,8 @@ static void test_sync_failure_gate1(void)
     zs_db_close(&db);
     hooks_reset();
 
-    /* The transaction did not happen. */
     char state[512];
-    CHECK(read_state(state, sizeof(state)), "reopen after gate 1 failure");
-    CHECK(strstr(state, "doomed") == NULL,
-          "the failed transaction is visible: '%s'", state);
-    CHECK(strstr(state, "before=1") != NULL,
-          "the earlier commit was lost: '%s'", state);
-
-    /* And a writer can continue. */
-    db = open_db(0);
-    CHECK(db != NULL, "cannot reopen");
-    CHECK(zs_db_store(db, "after", 5, "3", 1, 0) == ZS_OK, "cannot continue");
-    zs_db_close(&db);
-
-    passed++;
-    fprintf(stderr, "  sync failure at gate 1                   ok\n");
-}
-
-static void test_sync_failure_gate2(void)
-{
-    /* Gate 2 failing: the terminator may or may not be durable, and EITHER OUTCOME
-     * IS CORRECT -- so the requirement is that the error is reported and nothing
-     * else is done.  The assertion is therefore about what the database looks like
-     * afterwards: the commit is visible with durable data, or the span reads as
-     * absent, and nothing in between. */
-    total++;
-
-    hooks_reset();
-    hooks_on();
-    fresh_dir();
-
-    struct zs_db *db = open_db(ZS_CREATE);
-    CHECK(db != NULL, "open failed");
-    CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
-
-    /* The SECOND sync of the next commit is gate 2. */
-    long before_syncs = sync_calls;
-    fail_sync_at = before_syncs + 2;
-
-    int r = zs_db_store(db, "maybe", 5, "2", 1, 0);
-    CHECK(r != ZS_OK, "gate 2 failure was not reported");
-    CHECK(syncs_after_failure == 0,
-          "%ld fdatasync calls after a failure -- must be 0 (C-7a)",
-          syncs_after_failure);
-
-    zs_db_close(&db);
-    hooks_reset();
-
-    char state[512];
-    CHECK(read_state(state, sizeof(state)), "reopen after gate 2 failure");
+    CHECK(read_state(state, sizeof(state)), "reopen after a gate failure");
 
     /* Both outcomes are legal; a torn or invented one is not. */
     bool visible = strstr(state, "maybe=2") != NULL;
@@ -690,13 +651,79 @@ static void test_sync_failure_gate2(void)
     CHECK(strstr(state, "before=1") != NULL,
           "the earlier commit was lost: '%s'", state);
 
+    /* And a writer can continue: an unknown outcome must not be a wedged
+     * database (T-8a). */
     db = open_db(0);
     CHECK(db != NULL, "cannot reopen");
     CHECK(zs_db_store(db, "after", 5, "3", 1, 0) == ZS_OK, "cannot continue");
     zs_db_close(&db);
 
     passed++;
-    fprintf(stderr, "  sync failure at gate 2                   ok\n");
+    fprintf(stderr, "  sync failure at the gate                 ok\n");
+}
+
+static void test_commit_has_one_gate(void)
+{
+    /* C-7: one sync per commit, on BOTH commit paths.
+     *
+     * The paths differ in where the span's bytes are when the terminator is
+     * built.  A span still in the chunk buffer is merged with its terminator and
+     * leaves in one write; a span already flushed -- anything larger than
+     * ZSI_TXN_CHUNK -- writes the terminator separately.  The second path is
+     * where the old first gate lived, so a sync re-added there is invisible to
+     * any small-transaction assertion: the mutant "commit: syncs before the
+     * terminator too" went NOT CAUGHT until this test existed, because every
+     * other sync-counting test commits a single record. */
+    struct zs_db *db;
+    struct zs_txn *txn = NULL;
+    char *big;
+    long syncs;
+    size_t nrecs = (ZSI_TXN_CHUNK / 100) * 4;   /* comfortably over one chunk */
+
+    total++;
+
+    fresh_dir();
+    hooks_reset();
+    hooks_on();
+
+    db = open_db(ZS_CREATE);
+    CHECK(db != NULL, "open failed");
+
+    /* Merged path: one small record, so the span never leaves the chunk. */
+    syncs = sync_calls;
+    CHECK(zs_db_store(db, "small", 5, "1", 1, 0) == ZS_OK, "small store");
+    CHECK(sync_calls - syncs == 1,
+          "merged path: expected 1 sync, got %ld", sync_calls - syncs);
+
+    /* Flushed path: a span far larger than the chunk, so the terminator is
+     * written on its own.  Still one gate. */
+    big = malloc(100);
+    CHECK(big != NULL, "malloc");
+    memset(big, 'v', 100);
+    syncs = sync_calls;
+    CHECK(zs_db_begin_txn(db, 0, &txn) == ZS_OK, "begin");
+    for (size_t i = 0; i < nrecs; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "big%08zu", i);
+        CHECK(zs_txn_store(txn, k, strlen(k), big, 100, 0) == ZS_OK, "big store");
+    }
+    CHECK(zs_txn_commit(&txn) == ZS_OK, "big commit");
+    free(big);
+
+    /* A conversion may fire on the way out (D-25d) and carries structural syncs
+     * of its own (C-6b), which are not the commit's gate.  The commit is the
+     * floor: what must not happen is TWO per commit. */
+    CHECK(sync_calls - syncs >= 1,
+          "flushed path: expected at least the gate, got %ld", sync_calls - syncs);
+    CHECK(sync_calls - syncs <= 1 || db->stats.conversions > 0,
+          "flushed path: %ld syncs with no conversion to explain them",
+          sync_calls - syncs);
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    passed++;
+    fprintf(stderr, "  one gate per commit, both paths (C-7)    ok\n");
 }
 
 static void test_sync_failure_every_point(void)
@@ -712,7 +739,7 @@ static void test_sync_failure_every_point(void)
     fresh_dir();
     workload(nkeys);
     long nsyncs = sync_calls;
-    CHECK(nsyncs >= nkeys * 2, "only %ld syncs for %d commits", nsyncs, nkeys);
+    CHECK(nsyncs >= nkeys, "only %ld syncs for %d commits", nsyncs, nkeys);
 
     for (long at = 1; at <= nsyncs; at++) {
         hooks_reset();
@@ -927,7 +954,7 @@ static void snapshot_gap(const char *dir)
  *
  * This lives in the crash harness rather than zstest because the syscall hooks
  * only exist under ZS_TEST_HOOKS, which only this target defines.  It doubles as
- * a check that C-7's two gates are still two. */
+ * a check that C-7's single gate is still single. */
 static void test_idxcache_no_fsync_on_publish(void)
 {
     char cachedir[PATH_MAX];
@@ -973,7 +1000,7 @@ static void test_idxcache_no_fsync_on_publish(void)
     snprintf(cachedir, sizeof(cachedir), "%s", db->index_dir);
     zs_db_close(&db);
 
-    CHECK(without == 2, "C-7 gates: expected 2 syncs per commit, got %ld",
+    CHECK(without == 1, "C-7: expected 1 sync per commit, got %ld",
           without);
     CHECK(with == without,
           "publishing added %ld sync(s) to a commit (P-14)", with - without);
@@ -1139,8 +1166,8 @@ int main(int argc, char **argv)
         { "crash_nosync_mode",              test_crash_nosync_mode },
         { "nosync_structural_syncs",        test_nosync_structural_syncs },
         { "dirsync_justifies_c6",           test_dirsync_justifies_c6 },
-        { "sync_failure_gate1",             test_sync_failure_gate1 },
-        { "sync_failure_gate2",             test_sync_failure_gate2 },
+        { "commit_has_one_gate",            test_commit_has_one_gate },
+        { "sync_failure_gate",              test_sync_failure_gate },
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },
         { "crash_after_invalid_terminator", test_crash_after_invalid_terminator },
