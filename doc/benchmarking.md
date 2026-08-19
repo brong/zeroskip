@@ -96,8 +96,34 @@ that really commits, which is where the change was aimed.
 
 It also makes the chunk buffer matter in a way it did not before. A span still
 buffered leaves in ONE write together with its terminator; a span already flushed
-pays a second write, never a second sync. So `ZSI_TXN_CHUNK` now sets how much
-commit traffic takes the single-write path.
+pays a second write, never a second sync. So the buffer sets how much commit
+traffic takes the single-write path — which is why it now grows on demand from
+64KB to a 4MB ceiling. Exact counts, 20 000 records, `ZS_TEST_HOOKS`:
+
+| records/txn | span | writes at a fixed 64KB | writes growing | syncs |
+|---|---|---|---|---|
+| 1 | 0.1 KB | 20 001 | 20 001 | 20 002 |
+| 100 | 10.8 KB | 201 | 201 | 202 |
+| 1 000 | 108 KB | 61 | **21** | 22 |
+| 20 000 | 2.1 MB | 42 | **2** | 3 |
+
+**The buffer's time effect does not resolve on this laptop** — three paired runs
+at 200k records and 1000 per transaction gave 64KB 2.584/2.590/2.618 M/s against
+a 1MB buffer's 2.749/2.744/2.579, which overlap. That is what the mechanism
+predicts: bytes written and bytes synced are identical and only the call count
+moves, so it needs a machine where `write(2)` is not nearly free. The syscall
+counts above are exact and are the reason to keep it; the throughput claim below
+belongs to the gate.
+
+Both changes together, against a fixed 64KB buffer and two gates:
+
+| records per txn | before | after | change |
+|---|---|---|---|
+| 1 | 22.2k/s | 41.8k/s | **+88%** |
+| 10 | 204k/s | 360k/s | +76% |
+| 100 | 975k/s | 1.29M/s | +32% |
+| 1 000 | 2.96M/s | 3.51M/s | +19% |
+| all 20 000 | 3.77M/s | 4.20M/s | +11% |
 
 ## The pointer table cache (spec section 8)
 

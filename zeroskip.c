@@ -186,8 +186,18 @@ void (*zs_hook_snapshot_gap)(const char *dir) = NULL;
 
 /* The streaming writer's append buffer (C-8): stores batch into it, so a
  * store is a memcpy rather than a syscall, and it flushes whenever a read
- * needs bytes it still holds and at every terminator. */
-#define ZSI_TXN_CHUNK (64 * 1024)
+ * needs bytes it still holds and at every terminator.
+ *
+ * It STARTS here and doubles up to ZSI_TXN_CHUNK_MAX, because since C-7 went to
+ * one gate a span that is still buffered leaves in ONE write together with its
+ * terminator -- so the buffer decides how much commit traffic takes that path,
+ * and a transaction that outgrows it pays a second write per overflow.  Growing
+ * on demand rather than allocating the maximum is what keeps that from being a
+ * memory regression: the buffer belongs to an in-flight WRITE transaction, a
+ * process may hold many databases open at once, and a one-record transaction
+ * must go on costing what it costs today. */
+#define ZSI_TXN_CHUNK     (64 * 1024)
+#define ZSI_TXN_CHUNK_MAX (4 * 1024 * 1024)
 
 /********** LIBRARY SUPPORT *************/
 
@@ -6401,6 +6411,32 @@ static int zsi_txn_flush(struct zs_txn *txn)
  * store is not a syscall. */
 static int zsi_txn_stream(struct zs_txn *txn, const char *buf, size_t len)
 {
+    /* Prefer GROWING to flushing, up to the cap.  A span that never leaves the
+     * buffer is written once, with its terminator, at commit; flushing here is
+     * what forfeits that.  Doubling keeps it amortised, and a transaction that
+     * reaches the cap simply behaves as it always did.
+     *
+     * Reallocating is safe against A-4b, the one promise that hands out a pointer
+     * INTO this buffer: an ephemeral result lives only until the next call on the
+     * transaction, and this IS that next call.  Every other reader of the chunk
+     * (zsi_txn_at without the flag, zsi_txn_terminate) flushes or runs with no
+     * store in between.
+     *
+     * A failed grow is not an error -- fall through and flush, exactly as before. */
+    if (txn->chunklen + len > txn->chunkcap && txn->chunkcap < ZSI_TXN_CHUNK_MAX) {
+        size_t want = txn->chunkcap;
+        while (want < txn->chunklen + len && want < ZSI_TXN_CHUNK_MAX)
+            want *= 2;
+        if (want > ZSI_TXN_CHUNK_MAX) want = ZSI_TXN_CHUNK_MAX;
+        if (want > txn->chunkcap && txn->chunklen + len <= want) {
+            char *grown = realloc(txn->chunk, want);
+            if (grown) {
+                txn->chunk = grown;
+                txn->chunkcap = want;
+            }
+        }
+    }
+
     if (txn->chunklen + len > txn->chunkcap) {
         int r = zsi_txn_flush(txn);
         if (r != ZS_OK) return r;

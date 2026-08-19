@@ -1124,6 +1124,13 @@ mutant "commit: seal threshold inverted" catch \
 mutant "commit: publishes a table" catch \
   's/         \* never needed to read\. \*\/\n    \} else \{/         * never needed to read. *\/\n        if (r == ZS_OK \&\& db->index_dir) {\n            struct zsi_idxcfg cfg_ = { db->index_dir, db->index_threshold, db->index_local };\n            (void)zsi_idx_publish(act, \&cfg_, db->compar);\n        }\n    } else {/'
 
+# C-8's buffer grows instead of flushing, so a span over the initial chunk still
+# commits in one write.  Flushing instead is the old behaviour and costs a write
+# per overflow -- invisible to every data assertion, since the bytes are
+# identical, which is why the test counts syscalls.
+mutant "txn stream: flushes instead of growing" catch \
+  's/    if \(txn->chunklen \+ len > txn->chunkcap && txn->chunkcap < ZSI_TXN_CHUNK_MAX\) \{/    if (false) {/'
+
 # C-7 since 2026-08-18: ONE gate, not two.  This mutant restores the old first
 # gate -- a sync between the span and its terminator.  It is not a correctness
 # regression (it is strictly more ordering) but it doubles the syncs on every

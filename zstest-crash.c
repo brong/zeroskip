@@ -599,6 +599,62 @@ static void test_dirsync_justifies_c6(void)
  * T-8a: a FAILING fdatasync -- the case C-7a exists for
  * ------------------------------------------------------------------------- */
 
+static void test_txn_buffer_grows_to_one_write(void)
+{
+    /* C-8's buffer grows rather than flushing, so a span well over the initial
+     * ZSI_TXN_CHUNK still leaves in ONE write with its terminator (C-7).
+     *
+     * Counted rather than reasoned about, and counted on the SECOND transaction:
+     * the first one creates the active file, whose header write would otherwise
+     * be scored against the span.  Before the buffer grew, a 108KB span was three
+     * writes -- two chunk flushes and the terminator. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    char val[100];
+    long writes;
+    /* Comfortably over ZSI_TXN_CHUNK and comfortably under ZSI_TXN_CHUNK_MAX. */
+    const size_t nrecs = (ZSI_TXN_CHUNK / sizeof(val)) * 4;
+
+    total++;
+
+    fresh_dir();
+    hooks_reset();
+    hooks_on();
+
+    memset(val, 'v', sizeof(val));
+    setup.flags = ZS_CREATE;
+    setup.error = quiet_error;
+    setup.rollover_size = (size_t)512 * 1024 * 1024;   /* no conversion mid-test */
+    setup.rollover_txns = (size_t)1 << 40;
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open");
+
+    for (int pass = 0; pass < 2; pass++) {
+        writes = call_count;
+        CHECK(zs_db_begin_txn(db, 0, &txn) == ZS_OK, "begin");
+        for (size_t i = 0; i < nrecs; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "p%dk%08zu", pass, i);
+            CHECK(zs_txn_store(txn, k, strlen(k), val, sizeof(val), 0) == ZS_OK,
+                  "store");
+        }
+        CHECK(zs_txn_commit(&txn) == ZS_OK, "commit");
+    }
+
+    /* call_count ticks on write, fdatasync, rename and unlink; this transaction
+     * does one of the middle two and none of the last two, so the excess over 2
+     * is writes. */
+    CHECK(call_count - writes == 2,
+          "a %zu-record span took %ld syscalls, expected 1 write + 1 sync",
+          nrecs, call_count - writes);
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    passed++;
+    fprintf(stderr, "  a grown buffer commits in one write       ok\n");
+}
+
 static void test_sync_failure_gate(void)
 {
     /* The commit's only sync (C-7) made to fail.  The terminator is already
@@ -1167,6 +1223,7 @@ int main(int argc, char **argv)
         { "nosync_structural_syncs",        test_nosync_structural_syncs },
         { "dirsync_justifies_c6",           test_dirsync_justifies_c6 },
         { "commit_has_one_gate",            test_commit_has_one_gate },
+        { "txn_buffer_grows",               test_txn_buffer_grows_to_one_write },
         { "sync_failure_gate",              test_sync_failure_gate },
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },

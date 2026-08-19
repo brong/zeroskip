@@ -17,6 +17,13 @@ behaviour, PATCH for fixes.
   same error, so no caller could tell them apart. Check rather than assume. See
   C-7a.
 
+- **The writer's append buffer grows on demand**, from 64KB to a 4MB ceiling,
+  instead of being fixed at 64KB. With one gate a still-buffered span is written
+  once together with its terminator, so the buffer now decides how much commit
+  traffic takes that path: a 1000-record transaction goes from three writes to
+  one, and a 20 000-record one from 42 to 2. Growing rather than allocating the
+  ceiling keeps a small transaction costing what it did before.
+
 - No format change: same records, same terminators, same checksums.
 
 ## 2.5.0 — 2026-08-18
