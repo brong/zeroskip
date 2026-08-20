@@ -1098,12 +1098,16 @@ mutant "seal: seals a file with no spans" catch \
 
 # The write lock is the ONLY thing making it safe to convert the active file:
 # without it another writer may be appending to the file being converted.
+#
+# Anchored on the zsi_seal_locked call that FOLLOWS it, because zsi_compact now
+# opens with a byte-identical take of the same lock (C-1d's write -> repack) and
+# only source order keeps an unanchored pattern aimed here.
 mutant "seal: converts without the write lock" catch \
-  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;/    r = ZS_OK;/'
+  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    r = zsi_seal_locked\(db\);/    r = ZS_OK;\n\n    r = zsi_seal_locked(db);/'
 
 # A-10/R-3.  A read-only handle must not write to the database at all.
 mutant "seal: writes from a read-only handle" catch \
-  's/static int zsi_seal\(struct zs_db \*db\)\n\{\n    struct zsi_file \*act;\n    int r = zsi_check_writable\(db\);\n    if \(r != ZS_OK\) return r;/static int zsi_seal(struct zs_db *db)\n{\n    struct zsi_file *act;\n    int r = ZS_OK;/'
+  's/static int zsi_seal\(struct zs_db \*db\)\n\{\n    int r = zsi_check_writable\(db\);\n    if \(r != ZS_OK\) return r;/static int zsi_seal(struct zs_db *db)\n{\n    int r = ZS_OK;/'
 
 # D-25d.  Without the commit-tail seal, a one-transaction bulk load leaves an
 # oversized unordered file that every open must replay and whose conversion the
@@ -1201,7 +1205,7 @@ mutant "commit: never merges the terminator into the chunk" equivalent \
 # D-26.  Skipping the seal leaves the active generation out of the result, so the
 # database never reaches one file.
 mutant "compact: skips the seal" catch \
-  's/    r = zsi_seal\(db\);\n    if \(r != ZS_OK\) goto out;/    r = ZS_OK;/'
+  's/    r = zsi_seal_locked\(db\);/    r = ZS_OK;/'
 
 # D-26b.  Merging the in-order PREFIX merges nothing when an unmergeable file
 # sits second -- exactly the damaged database D-28 is about.
@@ -1525,10 +1529,19 @@ mutant "freshen: a NEW active file reads as fresh" catch \
 mutant "cursor: LIVE step stops looking" catch \
   's/            int r = zsi_db_freshen\(c->db\);\n            if \(r != ZS_OK\) return r;/            int r = ZS_OK;\n            if (r != ZS_OK) return r;/'
 
-# C-1d.  Taking WRITE outermost inverts the order against a conforming peer.  The
-# in-process assertion catches it from the other side.
-mutant "compact: takes the write lock outermost" catch \
-  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    \/\* Steps 1 and 2/    r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) return r;\n\n    \/* Steps 1 and 2/'
+# C-1d.  Taking REPACK outermost inverts the order against a conforming peer, and
+# is the direction the spec USED to require -- so this is the mutant a future
+# reader "restoring" the old order writes for themselves.  The in-process
+# assertion catches it from the other side, which is the only thing that can:
+# test_compact_lock_order completes under either order (see its comment).
+mutant "compact: takes the repack lock outermost" catch \
+  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) \{\n        zsi_lock_release\(&db->locks, ZSI_LOCK_WRITE\);\n        return r;\n    \}/    r = zsi_lock_take(\&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) return r;\n\n    r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) {\n        zsi_lock_release(\&db->locks, ZSI_LOCK_REPACK);\n        return r;\n    }/'
+
+# C-1d again, from the assertion side: restoring the pre-C-1l direction in
+# zsi_lock_take makes the assertion contradict the code it guards, so compaction
+# trips it on its own correct acquisition order.
+mutant "lock: order asserted as repack before write" catch \
+  's/    if \(which == ZSI_LOCK_WRITE\)\n        assert\(!\(lk->held & \(1u << ZSI_LOCK_REPACK\)\)\);/    if (which == ZSI_LOCK_REPACK)\n        assert(!(lk->held \& (1u << ZSI_LOCK_WRITE)));/'
 
 echo
 echo "salvage (S-1..S-12)"

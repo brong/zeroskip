@@ -4964,12 +4964,29 @@ static int zsi_lock_fcntl(int fd, enum zsi_lock which, int type, bool block)
  * passes every single-threaded test and corrupts a database the moment a second
  * handle writes, which is why T-14 must be run per implementation.
  *
- * C-1d lock ordering: the locks form ONE TOTAL ORDER, repack -> write -> remove.
+ * C-1d lock ordering: the locks form ONE TOTAL ORDER, write -> repack -> remove.
  * A holder may take a lock later in that order and must not take one earlier, so
  * no cycle exists.  Most operations use a sub-chain: a writer takes
  * write -> remove, a repacker repack -> remove, and the two never contend
- * (C-1a).  Only compaction (D-26) holds both repack and write, which is why the
- * order is a chain rather than two disjoint pairs.
+ * (C-1a).  Two operations hold both write and repack -- compaction (D-26) and
+ * C-1l's compacting seal -- which is why the order is a chain rather than two
+ * disjoint pairs.  The byte values in enum zsi_lock happen to be monotonic in
+ * it, which is a reading convenience and nothing more; the bytes are interop
+ * surface (C-1e) and the order is a separate statement.
+ *
+ * WHY THIS DIRECTION, since it was repack -> write until C-1l landed.  A writer
+ * that wants the repack lock is already inside a transaction, so it can only
+ * extend forward and write-before-repack is the only order available to it at
+ * all.  Compaction begins holding nothing and can acquire either way round, so
+ * it is the operation that adapts.  Keeping repack -> write would have made the
+ * two uses cyclic.  The ORDER is interop surface too (C-1e): two peers holding
+ * both locks in opposite orders deadlock against each other while each reads
+ * every byte correctly.
+ *
+ * The consequence to watch is D-16e's cascade at write-transaction begin, which
+ * takes repack BEFORE the write lock: it is legal only because zsi_repack
+ * releases repack before returning, so begin never holds both.  Under the old
+ * order that sequencing did not matter.
  *
  * Asserted here, which is sound now that a handle belongs to one thread of
  * control: `held` describes the one actor using it, and a violation deadlocks in
@@ -4982,11 +4999,11 @@ static int zsi_lock_take(struct zsi_locks *lk, enum zsi_lock which, int flags)
     assert(!(lk->held & (1u << which)));        /* not already held */
 
     /* C-1d, as a chain: taking a lock is legal only while holding locks strictly
-     * EARLIER in repack -> write -> remove. */
+     * EARLIER in write -> repack -> remove. */
     if (which == ZSI_LOCK_WRITE || which == ZSI_LOCK_REPACK)
         assert(!(lk->held & (1u << ZSI_LOCK_REMOVE)));
-    if (which == ZSI_LOCK_REPACK)
-        assert(!(lk->held & (1u << ZSI_LOCK_WRITE)));
+    if (which == ZSI_LOCK_WRITE)
+        assert(!(lk->held & (1u << ZSI_LOCK_REPACK)));
 
     /* C-1j before C-1e: the registry excludes this process's other handles, the
      * fcntl lock excludes every other process, and BOTH are always taken.  The
@@ -7948,24 +7965,18 @@ static int zsi_convert_pending(struct zs_db *db)
  * converting second reaches the same layout while consuming a generation per
  * seal, and generations are finite (D-9c); test_seal_creates_no_new_generation
  * is what holds that apart. */
-static int zsi_seal(struct zs_db *db)
+/* The body, with the WRITE LOCK ALREADY HELD.  Split out for zsi_compact, which
+ * under C-1d's write -> repack order must take write itself before it can take
+ * repack -- so it cannot call a form that acquires the lock for it. */
+static int zsi_seal_locked(struct zs_db *db)
 {
     struct zsi_file *act;
-    int r = zsi_check_writable(db);
-    if (r != ZS_OK) return r;
-
-    /* One writer at a time: sealing under an open write transaction would
-     * convert a file that transaction is about to append to. */
-    if (db->write_txn) return ZS_BADUSAGE;
-
-    r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
-                      db->nonblocking ? ZS_NONBLOCKING : 0);
-    if (r != ZS_OK) return r;
+    int r;
 
     /* Refresh under the lock: another writer may have rolled over while we
      * waited, and sealing a stale view would convert a file already superseded. */
     r = zsi_db_refresh(db);
-    if (r != ZS_OK) goto out;
+    if (r != ZS_OK) return r;
 
     act = zsi_snapshot_active(db->snap);
 
@@ -7992,6 +8003,26 @@ static int zsi_seal(struct zs_db *db)
     if (r == ZS_OK) (void)zsi_convert_pending(db);
 
 out:
+    return r;
+}
+
+/* The standalone form: takes the write lock, seals, releases.  zsi_compact takes
+ * the lock itself and calls zsi_seal_locked instead (C-1d). */
+static int zsi_seal(struct zs_db *db)
+{
+    int r = zsi_check_writable(db);
+    if (r != ZS_OK) return r;
+
+    /* One writer at a time: sealing under an open write transaction would
+     * convert a file that transaction is about to append to. */
+    if (db->write_txn) return ZS_BADUSAGE;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) return r;
+
+    r = zsi_seal_locked(db);
+
     zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
     return r;
 }
@@ -8449,26 +8480,47 @@ out:
  * unboundedness now a deliberate API entry point rather than an emergent
  * property of D-16's cascade.
  *
- * Lock order is REPACK then WRITE (C-1d), and zsi_seal releases the write lock
- * before returning, so the merge runs holding repack alone and a long compaction
- * does not block writers throughout.  C-1d had to be AMENDED for this: it
- * previously said nothing holds both write and repack.  The order is still
- * acyclic -- repack, write, remove is a chain -- and every other operation uses
- * a sub-chain of it. */
+ * Lock order is WRITE then REPACK (C-1d), and the write lock is released before
+ * the merge, so the merge runs holding repack alone and a long compaction does
+ * not block writers throughout.  C-1d had to be AMENDED twice for this: first
+ * because it said nothing holds both write and repack, then to REVERSE the two,
+ * because C-1l's compacting seal is already inside a write transaction when it
+ * wants repack and so has no repack-first form.  Compaction is the operation
+ * that adapts, since it begins holding nothing.
+ *
+ * Releasing write while still holding repack is out of order and is safe: a
+ * cycle needs two actors each ACQUIRING what the other holds, so only
+ * acquisition is ordered. */
 static int zsi_compact(struct zs_db *db)
 {
     size_t first, count;
     int r = zsi_check_writable(db);
     if (r != ZS_OK) return r;
 
-    r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
+    /* zsi_seal_locked does not make this check for itself, and the reason it
+     * must be made is the same: sealing under an open write transaction would
+     * convert a file that transaction is about to append to. */
+    if (db->write_txn) return ZS_BADUSAGE;
+
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
                       db->nonblocking ? ZS_NONBLOCKING : 0);
     if (r != ZS_OK) return r;
 
-    /* Steps 1 and 2: seal the active generation, and convert any straggler.
-     * zsi_seal takes and releases the write lock itself, and converts pending
+    r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
+                      db->nonblocking ? ZS_NONBLOCKING : 0);
+    if (r != ZS_OK) {
+        zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+        return r;
+    }
+
+    /* Steps 1 and 2: seal the active generation, and convert any straggler.  The
+     * write lock is already held, so this is the inner form; it converts pending
      * files on its way out. */
-    r = zsi_seal(db);
+    r = zsi_seal_locked(db);
+
+    /* C-1d: drop WRITE before the merge, whatever the seal returned. */
+    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+
     if (r != ZS_OK) goto out;
 
     r = zsi_db_refresh(db);

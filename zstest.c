@@ -14902,17 +14902,25 @@ static void test_seal_waits_for_the_write_lock(void)
     zs_db_close(&db);
 }
 
-/* C-1d: compaction takes REPACK then WRITE, and never the other way round.
+/* C-1d: compaction takes WRITE then REPACK, and never the other way round.
  *
- * A wrong order does not fail locally -- it deadlocks against a PEER holding the
- * other lock, so it needs a second process to show at all.  A child holds the
- * write lock briefly while the parent compacts: the parent must wait for it,
- * then complete.  alarm() bounds the wait, because a wrong order would otherwise
- * hang the suite rather than fail it, and a hang is much worse evidence.
+ * WHAT THIS TEST DOES AND DOES NOT CATCH, because the distinction was not
+ * written down and the test's name overstates it.  A child holds the write lock
+ * briefly while the parent compacts: the parent must wait for it, then complete.
+ * alarm() bounds the wait, because a deadlock would otherwise hang the suite
+ * rather than fail it, and a hang is much worse evidence.  That much is real --
+ * but it completes under EITHER order, since compaction needs both locks either
+ * way and the child holds only one.  It is a test that compaction blocks and
+ * finishes against a peer writer, not a test of the direction.
  *
- * The in-process assertion in zsi_lock_take catches the same mistake from the
- * other side, and did: it fired the first time compaction ran, because C-1d had
- * been amended in the spec without the assertion following. */
+ * The direction is caught by the in-process assertion in zsi_lock_take, which is
+ * the only thing that can catch it, and has twice: it fired the first time
+ * compaction ran, because C-1d had been amended in the spec without the
+ * assertion following, and the mutants `compact: takes the repack lock
+ * outermost` and `lock: order asserted as repack before write` are that pair of
+ * mistakes preserved.  A wrong order costs nothing locally -- it deadlocks
+ * against a PEER acquiring the other way round (C-1e), which no single-process
+ * test can produce. */
 static void test_compact_lock_order(void)
 {
     SKIP_IF_NO_FORK();
