@@ -6,9 +6,10 @@ Date: 2026-08-06
 `libzeroskip` is an append-only ordered key-value store: a directory of
 immutable and append-only files, with lock-free readers and a single writer.
 
-Requirements are labelled (`F-n` format, `D-n` database, `C-n` concurrency,
-`R-n` recovery, `A-n` API, `T-n` tests) so the conformance suite can cite
-them. **MUST** and **MUST NOT** are normative.
+Requirements are labelled (`G-n` guarantees, `F-n` format, `D-n` database,
+`C-n` concurrency, `R-n` recovery, `A-n` API, `P-n` pointer table cache,
+`S-n` salvage, `T-n` tests) so the conformance suite can cite them.
+**MUST** and **MUST NOT** are normative.
 
 ## 1. Purpose and scope
 
@@ -22,14 +23,12 @@ protocol (§6), and open and recovery (§7). Two implementations that agree on
 these can share a directory, read each other's files, and lock against each
 other.
 
-Salvage (§9) is likewise optional, and normative only for an implementation
-that offers one — what such a tool must not do matters more than whether it
-exists.
+Salvage (§9) is optional, and normative only for an implementation that offers
+one.
 
-The pointer table cache (§8) is normative *when present* — implementations that
-use one must agree on its bytes, or they will reject each other's work — but it
-is optional and never load-bearing. A conforming implementation MUST produce
-identical results with it absent.
+The pointer table cache (§8) is normative *when present*: implementations that
+use one must agree on its bytes. It is optional, and a conforming
+implementation MUST produce identical results with it absent.
 
 **What is a binding, not a contract:** §10 gives a C API. Its *semantics* are
 normative — what `store` with no value means, what a transaction makes visible,
@@ -39,8 +38,8 @@ language SHOULD express the same semantics idiomatically.
 - **G-0** Nothing in the format depends on `mmap`, on pointer-sized integers,
   or on any CPU feature. An implementation MAY read files with ordinary reads
   and copy data out; `mmap` is an optimisation the format permits, not one it
-  requires. Only §10's zero-copy pointer lifetimes (A-4) assume it, and that is a
-  binding-level promise a copying implementation simply makes differently.
+  requires. Only §10's zero-copy pointer lifetimes (A-4) assume it, which is a
+  binding-level promise a copying implementation makes differently.
 - **G-0a** Every integer in every structure is little-endian (F-1), including
   lengths, counts, generations and offsets. A header checksum will not catch a
   wrong byte order, since it is computed over whatever was written.
@@ -56,10 +55,6 @@ except by appending to a file or by creating a new file.** No file is ever
 modified in place or truncated, and there is no mutable object of any kind — no
 manifest, no shared cache. Files are created, appended to, and eventually
 removed once something else holds their data.
-
-Its sibling library `twom` is a mutable single-file skiplist. zeroskip suits
-workloads that are append-heavy, want readers that never take a lock, and
-tolerate compaction happening out of band.
 
 ## 2. Terminology
 
@@ -128,18 +123,17 @@ whether a pointer section must be present.
   never blocks readers.
 
   The non-transactional forms are deliberately not fixed in the same way: they
-  observe writes committed through their own handle as they go (D-14j), because
-  a traversal whose callback modifies the database is an ordinary pattern and a
-  fixed view makes it silently miss its own work. Nothing about that costs a
-  lock or a syscall — see D-14j for why.
+  observe writes committed through their own handle as they go (D-14j), so that a
+  traversal whose callback modifies the database observes its own work. This
+  costs no lock and no syscall (D-14j).
 - **G-5 One writer.** At most one writer per database, enforced by an `fcntl`
   byte-range lock. Because the kernel releases `fcntl` locks on process death, a
   killed writer never blocks the next one; no lock state can outlive a process.
   A handle is not thread-safe. Two write handles on one database within a
   process are excluded from each other by C-1j, so the second blocks or reports
-  `ZS_LOCKED` exactly as a second process would — but that is exclusion between
+  `ZS_LOCKED` exactly as a second process would. That is exclusion between
   *handles*, not thread safety: two threads sharing one handle remain the
-  caller's problem, and no lock in this specification helps them.
+  caller's problem.
 - **G-6 No shared mutable state.** Nothing a reader may be reading is ever
   rewritten beneath it: files are append-only, a new file is published by
   `rename`, and every index is private to the process that built it. There is no
@@ -217,7 +211,7 @@ Every file begins with the same 16 bytes:
 \x89  z  e  r  o  s  k  i  p  1 \r \n ^Z \n \0 \0
 ```
 
-Each part earns its place, following the reasoning behind the PNG signature:
+The parts, following the PNG signature convention:
 
 | Bytes | Purpose |
 |---|---|
@@ -235,9 +229,8 @@ Each part earns its place, following the reasoning behind the PNG signature:
   that validates the file as text fails at the first byte rather than part-way
   through, and anything that sanitises invalid UTF-8 by substitution replaces
   `0x89` with U+FFFD, destroying the magic detectably instead of silently
-  corrupting the body. This is the modern counterpart of the eighth-bit and
-  newline traps, and it costs nothing: every byte after the first is ASCII, so
-  byte 0 alone carries the property.
+  corrupting the body. Every byte after the first is ASCII, so byte 0 alone
+  carries the property.
 
 ### 4.3 File header (72 bytes)
 
@@ -266,13 +259,10 @@ Each part earns its place, following the reasoning behind the PNG signature:
   dropped for a format that shipped — made necessary by the per-record
   checksum (F-32): a version-1 record has no trailing checksum field to read.
 
-  D-1b's active-file rename is a second such break and likewise carries **no
-  version bump**, for the same reason: no database exists outside the project's
-  own test sets, so there is nothing to be compatible with. A reader of a
-  version-2 file written before that change would see an active file named for
-  its generation and no `zeroskip-<uuid>-current`; since no such database
-  survives, the case is not specified and MUST NOT be implemented as a
-  fallback. The golden corpus (T-0) is regenerated with the change.
+  D-1b's active-file rename is a second pre-release break and likewise carries
+  **no version bump**. A version-2 file written before that change would name
+  the active file for its generation; that case is not specified and MUST NOT be
+  implemented as a fallback.
 - **F-8** Reserved fields MUST be written as zero and MUST be ignored on read.
   Compatibility decisions belong to the version fields, not to reserved bytes.
 - **F-9** Generations start at 1, so `end == 0` is never a legitimate
@@ -336,9 +326,8 @@ Every legal combination, and no others:
   a key or of a span. A decoder reads a record's shape from the bits.
 - **F-12b** Each data shape has exactly one form. Nothing distinguishes a
   "create" at the record level, and nothing records where a key's previous
-  version lives: a record describes only itself. What used to need that —
-  deciding whether a repack may drop a tombstone — is derived at repack time
-  instead (D-19).
+  version lives: a record describes only itself. Whether a repack may drop a
+  tombstone is derived at repack time (D-19).
 - **F-12c** Bit `0x08` was `HasAncestor`, and each data shape had a second form
   carrying a 32-bit ancestor generation. It is reserved rather than reused so
   that the surviving values keep their meanings; a record carrying it MUST be
@@ -402,40 +391,17 @@ BIGDELETION (0x07)
   determined by the logical contents together with what the file already holds.
   The big form is chosen by key or value length, and by nothing else.
 
-### 4.6 Why records carry no back-reference
-
-Earlier revisions of this format gave every record an **ancestor**: the
-generation at which the shadow it casts hits the previous record for its key.
-It existed for exactly one consumer — a repack deciding whether it may drop a
-tombstone — and six requirements in this section specified it. They are gone,
-and the reasoning is recorded here because "store the answer" is the obvious
-design and it is the wrong one. (The retired labels are not repeated here: a
-label named anywhere in this document is a label the conformance map must carry
-a row for, so naming a dead requirement would resurrect it.)
+### 4.6 Self-contained records
 
 - **F-18** A record MUST NOT carry any reference to another record. In
   particular, whether a tombstone may be dropped MUST be **derived** when the
   question is asked (D-19), never read from the record.
 
-The trade the ancestor made was a bad one in both directions:
-
-- **It was written far more often than it was read.** Computing a record's
-  ancestor means finding where the key currently lives, which is a point lookup
-  across the whole file set — paid on **every** store, including creates, which
-  miss in every file and so have no early exit. It was then consulted only
-  during a repack. Measured on the reference implementation at the moment it was
-  removed, that search cost about 0.09µs per file in the set per store: nearly a
-  doubling of store cost at 4 files, and roughly 9µs per store at the 103 files
-  this has been seen at in the field.
-- **The information was not scarce.** A repack can establish the same fact by
-  looking, and it looks once per surviving tombstone rather than once per store.
-
-The general principle, which applies beyond this field: a derived fact should
-be stored only when deriving it is expensive **at the moment it is needed**.
-Here it was cheap then and expensive when recorded, because the two moments
-have wildly different frequencies. Storing it also made the fact
-interoperability surface — every implementation had to agree on it byte for
-byte — where deriving it leaves each implementation free to choose how (D-19b).
+  Earlier revisions gave every record an **ancestor**: the generation holding the
+  previous record for its key. Computing it required a point lookup across the
+  whole file set on every store, and it was read only by a repack. Deriving the
+  fact also keeps it out of the interoperability surface, leaving each
+  implementation free to choose how (D-19b).
 
 ### 4.7 Terminators
 
@@ -468,9 +434,9 @@ long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
 - **F-22** Because the checksum covers the span **and** the terminator, a
   terminator that reaches disk without its data fails validation and reads as
   absent. A torn tail is therefore always detectable, which recovery (F-24),
-  concurrent reading (C-4f) and the single gate of C-7 all depend on — C-7 orders
-  nothing within a commit, so detection is the whole of what makes a partial one
-  safe. Durability is separate, and is what the gate provides.
+  concurrent reading (C-4f) and the single gate of C-7 all depend on. C-7 orders
+  nothing within a commit, so detection alone is what makes a partial one safe;
+  durability is separate and is what the gate provides.
 
 ### 4.8 The span chain
 
@@ -605,9 +571,8 @@ filesize-4    4   checksum of the pointer section
   handle was opened `ZS_NOCSUM` (F-5e). The failure is reported for that
   record alone; other records remain readable. A cursor verifies the record
   it takes from the head of the merge even when a bound (such as a prefix)
-  then ends the scan instead of yielding it: converting a corrupt record into
-  a silent early end of traversal would hide exactly what this exists to
-  surface.
+  then ends the scan instead of yielding it, so that a corrupt record does not
+  become a silent early end of traversal.
 - **F-32b** A record's checksum MUST NOT be verified during span replay
   (F-24) or pointer-section load. Replay completes a file at its first
   invalid record, discarding everything after it — so verifying there turns
@@ -647,18 +612,14 @@ filesize-4    4   checksum of the pointer section
   carry a generation, and there is exactly one such name, so a database has at
   most one unordered file **structurally** rather than by policy (D-12a).
 
-  The separator before `current` is a **dot, not a hyphen**, and that is the
-  whole point of the choice: `zeroskip-<uuid>-*` then matches the
-  generation-named files and *only* those, so every glob, `readdir` filter and
-  shell one-liner that wants "the files with generations in their names" gets
-  them without having to exclude the active file by hand. `zeroskip-<uuid>*`
-  still matches the whole database. A name that has to be grepped out of the
-  common pattern is one that eventually is not.
+  The separator before `current` is a **dot, not a hyphen**, so
+  `zeroskip-<uuid>-*` matches the generation-named files and *only* those, while
+  `zeroskip-<uuid>*` still matches the whole database.
 
-  Its generation is read from its **header**, which costs nothing: the active
-  file is the one file a snapshot must open and replay anyway (D-13a). Every
-  other file still carries its range in its name, so one `readdir` still yields
-  the whole set without opening anything except this one.
+  Its generation is read from its **header**. The active file is the one file a
+  snapshot must open and replay anyway (D-13a); every other file carries its
+  range in its name, so one `readdir` still yields the whole set without opening
+  anything except this one.
 
   It sorts **after** every generation name, because `.` (0x2E) is above `-`
   (0x2D) at the position where the two diverge, so a name-ordered listing still
@@ -668,22 +629,13 @@ filesize-4    4   checksum of the pointer section
   window, where the active file's generation is not above every other file's
   but equal to the in-order file that has just superseded it.
 
-  What this buys is C-4i: a static name means a handle can detect every commit
-  by looking at **one file** instead of re-reading the directory. That check is
-  a single `stat` per transaction rather than a `getdents` sweep, which on a
-  local filesystem is a dentry-cache hit either way and on a network or ZFS
-  mount is the difference between one round trip and several. It was measured
-  costing about as much as the `fdatasync`es it sits beside.
+  A static name is what makes C-4i possible: a handle detects every commit by
+  looking at **one file** rather than re-reading the directory, so the check is a
+  single `stat` per transaction instead of a `getdents` sweep.
 
   It remains a **data** file for D-2's purposes: the discriminator there is the
   character after `zeroskip`, which is still `-`, so `zeroskip.*` continues to
   mean metadata and staging names are untouched.
-
-  This replaces a scheme in which the active file was named for its generation,
-  `zeroskip-<uuid>-00000005`, a strict prefix of the in-order name covering the
-  same generation. No version bump accompanies the change: nothing outside the
-  project's own test sets has ever been written, so this is a pre-release clean
-  break exactly as F-7a describes for version 1.
 - **D-2** `zeroskip-*` matches data files only and `zeroskip.*` matches
   metadata, so both sets are prefix-globbable and shell-completable. Staging
   names begin `zeroskip.` and therefore never match the data-file pattern.
@@ -699,47 +651,29 @@ filesize-4    4   checksum of the pointer section
   exclusion from outside: the holders keep locking the removed inode while a new
   process creates a fresh one and locks that, so **two writers each believe they
   hold the write lock** and append to the same file. This is the same failure mode
-  as mixing `flock` with `fcntl` (C-1e) and equally silent. It is worth saying
-  plainly because an empty file named `*.lock` is exactly what cleanup scripts
-  delete.
+  as mixing `flock` with `fcntl` (C-1e), and equally silent.
 - **D-3c** The lock file is empty and its contents are never read. Nothing about
   the database is stored in it, so it carries no version, no pid and no state to
   become stale.
-- **D-3d Why a dedicated file, when the database already holds two candidates.**
-  Neither works, and the reasons are worth recording because an empty file whose
-  contents are never read looks gratuitous next to them.
+- **D-3d** The lock MUST NOT be placed on the active file or on the directory.
 
-  Locking the **active file** is D-3b's failure mode reached by design rather
-  than by a stray cleanup script. `zeroskip-<uuid>.current` is precisely the name
-  the protocol replaces: D-12b seals it and D-23 then removes it, and D-10 lets a
-  writer replace an unclean one. So a writer holding the lock on that inode seals
-  it, the name becomes free, the next writer creates a new active file and locks
-  a **different inode** uncontended, and both believe they hold the write lock —
-  appending to the same file at colliding offsets, silently. It is also *absent*
-  in the steady state, since at most one unordered file can exist and there is
-  none at all right after a sealing commit (D-12a, D-25d), so the lock would have
-  to be created by the very act it exists to serialise.
+  The **active file** is the name the protocol replaces: D-12b seals it and D-23
+  then removes it, and D-10 lets a writer replace an unclean one. A writer
+  holding the lock on that inode seals it, the name becomes free, the next writer
+  creates a new active file and locks a different inode uncontended, and both
+  hold the write lock — D-3b's failure mode. It is also absent in the steady
+  state, since at most one unordered file can exist and there is none right after
+  a sealing commit (D-12a, D-25d), so the lock would have to be created by the
+  act it serialises.
 
-  Locking the **directory** is not implementable. POSIX requires `open()` to fail
-  with `EISDIR` when the named file is a directory and *oflag* includes
-  `O_WRONLY` or `O_RDWR`, and requires `fcntl` with `F_SETLK` to fail with
-  `EBADF` when `l_type` is `F_WRLCK` and the descriptor is not open for writing.
-  The composition leaves an exclusive record lock on a directory unobtainable on
-  any conforming system: there is no way to hold a writable descriptor for one.
-  Measured on Darwin 25, `F_RDLCK` on a directory descriptor succeeds and both
-  `F_SETLK` and `F_OFD_SETLK` with `F_WRLCK` fail with `EBADF`. Independently,
-  POSIX mandates record locking only for **regular** files, so the shared lock
-  that does succeed is unspecified behaviour — and a shared lock could not
-  serialise writers regardless. `flock` on a directory does work on Linux, macOS
-  and the BSDs, and C-1e is what rules it out.
-
-  Note what is **not** an argument here any more. While there were three locks
-  (C-1c) this section also observed that the two candidate objects could not
-  carry a third lock; with two locks the count works out, so the counting
-  argument is gone and the two above are what carry it. What the dedicated file
-  costs against them is one empty inode: created with the database (D-3a), never
-  unlinked (D-3b), one descriptor per handle for its lifetime (C-1g), contents
-  never read (D-3c) — and it is the identity C-1j's registry keys on.
+  The **directory** cannot carry an exclusive record lock at all. POSIX requires
+  `open()` to fail with `EISDIR` when the named file is a directory and *oflag*
+  includes `O_WRONLY` or `O_RDWR`, and requires `fcntl` with `F_SETLK` to fail
+  with `EBADF` when `l_type` is `F_WRLCK` and the descriptor is not open for
+  writing, so no conforming system can produce one. POSIX also mandates record
+  locking only for **regular** files, leaving the shared lock that does succeed
+  unspecified; a shared lock could not serialise writers regardless. `flock` on a
+  directory does work, and C-1e rules it out.
 
 ### 5.2 The file set
 
@@ -805,8 +739,7 @@ without opening a single file.
   therefore nothing committed is missing.
 - **D-7** `readdir` is not atomic, so a scan may miss an entry and produce a set
   that does not tile. That MUST be retried. A set that is *stale* but tiles is
-  not an error — it is simply an older snapshot, and every snapshot is an older
-  snapshot of something.
+  not an error: it is an older snapshot.
 - **D-8a Creating a database.** With `ZS_CREATE` and no existing directory, or a
   directory holding no data files, an implementation creates the directory, the
   lock file (D-3a), generates a UUID, and creates generation 1 as the active file — a 72-byte header
@@ -839,41 +772,31 @@ without opening a single file.
 - **D-9c** Generations are never reused and never reset, not even by a repack
   that collapses the whole database into one file — the next new file is
   `end + 1`. Allocating past `0xFFFFFFFF` MUST fail with `ZS_FULL` rather than
-  wrap. At the 2MB default that bound is around 8PB of cumulative writes, and
-  the remedy is to dump and reload into a fresh database.
+  wrap. The remedy is to dump and reload into a fresh database.
 - **D-9d** A writer MAY additionally treat the active file as due for rollover
   (D-9a) or sealing (D-25d) when its **replay window** holds more than some
   number of spans. The replay window is the span sequence a reader must walk to
   rebuild this file's index: from the `valid_upto` of the pointer table its
   index was seeded from (P-13), or from the end of the header if there was none.
 
-  What this bounds is the rebuild, which is linear in the spans in the window
-  and is paid at every snapshot rebuild — at open, and at a write begin that
-  follows another process's commit (C-4i). Nothing else bounds it.
-  `rollover_size` bounds *bytes*, and many small transactions put many spans
-  into few bytes: measured on the reference implementation with no cache
-  configured, a fresh open costs 0.23ms at 1024 spans, 0.52ms at 4096 and
-  2.01ms at 16384, growing without limit until the byte threshold is finally
-  reached. A sole writer never rebuilds and never notices; writers alternating
-  across processes rebuild at every begin, so for them this is a per-transaction
-  cost.
+  What this bounds is the rebuild, which is linear in the spans in the window and
+  is paid at every snapshot rebuild — at open, and at a write begin that follows
+  another process's commit (C-4i). Nothing else bounds it: `rollover_size` bounds
+  *bytes*, and many small transactions put many spans into few bytes, so a writer
+  that bounds only bytes has an unbounded rebuild. A sole writer never rebuilds;
+  writers alternating across processes rebuild at every begin, so for them this is
+  a per-transaction cost.
 
-  **The window, not the file.** Counting spans in the file instead would be the
-  intuitive reading and is the wrong quantity. Where a cache is configured,
-  P-13's threshold already bounds the window — the same measurement shows 311
-  spans replayed for a file holding 16384, flat as the file grows — so a writer
-  counting the window correctly never rolls over on this condition, while one
-  counting the file would seal files whose rebuild was already cheap. A table
-  records no span count (P-5), so the window is also the only quantity a writer
-  can obtain without the walk it is trying to avoid.
+  **The window, not the file.** Where a cache is configured, P-13's threshold
+  already bounds the window, so a writer counting the window never rolls over on
+  this condition while one counting the file would seal files whose rebuild was
+  already cheap. A table records no span count (P-5), so the window is also the
+  only quantity a writer can obtain without the walk it is avoiding.
 
   This is **writer-local policy, not a layout requirement**. Two conforming
   writers, or one writer configured two ways, MAY seal at different points; every
   resulting layout is valid, D-5 resolves any file set, and no reader can tell
-  which rule produced it. It is stated here rather than left unwritten because a
-  writer that bounds only bytes has an unbounded rebuild, which presents as a
-  database that is slow to open and slow to begin rather than as anything
-  identifiable.
+  which rule produced it.
 - **D-10** An active file with a corrupt header or zero length is treated as a
   **complete file with zero spans**. It is not an error, and no record in it is
   recoverable either way. Its generation is **not** discoverable, since D-1b
@@ -891,14 +814,13 @@ without opening a single file.
   through the error callback, and its generation treated as holding no records.
   It MUST NOT be fatal. Discarding the file still requires an explicit tool
   action.
-- **D-10b** An earlier version of D-10a made this fatal, which contradicts D-10
-  and breaks G-3. D-10 directs a writer to move on from an unclean active file;
-  the instant it does, that file becomes non-active, so a fatal rule turns the
-  **first write after an ordinary crash** into a permanently unopenable database.
-  Tolerating it costs nothing that was not already lost, because an invalid
-  header means no record in that file is recoverable either way — whereas
-  refusing to open costs every other file too. "Silently" is the hazard the rule
-  guards against, and reporting addresses it.
+- **D-10b** Treating D-10a as fatal would break G-3. D-10 directs a writer to
+  move on from an unclean active file, and the instant it does that file becomes
+  non-active — so a fatal rule turns the **first write after an ordinary crash**
+  into a permanently unopenable database. Tolerating it costs nothing that was
+  not already lost, since an invalid header means no record in that file is
+  recoverable either way, whereas refusing to open costs every other file too.
+  Reporting is what addresses the hazard of doing it silently.
 - **D-11** The writer never appends a pointer section to an unordered file. When
   it moves on, the previous file simply stays unordered until it is converted.
 - **D-12 Immediate conversion.** A writer that finds a **non-active unordered
@@ -962,14 +884,10 @@ own index, in private memory, for each unordered file in its snapshot.
   record in the file, so an implementation that discards the order it already has
   pays O(n log n) record decodes per commit for it.
 
-  This is a cost note rather than a requirement — nothing on disk changes and no
-  peer can observe it — but the cost is not a constant factor. The search is
-  against a structure that grows with the transaction, so it makes a *larger*
-  transaction slower per record, which is the opposite of what a caller batching
-  its writes expects and is invisible to any benchmark that commits at one size.
-  Measured on the reference implementation, 200k records with 100-byte values:
-  2.15M to 2.62M records/s at 1000 records per transaction, and 953k to 2.88M
-  with all of them in one.
+  This is a cost note rather than a requirement: nothing on disk changes and no
+  peer can observe it. The cost is not a constant factor, because the search is
+  against a structure that grows with the transaction, so record-by-record
+  folding makes a larger transaction slower per record.
 
   A reader seeded by a pointer table (P-12) folds a run too, but its records come
   from a **replay**, which yields them in offset order with a key possibly
@@ -1020,10 +938,8 @@ have the key is skipped, and no source may be skipped for any other reason.
 
 An implementation MAY probe the first and last pointers before the rest, which
 rejects an out-of-range key in two comparisons rather than the log₂n a plain
-binary search would take to walk to an end. This is a search *strategy*, not a
-way of avoiding the search: those two pointers still have to be dereferenced and
-their keys compared, so it is the same kind of work, just less of it. It needs no
-cached metadata and cannot change the answer.
+binary search would take to walk to an end. It needs no cached metadata and
+cannot change the answer.
 
 The cost is therefore proportional to the **number of files**, which is why
 keeping that count low is the point of the repack policy (D-16).
@@ -1051,13 +967,12 @@ The per-file cursors are held in an array kept sorted by:
   - **With `ZS_CURSOR_LIVE`**, it additionally observes writes committed by *other
     processes*. This is the only one that costs: readers take no lock (C-2) and
     have nothing to be notified by, so detecting an external write means looking
-    for it. An implementation MAY re-scan per record, and the flag exists so
-    that nobody pays for it who has not asked.
+    for it. An implementation MAY re-scan per record.
 - **D-14j-a** A source's records MUST NOT be yielded twice because of a write
-  made during the traversal. A cursor position expressed as an *index* into a
-  mutable structure is the trap here: inserting ahead of it shifts the element
-  under the index and re-yields a record. Positions into anything a write can
-  modify MUST therefore be expressed as keys, not offsets.
+  made during the traversal. A position expressed as an *index* into a mutable
+  structure does not satisfy this: inserting ahead of it shifts the element under
+  the index and re-yields a record. Positions into anything a write can modify
+  MUST be expressed as keys, not offsets.
 - **D-14j-b** After observing a change, a cursor resumes at the first key
   strictly after the last one it yielded. It does not re-yield, and it does not
   skip keys that were already present.
@@ -1105,13 +1020,12 @@ The per-file cursors are held in an array kept sorted by:
   this is a permission about effort, not about results, and nothing about it
   reaches disk.
 
-  Two such shortcuts are worth naming because they are not obvious:
+  Two such shortcuts:
 
   - The advanced source is usually still the smallest, so **one comparison
-    decides that nothing moves**, and the re-sort can return without touching
-    the array at all. Worth stating because the naive insertion sort lifts the
-    element out and puts it back regardless, which costs two copies of a source's
-    whole state on every record of every scan.
+    decides that nothing moves**, and the re-sort can return without touching the
+    array at all. A plain insertion sort lifts the element out and puts it back
+    regardless, copying a source's whole state on every record of every scan.
   - A source can be shown to win a **run** of records rather than one: if the
     key it will hold *K* advances from now still orders before the next source's
     current key, then for those *K* yields it stays at the front and no other
@@ -1218,11 +1132,10 @@ The per-file cursors are held in an array kept sorted by:
 
   The cost lands on the transaction that finds the work, the same amortisation
   D-12 uses for conversion. Since a cascade is unbounded (D-16b) this is a
-  latency spike on whichever writer trips it; what it buys is that no caller has
-  to remember. Forgetting is expensive and hard to attribute — every read merges
-  across every file, so the read path degrades **linearly in the file count**
-  while the database merely looks slow. `ZS_NOAUTOREPACK` (A-14) is for callers
-  who would rather schedule the cascade themselves.
+  latency spike on whichever writer trips it, against a caller that never repacks
+  at all: every read merges across every file, so the read path degrades
+  **linearly in the file count**. `ZS_NOAUTOREPACK` (A-14) is for callers that
+  schedule the cascade themselves.
 - **D-16a** The two jobs divide by whether a file has an `end`, which is what
   makes them independent (C-1a): a writer's conversion is bounded by
   `rollover_size` and runs inline (D-12d), the repacker's cascade is unbounded and
@@ -1273,9 +1186,9 @@ The per-file cursors are held in an array kept sorted by:
   look in one direction only.
 - **D-19a** The emitted record MUST be written even when a newer file already
   shadows the key: being shadowed does not permit dropping a record. Only D-19
-  does. This is now a cost argument rather than a correctness one — establishing
-  that a newer file shadows a key would take a lookup **per key**, where D-19's
-  test costs a lookup only per surviving tombstone — but the rule is unchanged.
+  does. The reason is also cost: establishing that a newer file shadows a key
+  takes a lookup **per key**, where D-19's test costs one per surviving
+  tombstone.
 - **D-19b** D-19 states a **predicate, not an algorithm**. An implementation MAY
   evaluate it by a point lookup per surviving tombstone, by a single merged pass
   over the files below the range, or by any other means giving the same answer.
@@ -1294,7 +1207,7 @@ The per-file cursors are held in an array kept sorted by:
   until it succeeds. A process identifier is not unique on shared storage — two
   hosts readily have the same pid — and two processes writing one staging file
   would produce an interleaved output that is then renamed into place as though
-  complete. `O_EXCL` costs nothing and removes the case.
+  complete.
 - **D-20b** Before writing the output, the writer MUST verify the checksums
   covering every input record it will copy: the records-region checksum
   (F-26e) of each in-order input, and the span checksums (F-22) of an
@@ -1319,34 +1232,32 @@ The per-file cursors are held in an array kept sorted by:
 - **D-23** Removing a data file — a converted unordered file, repack inputs, or
   the contained files left by an interrupted repack — is permitted **only for a
   file whose generation range is enclosed by another file that is already
-  published**, and the remover MUST be the process that published it. That is
-  the whole precondition, and it needs **no lock**: C-1c is why. If it cannot be
-  established the file MUST be left alone — leaking a file costs disk space,
-  removing a needed one costs the database.
+  published**, and the remover MUST be the process that published it. That is the
+  whole precondition, and it needs **no lock** (C-1c). If it cannot be established
+  the file MUST be left alone: leaking a file costs disk space, removing a needed
+  one costs the database.
 
   A remover MUST NOT delete a file on any other basis. "Nothing references it"
-  and "the volume is full" are not preconditions, and an implementation offering
-  either has left the argument C-1c rests on.
+  and "the volume is full" are not preconditions, and neither is covered by
+  C-1c's argument.
 - **D-23a** An implementation MAY test D-23's precondition by the set-wide route
   instead — does a complete set (D-6) exist without the candidate — and this
   implementation does. It is a sound way to establish enclosure and needs no
   extra bookkeeping, and it is the reason a **failed** check is not an error but
   a `ZS_AGAIN`-shaped "leave it alone".
 
-  If taken, **tiling alone is not sufficient**, and this is the trap that made
-  the whole condition look harder than it is. D-6 measures completeness from the
-  oldest *surviving* generation, so deleting the oldest file merely raises that
-  floor and the remainder tiles perfectly while its data is gone: with
+  If taken, **tiling alone is not sufficient**. D-6 measures completeness from
+  the oldest *surviving* generation, so deleting the oldest file merely raises
+  that floor and the remainder tiles perfectly while its data is gone: with
   `{[1-2], 3}`, removing `[1-2]` leaves `{3}`, which tiles. The set without the
   candidate MUST therefore also span the **same generation interval**, from the
   same lowest generation through the same highest. A set covering less is not a
   complete set of the same database.
 - **D-23b** The set-wide test reads the whole directory, so it can observe a set
-  mid-change — and that is harmless in the only direction it can go. A concurrent
-  publication only *adds* a file, which can neither break tiling nor shrink the
-  interval, and a concurrent removal or a torn `readdir` can only make the set
-  look **less** complete. So the error is always a spurious refusal, never a
-  spurious removal, which is the other half of why C-1c needs no lock.
+  mid-change, and only in one direction. A concurrent publication only *adds* a
+  file, which can neither break tiling nor shrink the interval; a concurrent
+  removal or a torn `readdir` can only make the set look **less** complete. The
+  error is therefore always a spurious refusal, never a spurious removal.
 - **D-24** `zs_db_should_repack` reports whether D-16 currently has work.
 - **D-25 Sealing.** A writer MAY convert the **active** file on demand, holding
   the write lock. D-12 skips the active file because another writer may be
@@ -1378,13 +1289,12 @@ The per-file cursors are held in an array kept sorted by:
   oversized unordered one. A failure to seal MUST NOT fail the commit: the
   records are already durable, and D-9a's rollover recovers the layout at the
   next commit. A writer that relies on D-9a alone remains conforming.
-- **D-25e** A writer sealing under D-25d publishes no pointer table for that file,
-  which P-13 now gives for free: a commit publishes nothing at all, since it never
-  replays. The reasoning is worth keeping because it is the sharpest case for
-  P-13's rule rather than a special case of it — a table for a file being sealed
-  covers only unordered files (P-1), so it is created already stale and removed at
-  the next sweep (P-16). A table published by a concurrent reader that took its
-  snapshot before the seal is harmless for the same reason.
+- **D-25e** A writer sealing under D-25d publishes no pointer table for that
+  file, which follows from P-13: a commit publishes nothing at all, since it never
+  replays. A table covers only unordered files (P-1), so one written for a file
+  about to be sealed is created already stale and removed at the next sweep
+  (P-16). A table published by a concurrent reader whose snapshot predates the
+  seal is harmless for the same reason.
 - **D-26 Compaction.** An implementation MAY merge the **entire** database into
   one file. The order is normative: seal (D-25), then convert every remaining
   unordered file (D-12), then merge in-order files until no two adjacent ones
@@ -1399,8 +1309,7 @@ The per-file cursors are held in an array kept sorted by:
   in-order files rather than the in-order prefix. A file that can be neither
   converted nor merged (D-28) splits the set into runs, and each must be merged
   separately. Taking only the prefix would merge nothing at all when such a file
-  is second in the set — which is precisely the damaged database where D-28's
-  "everything mergeable" has to mean something.
+  is second in the set, which is the damaged database D-28 is about.
 - **D-27** Because a compaction output spans the whole generation interval,
   there is no file below its range, so D-19 drops **every** tombstone. This
   needs no special case: it is what the rule already says when the set of files
@@ -1413,9 +1322,8 @@ The per-file cursors are held in an array kept sorted by:
   invalid header is the case that blocks it — D-10a tolerates such a file, but
   it can be neither converted nor merged.
 - **D-29** Compaction is unbounded: it rewrites the whole database in one
-  invocation while writers continue. That is open item 1's unboundedness made a
-  deliberate entry point rather than an emergent property of D-16's cascade, and
-  the mitigations sketched there apply to it equally.
+  invocation while writers continue. Unlike D-16b's cascade this unboundedness is
+  a deliberate entry point; open item 1's mitigations apply to it equally.
 
 ## 6. Concurrency and durability
 
@@ -1426,10 +1334,8 @@ The per-file cursors are held in an array kept sorted by:
   | 0 | write | a write transaction | appending, creating a new active file, converting an unordered file |
   | 1 | repack | a whole repack, possibly long | merging in-order files |
 
-  Byte 2 was a third lock, **remove**, held momentarily to verify completeness
-  and unlink; it was removed in 2026-08-20 and C-1c records why it was not
-  needed. The byte is **reserved, not reused**, so a peer still taking it
-  interoperates — it simply contends with nobody.
+  Byte 2 held a third lock, **remove**, and is **reserved, not reused** (C-1c).
+  A peer still taking it interoperates and contends with nobody.
 
   The mechanism is **exactly** `fcntl` record locking: `F_SETLK` or `F_SETLKW`
   with `l_type = F_WRLCK`, `l_whence = SEEK_SET`, `l_start` the byte above, and
@@ -1441,14 +1347,12 @@ The per-file cursors are held in an array kept sorted by:
   `fcntl` on Linux and does not exclude it, and is a no-op over some network
   filesystems.
 
-  C-1d's **order** is normative for the same reason, and is the easiest part of
-  this to overlook: two implementations that each hold write and repack but
-  acquire them in opposite orders deadlock against each other on a database both
-  are reading correctly, and neither is misreading a byte. The order is
-  interoperability surface, not an internal discipline. Reversing it, as C-1d
-  records, is a pre-release break in the sense F-7a describes and likewise
-  carries **no version bump**: nothing on disk changes, and no database exists
-  outside this project's own test sets for a peer to have deadlocked with.
+  C-1d's **order** is normative for the same reason: two implementations that
+  each hold write and repack but acquire them in opposite orders deadlock against
+  each other on a database both are reading correctly. The order is
+  interoperability surface, not an internal discipline. It has been reversed
+  once, a pre-release break in the sense F-7a describes and likewise carrying
+  **no version bump**, since nothing on disk changes.
 - **C-1f** `fcntl` locks are per-process, not per-thread: two threads of one
   process both acquire the same lock successfully, and two handles in one process
   do not exclude each other. The `fcntl` lock alone therefore does not deliver
@@ -1496,36 +1400,26 @@ The per-file cursors are held in an array kept sorted by:
   `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order,
   and a repack stays valid when a new in-order file appears above it midway
   through.
-- **C-1c Removal needs no lock, because removals commute.** Every removal in
-  this design is justified by a file the remover **published beforehand whose
-  range encloses the candidate** — a conversion's output over its input (D-5a),
-  a repack's output over its inputs. Enclosure is transitive, and anyone removing
-  that enclosing file must in turn have published something enclosing *it*, so
-  coverage survives every interleaving and two removals can never be jointly
-  unsafe while each is individually justified.
+- **C-1c Removal needs no lock.** Every removal is justified by a file the
+  remover **published beforehand whose range encloses the candidate** — a
+  conversion's output over its input (D-5a), a repack's output over its inputs.
+  Enclosure is transitive: anyone removing that enclosing file must in turn have
+  published something enclosing *it*. So coverage survives every interleaving,
+  and two removals are never jointly unsafe while each is individually justified.
 
-  There was a third lock for this until 2026-08-20, and the reasoning that
-  motivated it is worth recording because it is a tempting mistake. D-23's
-  condition is written as a property of the **whole set** — does a complete set
-  exist without the candidate — so two evaluators appear to interact, and
-  serialising them looks necessary. But the safety condition is **local**: is
-  this candidate enclosed by a file that is not itself going away. Local
-  conditions do not race. The set-wide form is a sound way to *test* the local
-  one and may be kept as one (D-23b); it just never needed serialising.
+  D-23's condition is written over the **whole set** — does a complete set exist
+  without the candidate — which makes two evaluators look as though they
+  interact. The safety condition is **local**: is this candidate enclosed by a
+  file that is not itself going away. Local conditions do not race. The set-wide
+  form is a sound way to test the local one (D-23a) and needs no serialising.
 
-  Three further facts made the lock's uselessness observable rather than
-  arguable. The two callers that took it already hold an exclusive lock over
-  their own removal candidates — a writer removes only the active-file name
-  (D-1b) and a repacker only the inputs it just merged, so neither could have
-  contended with anything anyway. A failed verification is fail-safe by
-  construction: D-23 leaves the file alone, and a leaked file costs disk space.
-  And a torn `readdir` can only make the set look *less* complete, so it can only
-  produce a spurious refusal, never a spurious removal.
+  Two properties of the removers make this concrete. Each already holds an
+  exclusive lock over its own candidates: a writer removes only the active-file
+  name (D-1b), a repacker only the inputs it just merged. And a failed check is
+  fail-safe — D-23 leaves the file alone, so a race costs a leaked file (D-23b).
 
-  What still MUST hold is the justification. An implementation MUST NOT remove a
-  file on any other basis — not for space, not because a scan found it
-  unreferenced — because that is the only kind of remover the argument above does
-  not cover, and it would need a lock that no longer exists.
+  A remover that deletes on any other basis is outside this argument and MUST NOT
+  exist (D-23).
 - **C-1k What a lock entitles you to.** A lock is a claim over **named files**,
   not a licence over the directory, and every name it authorises is determined
   before the work begins.
@@ -1551,16 +1445,14 @@ The per-file cursors are held in an array kept sorted by:
   exception precisely because it is the only file published *before* its
   contents.
 
-  That asymmetry is why publication takes **two forms** rather than one, and the
-  distinction is easy to get backwards. A conversion or repack output is complete
-  at the moment it is published, so it is written under a staging name and
-  `rename`d in after its sync (C-3, C-6b); the rename is atomic, so no reader
-  ever sees a partial file. A new active file is created **empty and directly at
-  its final name**, with `O_EXCL` — creating it *is* publishing it (D-8), there
-  is no completeness for the name to assert (D-21 says nothing about a file still
-  being appended to), and the `O_EXCL` is itself the entitlement check: under
-  D-1b a collision does not mean two writers allocated one generation, it means
-  the single active-file name is already occupied, which is D-10's case.
+  Publication therefore takes **two forms**. A conversion or repack output is
+  complete when published, so it is written under a staging name and `rename`d in
+  after its sync (C-3, C-6b); the rename is atomic, so no reader sees a partial
+  file. A new active file is created **empty and directly at its final name**,
+  with `O_EXCL`: creating it *is* publishing it (D-8), there is no completeness
+  for the name to assert, and the `O_EXCL` is the entitlement check. Under D-1b a
+  collision does not mean two writers allocated one generation; it means the
+  single active-file name is occupied, which is D-10's case.
 - **C-1l The compacting seal.** A writer holding the **write** lock MAY
   additionally take the **repack** lock and merge older in-order files into the
   output it is already building — publishing one in-order file `[a..N]`, where
@@ -1568,33 +1460,27 @@ The per-file cursors are held in an array kept sorted by:
   in-order files, in place of the `[N..N]` a plain conversion would produce
   (D-12, D-25).
 
-  A holder of the repack lock **MUST NOT** then take the write lock. There is no
-  repack-first form of this operation, so permitting one would make it and
-  compaction cyclic; C-1d states the resulting order and why it points this way.
+  A holder of the repack lock **MUST NOT** then take the write lock. This
+  operation has no repack-first form, so permitting one would make it and
+  compaction cyclic (C-1d).
 
-  It is **optional and writer-local**, exactly as D-16's selection is: a writer
-  that never does it is conforming, both layouts are valid, D-5 resolves either,
-  and no reader can tell which produced the file it is reading. What it buys is
-  the *intermediate* merging D-16's cascade otherwise pays — generation *N*'s
-  records are already in the writer's hands, so folding the older files in now
-  costs one pass, where the cascade would write `[N..N]`, read it back, and write
-  it again as part of the next merge that absorbs it. What it costs is a seal
-  that is no longer bounded by one generation, so a writer taking it inherits
-  D-29's unboundedness at a moment a caller was expecting a commit.
+  It is **optional and writer-local**, as D-16's selection is: a writer that never
+  does it is conforming, both layouts are valid, D-5 resolves either, and no
+  reader can tell which produced the file. What it buys is the *intermediate*
+  merging D-16's cascade otherwise pays, since generation *N*'s records are
+  already in the writer's hands. What it costs is a seal no longer bounded by one
+  generation, so a writer taking it inherits D-29's unboundedness inside a commit.
 
-  **The output is governed by the repack rules, not the conversion rules.** This
-  is the trap, and it is a data-loss one. A plain conversion retains every
-  tombstone unconditionally, which is sound only because its output covers
-  exactly its input's range (D-5a) and so has nothing below it to reason about. A
-  combined output has files below it whenever *a* > 1, so D-17 through D-23 apply
-  in full — and **D-19's predicate MUST be evaluated against the combined range**,
-  meaning "below *a*". Evaluating it against `[N..N]`, which is what reusing the
-  conversion path's notion of *below* would do, tests each tombstone against
-  generations *a*..*N*-1 that are its own inputs: where the newest record there
-  is a deletion the tombstone is dropped, and a value below *a* that the deletion
-  was hiding is resurrected. Erring the other way — treating the combined output
-  as a wide conversion and keeping every tombstone — is merely wasteful, and is
-  the direction D-19c already permits.
+  **The output is governed by the repack rules, not the conversion rules.** A
+  plain conversion retains every tombstone unconditionally, which is sound only
+  because its output covers exactly its input's range (D-5a) and so has nothing
+  below it. A combined output has files below it whenever *a* > 1, so D-17
+  through D-23 apply in full, and **D-19's predicate MUST be evaluated against the
+  combined range** — "below *a*". Evaluated against `[N..N]` instead, it tests
+  each tombstone against generations *a*..*N*-1 that are its own inputs: where
+  the newest record there is a deletion the tombstone is dropped, and a value
+  below *a* that the deletion was hiding is resurrected. Erring the other way,
+  keeping every tombstone, is merely wasteful and is what D-19c permits.
 - **C-1d Lock ordering.** The two locks form one order: **write → repack**. A
   holder MAY acquire repack while holding write and MUST NOT acquire write while
   holding repack, so no cycle exists. C-1's byte offsets are monotonic in it,
@@ -1608,19 +1494,14 @@ The per-file cursors are held in an array kept sorted by:
   duration. Releasing out of order is always safe: a cycle needs two actors each
   *acquiring* what the other holds, so only acquisition is ordered.
 
+  The direction is forced by C-1l. A writer that wants the repack lock already
+  holds the write lock, being mid-transaction, so write-before-repack is the only
+  order available to it; compaction begins holding nothing and can acquire either
+  way round, so it is the operation that adapts. The reverse order would make the
+  two cyclic.
+
   This was a three-lock chain, write → repack → remove, until the remove lock was
   shown unnecessary (C-1c).
-
-  **Why this direction.** A writer that wants the repack lock already holds the
-  write lock — it is mid-transaction, so it can only extend forward, and
-  write-before-repack is the only order available to it at all (C-1l).
-  Compaction is under no such constraint: it begins with nothing held and can
-  acquire in whichever order the chain names, so it is the operation that
-  adapts, taking write and then repack. An earlier version of this requirement
-  ordered them **repack → write**, which was sound while compaction was the only
-  operation holding both; since C-1l has no repack-first form, keeping that
-  direction would have made the two uses cyclic. The choice is therefore forced
-  by C-1l rather than preferred.
 - **C-1h Locks across databases.** C-1d orders the locks within one database.
   The library cannot see across two, so a caller that holds locks on several
   while writing MUST impose its own consistent order.
@@ -1669,11 +1550,10 @@ any point.
 - **C-4c-a** Immutability makes a file **shareable between snapshots**, which
   is what keeps a rebuild from costing the whole set: an implementation MAY
   carry an already-opened, already-indexed file object from one snapshot into
-  the next, since nothing about it can have changed. The **active file is
-  excluded**, and the exclusion is not an optimisation detail — its index and
-  its `complete` boundary are properties of the snapshot that built them, so
-  sharing it would let an older snapshot observe records committed after it was
-  taken, which is exactly the isolation G-4 promises. A generation that has
+  the next, since nothing about it can have changed. The **active file MUST be
+  excluded**: its index and its `complete` boundary are properties of the
+  snapshot that built them, so sharing it would let an older snapshot observe
+  records committed after it was taken, breaking G-4. A generation that has
   stopped being active is settled from then on and may be shared like any other.
 - **C-4d** Every index is private (D-13c), so a snapshot needs no synchronisation
   against a writer beyond what C-4c already provides. "Private" means private to
@@ -1723,18 +1603,14 @@ any point.
   A superseded file being removed underneath a reader is therefore not
   something to detect in advance: in-order files are immutable, so an open
   either succeeds on the file we expected or fails with `ENOENT`, and C-4b's
-  retry rescans and converges. Detection is lazy exactly where laziness costs
-  nothing.
+  retry rescans and converges.
 
   File timestamps, whose granularity is a filesystem property, play no part.
   `ZS_CURSOR_LIVE`'s per-step check (D-14j) MAY use the same inspection rather
   than rebuilding a snapshot each step.
 
-  This replaces an inspection of the directory's whole **name set**, which was
-  equally exact and cost a `getdents` sweep on every transaction. On a local
-  filesystem that is a dentry-cache hit; on a network or ZFS mount it was
-  measured costing about what the `fdatasync`es beside it cost, which is what
-  motivated D-1b.
+  Inspecting the directory's whole **name set** is equally exact and costs a
+  `getdents` sweep on every transaction, which is what motivated D-1b.
 - **C-5** The accepted cost of C-4g is that disk space is held until the last
   reader holding an old snapshot exits.
 - **C-6 Directory durability.** After creating a **data file** (a new active
@@ -1763,14 +1639,13 @@ any point.
   `fdatasync` rather than `fsync` because appending changes only the metadata
   needed to read the data back, which `fdatasync` is required to flush.
 
-  This was two gates until 2026-08-18 — a sync between the records and the
-  terminator, and a second after it — so that a valid terminator implied durable
-  data. F-22 already implies it a different way: the terminator's checksum covers
-  the span, so a terminator that reaches disk without its data fails validation
-  and the span reads as absent. Ordering the writes made that class of event
-  impossible rather than merely detectable, at the cost of a second sync on every
-  commit; detecting it is enough, and the second sync was measured at **+81% on
-  one-record transactions** and +11% at a thousand (§ `doc/benchmarking.md`).
+  An implementation MUST NOT add a second gate between the records and the
+  terminator. Such a gate makes a valid terminator imply durable data by
+  ordering, where F-22 already gives it by detection: the terminator's checksum
+  covers the span, so a terminator reaching disk without its data fails
+  validation and the span reads as absent. Detection is sufficient, and the
+  second sync costs a full round trip on every commit
+  (`doc/benchmarking.md`).
 - **C-7a** A commit that reports an error MUST be treated as having an **unknown**
   outcome: the terminator may or may not be durable, and either way the database
   is correct — a valid terminator means the commit is visible with durable data,
@@ -1780,12 +1655,6 @@ any point.
   In particular an implementation MUST NOT retry a failed sync and treat success as
   evidence the data survived: a second call can succeed after the dirty pages were
   discarded.
-
-  Under the two-gate protocol a first-gate failure additionally guaranteed the
-  transaction had *not* happened, since no terminator had been written yet. That
-  guarantee is not recoverable under C-7 and was never observable through this
-  API: both gates reported the same error, so a caller could not tell which had
-  failed and had to treat the outcome as unknown regardless.
 - **C-7b** The cost is one sync per commit. It is paid per *transaction*, not per
   record, so a caller that batches many operations into one transaction amortises
   it — which is the reason `zs_txn_*` exists alongside the single-operation
@@ -1833,10 +1702,9 @@ any point.
   records with no terminator after them, and a writer that then appended a further
   span into the same file would put it beyond bytes its own size no longer
   describes, so F-24 would complete the file below a commit that *was*
-  acknowledged. An implementation is not required to rely on recovery noticing:
-  a file left in that state is unclean, so R-4 and D-9a move the next writer to a
-  new generation, but that is a backstop and not the licence to reason from a
-  value a failed write has invalidated.
+  acknowledged. R-4 and D-9a move the next writer to a new generation in that
+  case, but that is a backstop, not a licence to reason from a value a failed
+  write invalidated.
 
   **This makes a rolled-back span writer-optional, which is an interoperability
   statement.** Whether an abort leaves one on disk depends on how much the writer
@@ -1862,17 +1730,12 @@ Opening is recovery; there is no separate pass.
   to update (D-13c); `zeroskip.cache` (P-2b), when present, is outside the
   file set — nothing in it parses as a data file (D-2, P-3). Publishing a
   pointer table (§8) is therefore not a write to the database, and a read-only
-  handle MAY both publish into the cache directory and **create it** (P-2b).
-
-  Creating it used to be forbidden, on the grounds that a directory inside the
-  database is a visible side effect. That drew the line in the wrong place: a
-  read-only handle was already permitted to create *files* in that directory,
-  which is what makes the cache work for readers at all, so the rule refused only
-  the directory holding them. It also cost the case the cache exists for — a
-  read-mostly database with the flag set got no cache until an unrelated write
-  arrived, giving bimodal open latency with nothing to indicate which mode was in
-  effect. A read-only **mount** is still side-effect-free by construction: the
-  creation fails and the handle continues without a cache.
+  handle MAY both publish into the cache directory and **create it** (P-2b). A
+  handle permitted to create files in that directory is permitted to create the
+  directory holding them; forbidding only the directory would leave a read-mostly
+  database with no cache until an unrelated write arrived. A read-only **mount**
+  remains side-effect-free by construction: the creation fails and the handle
+  continues without a cache.
 - **R-4** There is no in-place repair. A file that is not clean is simply
   complete at its last valid span (F-24), and the writer moves to a new
   generation. Nothing is ever appended past a boundary that failed to
@@ -1975,9 +1838,9 @@ unreadable one.
 - **P-7** A table's checksums use **the engine named by the covered data file's
   header**, not the engine the reading or writing handle would choose for a new
   file. This is F-5a applied to the table: any peer able to read the data file
-  can validate its table. A table checksummed under the handle's engine instead
-  validates for nobody, so every reader silently rejects it and the cache does
-  nothing while appearing to work.
+  can validate its table. A table checksummed under the handle's engine validates
+  for nobody, so every reader rejects it and the cache does nothing while
+  appearing to work.
 - **P-8** `valid_upto` is the data-file offset the table covers. It MUST be a
   span boundary: the offset immediately after a valid span's terminator, or the
   data file's header length when the file has no valid spans.
@@ -2009,9 +1872,7 @@ unreadable one.
   - flags bit 4 is set. A conforming builder always sets it, since span
     verification rides indexing in every mode (F-5e); a table without it
     was built by an implementation that indexed spans nobody verified, and
-    accepting it would seed an index with them. (Bit 4 was reader-exempted
-    under `ZS_NOCSUM` until 2026-08-14, when F-5e narrowed to record
-    checksums.);
+    accepting it would seed an index with them;
   - `H ≤ valid_upto ≤` the data file's size, where `H` is the data file's header
     length;
   - every offset lies in `[H, valid_upto)`;
@@ -2028,54 +1889,32 @@ unreadable one.
   loaded — reaches an implementation-defined threshold.
 
   **Publishing amortises a replay, so only a replay earns it.** A process that
-  replayed has already paid for the offsets and writes them out once; a writer
-  maintaining its index incrementally (D-13b) never replays at all, so a table it
-  publishes is pure additional cost on the write path with no local benefit. An
-  earlier version of this requirement had readers and writers publish on the same
-  rule, which read as pleasing symmetry and was not: measured on the reference
-  implementation, publishing from the commit path was 22% of a cached 2M-record
-  load, and 38% at a 64MB `rollover_size`.
+  replayed has already paid for the offsets and writes them out once. A writer
+  maintaining its index incrementally (D-13b) never replays, so a table it
+  publishes on the commit path is cost with no local benefit — and mostly waste,
+  because a generation is sealed into an in-order file carrying a pointer section
+  (F-26) before anything opens the database. Tables still appear, since a writer
+  replays at its own open and at any begin whose C-4i inspection found another
+  process's commit. What is given up is a consumer that can never publish — a
+  database on a read-only mount whose writer never replayed — which replays at
+  every open.
 
-  It was also mostly waste. At a 2MB `rollover_size` that load creates a
-  generation every 2MB and publishes many tables into each before D-25d seals it —
-  and a sealed generation is an in-order file with a pointer *section* (F-26), so
-  every table published for it is irrelevant before anything opens the database.
+  The threshold is required rather than advisory, and **both ends of it cost**,
+  paid by different parties. The replay from the last published `valid_upto` is
+  paid per snapshot **rebuild**: at open, and at any begin whose C-4i inspection
+  detected another process's commit. A sole writer's steady state rebuilds
+  nothing — its begins reuse the snapshot (C-4i) and its commits fold
+  incrementally (D-13b) — but writers alternating one-store transactions across
+  processes rebuild at every begin, so a threshold that publishes rarely leaves
+  each of those replays unbounded and makes that load quadratic in the active
+  file. Too low costs whoever publishes an O(records) merge and a whole-table
+  rewrite per commit, which is bounded, since a table is never synced (P-14).
 
-  The tables still appear, because a writer replays too: at its own open, and at
-  any begin whose C-4i inspection found another process's commit. What is given up
-  is the speculative half — a table for a file this process never needed to read —
-  and with it the case where nothing can publish at all, a database on a read-only
-  mount whose writer never replayed. That consumer replays at every open.
-
-  The threshold is required rather than advisory, and **both ends of it
-  cost** — paid by different parties.
-
-  The replay from the last published `valid_upto` is paid per snapshot
-  **rebuild**: at open, and at any begin whose C-4i inspection detected
-  another process's commit. A sole writer's steady state rebuilds nothing —
-  its begins reuse the snapshot (C-4i) and its commits fold incrementally
-  (D-13b) — but writers alternating one-store transactions across processes
-  rebuild at every begin, and a threshold that publishes rarely leaves each
-  of those replays unbounded, making that load quadratic in the active file.
-  Too low costs whoever publishes an O(records) merge and a whole-table
-  rewrite per commit, which is real but bounded, because a table is never
-  synced (P-14).
-
-  Measured on 16000 single-store transactions over a 2 MB active file, with a
-  rebuild forced at every begin — the alternating shape: no cache 13.2 s,
-  threshold 1 byte 5.7 s, 4 KB 2.0 s, 32 KB 2.0 s, 256 KB 3.5 s, 1 MB 8.8 s.
-  The same load as a sole writer whose begins reuse: no cache 1.2 s, 1 byte
-  5.0 s, 4 KB 1.4 s, 32 KB 1.3 s, 256 KB 1.2 s, 1 MB 1.3 s. The low end
-  keeps its cost in both shapes; the high end costs only whoever rebuilds —
-  and the knee a default must sit in is the rebuilding shape's, because that
-  is the shape a threshold exists to bound. An implementation SHOULD choose
-  its default from measurements like these, and the figure is an absolute
-  byte count rather than a fraction of `rollover_size`: the knee is set by
-  how much data a replay walks, which has nothing to do with how large a
-  caller lets a generation grow.
+  A-9 governs how the default is derived, and `doc/benchmarking.md` carries the
+  measurements behind it.
 - **P-14** A table MUST NOT be `fsync`ed before publication. It is rebuildable,
   and a torn or zero-filled file after a crash is rejected by P-11. Syncing it
-  would add a sync to the commit path, which C-7 defines as exactly two.
+  would add a sync to a commit path C-7 defines as having exactly one.
 - **P-15** A failure to publish MUST NOT fail the operation that triggered it.
   The data is already durable, and a cache is not something a caller can act on.
 - **P-16** A process MAY unlink tables in its per-database cache directory
@@ -2108,8 +1947,7 @@ every byte of it.
 Recovery of what is readable from a **damaged** directory. Everything in this
 section is OPTIONAL: an implementation that offers no salvage is fully
 conforming. What is normative is what an implementation that *does* offer it
-must and must not do — because a salvage tool that silently invents data, or
-silently resurrects a transaction that never committed, is worse than none.
+must and must not do.
 
 - **S-1** Salvage reads a source directory and writes a **new** database
   elsewhere. It MUST NOT write to the source, take any lock on it, or unlink
@@ -2149,10 +1987,9 @@ silently resurrects a transaction that never committed, is worse than none.
   terminator's own bytes and compare against the terminator's stored checksum.
   A match is a **verified** span, and the walk resumes from it.
 
-  This is what makes the default sound rather than a guess: everything recovered
-  after damage is checksum-verified, not merely decodable. Under F-24 one bad
-  span discards every later span in its generation, and those later spans are
-  exactly what this recovers.
+  Everything recovered after damage is therefore checksum-verified rather than
+  merely decodable. Under F-24 one bad span discards every later span in its
+  generation, and those later spans are what this recovers.
 - **S-8** The span that failed cannot be verified — its terminator is what would
   prove it — and neither can a trailing region with no valid terminator. Their
   records MUST NOT be recovered unless explicitly requested, and every record so
@@ -2326,22 +2163,17 @@ different calls, though not every flag is meaningful everywhere:
   `ZS_IFNOTEXIST` and sharing their probe, so it composes with earlier writes
   in the same transaction (A-1a).
 
-  This is a **caller's** optimisation, not the implementation's: a store MUST
-  NOT skip a redundant write without it. Deciding costs a point lookup, which
-  the write path otherwise never performs — that lookup is exactly what was
-  removed with the ancestor (§4.6), and reintroducing it for every store would
-  give back the cost this format changed to avoid. A caller whose workload
-  rewrites identical values knows that and can ask; one that does not, should
-  not pay.
+  This is a **caller's** optimisation, not the implementation's: a store MUST NOT
+  skip a redundant write without it. Deciding costs a point lookup, which the
+  write path otherwise never performs — the same lookup removed with the ancestor
+  (§4.6).
 
   A skipped write MUST be invisible: it makes no record, and it MUST NOT be
-  reported as a change to a cursor traversing the transaction (D-14j), because
-  nothing changed for a cursor to observe.
+  reported as a change to a cursor traversing the transaction (D-14j).
 
-  Its use with a deletion is worth naming, because it is the one case where the
-  saving is structural rather than incidental: deleting an absent key otherwise
-  writes a tombstone for a key that never existed, which a later repack must
-  then carry until it can prove the key is absent below it (D-19).
+  With a deletion the saving is structural rather than incidental: deleting an
+  absent key otherwise writes a tombstone for a key that never existed, which a
+  later repack carries until it can prove the key absent below it (D-19).
 - **A-1a** A write inside a transaction is visible to subsequent reads on that
   same transaction, and to nothing else until commit. `zs_txn_fetch` and
   `zs_txn_foreach` therefore consult the transaction's own uncommitted records
@@ -2357,9 +2189,7 @@ different calls, though not every flag is meaningful everywhere:
   unless that result was asked for with `ZS_EPHEMERAL`, which is precisely
   the promise A-4b gives up.
   Cursors are not thread-safe and this promises nothing across threads (G-5's
-  caveats apply); it promises composition within one caller, which is what a
-  layered consumer — one query touching several key ranges inside one write
-  transaction — depends on.
+  caveats apply); it promises composition within one caller.
 - **A-2** There is no `yield` call and no yield flags: readers hold no lock, so
   there is nothing to yield.
 - **A-3** There is no MVCC flag. Snapshot isolation is the only read mode,
@@ -2375,16 +2205,14 @@ different calls, though not every flag is meaningful everywhere:
   moment (A-4a). A caller may therefore finalise cursors freely, on every insert,
   delete or re-seek, while holding fetch results across all of it.
 
-  Stated because the mechanism argues the other way and an implementation can get
-  this right by accident. A cursor's end **is** the first moment a mapping it
-  yielded out of may be released, so an implementation that reference-counts per
-  borrower (A-4a) really does drop references there; what keeps the fetch's bytes
-  alive is that the transaction holds a claim of its own on the same files. An
-  implementation whose transactions borrow their cursors' references, or which
-  releases a file when the most recent borrower ends, passes every
-  single-borrower test and hands back dangling pointers to a caller whose
-  statement-per-cursor pattern is otherwise entirely ordinary — which is what a
-  layered consumer keeping before-images for rollback does.
+  The mechanism argues the other way, so this needs stating. A cursor's end **is**
+  the first moment a mapping it yielded out of may be released, so an
+  implementation that reference-counts per borrower (A-4a) does drop references
+  there; what keeps the fetch's bytes alive is that the transaction holds a claim
+  of its own on the same files. An implementation whose transactions borrow their
+  cursors' references, or which releases a file when the most recent borrower
+  ends, passes every single-borrower test and returns dangling pointers to a
+  caller using a cursor per statement.
 - **A-4a** A-4 binds across a **snapshot swap**. A transaction or cursor may
   move to a newer snapshot while it is alive — a write transaction resolves its
   active file at its first store (D-9), and a `ZS_CURSOR_LIVE` cursor follows
@@ -2400,8 +2228,8 @@ different calls, though not every flag is meaningful everywhere:
   hold a reference to each file it may have returned pointers into, released
   when the borrower ends.
 
-  Reference-counting anything coarser leads to the two mistakes worth naming,
-  because both look like sound reasoning about a snapshot:
+  Reference-counting anything coarser admits two mistakes, both of which read as
+  sound reasoning about a snapshot:
 
   - **"Someone else still holds the snapshot, so the bytes are safe."** That
     assumes the other holder outlives the borrower, and nothing establishes it.
@@ -2417,11 +2245,10 @@ different calls, though not every flag is meaningful everywhere:
   With the count on the file, both questions are asked directly and neither
   needs the other's answer.
 
-  This is not a fresh guarantee, only the reading of A-4 that a caller depends
-  on. It is called out because both of the swaps above are invisible from the
-  API — nothing the caller did says "the file set moved" — so an implementation
-  passes every single-snapshot test and still hands out dangling pointers the
-  moment a transaction's first store starts a new generation.
+  This is A-4's reading, not a fresh guarantee. Both swaps above are invisible
+  from the API — nothing the caller did says "the file set moved" — so an
+  implementation passes every single-snapshot test and still hands out dangling
+  pointers the moment a transaction's first store starts a new generation.
 - **A-4b** `ZS_EPHEMERAL` on a fetch **weakens A-4 for that result**: the key and
   value pointers it returns remain valid only until the **next call on that
   transaction** — or, for `zs_db_fetch`, on that `struct zs_db`. A caller MUST
@@ -2431,9 +2258,9 @@ different calls, though not every flag is meaningful everywhere:
 
   It is valid on `zs_db_fetch` and `zs_txn_fetch`, including their `ZS_FETCHNEXT`
   and `ZS_FETCHPREV` forms (A-12). On a cursor or either `foreach` form it is a
-  usage error (`ZS_BADUSAGE`), for A-13's reason: those yield across steps, a
+  usage error (`ZS_BADUSAGE`), for A-13's reason: those yield across steps, and a
   caller holding the previous record while it looks at the next one is the
-  ordinary shape, and a rejected flag is cheaper than an untested promise.
+  ordinary shape.
 
   **It is a permission, not a requirement.** A conforming implementation MAY
   ignore it entirely and return pointers with A-4's full lifetime — the weaker
@@ -2441,17 +2268,13 @@ different calls, though not every flag is meaningful everywhere:
   correct either way. Nothing on disk changes and no peer can observe whether it
   was used, so it is not interoperability surface.
 
-  What it buys is the write-combining an implementation would otherwise have to
-  give up. A read of a record the transaction itself has just stored (A-1a) must
-  see that record's bytes; an implementation that streams records to the active
-  file as they are stored (C-8) and returns pointers into a mapping of it can
-  only point at bytes that have reached the file, so every such read forces out
-  whatever buffer it was accumulating. With the weaker lifetime it may answer
-  from that buffer instead. Measured on the reference implementation, 100 000
-  store-then-fetch-back pairs in one transaction: 100 000 flushes and 0.30s
-  becomes 135 flushes and 0.08s, against 0.07s for the stores alone — the whole
-  cost of reading back what you just wrote, which is the shape a layered
-  consumer doing read-modify-write hits on every row.
+  What it buys is write-combining. A read of a record the transaction itself has
+  just stored (A-1a) must see that record's bytes; an implementation that streams
+  records to the active file as they are stored (C-8) and returns pointers into a
+  mapping of it can only point at bytes that have reached the file, so every such
+  read forces out whatever buffer it was accumulating. With the weaker lifetime it
+  may answer from that buffer instead, which is the difference between one flush
+  per read-modify-write and none (`doc/benchmarking.md`).
 - **A-5** `ZS_SHARED` is read-only and MUST NOT write (R-3).
 - **A-6** A `ZS_CSUM_*` flag chooses the engine for files this handle **creates**;
   it never overrides what an existing file records, since each file's engine comes
@@ -2490,13 +2313,9 @@ different calls, though not every flag is meaningful everywhere:
     publications per generation stays constant while each one costs more, so the
     total is **quadratic in generation size**.
 
-  Measured on the reference implementation, a 2M-record load with a cache
-  configured and an absolute 32KB threshold: 1.48GB of writes at a 2MB
-  `rollover_size`, 2.03GB at 16MB and 4.70GB at 64MB, for about 2000 publications
-  in every case — and 4.69s against 1.91s for the same load with no cache at all.
-  Making the threshold a fraction of `rollover_size` fixes that end and breaks the
-  other: a 1MB database with a 16MB `rollover_size` then publishes a handful of
-  times, and its open-plus-first-read went from 0.093ms to 0.152ms.
+  A fraction of `rollover_size` fixes the second end and breaks the first, since
+  a small database under a large `rollover_size` then publishes a handful of
+  times and pays at every open. `doc/benchmarking.md` carries the measurements.
 
   A caller that supplies a non-zero value gets exactly it, unscaled, since the
   point of the knob is control.
@@ -2514,11 +2333,8 @@ different calls, though not every flag is meaningful everywhere:
   it: the family is two directions by two bounds, with one spelling each.
   The transactional form sees the transaction's own pending writes, like
   every other read (A-1a). `ZS_FETCHNEXT` and `ZS_FETCHPREV` together are a
-  usage error (`ZS_BADUSAGE`). A-4's lifetime applies to the result
-  unchanged, or A-4b's if `ZS_EPHEMERAL` was given. (History: bare
-  `ZS_FETCHNEXT` was the strict bound until
-  2026-08-13, when the strictness moved to the modifier for symmetry with
-  `ZS_FETCHPREV`; every known consumer was updated with the change.)
+  usage error (`ZS_BADUSAGE`). A-4's lifetime applies to the result unchanged, or
+  A-4b's if `ZS_EPHEMERAL` was given.
 - **A-13** `ZS_REVERSE` on `zs_db_begin_cursor` and `zs_txn_begin_cursor`
   opens a D-14k cursor: a null or empty start key positions at the last key
   in the database; a non-empty one at the largest key ≤ it, with
@@ -2527,8 +2343,7 @@ different calls, though not every flag is meaningful everywhere:
   `zs_cursor_replace` and `zs_cursor_delete` work at the current position
   unchanged, and A-4 applies to everything yielded. `ZS_REVERSE` with
   `ZS_CURSOR_LIVE`, or on either `foreach` form, is a usage error
-  (`ZS_BADUSAGE`): neither is needed by any known consumer, and a rejected
-  flag is cheaper than an untested promise.
+  (`ZS_BADUSAGE`).
 - **A-14** `ZS_NOAUTOREPACK` suppresses D-16e, so the repack cascade runs only
   when the caller asks for it through `zs_db_repack`. It changes no on-disk
   state and nothing another implementation can observe — a database written by a
@@ -2540,30 +2355,26 @@ different calls, though not every flag is meaningful everywhere:
   read path that degrades linearly in the file count.
 - **A-15** `rollover_txns` is D-9d's span bound. Zero selects an
   implementation-defined default, so a caller that sets nothing still gets a
-  bounded rebuild; the reference implementation uses 1024, which its own figures
-  put at about 0.23ms of replay. Like `ZS_NOAUTOREPACK` it changes no on-disk
-  state and nothing another implementation can observe — a database written
-  under any value of it is indistinguishable from any other, only differently
-  divided. It is a knob rather than a constant for `rollover_size`'s reason: a
-  caller that knows its transaction sizes, or that has configured a pointer
-  table cache and would rather let P-13 do this work, can say so.
+  bounded rebuild; the reference implementation uses 1024. Like
+  `ZS_NOAUTOREPACK` it changes no on-disk state and nothing another
+  implementation can observe — a database written under any value of it is
+  indistinguishable from any other, only differently divided. It is a knob
+  rather than a constant because a caller may know its transaction sizes, or may
+  have configured a pointer table cache and prefer to let P-13 do this work.
 - **A-16** `repack_max_size` is the size above which an in-order file stops
   being a candidate to **start** a repack, bounding what one merge rewrites
   (D-16). Zero selects an implementation-defined default, 512MB in the
   reference implementation — a no-op for any database that never reaches it. A
   value above the largest file disables the cap and gives the uncapped
-  geometric policy; there is no separate spelling for that, because "no file is
-  ever too big" already says it. Selection is not normative, so like
+  geometric policy. Selection is not normative, so like
   `ZS_NOAUTOREPACK` and `rollover_txns` this changes no on-disk state and
   nothing another implementation can observe — a database repacked under any
   value of it is indistinguishable from any other, only differently divided.
 
-  What it costs is read cost. Skipped files accumulate and the read path
-  degrades linearly in the file count (D-14d), which is why D-16 bounds the
-  skipped count rather than letting the cap run unchecked. Lowering it bounds
-  the pause and raises the file count; raising it does the reverse. It is a
-  knob rather than a constant because only the caller knows which of the two it
-  can afford.
+  What it costs is read cost: skipped files accumulate and the read path degrades
+  linearly in the file count (D-14d), which is why D-16 bounds the skipped count
+  rather than letting the cap run unchecked. Lowering it bounds the pause and
+  raises the file count; raising it does the reverse.
 - **A-17** `zs_db_stats` reports what **this handle has rewritten** since it was
   opened: for repacks (D-16, and D-26's compaction, which is a merge of
   everything) and for conversions (D-12) separately, the number performed, the
@@ -2572,14 +2383,11 @@ different calls, though not every flag is meaningful everywhere:
   not reportable, and cannot be, since no on-disk state records who rewrote what
   (D-3: there is no manifest).
 
-  This is observability, not policy, and it is in the API for a reason a knob
-  would not serve. A caller cannot otherwise tell how much of a write's cost went
-  on rewriting records it had already written: a store appends each record once,
-  a conversion then rewrites its generation in key order, and a repack rewrites
-  whatever it merges, so the bytes a bulk load writes are a multiple of the bytes
-  it stored. Measured on the reference implementation at 2M records in 1000-record
-  transactions, that multiple is about 5, of which one pass is the append, one the
-  conversion, and the rest the cascade.
+  This is observability, not policy. A caller cannot otherwise tell how much of a
+  write's cost went on rewriting records it had already written: a store appends
+  each record once, a conversion rewrites its generation in key order, and a
+  repack rewrites whatever it merges, so the bytes a bulk load writes are a
+  multiple of the bytes it stored (`doc/benchmarking.md`).
 
   **The two are counted apart because their remedies differ.** A conversion is
   structural — every generation becomes an in-order file exactly once (D-5a), and
@@ -2631,8 +2439,7 @@ run by a shared language-neutral runner over every implementation.
   | `hold-write --for MS` | take the write lock and hold it, for lock-contention tests |
 
   Output is a defined line format so the runner compares text, not internals.
-  Without this each language reimplements the suite and they drift apart, which
-  is the failure mode the whole exercise exists to prevent.
+  Without it each language reimplements the suite and the suites drift apart.
 
 **T-1 Golden vectors.** Byte-exact encode assertions against checked-in files,
 deterministic because F-15 makes encoding canonical, with `zstool` accepting an
@@ -2831,11 +2638,10 @@ asserting its data stays readable while inputs are unlinked (C-4). Two
 processes racing to remove debris, asserting the surviving set still tiles and
 no needed file is removed; a directory seeded with the debris of two
 half-finished repacks over overlapping ranges, where naive independent cleanup
-would remove both and lose a generation; removal attempted without the packer
-lock, asserting refusal (D-23). Concurrent repack and writer both proceeding,
-with publish serialised — and a writer whose conversion finds the packer lock held
-by a repack, asserting it skips rather than waits and that the next writer
-performs it (D-12b).
+would remove both and lose a generation; and a removal of a file nothing encloses,
+asserting refusal (D-23). Concurrent repack and writer both proceeding, with
+publish serialised, and a removal proceeding while a peer holds both locks,
+asserting it takes neither (C-1c).
 
 **T-10b The snapshot protocol.** Each step of C-4 attacked directly, since these
 fail only under concurrency. A reader interrupted between scanning the directory
@@ -2903,14 +2709,9 @@ otherwise dead code on every platform that has `F_OFD_SETLK`, which is where
 development happens, so it would rot unexercised and be discovered by the one
 platform that depends on it.
 
-The test began as the opposite assertion — that an implementation does *not*
-claim to exclude them — because a per-handle mutex excludes only threads
-sharing a handle and would have been a guarantee the format cannot enforce.
-That hazard is unchanged; what changed is that C-1j names two mechanisms which
-key on the *database's* identity rather than the handle's, and so deliver the
-property the mutex only appeared to. An implementation that excludes them by a
-mutex is still wrong, and this test cannot tell the two apart — only reading
-the code can.
+An implementation that excludes two handles by a **mutex** is wrong — a
+per-handle mutex excludes only threads sharing a handle — and this test cannot
+tell that apart from a conforming mechanism. Only reading the code can.
 
 **T-11 Traceability.** `doc/conformance.md` maps every normative requirement
 here to the test enforcing it. A requirement with no test is a gap to close. Each
@@ -2926,7 +2727,7 @@ backend is a thin separate adapter, out of scope.
 ## 13. Open items
 
 1. **Repack duration is unbounded.** D-16 can cascade into rewriting the whole
-   database while the writer continues appending. The packer lock permits one
+   database while the writer continues appending. The repack lock permits one
    repack at a time, but nothing bounds how long one runs or lets it be
    interrupted and resumed. This is a deliberate trade for lower total I/O and
    a smaller file count (D-16b), and writing continues throughout regardless.
