@@ -5189,24 +5189,13 @@ static void test_lock_basic(void)
         ASSERT_EQU(lk.held, 0u);
     }
 
-    /* C-1d's two legal orderings -- write -> remove and repack -> remove -- and
-     * only those.  Nothing holds both write and repack, and nothing takes either
-     * while holding remove, so no cycle exists.
-     *
-     * Not asserted at runtime -- see the note at zsi_lock_take about why a
-     * per-handle bitmask cannot express a per-thread rule -- so this test is the
-     * record that the two orderings are the intended ones. */
+    /* C-1d: write -> repack is the one legal combination, and the reverse is
+     * asserted against in zsi_lock_take. */
     ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0));
-    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0));
-    ASSERT_EQU(lk.held, (1u << ZSI_LOCK_WRITE) | (1u << ZSI_LOCK_REMOVE));
-    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REMOVE));
-    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
-
     ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REPACK, 0));
-    ASSERT_OK(zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0));
-    ASSERT_EQU(lk.held, (1u << ZSI_LOCK_REPACK) | (1u << ZSI_LOCK_REMOVE));
-    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REMOVE));
+    ASSERT_EQU(lk.held, (1u << ZSI_LOCK_WRITE) | (1u << ZSI_LOCK_REPACK));
     ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_REPACK));
+    ASSERT_OK(zsi_lock_release(&lk, ZSI_LOCK_WRITE));
     ASSERT_EQU(lk.held, 0u);
 
     /* Releasing an unheld lock is a no-op, so cleanup paths need no guard. */
@@ -5233,7 +5222,7 @@ static void test_lock_byte_offsets(void)
 
     ASSERT_EQ(ZSI_LOCK_WRITE, 0);
     ASSERT_EQ(ZSI_LOCK_REPACK, 1);
-    ASSERT_EQ(ZSI_LOCK_REMOVE, 2);
+    ASSERT_EQ(ZSI_NLOCKS, 2);           /* byte 2 reserved, not reused (C-1) */
     ASSERT_STR_EQ(ZSI_LOCK_NAME, "zeroskip.lock");
 
     ASSERT_EQ(mkdbdir(), 0);
@@ -11910,14 +11899,13 @@ static void test_mp_racing_removers(void)
     zs_db_close(&db);
 }
 
-static void test_mp_removal_needs_the_lock(void)
+static void test_mp_removal_takes_no_lock(void)
 {
-    /* D-23: removal attempted WITHOUT the remove lock, asserting refusal.
+    /* C-1c: removal takes no lock.  A peer holds BOTH the write and the repack
+     * lock; a non-blocking removal of a superseded file must still succeed.
      *
-     * The lock is what makes verification and unlinking one step, so the set cannot
-     * change in between.  Asserted by holding the lock in a child and confirming a
-     * non-blocking removal in the parent is refused rather than proceeding on a
-     * stale verification. */
+     * The second half is the fail-safe half (D-23, D-23b): a file the set still
+     * needs is refused with ZS_AGAIN and left on disk. */
     SKIP_IF_NO_FORK();
 
     clear_db();
@@ -11935,8 +11923,9 @@ static void test_mp_removal_needs_the_lock(void)
         struct zsi_locks lk;
         close(pipefd[0]);
         if (zsi_lock_open(&lk, dbdir) != ZS_OK) _exit(1);
-        if (zsi_lock_take(&lk, ZSI_LOCK_REMOVE, 0) != ZS_OK) _exit(2);
-        if (write(pipefd[1], "x", 1) != 1) _exit(3);
+        if (zsi_lock_take(&lk, ZSI_LOCK_WRITE, 0) != ZS_OK) _exit(2);
+        if (zsi_lock_take(&lk, ZSI_LOCK_REPACK, 0) != ZS_OK) _exit(3);
+        if (write(pipefd[1], "x", 1) != 1) _exit(4);
         close(pipefd[1]);
         usleep(400000);
         zsi_lock_close(&lk);
@@ -11954,20 +11943,21 @@ static void test_mp_removal_needs_the_lock(void)
     struct zs_db *db = NULL;
     ASSERT_OK(zs_db_open(dbdir, &setup, &db));
 
+    /* [1-1] is enclosed by [1-2], so it goes -- while the peer holds both locks. */
     char nm[ZSI_NAME_MAX];
     zsi_name_format(nm, db->uuid, 1, 1);
-    ASSERT_EQ(zsi_remove_file(db, nm), ZS_LOCKED);
-    ASSERT_EQ(fexists(dbpath(nm)), 0);          /* untouched */
-    zs_db_close(&db);
-
-    ASSERT_EQ(reap(pid), 0);
-
-    /* With the lock free it succeeds. */
-    db = open_db(0);
-    ASSERT_NOT_NULL(db);
     ASSERT_OK(zsi_remove_file(db, nm));
     ASSERT_EQ(fexists(dbpath(nm)), -ENOENT);
+
+    /* The active file holds the highest generation and nothing encloses it, so it
+     * is refused and left alone.  D-1b: its name carries no generation. */
+    char top[ZSI_NAME_MAX];
+    zsi_name_current(top, db->uuid);
+    ASSERT_EQ(zsi_remove_file(db, top), ZS_AGAIN);
+    ASSERT_EQ(fexists(dbpath(top)), 0);
+
     zs_db_close(&db);
+    ASSERT_EQ(reap(pid), 0);
 }
 
 static void test_mp_repack_and_writer_concurrent(void)
@@ -18268,7 +18258,7 @@ static struct test_entry tests[] = {
     { "test_mp_killed_writer",          test_mp_killed_writer },
     { "test_mp_reader_across_repack",   test_mp_reader_across_repack },
     { "test_mp_racing_removers",        test_mp_racing_removers },
-    { "test_mp_removal_needs_the_lock", test_mp_removal_needs_the_lock },
+    { "test_mp_removal_takes_no_lock", test_mp_removal_takes_no_lock },
     { "test_mp_repack_and_writer_concurrent",
                                         test_mp_repack_and_writer_concurrent },
     { "test_mp_reader_sees_torn_span",  test_mp_reader_sees_torn_span },

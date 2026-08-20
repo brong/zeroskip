@@ -17,8 +17,8 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 276 |
-| With an enforcing test | 265 |
+| Requirements | 277 |
+| With an enforcing test | 266 |
 | Gaps, each with a reason | 11 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
@@ -174,8 +174,9 @@ a spec label is missing here.
 | `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs`, `repack_verifies_inputs_nocsum`, `seal_verifies_spans_nocsum` |
 | `D-21` | The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to | `repack_selection` |
 | `D-22` | The output may legitimately contain **zero records**, in the form | `inorder_empty`, `repack_empty_output` |
-| `D-23` | Removing a data file — a converted unordered file, repack inputs, or | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
+| `D-23` | Removing a data file is permitted only for a file whose range is enclosed | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
 | `D-23a` | Tiling alone is **not** a sufficient test, because D-6 measures | `crash/snapshot_gap_retry` |
+| `D-23b` | The set-wide test reads the whole directory, so it can observe a set | `mp_racing_removers`, `mp_removal_takes_no_lock` |
 | `D-24` | `zs_db_should_repack` reports whether D-16 currently has work. | `repack_selection` |
 | `D-25` | **Sealing.** A writer MAY convert the **active** file on demand, holding | `seal_converts_the_active_file` |
 | `D-25a` | Sealing MUST NOT create a replacement active file. A conversion | `seal_creates_no_new_generation` |
@@ -199,7 +200,7 @@ a spec label is missing here.
 | `C-1` | Three byte-range locks on `zeroskip.lock`: | `lock_basic, lock_byte_offsets` |
 | `C-1a` | The write and repack locks never contend, because the two jobs | `conversion_avoids_the_repack_lock`, `lock_excludes_other_process`, `mp_repack_and_writer_concurrent` |
 | `C-1b` | Publishing a new file needs **no lock at all**: `rename` into the | `mp_repack_and_writer_concurrent` |
-| `C-1c` | The **remove** lock makes verifying completeness and unlinking one | `mp_removal_needs_the_lock` |
+| `C-1c` | **Removal needs no lock, because removals commute.** Every removal is | `mp_removal_takes_no_lock`, `mp_racing_removers` |
 | `C-1d` | **Lock ordering.** The locks form one total order: write → repack → remove. | `lock_basic`, `compact_lock_order` |
 | `C-1e` | The primitive and the byte offsets are normative, because | `lock_byte_offsets`, `lock_never_uses_flock` |
 | `C-1f` | `fcntl` locks are per-process, not per-thread: two threads of one | `lock_byte_offsets`, `lock_dies_with_process`, `lock_two_handles_one_process`, +1 more |

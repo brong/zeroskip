@@ -733,12 +733,13 @@ filesize-4    4   checksum of the pointer section
   serialise writers regardless. `flock` on a directory does work on Linux, macOS
   and the BSDs, and C-1e is what rules it out.
 
-  There is also no third object to carry the **remove** lock, and C-1d's total
-  order is enforceable only because all three locks share one lock space. What
-  the dedicated file costs against that is one empty inode: created with the
-  database (D-3a), never unlinked (D-3b), one descriptor per handle for its
-  lifetime (C-1g), contents never read (D-3c) — and it is the identity C-1j's
-  registry keys on.
+  Note what is **not** an argument here any more. While there were three locks
+  (C-1c) this section also observed that the two candidate objects could not
+  carry a third lock; with two locks the count works out, so the counting
+  argument is gone and the two above are what carry it. What the dedicated file
+  costs against them is one empty inode: created with the database (D-3a), never
+  unlinked (D-3b), one descriptor per handle for its lifetime (C-1g), contents
+  never read (D-3c) — and it is the identity C-1j's registry keys on.
 
 ### 5.2 The file set
 
@@ -922,8 +923,9 @@ without opening a single file.
   carried over, so no chain is built on an untrustworthy boundary. Only the
   invalid-header case has nothing to convert, and D-10 handles it.
 - **D-12c** Conversion never takes the repack lock. It renames its output in
-  without any lock, and takes the remove lock only momentarily to retire the
-  input, so a writer never waits on a repack.
+  without any lock (C-1b) and retires the input without one either (C-1c), so a
+  writer never waits on a repack. Its only lock is the write lock it already
+  holds.
 - **D-12d** Each conversion is bounded by `rollover_size` — sort the keys, write
   the records in order, append the pointer section and trailer — so a writer's
   extra cost is bounded and predictable rather than proportional to the database.
@@ -1315,20 +1317,36 @@ The per-file cursors are held in an array kept sorted by:
   generation range stays tiled (D-6). It is cheap and short-lived: an empty
   file violates D-16's size relation maximally, so the next repack absorbs it.
 - **D-23** Removing a data file — a converted unordered file, repack inputs, or
-  the contained files left by an interrupted repack — MUST be done **holding the
-  remove lock**, and only after verifying
-  that a complete set of files exists without it (D-6). Verification and
-  removal MUST happen under one unbroken hold of the lock, so the set cannot
-  change in between. If verification fails the file MUST be left alone:
-  leaking a file costs disk space, removing a needed one costs the database.
-- **D-23a** Tiling alone is **not** a sufficient test, because D-6 measures
-  completeness from the oldest *surviving* generation: deleting the oldest file
-  merely raises that floor, so the remainder tiles perfectly while its data is
-  gone. With `{[1-2], 3}`, removing `[1-2]` leaves `{3}`, which tiles. The
-  candidate MUST therefore also be **superseded**: the set without it MUST still
-  span the **same generation interval**, from the same lowest generation through
-  the same highest. A set covering less is not a complete set of the same
-  database.
+  the contained files left by an interrupted repack — is permitted **only for a
+  file whose generation range is enclosed by another file that is already
+  published**, and the remover MUST be the process that published it. That is
+  the whole precondition, and it needs **no lock**: C-1c is why. If it cannot be
+  established the file MUST be left alone — leaking a file costs disk space,
+  removing a needed one costs the database.
+
+  A remover MUST NOT delete a file on any other basis. "Nothing references it"
+  and "the volume is full" are not preconditions, and an implementation offering
+  either has left the argument C-1c rests on.
+- **D-23a** An implementation MAY test D-23's precondition by the set-wide route
+  instead — does a complete set (D-6) exist without the candidate — and this
+  implementation does. It is a sound way to establish enclosure and needs no
+  extra bookkeeping, and it is the reason a **failed** check is not an error but
+  a `ZS_AGAIN`-shaped "leave it alone".
+
+  If taken, **tiling alone is not sufficient**, and this is the trap that made
+  the whole condition look harder than it is. D-6 measures completeness from the
+  oldest *surviving* generation, so deleting the oldest file merely raises that
+  floor and the remainder tiles perfectly while its data is gone: with
+  `{[1-2], 3}`, removing `[1-2]` leaves `{3}`, which tiles. The set without the
+  candidate MUST therefore also span the **same generation interval**, from the
+  same lowest generation through the same highest. A set covering less is not a
+  complete set of the same database.
+- **D-23b** The set-wide test reads the whole directory, so it can observe a set
+  mid-change — and that is harmless in the only direction it can go. A concurrent
+  publication only *adds* a file, which can neither break tiling nor shrink the
+  interval, and a concurrent removal or a torn `readdir` can only make the set
+  look **less** complete. So the error is always a spurious refusal, never a
+  spurious removal, which is the other half of why C-1c needs no lock.
 - **D-24** `zs_db_should_repack` reports whether D-16 currently has work.
 - **D-25 Sealing.** A writer MAY convert the **active** file on demand, holding
   the write lock. D-12 skips the active file because another writer may be
@@ -1401,13 +1419,17 @@ The per-file cursors are held in an array kept sorted by:
 
 ## 6. Concurrency and durability
 
-- **C-1** Three byte-range locks on `zeroskip.lock`:
+- **C-1** Two byte-range locks on `zeroskip.lock`:
 
   | Byte | Lock | Held for | Covers |
   |---|---|---|---|
   | 0 | write | a write transaction | appending, creating a new active file, converting an unordered file |
   | 1 | repack | a whole repack, possibly long | merging in-order files |
-  | 2 | remove | momentarily | verify completeness, then unlink |
+
+  Byte 2 was a third lock, **remove**, held momentarily to verify completeness
+  and unlink; it was removed in 2026-08-20 and C-1c records why it was not
+  needed. The byte is **reserved, not reused**, so a peer still taking it
+  interoperates — it simply contends with nobody.
 
   The mechanism is **exactly** `fcntl` record locking: `F_SETLK` or `F_SETLKW`
   with `l_type = F_WRLCK`, `l_whence = SEEK_SET`, `l_start` the byte above, and
@@ -1443,7 +1465,7 @@ The per-file cursors are held in an array kept sorted by:
      file description and so already excludes two handles with no extra state;
   2. otherwise a **process-global registry** keyed by the lock file's identity
      — its `st_dev` and `st_ino`, not its path, since two paths can reach one
-     inode — recording which of C-1's three locks are held within this process.
+     inode — recording which of C-1's locks are held within this process.
      It MUST be consulted before the `fcntl` lock and released after it, so the
      two agree on C-1d's ordering.
 
@@ -1474,8 +1496,36 @@ The per-file cursors are held in an array kept sorted by:
   `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order,
   and a repack stays valid when a new in-order file appears above it midway
   through.
-- **C-1c** The **remove** lock makes verifying completeness and unlinking one
-  step (D-23).
+- **C-1c Removal needs no lock, because removals commute.** Every removal in
+  this design is justified by a file the remover **published beforehand whose
+  range encloses the candidate** — a conversion's output over its input (D-5a),
+  a repack's output over its inputs. Enclosure is transitive, and anyone removing
+  that enclosing file must in turn have published something enclosing *it*, so
+  coverage survives every interleaving and two removals can never be jointly
+  unsafe while each is individually justified.
+
+  There was a third lock for this until 2026-08-20, and the reasoning that
+  motivated it is worth recording because it is a tempting mistake. D-23's
+  condition is written as a property of the **whole set** — does a complete set
+  exist without the candidate — so two evaluators appear to interact, and
+  serialising them looks necessary. But the safety condition is **local**: is
+  this candidate enclosed by a file that is not itself going away. Local
+  conditions do not race. The set-wide form is a sound way to *test* the local
+  one and may be kept as one (D-23b); it just never needed serialising.
+
+  Three further facts made the lock's uselessness observable rather than
+  arguable. The two callers that took it already hold an exclusive lock over
+  their own removal candidates — a writer removes only the active-file name
+  (D-1b) and a repacker only the inputs it just merged, so neither could have
+  contended with anything anyway. A failed verification is fail-safe by
+  construction: D-23 leaves the file alone, and a leaked file costs disk space.
+  And a torn `readdir` can only make the set look *less* complete, so it can only
+  produce a spurious refusal, never a spurious removal.
+
+  What still MUST hold is the justification. An implementation MUST NOT remove a
+  file on any other basis — not for space, not because a scan found it
+  unreferenced — because that is the only kind of remover the argument above does
+  not cover, and it would need a lock that no longer exists.
 - **C-1k What a lock entitles you to.** A lock is a claim over **named files**,
   not a licence over the directory, and every name it authorises is determined
   before the work begins.
@@ -1495,8 +1545,8 @@ The per-file cursors are held in an array kept sorted by:
 
   **Publication ends the creator's claim.** Once a file is in the set, the
   process that wrote it has no more right to it than any reader does: it MUST NOT
-  be extended, rewritten or repaired (G-1, R-4), and unlinking it is the separate
-  entitlement of the remove lock (D-23). The one exception is the active file,
+  be extended, rewritten or repaired (G-1, R-4), and unlinking it is governed by
+  D-23 rather than by any lock (C-1c). The one exception is the active file,
   which the writer holding the write lock goes on appending to — and it is the
   exception precisely because it is the only file published *before* its
   contents.
@@ -1545,20 +1595,21 @@ The per-file cursors are held in an array kept sorted by:
   was hiding is resurrected. Erring the other way — treating the combined output
   as a wide conversion and keeping every tombstone — is merely wasteful, and is
   the direction D-19c already permits.
-- **C-1d Lock ordering.** The locks form one total order: **write → repack →
-  remove**. A holder MAY acquire any lock later in that order and MUST NOT
-  acquire one earlier, so no cycle exists. C-1's byte offsets are monotonic in
-  it, which is a convenience for reading an implementation and carries no
-  meaning of its own.
+- **C-1d Lock ordering.** The two locks form one order: **write → repack**. A
+  holder MAY acquire repack while holding write and MUST NOT acquire write while
+  holding repack, so no cycle exists. C-1's byte offsets are monotonic in it,
+  which is a convenience for reading an implementation and carries no meaning of
+  its own.
 
-  Most operations use a sub-chain of it: a writer takes write → remove, a
-  repacker takes repack → remove, and the two never contend (C-1a). Two
-  operations hold both write and repack — compaction (D-26) and the compacting
-  seal (C-1l) — which is why the order is stated as a chain rather than as two
-  disjoint pairs. A caller holding both MUST release **write** before a long
+  Most operations take one lock and no order arises. Two hold both — compaction
+  (D-26) and the compacting seal (C-1l) — which is the whole reason an order has
+  to be stated at all. A caller holding both MUST release **write** before a long
   merge, so an unbounded compaction does not block writers for its whole
   duration. Releasing out of order is always safe: a cycle needs two actors each
   *acquiring* what the other holds, so only acquisition is ordered.
+
+  This was a three-lock chain, write → repack → remove, until the remove lock was
+  shown unnecessary (C-1c).
 
   **Why this direction.** A writer that wants the repack lock already holds the
   write lock — it is mid-transaction, so it can only extend forward, and

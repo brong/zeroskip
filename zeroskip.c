@@ -4730,8 +4730,12 @@ static int zsi_snapshot_take(const char *dir, const zsi_uuid_t *uuid,
  * process-global registry keyed by the lock file's inode.  That is the
  * difference between the property and the appearance of it. */
 
-enum zsi_lock { ZSI_LOCK_WRITE = 0, ZSI_LOCK_REPACK = 1, ZSI_LOCK_REMOVE = 2 };
-#define ZSI_NLOCKS 3
+/* Byte 2 was a third lock, REMOVE, until C-1c showed it guarded nothing: every
+ * removal is justified by an enclosing file the remover published first, and
+ * enclosure is transitive, so removals commute.  The byte is RESERVED, not
+ * reused -- a peer still taking it interoperates and contends with nobody. */
+enum zsi_lock { ZSI_LOCK_WRITE = 0, ZSI_LOCK_REPACK = 1 };
+#define ZSI_NLOCKS 2
 
 /* C-1j mechanism 1: locks scoped to an open file description rather than to the
  * process, so two handles exclude each other with no extra state at all.  Linux
@@ -4998,10 +5002,8 @@ static int zsi_lock_take(struct zsi_locks *lk, enum zsi_lock which, int flags)
     assert(lk->fd >= 0);
     assert(!(lk->held & (1u << which)));        /* not already held */
 
-    /* C-1d, as a chain: taking a lock is legal only while holding locks strictly
-     * EARLIER in write -> repack -> remove. */
-    if (which == ZSI_LOCK_WRITE || which == ZSI_LOCK_REPACK)
-        assert(!(lk->held & (1u << ZSI_LOCK_REMOVE)));
+    /* C-1d: write -> repack, so taking WRITE while holding REPACK is the one
+     * illegal acquisition. */
     if (which == ZSI_LOCK_WRITE)
         assert(!(lk->held & (1u << ZSI_LOCK_REPACK)));
 
@@ -7611,12 +7613,8 @@ static int zsi_remove_file(struct zs_db *db, const char *name)
     struct zsi_fileset fs;
     int r;
 
-    r = zsi_lock_take(&db->locks, ZSI_LOCK_REMOVE,
-                      db->nonblocking ? ZS_NONBLOCKING : 0);
-    if (r != ZS_OK) return r;
-
     r = zsi_fileset_scan(db->dir, &db->uuid, &fs);
-    if (r != ZS_OK) goto out;
+    if (r != ZS_OK) return r;
 
     /* The interval the database currently covers.  Tiling ALONE is not a
      * sufficient precondition, which is worth spelling out because it is a
@@ -7643,7 +7641,7 @@ static int zsi_remove_file(struct zs_db *db, const char *name)
     for (size_t i = 0; i < fs.nall; i++)
         if (strcmp(fs.all[i].name, name) != 0) fs.all[w++] = fs.all[i];
 
-    if (w == fs.nall) { r = ZS_NOTFOUND; zsi_fileset_fini(&fs); goto out; }
+    if (w == fs.nall) { zsi_fileset_fini(&fs); return ZS_NOTFOUND; }
     fs.nall = w;
 
     r = zsi_fileset_resolve(&fs);
@@ -7661,19 +7659,16 @@ static int zsi_remove_file(struct zs_db *db, const char *name)
 
     zsi_fileset_fini(&fs);
 
-    if (r != ZS_OK) {
-        /* Still needed.  Leave it: a leaked file is reclaimed by a later pass. */
-        r = ZS_AGAIN;
-        goto out;
-    }
+    /* Still needed.  Leave it: a leaked file is reclaimed by a later pass.  D-23b:
+     * this is the only direction the check can be wrong in, since a concurrent
+     * publication only ADDS a file and a torn readdir only hides one -- both make
+     * the set look less complete, so a race costs a refusal, never a removal. */
+    if (r != ZS_OK) return ZS_AGAIN;
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", db->dir, name);
-    if (ZS_UNLINK(path) < 0 && errno != ENOENT) r = ZS_IOERROR;
-
-out:
-    zsi_lock_release(&db->locks, ZSI_LOCK_REMOVE);
-    return r;
+    if (ZS_UNLINK(path) < 0 && errno != ENOENT) return ZS_IOERROR;
+    return ZS_OK;
 }
 
 /* Write an in-order file holding the records at the given offsets of src, in the
@@ -7895,9 +7890,9 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f)
     free(offs);
     if (r != ZS_OK) { db->stats.convert_ns += zsi_since_ns(t0); return r; }
 
-    /* Retire the input under the remove lock (D-23).  D-12c: conversion never
-     * takes the repack lock -- it renames its output in without any lock and holds
-     * remove only momentarily, so a writer never waits on a repack. */
+    /* Retire the input (D-23).  D-12c: conversion takes NO lock beyond the write
+     * lock it already holds -- it renames its output in without one (C-1b) and
+     * removal needs none either (C-1c), so a writer never waits on a repack. */
     char iname[ZSI_NAME_MAX];
     zsi_name_current(iname, db->uuid);           /* D-1b */
     r = zsi_remove_file(db, iname);
