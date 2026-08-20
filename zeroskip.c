@@ -4968,15 +4968,13 @@ static int zsi_lock_fcntl(int fd, enum zsi_lock which, int type, bool block)
  * passes every single-threaded test and corrupts a database the moment a second
  * handle writes, which is why T-14 must be run per implementation.
  *
- * C-1d lock ordering: the locks form ONE TOTAL ORDER, write -> repack -> remove.
- * A holder may take a lock later in that order and must not take one earlier, so
- * no cycle exists.  Most operations use a sub-chain: a writer takes
- * write -> remove, a repacker repack -> remove, and the two never contend
- * (C-1a).  Two operations hold both write and repack -- compaction (D-26) and
- * C-1l's compacting seal -- which is why the order is a chain rather than two
- * disjoint pairs.  The byte values in enum zsi_lock happen to be monotonic in
- * it, which is a reading convenience and nothing more; the bytes are interop
- * surface (C-1e) and the order is a separate statement.
+ * C-1d lock ordering: the two locks form ONE ORDER, write -> repack.  Repack may
+ * be taken while holding write; write must NOT be taken while holding repack, so
+ * no cycle exists.  Most operations take one lock and no order arises.  Two hold
+ * both -- compaction (D-26) and C-1l's compacting seal -- which is the whole
+ * reason an order has to be stated.  The byte values in enum zsi_lock happen to
+ * be monotonic in it, which is a reading convenience and nothing more; the bytes
+ * are interop surface (C-1e) and the order is a separate statement.
  *
  * WHY THIS DIRECTION, since it was repack -> write until C-1l landed.  A writer
  * that wants the repack lock is already inside a transaction, so it can only
@@ -7247,9 +7245,14 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
         if (db->write_txn) return ZS_BADUSAGE;      /* one at a time */
 
         /* D-16e.  Here rather than at the end of the commit that created the
-         * work, because C-1d orders repack BEFORE write: a commit holds the
-         * write lock and so structurally cannot take the repack lock.  This
-         * transaction holds nothing yet, so the chain is available in order.
+         * work, and NOT because a commit cannot take the repack lock -- since
+         * C-1d became write -> repack it can, which is exactly what C-1l's
+         * compacting seal does.  The reason is that the cascade is UNBOUNDED
+         * (D-16b): taking repack from inside a commit would hold the WRITE lock
+         * across an unbounded merge and block every other writer for its whole
+         * duration.  This transaction holds nothing yet, so the merge runs under
+         * the repack lock alone and zsi_repack releases it before the write lock
+         * is taken below.
          *
          * Only when this transaction is about to START A NEW GENERATION --
          * the same condition zsi_writer_active applies (D-9a): no clean active

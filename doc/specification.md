@@ -1118,10 +1118,13 @@ The per-file cursors are held in an array kept sorted by:
   appear; a transaction appending to an existing active file cannot have created
   any.
 
-  **Before the write lock, not after the commit.** C-1d orders repack before
-  write, so a commit — which holds the write lock for its whole life — cannot
-  take the repack lock at all. At the start of a transaction nothing is held yet
-  and the chain is available in order.
+  **Before the write lock, not after the commit.** Not because a commit cannot
+  take the repack lock — under C-1d it can, and C-1l's compacting seal does —
+  but because the cascade is **unbounded** (D-16b): taking repack from inside a
+  commit holds the write lock across an unbounded merge and blocks every other
+  writer for its duration. At the start of a transaction nothing is held, so the
+  merge runs under the repack lock alone, which MUST be released before the write
+  lock is taken (C-1d).
 
   Both the "new generation" test and D-24's are made against a snapshot that may
   be stale, and neither decides anything except whether the repack lock is worth
