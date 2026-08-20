@@ -333,8 +333,21 @@ int  zs_db_stats(struct zs_db *db, struct zs_db_stats *out);
  * downstream over 20 000 single-record commits: p99.9 improved 42% against the
  * default, and NO commit did file-lifecycle work at all.
  *
- * Two things to get right, both found by a downstream sweep rather than by
- * reasoning:
+ * THE CADENCE IS A FILE-COUNT KNOB FIRST AND A LATENCY KNOB SECOND, and that is
+ * the trap: every seal ends a generation (D-25a), so the cadence sets the file
+ * count directly and D-14d makes every read linear in it.  Measured here at
+ * 200 000 one-record commits under ZS_NOAUTOREPACK: no cadence leaves 196 files,
+ * sealing every 500 commits leaves 400 -- and against those two layouts a point
+ * lookup runs 24% slower on a hit and 40% slower on a MISS, which is the shape a
+ * probe-then-insert caller has.  Downstream on ZFS the same pairing cost 73% of
+ * throughput and 245% of the median while making p99.9 36% WORSE, which is the
+ * opposite of what the cadence was reached for.
+ *
+ * So: DO NOT PAIR A TIGHT CADENCE WITH A DISARMED CASCADE.  Each half is
+ * defensible alone and together they only accumulate files.  If the cascade is
+ * disarmed, a bounded zs_db_repack catch-up MUST actually run, often enough to
+ * hold the file count down, or the cadence is buying latency with read
+ * throughput at a rate no workload wants.
  *
  * CADENCE MUST BEAT WHICHEVER BOUND IS ENDING GENERATIONS, and for small
  * transactions that is rollover_txns, not rollover_size.  A generation ends at
@@ -344,11 +357,14 @@ int  zs_db_stats(struct zs_db *db, struct zs_db_stats *out);
  * 15 of them, because the span bound had already fired.  D-12d bounds how TALL
  * the outlier can be; this sets how often you pre-empt it.
  *
- * DO NOT SEAL FREQUENTLY WITH THE REPACK CASCADE ARMED.  Sealing early makes
- * more and smaller generations, and the cascade then has more to merge: measured
- * 3.2x to 4.3x of stored bytes rewritten.  The combination that works is all
- * three together -- ZS_NOAUTOREPACK, this call from idle, and a bounded
- * zs_db_repack catch-up from idle too. */
+ * ALSO DO NOT SEAL FREQUENTLY WITH THE CASCADE ARMED: sealing early makes more
+ * and smaller generations and the cascade then has more to merge, measured at
+ * 3.2x to 4.3x of stored bytes rewritten.  Both arrangements have a cost, which
+ * is why this is a BULK-IMPORT AND MAINTENANCE tool rather than a steady-state
+ * mode.  For a steady-state single-record writer the plain default -- cascade
+ * armed, no ZS_NOAUTOREPACK, no cadence -- is the right configuration, and the
+ * p99.9 figure above was measured on a 20 000-commit fixture too small for
+ * either file-count cost to appear. */
 int  zs_db_seal(struct zs_db *db);
 
 /* Merge the entire database into a single file (D-26), reclaiming the tombstones

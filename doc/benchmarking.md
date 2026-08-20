@@ -437,8 +437,45 @@ already resident from having just been written, so the hint is a no-op; five pai
 runs of `repack cascade` drift 15% while the machine cools and show no consistent
 sign. What bounds its cost is arithmetic rather than a benchmark: a 200k-record
 cascade issues on the order of 60–120 `posix_madvise` calls in a 0.8 s run, which
-at ~1 µs each is ~0.03%. This one is banked on the downstream call graph and on the
-mechanism, not on a local number.
+at ~1 µs each is ~0.03%.
+
+**Measured downstream on ZFS**, 2M records at 128K recordsize, cascade disarmed
+then the page cache dropped then a timed cold catch-up. Two independent runs, three
+passes per arm each, arm order alternating, both arms rebuilt from git every time —
+twelve samples:
+
+| | major faults | minor (mean) | cold catch-up |
+|---|---|---|---|
+| no hint | 126109, all six | 6294 | 1.98–2.00, spread 0.02 |
+| hint | 122482, all six | 6906 | 1.92–2.02, spread 0.10 |
+| | **−3627 (−2.9%)** | +612, sign only | no signal |
+
+**The fault count is the whole result.** Identical to the unit in every one of the
+twelve samples: 126109 six times, 122482 six times. That determinism is what
+justifies the call.
+
+**The clock resolves nothing here, and an earlier version of this table claimed it
+did.** After one run the arms looked just separable — 1.98–2.00 against 1.92–1.97 —
+and this section said the timing corroborated the faults. Pooled over twelve
+samples the hint arm's range *encloses* the other's, its spread is five times
+larger, and it holds both the fastest sample and the slowest. The arithmetic says
+there was never a signal to find: 3015 net faults avoided at ~15.9 µs each is 48 ms,
+2.4% of a 1.99 s run, against ±0.5% noise on the quiet arm and more on the other.
+The effect is real and **below this fixture's timing resolution**, which is a
+different statement from absent — and reading faults before the clock is exactly
+why the phase was built that way.
+
+**Minor faults give a direction and not a magnitude.** +612 on average against 3627
+major faults avoided, so most of those faults stop happening rather than becoming
+cheap. But the figure swings fourfold between runs (+247, +976) while the major
+count does not move at all, so the sign is the finding and the size is not.
+Fault-around remains mechanism-consistent-with-counts rather than measured.
+
+**−2.9% is a floor, not the benefit.** `drop_caches` empties the page cache and not
+the ARC, so every fault in this fixture is a ~15.9 µs memory hit rather than a
+raidz2 read, and asynchronous issue — the part that matters on a genuinely cold
+pool — is out of the fixture's reach. Only a dataset larger than ARC would give the
+real magnitude; nobody has run it, because the decision it informs is already made.
 
 ## What an idle unordered file costs, and what D-9d already saves you
 
