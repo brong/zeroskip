@@ -17,9 +17,9 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 271 |
-| With an enforcing test | 261 |
-| Gaps, each with a reason | 10 |
+| Requirements | 276 |
+| With an enforcing test | 265 |
+| Gaps, each with a reason | 11 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -112,6 +112,7 @@ a spec label is missing here.
 | `D-3a` | It is created with the database (D-8a), and is created on open with | `lock_basic`, `open_lock_file_recreated` |
 | `D-3b` | It MUST NOT be unlinked — not by the library, and not by anything | `never_unlinks_the_lock_file` |
 | `D-3c` | The lock file is empty and its contents are never read. Nothing about | `lock_basic` |
+| `D-3d` | Why a dedicated file, when the database already holds two candidates. | `never_unlinks_the_lock_file` |
 | `D-4` | A file participates if its name matches `zeroskip-<uuid>-*` for this | `filename_rejections`, `fileset_ignores_foreign` |
 | `D-4a` | On first open the UUID is not yet known, so it is **discovered**: take | `fileset_uuid_discovery`, `open_create`, `open_uuid_mismatch` |
 | `D-5` | Resolution by scan. An output is renamed into place before its inputs | `fileset_overlap_table`, `filename_rejections`, `snapshot_resolves_overlap` |
@@ -199,13 +200,15 @@ a spec label is missing here.
 | `C-1a` | The write and repack locks never contend, because the two jobs | `conversion_avoids_the_repack_lock`, `lock_excludes_other_process`, `mp_repack_and_writer_concurrent` |
 | `C-1b` | Publishing a new file needs **no lock at all**: `rename` into the | `mp_repack_and_writer_concurrent` |
 | `C-1c` | The **remove** lock makes verifying completeness and unlinking one | `mp_removal_needs_the_lock` |
-| `C-1d` | **Lock ordering.** The locks form one total order: repack → write → remove. | `lock_basic`, `compact_lock_order` |
+| `C-1d` | **Lock ordering.** The locks form one total order: write → repack → remove. | `lock_basic`, `compact_lock_order` |
 | `C-1e` | The primitive and the byte offsets are normative, because | `lock_byte_offsets`, `lock_never_uses_flock` |
 | `C-1f` | `fcntl` locks are per-process, not per-thread: two threads of one | `lock_byte_offsets`, `lock_dies_with_process`, `lock_two_handles_one_process`, +1 more |
 | `C-1g` | `fcntl` locks are released by closing **any** descriptor for the file | `one_lock_descriptor` |
 | `C-1h` | Locks across databases. C-1d orders the locks within one database. | **none** |
 | `C-1i` | An implementation MAY use `F_OFD_SETLK` instead of `F_SETLK`, but only | `lock_two_handles_one_process` |
 | `C-1j` | **Same-process exclusion.** An implementation SHOULD exclude two handles | `lock_two_handles_one_process`, `lock_registry_keys_on_inode`, `lock_registry_is_per_database` |
+| `C-1k` | What a lock entitles you to. A lock is a claim over **named files**, | `convert_basic`, `seal_creates_no_new_generation`, `fileset_next_gen` |
+| `C-1l` | The compacting seal. A writer holding the **write** lock MAY | **none** |
 | `C-2` | Readers take **no lock**. | `mp_two_writers`, `mp_writer_and_readers` |
 | `C-3` | A file is published by writing it under a staging name, then | `convert_basic, mp_reader_across_repack` |
 | `C-4` | Taking a snapshot. The protocol is: | `crash/crash_after_invalid_terminator`, `file_open_failures`, `fileset_gaps`, +1 more |
@@ -354,6 +357,7 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`D-14g`** — Not yet attributed.
 - **`D-19b`** — Permissive: it states what an implementation MAY do (any means of evaluating D-19's predicate), so there is nothing to enforce. What *is* enforced is the predicate itself, by `repack_d18_table`.
 - **`D-19c`** — Permissive in the same way, and the direction it permits is the safe one. A test could show that repacking two ranges in either order leaves a conforming result, but it would be asserting the absence of a constraint.
+- **`C-1l`** — Permissive, and not yet implemented: it states an option a writer MAY take, and this implementation does not take it, so its seal always produces `[N..N]`. Its `MUST NOT` half — a repack-lock holder acquiring the write lock — is enforced by the assertion in `zsi_lock_take`, which no test can trip precisely because nothing in the library acquires the wrong way round; it is guarded by the mutants `compact: takes the repack lock outermost` and `lock: order asserted as repack before write` instead. Note that `compact_lock_order` does not cover the direction either, and says so in its own comment.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
 - **`T-12`** — Needs a second implementation. The corpus (T-0) and driver contract (T-0a) it requires are both in place.
 - **`T-13`** — Needs a second implementation. zstool provides hold-write for it.

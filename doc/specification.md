@@ -705,6 +705,40 @@ filesize-4    4   checksum of the pointer section
 - **D-3c** The lock file is empty and its contents are never read. Nothing about
   the database is stored in it, so it carries no version, no pid and no state to
   become stale.
+- **D-3d Why a dedicated file, when the database already holds two candidates.**
+  Neither works, and the reasons are worth recording because an empty file whose
+  contents are never read looks gratuitous next to them.
+
+  Locking the **active file** is D-3b's failure mode reached by design rather
+  than by a stray cleanup script. `zeroskip-<uuid>.current` is precisely the name
+  the protocol replaces: D-12b seals it and D-23 then removes it, and D-10 lets a
+  writer replace an unclean one. So a writer holding the lock on that inode seals
+  it, the name becomes free, the next writer creates a new active file and locks
+  a **different inode** uncontended, and both believe they hold the write lock —
+  appending to the same file at colliding offsets, silently. It is also *absent*
+  in the steady state, since at most one unordered file can exist and there is
+  none at all right after a sealing commit (D-12a, D-25d), so the lock would have
+  to be created by the very act it exists to serialise.
+
+  Locking the **directory** is not implementable. POSIX requires `open()` to fail
+  with `EISDIR` when the named file is a directory and *oflag* includes
+  `O_WRONLY` or `O_RDWR`, and requires `fcntl` with `F_SETLK` to fail with
+  `EBADF` when `l_type` is `F_WRLCK` and the descriptor is not open for writing.
+  The composition leaves an exclusive record lock on a directory unobtainable on
+  any conforming system: there is no way to hold a writable descriptor for one.
+  Measured on Darwin 25, `F_RDLCK` on a directory descriptor succeeds and both
+  `F_SETLK` and `F_OFD_SETLK` with `F_WRLCK` fail with `EBADF`. Independently,
+  POSIX mandates record locking only for **regular** files, so the shared lock
+  that does succeed is unspecified behaviour — and a shared lock could not
+  serialise writers regardless. `flock` on a directory does work on Linux, macOS
+  and the BSDs, and C-1e is what rules it out.
+
+  There is also no third object to carry the **remove** lock, and C-1d's total
+  order is enforceable only because all three locks share one lock space. What
+  the dedicated file costs against that is one empty inode: created with the
+  database (D-3a), never unlinked (D-3b), one descriptor per handle for its
+  lifetime (C-1g), contents never read (D-3c) — and it is the identity C-1j's
+  registry keys on.
 
 ### 5.2 The file set
 
@@ -870,7 +904,9 @@ without opening a single file.
   file** MUST convert it to its single-generation in-order form —
   `<uuid>-N` becomes `<uuid>-N-N` — before it finishes, oldest first, and MUST
   NOT go further: it does not merge in-order files, which is the repacker's job
-  (D-16).
+  (D-16). The one way further is to become a repacker, by taking the repack lock
+  as well — the compacting seal of C-1l, which is optional and changes which
+  retention rules govern the output.
 - **D-12a** With D-1b there is exactly one active-file name, so **at most one
   unordered file can exist at all** — the invariant is structural, not a
   steady state maintained by policy. A snapshot replays that file and nothing
@@ -1334,7 +1370,9 @@ The per-file cursors are held in an array kept sorted by:
 - **D-26 Compaction.** An implementation MAY merge the **entire** database into
   one file. The order is normative: seal (D-25), then convert every remaining
   unordered file (D-12), then merge in-order files until no two adjacent ones
-  remain.
+  remain. It acquires **write before repack** (C-1d) and releases write before
+  the merge, which is the acquisition order C-1l forces on everything holding
+  both.
 - **D-26a** A repacker's size-based selection does NOT apply to compaction: any
   such policy exists to keep a repack amortised, and compaction is explicitly
   the unamortised case. Every other repack rule applies unchanged, D-17 through
@@ -1380,6 +1418,15 @@ The per-file cursors are held in an array kept sorted by:
   implementation MUST NOT use `flock`, which occupies a separate lock space from
   `fcntl` on Linux and does not exclude it, and is a no-op over some network
   filesystems.
+
+  C-1d's **order** is normative for the same reason, and is the easiest part of
+  this to overlook: two implementations that each hold write and repack but
+  acquire them in opposite orders deadlock against each other on a database both
+  are reading correctly, and neither is misreading a byte. The order is
+  interoperability surface, not an internal discipline. Reversing it, as C-1d
+  records, is a pre-release break in the sense F-7a describes and likewise
+  carries **no version bump**: nothing on disk changes, and no database exists
+  outside this project's own test sets for a peer to have deadlocked with.
 - **C-1f** `fcntl` locks are per-process, not per-thread: two threads of one
   process both acquire the same lock successfully, and two handles in one process
   do not exclude each other. The `fcntl` lock alone therefore does not deliver
@@ -1417,6 +1464,11 @@ The per-file cursors are held in an array kept sorted by:
   `end == 0`, and the repacker only ever merges files with `end != 0` (D-16). A
   file becomes visible to the repacker precisely when the writer has finished
   with it, so a writer never waits on a repack.
+
+  That holds for a writer doing only its own job. Two operations deliberately
+  step outside it and hold both locks — compaction (D-26) and the compacting
+  seal (C-1l) — and both are exceptions stated as such. They are why C-1d is a
+  chain and not two disjoint pairs.
 - **C-1b** Publishing a new file needs **no lock at all**: `rename` into the
   directory is atomic, and a repack's output `[a..b]` and a conversion's output
   `[c..c]` with *c* > *b* are disjoint, so they cannot interfere in either order,
@@ -1424,16 +1476,100 @@ The per-file cursors are held in an array kept sorted by:
   through.
 - **C-1c** The **remove** lock makes verifying completeness and unlinking one
   step (D-23).
-- **C-1d Lock ordering.** The locks form one total order: **repack → write →
+- **C-1k What a lock entitles you to.** A lock is a claim over **named files**,
+  not a licence over the directory, and every name it authorises is determined
+  before the work begins.
+
+  The **write** lock authorises exactly three things: appending spans to a clean
+  active file; creating the new active file, at the generation D-9b names and no
+  other; and creating the in-order file `[N..N]` for the active generation *N*,
+  which is D-12's conversion. It authorises no file at any other generation, and
+  no second file at either of those — the one way to widen it is to take the
+  repack lock as well (C-1l), which is an entitlement the write lock does not
+  confer by itself.
+
+  The **repack** lock authorises creating one in-order file `[a..b]` over a
+  contiguous run of existing in-order files (D-16), and nothing else. It does
+  **not** confer the write lock's entitlements, and a holder MUST NOT acquire the
+  write lock to obtain them (C-1d, C-1l).
+
+  **Publication ends the creator's claim.** Once a file is in the set, the
+  process that wrote it has no more right to it than any reader does: it MUST NOT
+  be extended, rewritten or repaired (G-1, R-4), and unlinking it is the separate
+  entitlement of the remove lock (D-23). The one exception is the active file,
+  which the writer holding the write lock goes on appending to — and it is the
+  exception precisely because it is the only file published *before* its
+  contents.
+
+  That asymmetry is why publication takes **two forms** rather than one, and the
+  distinction is easy to get backwards. A conversion or repack output is complete
+  at the moment it is published, so it is written under a staging name and
+  `rename`d in after its sync (C-3, C-6b); the rename is atomic, so no reader
+  ever sees a partial file. A new active file is created **empty and directly at
+  its final name**, with `O_EXCL` — creating it *is* publishing it (D-8), there
+  is no completeness for the name to assert (D-21 says nothing about a file still
+  being appended to), and the `O_EXCL` is itself the entitlement check: under
+  D-1b a collision does not mean two writers allocated one generation, it means
+  the single active-file name is already occupied, which is D-10's case.
+- **C-1l The compacting seal.** A writer holding the **write** lock MAY
+  additionally take the **repack** lock and merge older in-order files into the
+  output it is already building — publishing one in-order file `[a..N]`, where
+  *N* is the active generation and `[a..N-1]` is a contiguous run of existing
+  in-order files, in place of the `[N..N]` a plain conversion would produce
+  (D-12, D-25).
+
+  A holder of the repack lock **MUST NOT** then take the write lock. There is no
+  repack-first form of this operation, so permitting one would make it and
+  compaction cyclic; C-1d states the resulting order and why it points this way.
+
+  It is **optional and writer-local**, exactly as D-16's selection is: a writer
+  that never does it is conforming, both layouts are valid, D-5 resolves either,
+  and no reader can tell which produced the file it is reading. What it buys is
+  the *intermediate* merging D-16's cascade otherwise pays — generation *N*'s
+  records are already in the writer's hands, so folding the older files in now
+  costs one pass, where the cascade would write `[N..N]`, read it back, and write
+  it again as part of the next merge that absorbs it. What it costs is a seal
+  that is no longer bounded by one generation, so a writer taking it inherits
+  D-29's unboundedness at a moment a caller was expecting a commit.
+
+  **The output is governed by the repack rules, not the conversion rules.** This
+  is the trap, and it is a data-loss one. A plain conversion retains every
+  tombstone unconditionally, which is sound only because its output covers
+  exactly its input's range (D-5a) and so has nothing below it to reason about. A
+  combined output has files below it whenever *a* > 1, so D-17 through D-23 apply
+  in full — and **D-19's predicate MUST be evaluated against the combined range**,
+  meaning "below *a*". Evaluating it against `[N..N]`, which is what reusing the
+  conversion path's notion of *below* would do, tests each tombstone against
+  generations *a*..*N*-1 that are its own inputs: where the newest record there
+  is a deletion the tombstone is dropped, and a value below *a* that the deletion
+  was hiding is resurrected. Erring the other way — treating the combined output
+  as a wide conversion and keeping every tombstone — is merely wasteful, and is
+  the direction D-19c already permits.
+- **C-1d Lock ordering.** The locks form one total order: **write → repack →
   remove**. A holder MAY acquire any lock later in that order and MUST NOT
-  acquire one earlier, so no cycle exists.
+  acquire one earlier, so no cycle exists. C-1's byte offsets are monotonic in
+  it, which is a convenience for reading an implementation and carries no
+  meaning of its own.
 
   Most operations use a sub-chain of it: a writer takes write → remove, a
-  repacker takes repack → remove, and the two never contend (C-1a). Only
-  compaction (D-26) holds both repack and write, which is why the order is
-  stated as a chain rather than as two disjoint pairs. A caller taking both
-  MUST release write before the merge, so an unbounded compaction does not
-  block writers for its whole duration.
+  repacker takes repack → remove, and the two never contend (C-1a). Two
+  operations hold both write and repack — compaction (D-26) and the compacting
+  seal (C-1l) — which is why the order is stated as a chain rather than as two
+  disjoint pairs. A caller holding both MUST release **write** before a long
+  merge, so an unbounded compaction does not block writers for its whole
+  duration. Releasing out of order is always safe: a cycle needs two actors each
+  *acquiring* what the other holds, so only acquisition is ordered.
+
+  **Why this direction.** A writer that wants the repack lock already holds the
+  write lock — it is mid-transaction, so it can only extend forward, and
+  write-before-repack is the only order available to it at all (C-1l).
+  Compaction is under no such constraint: it begins with nothing held and can
+  acquire in whichever order the chain names, so it is the operation that
+  adapts, taking write and then repack. An earlier version of this requirement
+  ordered them **repack → write**, which was sound while compaction was the only
+  operation holding both; since C-1l has no repack-first form, keeping that
+  direction would have made the two uses cyclic. The choice is therefore forced
+  by C-1l rather than preferred.
 - **C-1h Locks across databases.** C-1d orders the locks within one database.
   The library cannot see across two, so a caller that holds locks on several
   while writing MUST impose its own consistent order.
