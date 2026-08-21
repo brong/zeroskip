@@ -573,12 +573,12 @@ static void bench_batched_store(void)
      * fillseq uses.  Without it the closest zsbench figure commits every 1000,
      * so a side-by-side bulk-load row compared batching policy rather than the
      * two libraries -- 20 commits and 40 fdatasyncs against one and two. */
-    for (int per = 10; per <= nrecs * 10; per *= 10) {
+    for (long long per = 10; per <= (long long)nrecs * 10; per *= 10) {
         char label[64], slug[64];
         struct reptimes rt = { {0}, 0 };
         if (per > nrecs) per = nrecs;
         snprintf(label, sizeof(label), per == nrecs ? "store, all in one txn"
-                                                    : "store, %d per txn", per);
+                                                    : "store, %lld per txn", per);
         if (!selected(label)) { if (per == nrecs) break; else continue; }
 
         for (int r = 0; r < reps; r++) {
@@ -604,7 +604,7 @@ static void bench_batched_store(void)
         }
 
         if (per == nrecs) snprintf(slug, sizeof(slug), "store_all_per_txn");
-        else              snprintf(slug, sizeof(slug), "store_%d_per_txn", per);
+        else              snprintf(slug, sizeof(slug), "store_%lld_per_txn", per);
         record(slug, label, (size_t)nrecs, &rt, "");
         if (per == nrecs) break;    /* the sweep ends at "all" */
     }
@@ -943,7 +943,7 @@ static void bench_fetch(void)
                 char k[ZSB_KEYMAX];
                 const char *v;
                 size_t vl;
-                makekey(k, sizeof(k), (i * 7919) % nrecs);
+                makekey(k, sizeof(k), (i * 7919LL) % nrecs);
                 if (zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0) == ZS_OK)
                     hits++;
             }
@@ -1824,7 +1824,7 @@ static void bench_compact(void)
                 makekey(k, sizeof(k), i);
                 zs_db_store(db, k, strlen(k), val, valsize, 0);
             }
-            for (int i = 0; i < nrecs * deleted_pct[t] / 100; i++) {
+            for (int i = 0; i < (long long)nrecs * deleted_pct[t] / 100; i++) {
                 char k[ZSB_KEYMAX];
                 makekey(k, sizeof(k), i);
                 zs_db_delete(db, k, strlen(k), 0);
