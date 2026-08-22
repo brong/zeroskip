@@ -3,6 +3,32 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 2.9.2 — 2026-08-26
+
+- **`XXH_NO_INLINE_HINTS` is no longer set for optimised builds, and hashing is
+  about 3x faster because of it.** The flag makes every internal xxhash function
+  a plain `static`, which costs roughly 3x on *all* hashing — one-shot as well as
+  streaming — so every span checksum, conversion, repack and consistency check
+  was paying it. Measured over 21MB on aarch64: gcc 14 goes 19.4 → 59.0 GB/s,
+  clang 19 goes 24.3 → 62.5. About **+8%** on a bulk load. It is still required
+  below `-O2` on gcc/aarch64, so the Makefile's low-optimisation targets pass it
+  themselves (`XXH_LOWOPT_DEF`); a hand-rolled `-Og` build without it now fails
+  at compile time rather than silently paying 3x.
+
+- **`XXH3_STREAM_USE_STACK` is now set explicitly.** xxhash defines it for every
+  compiler except clang, and without it clang keeps the eight XXH3 accumulator
+  lanes in the heap-allocated state instead of registers, so streaming ran at a
+  third of the one-shot rate. With it they are at parity (51.5 against 51.4 GB/s
+  over 64MB). No digest, format or API change: both flags affect inlining only.
+
+- **The `VERSION` in the Makefile said 2.5.0 and had done since the 2.5 series**,
+  so `zeroskip.pc` and the library's version string were nine minor releases
+  behind the changelog. Corrected to match; no code change.
+
+- Benchmark fix: `zsbench`'s key generator overflowed `int` above 271181
+  records, so any read figure recorded above that size on an earlier build was
+  measuring a smaller working set than its row claimed.
+
 ## 2.9.1 — 2026-08-19
 
 - Documentation fixes, no behaviour change. `rollover_txns` said a handle with

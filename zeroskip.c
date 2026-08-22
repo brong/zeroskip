@@ -38,8 +38,35 @@
 #include "zeroskip.h"
 
 #define XXH_INLINE_ALL
-#define XXH_NO_INLINE_HINTS 1   /* callers without the SSE2 target attribute
-                                   cannot inline always_inline SSE2 helpers */
+
+/* XXH3_STREAM_USE_STACK copies the eight accumulator lanes into a local array
+ * for the duration of an update, so they can live in vector registers the way
+ * the one-shot path's local acc[8] does.  xxhash sets it itself for every
+ * compiler EXCEPT clang ("clang doesn't need additional stack space"), which is
+ * wrong here: without it clang leaves the accumulator in the heap-allocated
+ * state and streaming runs at a THIRD of the one-shot rate (clang 19, aarch64:
+ * 20.3 GB/s against 62.5).  With it, 63.2 against 61.0 -- parity.  Harmless on
+ * gcc, which already defines it. */
+#define XXH3_STREAM_USE_STACK 1
+
+/* XXH_NO_INLINE_HINTS is deliberately NOT set here, and must not be: it turns
+ * every internal xxhash function into a plain `static`, and on modern compilers
+ * that costs about 3x on ALL hashing -- one-shot as well as streaming, so every
+ * span checksum, conversion, repack and consistency check pays it.  Measured at
+ * 21MB, aarch64: gcc 14 goes 59.0 -> 19.4 GB/s and clang 19 goes 62.5 -> 24.3.
+ * End to end that is 8% of a bulk load (zsbench 400k at 1000-per-txn, best of
+ * nine: gcc 1107k -> 1202k/s, clang 1122k -> 1205k/s).
+ *
+ * It IS still required below -O2 on gcc, which refuses always_inline for the
+ * NEON helpers at -Og ("function not considered for inlining") and hits an
+ * internal compiler error at -O1 on aarch64.  So the low-optimisation targets
+ * in the Makefile pass -DXXH_NO_INLINE_HINTS=1 themselves; see XXH_LOWOPT_DEF
+ * there.  A hand-rolled -Og build without it fails loudly at compile time,
+ * which is the right way round -- the alternative was every optimised build
+ * silently paying 3x.  (Downstream twom sets this flag too and does NOT need
+ * it: it only ever calls one-shot XXH3_64bits, so the streaming helpers that
+ * fail to inline are never instantiated.) */
+
 #include "xxhash.h"
 
 /* Syscall interposition for crash and sync-failure injection (T-8, T-8a).

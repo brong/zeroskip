@@ -10,8 +10,8 @@
 #   Bump MINOR for new features (backward compatible)
 #   Bump PATCH for bug fixes
 VERSION_MAJOR = 2
-VERSION_MINOR = 5
-VERSION_PATCH = 0
+VERSION_MINOR = 9
+VERSION_PATCH = 2
 VERSION = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 
 CC ?= cc
@@ -43,6 +43,16 @@ endif
 ifeq ($(UNAME_S),Linux)
 PTHREAD_CFLAGS = -pthread
 endif
+
+# Below -O2, gcc refuses xxhash's always_inline NEON helpers ("function not
+# considered for inlining") and at -O1 on aarch64 it hits an internal compiler
+# error outright.  XXH_NO_INLINE_HINTS makes every internal xxhash function a
+# plain static and dodges both -- but it costs about 3x on ALL hashing (see the
+# comment at zeroskip.c's include of xxhash.h), so it belongs ONLY on the
+# targets that actually build below -O2 and must never reach a shipped build.
+# Every such target appends it; a hand-rolled low-opt build fails at compile
+# time instead, which is the loud failure rather than the silent 3x.
+XXH_LOWOPT_DEF = -DXXH_NO_INLINE_HINTS=1
 
 # Appended last, so a caller (or the asan target) can add flags without having
 # to restate the platform defines above -- restating them is how a sanitiser
@@ -183,7 +193,7 @@ check-noprobe:
 # and line numbers useful without making the fuzz cases unbearably slow.
 asan:
 	$(MAKE) clean
-	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address,undefined \
+	$(MAKE) zstest EXTRA_CFLAGS="-O1 $(XXH_LOWOPT_DEF) -fsanitize=address,undefined \
 		-fno-omit-frame-pointer -fno-sanitize-recover=all"
 	./zstest
 
@@ -202,7 +212,7 @@ ifeq ($(UNAME_S),Darwin)
 	$(MAKE) zstest
 	ZS_TEST_NO_FORK=1 MallocStackLogging=1 leaks --atExit -- ./zstest
 else
-	$(MAKE) zstest EXTRA_CFLAGS="-O1 -fsanitize=address -fno-omit-frame-pointer"
+	$(MAKE) zstest EXTRA_CFLAGS="-O1 $(XXH_LOWOPT_DEF) -fsanitize=address -fno-omit-frame-pointer"
 	ASAN_OPTIONS=detect_leaks=1 ./zstest
 endif
 
