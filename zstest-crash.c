@@ -1141,7 +1141,11 @@ static void snapshot_gap(const char *dir)
  * only exist under ZS_TEST_HOOKS, which only this target defines. */
 static void test_idxcache_no_fsync_on_publish(void)
 {
-    char cachedir[PATH_MAX], resolved[PATH_MAX];
+    /* resolved holds cachedir plus a uuid and a separator.  Sized to say so:
+     * gcc checks the DECLARED bounds, and cachedir is itself PATH_MAX, so
+     * PATH_MAX for the result is a -Wformat-truncation error under -Werror --
+     * which Cyrus builds with.  Same reason DBPATH_MAX exists above. */
+    char cachedir[PATH_MAX], resolved[PATH_MAX + ZSI_UUID_STR_LEN + 2];
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     long without, with;

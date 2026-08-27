@@ -1470,7 +1470,11 @@ static void test_record_byte_layout(void)
      * padded to 16.  The distinction still cannot be made from the length alone
      * in general (a 1-byte value would also be 9), which is why A-1 needs the
      * flag; but it does mean the two are never confusable here. */
-    ASSERT_EQ(kv_empty[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE | (2 << 4) & 0x0F);
+    /* The nibble alone, which is the claim; the byte itself is asserted below.
+     * This read `ZSI_MUSTBEONE | (2 << 4) & 0x0F` until gcc -Werror pointed out
+     * that & binds tighter than |, making the second term contribute nothing --
+     * so it passed by accident and duplicated the next line. */
+    ASSERT_EQ(kv_empty[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE);
     ASSERT_EQ(kv_empty[0], 0x28);
     ASSERT_EQ(del[0], 0x2A);
     ASSERT_EQ(del[0] ^ kv_empty[0], ZSI_ISDELETE);
@@ -15869,6 +15873,7 @@ static void test_salvage_all_or_nothing_inorder(void)
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);                        /* b is reused for the clean case below */
 
     /* Without the flag: nothing recovered, and the file reported once. */
     memset(&s, 0, sizeof(s));

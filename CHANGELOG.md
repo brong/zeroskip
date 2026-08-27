@@ -3,6 +3,61 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## 4.0.0 — 2026-08-27
+
+**Format 4. An ABI break and an on-disk break: a version-4 build cannot read a
+version-2 or version-3 database, and refuses it at open rather than
+part-parsing it.** There is no migration path in the library; a caller with
+existing data must dump and reload.
+
+- **Both file kinds now store the same self-framing record.** A 4-bit flag
+  nibble in the low half of byte 0, then `keylen` and `vallen`: 4 bytes of
+  header while `keylen <= 4095` and `vallen <= 65535`, 16 bytes above that, then
+  `key NUL value NUL`. Records are **packed** — the previous format rounded
+  every record up to a multiple of 8. `keylen == 0` is a span terminator,
+  always 20 bytes. Six legal encodings in total.
+
+- **An in-order file is `[header][records][pad][pointers][trailer]`**, with the
+  pointer array *after* the data and a 32-byte trailer carrying
+  `pointers_start`, `nptrs`, `ptrsize` and one checksum over the whole file.
+  Putting the array last is what lets a merge hold 8 bytes per record in a
+  single pass, and it removes the requirement to know every section length
+  before writing the first byte.
+
+- **No record carries a checksum, so a read verifies nothing.** An in-order
+  file's single checksum is verified only by `zs_db_check_consistency`, by a
+  merge reading the file as an input, and by salvage — never on open, never on a
+  read. Between checks, corrupt bytes are served to the caller without
+  complaint. An unordered file's span checksums are unaffected and still
+  verified whenever a span is indexed.
+
+- **Salvaging an in-order file is all or nothing** (S-13): one checksum cannot
+  name a record, so a single flipped bit makes every key in the file
+  unverifiable. Without `ZS_SALVAGE_UNVERIFIED` the file contributes nothing;
+  with it, every key is recovered and the file is reported once. A new event
+  kind, `ZS_SALVAGE_REGION_UNVERIFIED`, carries that.
+
+- **`zs_csum` returns `uint64_t`.** Checksums are all 64 bits: XXH3-64 with seed
+  0, untruncated. A caller supplying an external engine must change its
+  signature; one narrower than 64 bits places its value in the low half.
+
+- **`ZS_NOCSUM` is rejected with `ZS_BADUSAGE`, not ignored** (A-18). It has
+  nothing left to skip, and a caller passing it believes it is weakening
+  verification.
+
+- **Version 3 is skipped and must never be written.** It was assigned to an
+  unreleased format whose in-order files held a dense key-entry array pointing
+  into a region of bare values; files carrying it exist outside this
+  repository, so reusing the number would make two layouts indistinguishable.
+  The magic's version digit is now `4` and agrees with the header's version
+  fields.
+
+- Measured against format 2 on the same machine, arms differing only in the
+  format: identical data occupies **3.1% fewer bytes** (364,808,008 →
+  353,627,456 over 18 files), and point lookup is **+1.6% to +2.4%**
+  (non-overlapping over five rounds). Scan and store did not resolve above
+  laptop noise. See `doc/benchmarking.md`.
+
 ## 2.9.2 — 2026-08-26
 
 - **`XXH_NO_INLINE_HINTS` is no longer set for optimised builds, and hashing is
