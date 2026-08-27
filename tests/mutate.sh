@@ -209,13 +209,24 @@ mutant "compar: memcmp magnitude returned raw" equivalent \
   's/    if \(c\) return c < 0 \? -1 : 1;/    if (c) return c;/'
 
 mutant "csum: empty-input short-circuit" catch \
-  's/\{\n    return \(uint32_t\)\(XXH3_64bits\(buf, len\) & 0xFFFFFFFFu\);\n\}/{\n    if (!len) return 0;\n    return (uint32_t)(XXH3_64bits(buf, len) \& 0xFFFFFFFFu);\n}/'
+  's/\{\n    return XXH3_64bits\(buf, len\);\n\}/{\n    if (!len) return 0;\n    return XXH3_64bits(buf, len);\n}/'
 
-mutant "csum: keep high 32 bits" catch \
-  's/return \(uint32_t\)\(XXH3_64bits\(buf, len\) & 0xFFFFFFFFu\);/return (uint32_t)(XXH3_64bits(buf, len) >> 32);/'
+# Since version 4 the stored value is all 64 bits (F-5b).  Truncating to either
+# half is what a peer would do by copying version 2's engine, and every one of
+# these must be caught by test_interop_constants_csum -- which asserts the full
+# value AND that its low half still equals version 2's constant, so a truncation
+# fails the first assertion rather than passing both.
+mutant "csum: truncate to the low 32 bits" catch \
+  's/    return XXH3_64bits\(buf, len\);/    return XXH3_64bits(buf, len) \& 0xFFFFFFFFu;/'
+
+mutant "csum: keep the high 32 bits" catch \
+  's/    return XXH3_64bits\(buf, len\);/    return XXH3_64bits(buf, len) >> 32;/'
 
 mutant "csum: nonzero seed" catch \
-  's/return \(uint32_t\)\(XXH3_64bits\(buf, len\) & 0xFFFFFFFFu\);/return (uint32_t)(XXH3_64bits_withSeed(buf, len, 1) \& 0xFFFFFFFFu);/'
+  's/    return XXH3_64bits\(buf, len\);/    return XXH3_64bits_withSeed(buf, len, 1);/'
+
+mutant "csum: byte-swapped digest" catch \
+  's/    return XXH3_64bits\(buf, len\);/    return XXH_swap64(XXH3_64bits(buf, len));/'
 
 mutant "accessors: big-endian get32" catch \
   's/    return \(uint32_t\)u\[0\] \| \(\(uint32_t\)u\[1\] << 8\)\n         \| \(\(uint32_t\)u\[2\] << 16\) \| \(\(uint32_t\)u\[3\] << 24\);/    return (uint32_t)u[3] | ((uint32_t)u[2] << 8)\n         | ((uint32_t)u[1] << 16) | ((uint32_t)u[0] << 24);/'
@@ -242,10 +253,18 @@ mutant "magic: only 8 bytes checked" catch \
   's/if \(memcmp\(buf \+ ZSI_HDR_OFF_MAGIC, zsi_magic, ZSI_MAGIC_LEN\) != 0\)/if (memcmp(buf + ZSI_HDR_OFF_MAGIC, zsi_magic, 8) != 0)/'
 
 mutant "csum: header never verified" catch \
-  's/    if \(zsi_get32\(buf \+ ZSI_HDR_OFF_CSUM\) != csum\(buf, ZSI_HDR_OFF_CSUM\)\)\n        return ZS_BADCHECKSUM;/    (void)csum;/'
+  's/    if \(zsi_get64\(buf \+ ZSI_HDR_OFF_CSUM\) != csum\(buf, ZSI_HDR_OFF_CSUM\)\)\n        return ZS_BADCHECKSUM;/    (void)csum;/'
 
-mutant "csum: covers 72 not 68" catch \
-  's/zsi_put32\(buf \+ ZSI_HDR_OFF_CSUM, csum\(buf, ZSI_HDR_OFF_CSUM\)\);/zsi_put32(buf + ZSI_HDR_OFF_CSUM, csum(buf, ZSI_HEADER_LEN));/'
+# F-4: the field covers everything BEFORE it, so covering the whole header
+# includes the field itself and can never validate.
+mutant "csum: header covers its own field" catch \
+  's/zsi_put64\(buf \+ ZSI_HDR_OFF_CSUM, csum\(buf, ZSI_HDR_OFF_CSUM\)\);/zsi_put64(buf + ZSI_HDR_OFF_CSUM, csum(buf, ZSI_HEADER_LEN));/'
+
+# F-3a: the header keeps its own checksum even though one checksum now covers the
+# whole file, because a header must be validated WITHOUT hashing the file.
+# Truncating it to 32 bits is what a peer carrying version 2's width would do.
+mutant "csum: header checksum truncated to 32 bits" catch \
+  's/zsi_put64\(buf \+ ZSI_HDR_OFF_CSUM, csum\(buf, ZSI_HDR_OFF_CSUM\)\);/zsi_put32(buf + ZSI_HDR_OFF_CSUM, (uint32_t)csum(buf, ZSI_HDR_OFF_CSUM));/'
 
 # Anchored on a string unique to zsi_header_decode.  An earlier version anchored
 # on the "F-9: generations start at 1" comment, which zsi_name_parse later grew
@@ -267,8 +286,8 @@ mutant "layout: start/end swapped" catch \
 mutant "layout: uuid at 25" catch \
   's/#define ZSI_HDR_OFF_UUID       24   \/\* 16 \*\//#define ZSI_HDR_OFF_UUID       25   \/* 16 *\//'
 
-mutant "layout: header length 64" catch \
-  's/#define ZSI_HEADER_LEN         72/#define ZSI_HEADER_LEN         64/'
+mutant "layout: header length 72 (version 2's)" catch \
+  's/#define ZSI_HEADER_LEN         80/#define ZSI_HEADER_LEN         72/'
 
 mutant "layout: flags big-endian" catch \
   's/zsi_put16\(buf \+ ZSI_HDR_OFF_FLAGS, hdr->flags\);/{ unsigned char *fu = (unsigned char *)(buf + ZSI_HDR_OFF_FLAGS); fu[0] = (unsigned char)(hdr->flags >> 8); fu[1] = (unsigned char)(hdr->flags \& 0xFF); }/'
@@ -500,66 +519,65 @@ echo "pointer section (Task 9)"
 # byte-identical every time it is produced and other implementations must agree.
 # F-26g: an empty records region checksums to the ENGINE'S value for empty input,
 # not to zero.  This is the trap twom's csum_null-style short-circuit sets.
-mutant "empty file: records csum forced to zero" catch \
-  's/    zsi_put32\(buf \+ seclen \+ 8, records_csum\);/    zsi_put32(buf + seclen + 8, n ? records_csum : 0);/'
+# F-26g: a zero-record file's checksum is the ENGINE's value over its 104-byte
+# prefix, not zero -- which is the short-circuit an implementer is most likely to
+# add (twom's engine does exactly that).
+mutant "empty file: file csum forced to zero" catch \
+  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  n ? zsi_csumv(csum, csum_id, v, nv) : 0);/'
 
-mutant "empty file: PTRS64 when count is 0" catch \
-  's/    bool wide = records_end > 0xFFFFFFFFu;/    bool wide = n == 0 || records_end > 0xFFFFFFFFu;/'
+mutant "empty file: width 8 when there are no offsets" catch \
+  's/    return records_end > 0xFFFFFFFFu \? 8 : 4;/    return 8;/'
 
 # F-26b: the section checksum covers section + padding + back pointer + records
 # checksum, up to the checksum field itself.
-mutant "section csum: covers section only" catch \
-  's/    zsi_put32\(buf \+ seclen \+ 12, csum\(buf, seclen \+ 12\)\);/    zsi_put32(buf + seclen + 12, csum(buf, seclen));/'
+mutant "file csum: covers the tail only, not the records" catch \
+  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  zsi_csumv(csum, csum_id, v + npre, 1));/'
 
-mutant "section csum: not verified on load" catch \
-  's/    if \(f->csum\(cbase, covered\) != sec_csum\) return ZS_BADCHECKSUM;/    (void)cbase; (void)covered;/'
+mutant "file csum: verified on open, breaking F-31's O(1)" catch \
+  's/    const char \*tr = zsi_file_at\(f, f->size - ZSI_TRAILER_LEN, ZSI_TRAILER_LEN\);\n    if \(!tr\) return ZS_BADFORMAT;/    const char *tr = zsi_file_at(f, f->size - ZSI_TRAILER_LEN, ZSI_TRAILER_LEN);\n    if (!tr) return ZS_BADFORMAT;\n    { const char *ab = zsi_file_at(f, 0, f->size);\n      if (!ab || f->csum(ab, f->size - ZSI_CSUM_LEN)\n                 != zsi_get64(ab + f->size - ZSI_CSUM_LEN))\n          return ZS_BADCHECKSUM; }/'
 
 # F-26f: the records checksum is verified on DEMAND, never on open, which must
 # stay O(1).  Verifying it on open makes opening proportional to file size.
-mutant "records csum: verified on open" catch \
-  's/    f->records_csum = rec_csum;/    f->records_csum = rec_csum;\n    { size_t rl = ptr_off - ZSI_HEADER_LEN;\n      const char *rp = zsi_file_at(f, ZSI_HEADER_LEN, rl);\n      if (f->csum(rp ? rp : "", rl) != rec_csum) return ZS_BADCHECKSUM; }/'
+mutant "file csum: verified inside the load, not on demand" catch \
+  's/    f->ptr_size  = \(unsigned\)ptrsize;/    f->ptr_size  = (unsigned)ptrsize;\n    { const char *ab = zsi_file_at(f, 0, f->size);\n      if (!ab || f->csum(ab, f->size - ZSI_CSUM_LEN) != fcsum)\n          return ZS_BADCHECKSUM; }/'
 
-mutant "records csum: over the wrong region" catch \
-  's/    size_t len = f->ptr_off - ZSI_HEADER_LEN;/    size_t len = f->ptr_off;/'
+mutant "file csum: over the wrong region" catch \
+  's/    len = f->size - ZSI_CSUM_LEN;/    len = f->size - ZSI_HEADER_LEN - ZSI_CSUM_LEN;/'
 
 # F-26a: the back pointer is plain data, but must be bounds-checked and aligned.
-mutant "back pointer: alignment not checked" subsumed \
-  's/    if \(back % 8 != 0\) return ZS_BADFORMAT;/    \/* alignment check removed *\//'
+mutant "trailer: size agreement not checked" subsumed \
+  's/        if \(t.filesize != f->size\) return ZS_BADFORMAT;/        (void)t;/'
 
-mutant "back pointer: lower bound not checked" subsumed \
-  's/    if \(back < ZSI_HEADER_LEN\) return ZS_BADFORMAT;/    \/* lower bound removed *\//'
+mutant "trailer: array start lower bound not checked" subsumed \
+  's/    if \(start < ZSI_HEADER_LEN\) return ZS_BADFORMAT;/    \/* lower bound removed *\//'
 
-mutant "back pointer: may overlap the trailer" subsumed \
-  's/    if \(sec_end > f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (sec_end > f->size) return ZS_BADFORMAT;/'
+mutant "trailer: array may overlap the trailer" subsumed \
+  's/    if \(ptr_off > f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (ptr_off > f->size) return ZS_BADFORMAT;/'
 
-mutant "section type: anything accepted" subsumed \
-  's/    else                         return ZS_BADFORMAT;/    else                         wide = false;/'
+mutant "trailer: any pointer width accepted" subsumed \
+  's/    if \(ptrsize != 4 && ptrsize != 8\) return ZS_BADFORMAT;/    if (ptrsize != 4 \&\& ptrsize != 8) ptrsize = 4;/'
 
 # The section length must exactly account for the rest of the file.
-mutant "section length: bound not equality" subsumed \
-  's/    if \(want_end != f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (want_end > f->size - ZSI_TRAILER_LEN) return ZS_BADFORMAT;/'
+mutant "trailer: size agreement a bound, not an equality" subsumed \
+  's/        if \(t.filesize != f->size\) return ZS_BADFORMAT;/        if (t.filesize > f->size) return ZS_BADFORMAT;/'
 
 # ...and the combined mutant: strip the WHOLE back-pointer validation group at
 # once, so nothing structural stands between a corrupt trailer and the pointer
 # array.  Each layer above is individually subsumed by its siblings; this shows
 # the group as a whole is load-bearing rather than uniformly redundant.
-mutant "back pointer: no validation at all" catch \
-  's/    if \(back < ZSI_HEADER_LEN\) return ZS_BADFORMAT;\n    if \(back % 8 != 0\) return ZS_BADFORMAT;/    \/* all back pointer checks removed *\//; s/    if \(sec_end > f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (sec_end > f->size) return ZS_BADFORMAT;/; s/    else                         return ZS_BADFORMAT;/    else                         wide = false;/; s/    if \(want_end != f->size - ZSI_TRAILER_LEN\) return ZS_BADFORMAT;/    if (want_end > f->size) return ZS_BADFORMAT;/'
+mutant "trailer: no validation at all" catch \
+  's/    if \(ptrsize != 4 && ptrsize != 8\) return ZS_BADFORMAT;\n    if \(start < ZSI_HEADER_LEN\) return ZS_BADFORMAT;/    if (ptrsize != 4 \&\& ptrsize != 8) ptrsize = 4;/; s/        if \(t.filesize != f->size\) return ZS_BADFORMAT;/        (void)t;/'
 
 # F-27: every pointer 8-aligned and inside the records region.
 mutant "F-27: pointer bounds not checked" catch \
   's/        if \(off >= ptr_off\) return ZS_BADFORMAT;/        \/* upper bound removed *\//'
 
-mutant "F-27: pointer alignment not checked" catch \
-  's/        if \(off % 8 != 0\) return ZS_BADFORMAT;/        \/* alignment removed *\//'
+mutant "F-27a: a pointer at a zero byte accepted" catch \
+  's/        if \(b\[0\] == 0\) return ZS_BADFORMAT;/        \/* F-27a check removed *\//'
 
 # F-26d: the narrow section pads to a multiple of 8 so the trailer is aligned.
-mutant "F-26d: no padding to 8" catch \
-  's/    return zsi_roundup8\(total\);\n\}/    return total;\n}/'
-
-# F-26c: PTRS32 whenever the offsets fit, so encoding is canonical.
-mutant "F-26c: always PTRS64" catch \
-  's/    bool wide = records_end > 0xFFFFFFFFu;/    bool wide = true;/'
+mutant "F-26d: no pad before the pointer array" catch \
+  's/    pad = t.pad; arrlen = t.arrlen; total = t.tail_len;/    pad = 0; arrlen = t.arrlen; total = t.arrlen + ZSI_TRAILER_LEN;/'
 
 # The search must be a lower bound over a strictly ordered array.
 mutant "search: probe returns wrong end" catch \
@@ -694,10 +712,10 @@ mutant "F-25: rollback replayed anyway" catch \
 # F-22 / C-4f: the terminator checksum is what makes a torn tail detectable, and
 # what makes reading a live file safe with no lock.
 mutant "F-22: span checksum not verified" catch \
-  's/            uint32_t want = zsi_csum2\(f->csum, f->csum_id,\n                                      spandata \? spandata : "", datalen,\n                                      termbytes, term.len - 4\);\n            if \(want != term.csum\) break;/            (void)spandata; (void)termbytes;/'
+  's/            uint64_t want = zsi_csum2\(f->csum, f->csum_id,\n                                      spandata \? spandata : "", datalen,\n                                      termbytes, ZSI_TERM_CSUM_COVER\);\n            if \(want != term.csum\) break;/            (void)spandata; (void)termbytes;/'
 
 mutant "F-22: checksum over span only" catch \
-  's/                                      spandata \? spandata : "", datalen,\n                                      termbytes, term.len - 4\);/                                      spandata ? spandata : "", datalen,\n                                      termbytes, 0);/'
+  's/                                      termbytes, ZSI_TERM_CSUM_COVER\);\n            if \(want != term.csum\) break;/                                      termbytes, 0);\n            if (want != term.csum) break;/'
 
 # F-23: the terminator'"'"'s span length must equal the bytes actually present.
 mutant "F-23: span length not checked" catch \
@@ -732,8 +750,8 @@ mutant "D-10: invalid header replayed anyway" catch \
 # walk's check is a fast path over a rule enforced one level down (and that level
 # IS tested, by test_record_bounds).  Kept because the walk should not depend on
 # the decoder's error taxonomy to know that a pointer section ends a span.
-mutant "PTRS accepted mid-span" equivalent \
-  's/            if \(!\(type & ZSI_HASKEY\)\) break;/            \/* family check removed *\//'
+mutant "span walk: a terminator read as a record" equivalent \
+  's/            if \(\(zsi_get16\(b\) >> ZSI_KEYLEN_SHIFT\) == 0\) \{/            if (false) {/'
 
 # F-29: the progress rule.
 #
@@ -820,20 +838,20 @@ mutant "open: directory accepted as a file" catch \
 echo
 echo "records and terminators (Task 4)"
 
-mutant "type: computed instead of tabled" catch \
-  's/    switch \(type\) \{\n    case ZSI_KEYVALUE:/    if (type \& 0xC0) return false;\n    return true;\n    switch (type) {\n    case ZSI_KEYVALUE:/'
+mutant "flags: computed instead of tabled" catch \
+  's/    switch \(nibble\) \{\n    case ZSI_MUSTBEONE:/    return (nibble \& ZSI_MUSTBEONE) != 0;\n    switch (nibble) {\n    case ZSI_MUSTBEONE:/'
 
-mutant "type: 0x00 accepted" catch \
-  's/    case ZSI_PTRS64:\n        return true;\n    \}\n\n    return false;/    case ZSI_PTRS64:\n    case 0x00:\n        return true;\n    }\n\n    return false;/'
+mutant "flags: nibble 0x00 accepted" catch \
+  's/    case ZSI_MUSTBEONE \| ZSI_ISROLLBACK:                    \/\* ROLLBACK \*\/\n        return !haskey;/    case ZSI_MUSTBEONE | ZSI_ISROLLBACK:\n        return !haskey;\n    case 0x00:\n        return true;/'
 
-mutant "type: reserved bit ignored" catch \
-  's/static inline bool zsi_type_valid\(uint8_t type\)\n\{\n    switch \(type\) \{/static inline bool zsi_type_valid(uint8_t type)\n{\n    type \&= 0x3F;\n    switch (type) {/'
+mutant "flags: MustBeOne forced on rather than required" catch \
+  's/static inline bool zsi_flags_valid\(uint8_t nibble, bool haskey\)\n\{\n    switch \(nibble\) \{/static inline bool zsi_flags_valid(uint8_t nibble, bool haskey)\n{\n    nibble |= ZSI_MUSTBEONE;\n    switch (nibble) {/'
 
-mutant "keylen boundary: 256 stays short" catch \
-  's/bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) \{\n        hdr = big \? ZSI_HDRLEN_BIGDELETION/bool big = keylen > 256\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);\n\n    if (isdelete) {\n        hdr = big ? ZSI_HDRLEN_BIGDELETION/'
+mutant "keylen boundary: 4096 stays small" catch \
+  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(big && \(uint64_t\)keylen > ZSI_BIG_KEYLEN_MAX\) return 0;/    bool big = keylen > 4096\n            || (!isdelete \&\& vallen > ZSI_SHORT_VALLEN_MAX);\n\n    if (big \&\& (uint64_t)keylen > ZSI_BIG_KEYLEN_MAX) return 0;/'
 
-mutant "vallen boundary: 65536 stays short" catch \
-  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n\n    if \(isdelete\) return big/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > 65536);\n\n    if (isdelete) return big/'
+mutant "vallen boundary: 65536 stays small" catch \
+  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n    uint8_t f = ZSI_MUSTBEONE;/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || (!isdelete \&\& vallen > 65536);\n    uint8_t f = ZSI_MUSTBEONE;/'
 
 # Changes BOTH zsi_rec_type_for and zsi_rec_encoded_len, so the two stay
 # consistent with each other and the mutant is a plausible bug rather than an
@@ -841,16 +859,13 @@ mutant "vallen boundary: 65536 stays short" catch \
 # offsets into a short-length buffer, so it was "caught" by a heap overflow --
 # detected, but not by any assertion, and therefore no evidence about the tests.
 mutant "lengths include the NUL terminators" catch \
-  's/        if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0 + 4, \&body)) return 0;/'
+  's/        if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return 0;/        if (!zsi_add3_sz(keylen, vallen, 0, \&body)) return 0;/'
 
 mutant "vallen stored at +3 not +2" catch \
-  's/            zsi_put16\(buf \+ 2, \(uint16_t\)vallen\);/            zsi_put16(buf + 3, (uint16_t)vallen);/'
+  's/    else     zsi_put16\(buf \+ 2, \(uint16_t\)vallen\);/    else     zsi_put16(buf + 3, (uint16_t)vallen);/'
 
-mutant "big keylen at +16, vallen at +8" catch \
-  's/            zsi_put64\(buf \+ 8, \(uint64_t\)keylen\);\n            zsi_put64\(buf \+ 16, \(uint64_t\)vallen\);/            zsi_put64(buf + 16, (uint64_t)keylen);\n            zsi_put64(buf + 8, (uint64_t)vallen);/'
-
-mutant "encoder: no memset (dirty record padding)" catch \
-  's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/'
+mutant "big form: keylen in its own field, not sharing the first word" catch \
+  's/    if \(big\) zsi_put64\(buf, \(uint64_t\)nibble \| \(keylen << ZSI_KEYLEN_SHIFT\)\);/    if (big) { zsi_put64(buf, (uint64_t)nibble); zsi_put64(buf + 8, keylen); }/'
 
 # The explicit NUL writes are redundant with the memset that precedes them: it
 # covers the whole record, and both NUL positions are inside it.  So removing
@@ -859,48 +874,39 @@ mutant "encoder: no memset (dirty record padding)" catch \
 # narrowing the memset to just the padding -- a plausible future optimisation --
 # would make them load-bearing again.
 mutant "no NUL after value" equivalent \
-  's/buf\[body \+ keylen \+ 1 \+ vallen\] = /(void)0; \/\/ /'
+  's/        buf\[hdr \+ keylen \+ 1 \+ vallen\] = /        (void)0; \/\/ /'
 
 mutant "no NUL after key" equivalent \
-  's/    buf\[body \+ keylen\] = /    (void)0; \/\/ /'
+  's/    buf\[hdr \+ keylen\] = /    (void)0; \/\/ /'
 
 # ...and the pairing that proves the claim above: with the memset gone AND the
 # NUL writes gone, the trailing NULs really are absent and a test must object.
-mutant "no memset and no NULs" catch \
-  's/    memset\(buf, 0, total\);\n    buf\[0\] = \(char\)type;/    buf[0] = (char)type;/; s/buf\[body \+ keylen \+ 1 \+ vallen\] = /(void)0; \/\/ /; s/    buf\[body \+ keylen\] = /    (void)0; \/\/ /'
+mutant "neither NUL written" catch \
+  's/        buf\[hdr \+ keylen \+ 1 \+ vallen\] = /        (void)0; \/\/ /; s/    buf\[hdr \+ keylen\] = /    (void)0; \/\/ /'
 
 mutant "F-14: zero keylen allowed" catch \
-  's/    if \(keylen < 1\) return ZS_BADFORMAT;             \/\* F-14 \*\//    \/* F-14 check removed *\//'
+  's/    if \(keylen < 1\) return ZS_BADFORMAT;             \/\* F-14; a terminator \*\//    \/* F-14 check removed *\//'
 
 mutant "decode: total not bounded by len" catch \
   's/    if \(total > len\) return ZS_BADFORMAT;/    \/* bound removed *\//'
 
 mutant "decode: unchecked keylen+vallen" catch \
-  's/            if \(!zsi_add3_sz\(keylen, vallen, 2 \+ 4, &body\)\) return ZS_BADFORMAT;/            body = keylen + vallen + 2 + 4;/'
+  's/            if \(!zsi_add3_sz\(keylen, vallen, 2, &body\)\) return ZS_BADFORMAT;/            body = keylen + vallen + 2;/'
 
 # The short form skips those guards because its lengths cannot wrap, which means
 # the size expression exists twice.  Two copies drift; a record sized differently
 # by the two forms puts the key and value pointers into the wrong bytes.
-mutant "decode: short form sizes a record differently" catch \
-  's/        total = zsi_roundup8\(hdr \+ keylen \+ \(isdelete \? 1 : vallen \+ 2\) \+ 4\);/        total = zsi_roundup8(hdr + keylen + (isdelete ? 1 : vallen + 2) + 12);/'
+mutant "decode: the small form sizes a record differently from the big one" catch \
+  's/        total = hdr \+ keylen \+ \(isdelete \? 1 : vallen \+ 2\);/        total = hdr + keylen + (isdelete ? 2 : vallen + 1);/'
 
-mutant "decode: data record accepts COMMIT" catch \
-  's/    if \(!\(type & ZSI_HASKEY\)\) return ZS_BADFORMAT;   \/\* not a data record \*\//    \/* family check removed *\//'
-
-mutant "terminator: span boundary off by one" catch \
-  's/    return spanlen <= ZSI_SHORT_SPANLEN_MAX \? ZSI_TERMLEN_SHORT\n                                            : ZSI_TERMLEN_LONG;/    return spanlen < ZSI_SHORT_SPANLEN_MAX ? ZSI_TERMLEN_SHORT\n                                          : ZSI_TERMLEN_LONG;/'
+mutant "decode: a record decoder accepts a terminator" catch \
+  's/    if \(keylen < 1\) return ZS_BADFORMAT;             \/\* F-14; a terminator \*\//    if (keylen < 1) keylen = 1;/'
 
 mutant "terminator csum: span only, not terminator" catch \
-  's/        zsi_put32\(buf \+ 4, zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                                     buf, ZSI_TERMLEN_SHORT - 4\)\);/        zsi_put32(buf + 4, csum(spandata, (size_t)spanlen));/'
+  's/              zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                        buf, ZSI_TERM_CSUM_COVER\)\);/              csum(spandata, (size_t)spanlen));/'
 
 mutant "terminator: rollback bit dropped" catch \
-  's/        buf\[0\] = \(char\)\(rollback \? ZSI_ROLLBACK : ZSI_COMMIT\);/        buf[0] = (char)ZSI_COMMIT;/'
-
-mutant "terminator: long spanlen at +16" catch \
-  's/        zsi_put64\(buf \+ 8, spanlen\);/        zsi_put64(buf + 16, spanlen);/'
-
-mutant "terminator: long csum at +16 not +20" catch \
-  's/        zsi_put32\(buf \+ 20, zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                                      buf, ZSI_TERMLEN_LONG - 4\)\);/        zsi_put32(buf + 16, zsi_csum2(csum, csum_id, spandata, (size_t)spanlen,\n                                      buf, ZSI_TERMLEN_LONG - 4));/'
+  's/    uint8_t nibble = ZSI_MUSTBEONE \| \(rollback \? ZSI_ISROLLBACK : 0\);/    uint8_t nibble = ZSI_MUSTBEONE;/'
 
 # The data-loss bug this task originally shipped with: rejecting a decodable but
 # non-canonical record.  Combined with F-24 that discards every committed record
@@ -941,7 +947,7 @@ mutant "idx: drops the exact-size check" subsumed \
   's/    if \(want != len\) goto out;/    \/* P-11 exact-size check removed *\//'
 
 mutant "idx: drops the offset-array checksum" catch \
-  's/    if \(zsi_get32\(buf \+ len - 4\)\n        != f->csum\(buf \+ ZSI_IDX_HEADER_LEN, arrlen\)\)\n        goto out;/    \/* P-11 array checksum removed *\//'
+  's/    if \(zsi_get64\(buf \+ len - ZSI_CSUM_LEN\)\n        != f->csum\(buf \+ ZSI_IDX_HEADER_LEN, arrlen\)\)\n        goto out;/    \/* P-11 array checksum removed *\//'
 
 mutant "idx: drops the offset range check" catch \
   's/        if \(v < ZSI_HEADER_LEN \|\| v >= h\.valid_upto\) goto out;/        \/* P-11 offset range check removed *\//'
@@ -1474,26 +1480,26 @@ mutant "convert: the D-20b re-verify removed" catch \
 
 # F-32a.  Skipping verification at the yield is the headline gap the whole
 # format change exists to close: corrupt bytes served without a word.
-mutant "record: not verified at yield" catch \
-  's/    if \(c->cur\[0\]\.file && !c->db->nocsum\) \{\n        int vr = zsi_rec_verify\(c->cur\[0\]\.file->csum, &rec\);\n        if \(vr != ZS_OK\) return vr;\n    \}/    \/* F-32a removed *\//'
+mutant "read path: verifies a record, which F-33 forbids" catch \
+  's/    if \(zsi_rec_decode\(b, avail, &r\) != ZS_OK\) break;/    if (zsi_rec_decode(b, avail, \&r) != ZS_OK) break;\n            if (f->csum \&\& r.len > 8 \&\& f->csum(r.base, r.len - 8) == 0) break;/'
 
 # F-32.  Covering [0, len) instead of [0, len-4) includes the checksum field in
 # its own coverage -- the off-by-pad class, wrong for every record.
-mutant "record: csum covers its own field" catch \
-  's/    if \(csum\(r->base, r->len - 4\) != r->csum\) return ZS_BADCHECKSUM;/    if (csum(r->base, r->len) != r->csum) return ZS_BADCHECKSUM;/'
+mutant "file csum: covers its own field" catch \
+  's/    if \(f->csum\(p, len\) != zsi_get64\(p \+ len\)\) return ZS_BADCHECKSUM;/    if (f->csum(p, f->size) != zsi_get64(p + len)) return ZS_BADCHECKSUM;/'
 
 # F-32b.  Verifying during replay is the tempting wrong version: replay
 # completes a file at its first invalid record (F-24), so this turns one
 # flipped value byte into the silent loss of every record after it -- caught by
 # the no-truncate test, which is the G-3 half of the requirement.
-mutant "record: verified during replay" catch \
-  's/            struct zsi_rec r;\n            if \(zsi_rec_decode\(b, avail, &r\) != ZS_OK\) break;/            struct zsi_rec r;\n            if (zsi_rec_decode(b, avail, \&r) != ZS_OK) break;\n            if (zsi_rec_verify(f->csum, \&r) != ZS_OK) break;/'
+mutant "replay: rejects a record on a content test (F-33a)" catch \
+  's/            struct zsi_rec r;\n            if \(zsi_rec_decode\(b, avail, &r\) != ZS_OK\) break;/            struct zsi_rec r;\n            if (zsi_rec_decode(b, avail, \&r) != ZS_OK) break;\n            if (r.val \&\& r.vallen \&\& r.val[0] == 0x56) break;/'
 
 # F-32.  The write-side gap: a checksum never computed reads as engine 0's
 # everywhere, so every engine-1 read fails -- unmissable, which is the point:
 # it proves the read tests depend on the WRITTEN value, not on a round-trip.
-mutant "record: checksum never written" catch \
-  's/    zsi_put32\(buf \+ total - 4, csum\(buf, total - 4\)\);/    zsi_put32(buf + total - 4, 0);/'
+mutant "file csum: never written" catch \
+  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  0);/'
 
 # F-32c.  Copying verbatim across an engine boundary carries a checksum that
 # validates for nobody -- the A-6 trap at one remove, silent until read.
@@ -1550,7 +1556,7 @@ echo "salvage (S-1..S-12)"
 # without checksumming the span it implies turns salvage from a recovery into a
 # guess, and everything it produced would be unverified while claiming not to be.
 mutant "salvage: resync believes a candidate unchecked" catch \
-  's/        if \(zsi_csum2\(cs, csum_id, spandata \? spandata : "",\n                      \(size_t\)t\.spanlen, termbytes, t\.len - 4\) != t\.csum\)\n            continue;/        \/* S-7 proof removed *\//'
+  's/        if \(zsi_csum2\(cs, csum_id, spandata \? spandata : "",\n                      \(size_t\)t\.spanlen, termbytes, ZSI_TERM_CSUM_COVER\) != t\.csum\)\n            continue;/        \/* S-7 proof removed *\//'
 
 # S-7 again.  SUBSUMED, and the group's demonstration is the checksum mutant
 # above rather than a combined one.
@@ -2062,6 +2068,96 @@ mutant "rollover: only bytes are counted" catch \
   's/    return f->size >= db->rollover_size \|\| f->nspans >= db->rollover_txns;/    return f->size >= db->rollover_size;/'
 
 echo
+echo "format 4: the flag nibble, the trailer, and one checksum"
+
+# F-12b.  MustBeOne is what makes byte 0 non-zero for every record, and that is
+# what F-26d1's pad recognition and F-27a's pointer check rest on.  Clearing it
+# from the encoder produces records a conforming reader rejects -- and, for a
+# 16-byte key, a record whose first byte is 0x00 and so indistinguishable from
+# pad.  test_flag_nibble_validity walks every key length for exactly this.
+mutant "F-12b: MustBeOne not set by the encoder" catch \
+  's/    uint8_t f = ZSI_MUSTBEONE;/    uint8_t f = 0;/'
+
+# F-12b again, from the reader's side.
+mutant "F-12b: MustBeOne clear accepted on read" catch \
+  's/    case ZSI_MUSTBEONE:                                     \/\* record, or COMMIT \*\/\n        return true;/    case ZSI_MUSTBEONE:\n    case 0:\n        return true;/'
+
+# F-14a.  A deletion has no value and therefore no value NUL.  Adding one back is
+# the version-2 shape, and in a self-framing stream it does not produce a wrong
+# record -- it desynchronises every boundary after it, so the symptom is
+# "everything after the first tombstone vanished".
+mutant "F-14a: a deletion carries a value NUL" catch \
+  's/        if \(!zsi_add3_sz\(hdr, keylen, 1, &total\)\) return 0;/        if (!zsi_add3_sz(hdr, keylen, 2, \&total)) return 0;/'
+
+# F-14b.  vallen MUST NOT be consulted when framing a deletion, or a record has
+# two candidate lengths -- and in a self-framing stream that is not a wrong
+# record, it desynchronises every boundary after it, so the symptom is
+# "everything after the first tombstone vanished".
+#
+# THIS IS A COMPOUND MUTANT AND HAS TO BE, which is worth knowing before anyone
+# splits it.  The rule is enforced twice over: the decoder zeroes vallen for a
+# deletion, AND the size expression takes the isdelete branch regardless.  Either
+# mutation alone is masked by the other and goes NOT CAUGHT while the requirement
+# is fully enforced -- I aimed at each in turn before working that out.  Only
+# removing both changes the framing, so only both together prove anything.
+mutant "F-14b: framing a deletion consults vallen" catch \
+  's/    if \(isdelete\) vallen = 0;\n\n    \/\* Note what is NOT checked here/    \/* F-14b: the clear removed *\/\n\n    \/* Note what is NOT checked here/; s/        total = hdr \+ keylen \+ \(isdelete \? 1 : vallen \+ 2\);/        total = hdr + keylen + vallen + (isdelete ? 1 : 2);/'
+
+# F-14c.  Only a deletion's KEY can promote it to the big form.  Aimed at
+# zsi_rec_flags_for rather than at zsi_rec_encoded_len, because the former is what
+# decides the nibble the encoder writes -- mutating the latter alone left the two
+# consistent and the mutant inert.
+mutant "F-14c: a deletion promoted by vallen" catch \
+  's/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            \|\| \(!isdelete && vallen > ZSI_SHORT_VALLEN_MAX\);\n    uint8_t f = ZSI_MUSTBEONE;/    bool big = keylen > ZSI_SHORT_KEYLEN_MAX\n            || vallen > ZSI_SHORT_VALLEN_MAX;\n    uint8_t f = ZSI_MUSTBEONE;/'
+
+# F-19a.  vallen describes the terminator'"'"'s fixed payload; a reader checks it for
+# exactly 16, so writing anything else makes every terminator undecodable.
+mutant "F-19a: terminator vallen not the payload length" catch \
+  's/    zsi_put16\(buf \+ 2, ZSI_TERM_VALLEN\);/    zsi_put16(buf + 2, 0);/'
+
+# F-26b.  The three position fields are redundant ON PURPOSE, so a truncated or
+# extended file fails the equality even though each field is in range.  Writing a
+# start that disagrees with where the array actually is exercises that.
+mutant "F-26b: trailer start disagrees with the array" catch \
+  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_START, \(uint64_t\)t.ptr_start\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_START, (uint64_t)records_end);/'
+
+mutant "F-26b: trailer nptrs disagrees with the array" catch \
+  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_NPTRS, \(uint64_t\)n\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_NPTRS, (uint64_t)n + 1);/'
+
+mutant "F-26b: trailer ptrsize disagrees with the array" catch \
+  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_PTRSIZE, \(uint64_t\)t.ptrsize\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_PTRSIZE, (uint64_t)(t.ptrsize == 4 ? 8 : 4));/'
+
+# F-26d.  Pad bytes MUST be zero -- that is what makes them recognisable given
+# MustBeOne, and it is what salvage stops on when it has no pointer count (S-6).
+mutant "F-26d: the pad is not zeroed" catch \
+  's/    char \*buf = zsi_zmalloc\(total\);      \/\* zeroed: F-26d requires a zero pad \*\//    char *buf = malloc(total); if (buf) memset(buf, 0xAB, total);/'
+
+# F-26e.  The one checksum covers the HEADER too, which binds a header to its
+# body so a valid header cannot be grafted onto a different one.
+mutant "F-26e: the checksum skips the header" catch \
+  's/        for \(i = 0; i < npre; i\++\) v\[nv\++\] = pre\[i\];/        for (i = 1; i < npre; i++) v[nv++] = pre[i];/'
+
+# S-13.  The file is reported ONCE, never per key -- two million events is not a
+# report, and the distinct kind is what lets a caller tell the two apart.
+mutant "S-13: an unverified file reported per key" catch \
+  's/        if \(!ctx->file_unverified\)\n            zsi_salvage_emit\(ctx, ZS_SALVAGE_KEY_UNVERIFIED, 0, 0,\n                             rec->key, rec->keylen\);/        zsi_salvage_emit(ctx, ZS_SALVAGE_KEY_UNVERIFIED, 0, 0,\n                         rec->key, rec->keylen);/'
+
+# S-13 the other way: recovering an unverifiable file without being asked.
+mutant "S-13: an unverified file recovered without the flag" catch \
+  's/        if \(!\(ctx->setup->flags & ZS_SALVAGE_UNVERIFIED\)\) return ZS_OK;/        \/* flag no longer required *\//'
+
+# A-18.  ZS_NOCSUM is rejected rather than ignored, because a caller passing it
+# believes it is weakening verification and is entitled to be told otherwise.
+mutant "A-18: ZS_NOCSUM silently ignored" catch \
+  's/    if \(setup->flags & ZS_NOCSUM\) return ZS_BADUSAGE;/    \/* A-18 rejection removed *\//'
+
+# The resync scan must step ONE byte at a time now that records are packed: an
+# 8-stepping scan walks straight past a terminator at offset 90.  This is the bug
+# that made salvage recover only the span whose terminator happened to land on a
+# multiple of 8.
+mutant "salvage: resync scans 8 bytes at a time" catch \
+  's/    for \(size_t p = from; p < f->size; p\++\) \{/    for (size_t p = (from + 7u) \& ~(size_t)7; p < f->size; p += 8) {/'
+
 if [ "$ROTONLY" -eq 1 ]; then
     printf '%d patterns intact, %d ROTTED (no mutant was built or run)\n' \
         "$intact" "$broken"
