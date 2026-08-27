@@ -79,24 +79,69 @@ in the payload rather than in the length field is deliberate: a 16-bit `vallen`
 would cap spans at 64KB and force every terminator above that into the big form
 for nothing.
 
-### The size arithmetic is branchless, and that is the point
+### The size arithmetic
 
 ```
-reclen = hdr + keylen + vallen + 2          hdr = 4 (small) | 16 (big)
+reclen = hdr + keylen + 1 + (IsDelete ? 0 : vallen + 1)
+                                            hdr = 4 (small) | 16 (big)
 ```
 
-**A deletion carries both NULs**, even though its value is empty. F-37's
-precedent — a deletion contributes nothing to the values region — invites
-`hdr + keylen + 1` for a tombstone, and that puts a conditional in the one
-expression that decides where the *next* record begins. In a self-framing stream
-that is not a wrong record, it is a desynchronised remainder: two peers, one
-computing `+ 2` and one computing `+ 1 + (isdelete ? 0 : 1)`, disagree about
-every subsequent boundary, and F-24 then completes the file at the first garbage.
-The symptom would read as "everything after the first tombstone vanished". One
-byte per tombstone, on the record D-19 exists to drop.
+**A deletion carries the key's NUL and no value NUL**, which is what every
+format so far has done — `zsi_rec_encoded_len` already reads
+`if (isdelete) { /* key NUL, no value at all */ }`. The NUL is the *value's*
+terminator and a deletion has no value, so there is nothing for it to terminate;
+F-13 puts the terminators outside the stored lengths precisely because they
+belong to the key and the value rather than to the record.
 
-It also makes an empty value and a deletion the same size, differing in one bit,
-so nothing about the framing depends on which state it is.
+An unconditional `+ 2` was considered, on the grounds that a conditional in the
+expression deciding where the next record starts is a resync hazard. It was
+rejected twice over.
+
+It defends against exactly one bug — a writer that emits value bytes on a
+deletion — while being equally undefended against its mirror, a writer that sets
+`vallen` and emits nothing. No length field is protected from corruption here: a
+wrong `keylen` desynchronises the stream identically.
+
+And **the conditional is free because the branch is already there.** A lookup
+never computes a record's length at all: it is pointer-driven, so it reads the
+header, `keylen`, and the key to compare, then `vallen` and the value on a hit —
+which is what `zsi_ptrs_rec` already does, locating by pointer and decoding
+fields without ever summing them. `reclen` is needed only by a *sequential* walk,
+and every sequential walk that yields records must already test `IsDelete`,
+because a tombstone shadows its key and must not be handed back (D-17b). So the
+flag is already extracted and already branched on at exactly the point the length
+is wanted. The one path where the conditional adds a branch that was not there is
+an unordered file's replay, which does not care about delete-ness while building
+an index — one predictable test on a path that is already decoding a key and
+inserting it into a sorted structure.
+
+A useful structural consequence of the first half: an in-order file's records do
+not need to be *walkable* for the read path at all. Walkability is for merges and
+for salvage.
+
+Three clauses make the conditional unambiguous, and all three need to be
+normative:
+
+- a deletion's `vallen` MUST be 0;
+- a reader MUST NOT consult `vallen` when framing a deletion, so there is never
+  more than one candidate length for a record;
+- a deletion's `vallen` does not participate in form selection either — only its
+  key can promote it to the big form, which is what the current code's
+  `big = keylen > MAX || (!isdelete && vallen > MAX)` already says.
+
+A non-zero `vallen` on a deletion is therefore a `zs_db_check_consistency`
+report, not a framing change.
+
+**What the byte is worth**, since it was measured before being argued about: the
+NUL is `1/(keylen+5)` of a tombstone, so 5.9% at a 12-byte sqlite rowid, 4.8% at
+16 bytes, 2.2% at a 41-byte conversations key, and 0.08% at a message-id. In a
+mixed workload it disappears — a 16-byte key with a 200-byte value is a 222-byte
+store against a 22-byte delete. The one place it could reach a profile is via
+`rollover_size`, which is a byte threshold, so fatter tombstones cross it sooner
+and a delete-dominated load creates proportionally more generations — and every
+generation is a file created, converted, unlinked and `readdir`-ed, at 1.8ms per
+`unlink` on ZFS. Zero after a compaction, which spans everything and so drops
+every tombstone (D-19).
 
 **Canonicality**, following F-15: a writer MUST use the small form when it fits,
 and a reader MUST accept a big form that would have fitted rather than rejecting
