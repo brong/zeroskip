@@ -3522,8 +3522,14 @@ static int zsi_idx_publish(struct zsi_file *f, const struct zsi_idxcfg *cfg,
     if (zsi_index_flatten(f->index, compar, &offs, &n) != ZS_OK)
         return ZS_INTERNAL;
 
-    if (n > (ZSI_IDX_MAX_BYTES - ZSI_IDX_HEADER_LEN - 4) / 8) goto out;
-    arrlen = n * 8;
+    /* Through zsi_idx_file_len, not a bound spelled out again -- this line still
+     * said "- 4" after the trailing checksum widened to 8, which is the same
+     * duplication that broke the loader's size equality. */
+    {
+        size_t want = zsi_idx_file_len((uint64_t)n);
+        if (!want || want > ZSI_IDX_MAX_BYTES) goto out;
+    }
+    arrlen = n * ZSI_IDX_PTR_LEN;
 
     arr = malloc(arrlen ? arrlen : 1);
     if (!arr) goto out;

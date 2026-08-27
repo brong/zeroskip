@@ -85,7 +85,7 @@ a spec label is missing here.
 | `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
 | `F-19a` | The span length is carried in the terminator's payload, so a terminator is always the small form | `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
-| `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
+| `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` , `abort_of_a_flushed_span` |
 | `F-22` | Because the checksum covers the span **and** the terminator, a | `crash/crash_nosync_mode`, `mp_reader_sees_torn_span`, `span_terminator_without_data`, +2 more |
 | `F-22a` | A span's terminator checksum is the only thing covering an unordered file's bytes | `span_checksum_is_the_only_witness` |
 | `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_basic`, `span_engine_zero` |
@@ -143,7 +143,7 @@ a spec label is missing here.
 | `D-9a` | A writer moves to a new file when the active file is not clean, or | `write_rollover` |
 | `D-9b` | The next generation is one above the highest present in the directory. | `fileset_next_gen` |
 | `D-9c` | Generations are never reused and never reset, not even by a repack | `fileset_next_gen`, `header_roundtrip` |
-| `D-9d` | A writer MAY additionally treat the active file as due for rollover | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
+| `D-9d` | A writer MAY additionally treat the active file as due for rollover | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` , `idxcache_nspans_resets_at_publication` |
 | `D-10` | An active file with a corrupt header or zero length is treated as a | `file_bad_header`, `file_zero_length`, `open_bad_nonactive`, +3 more |
 | `D-10a` | A **non-active** file with an invalid header MUST be **reported** | `file_bad_header`, `open_bad_nonactive`, `snapshot_bad_nonactive` |
 | `D-10b` | An earlier version of D-10a made this fatal, which contradicts D-10 | `open_bad_nonactive`, `snapshot_bad_nonactive` |
@@ -187,7 +187,7 @@ a spec label is missing here.
 | `D-19c` | The test MAY err toward **retention**, never toward dropping. A | **none** |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
 | `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
-| `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs` |
+| `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs` , `convert_reverifies_spans` |
 | `D-21` | The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to | `repack_selection` |
 | `D-22` | The output may legitimately contain **zero records**, in the form | `inorder_empty`, `repack_empty_output` |
 | `D-23` | Removing a data file is permitted only for a file whose range is enclosed | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
@@ -264,7 +264,7 @@ a spec label is missing here.
 
 | Req | Requirement | Enforced by |
 |---|---|---|
-| `P-1` | A pointer table covers exactly one **unordered** file, identified by | `idxcache_only_unordered_files` |
+| `P-1` | A pointer table covers exactly one **unordered** file, identified by | `idxcache_only_unordered_files` , `idxcache_publishes_nothing_for_inorder` |
 | `P-2` | Tables live in a **cache root** named by the caller, or — when the | `idxcache_rejects_db_dir` |
 | `P-2a` | Under a configured root, the tables for a database live in the | `idxcache_threshold_defaults`, `corpus_index_table` |
 | `P-2b` | With A-8a's flag, the cache directory is `zeroskip.cache` inside | `index_local_publishes`, `index_local_readonly_creates_the_cache`, `index_local_sweeps_foreign_uuid` |
@@ -294,7 +294,7 @@ a spec label is missing here.
 | `S-4` | The source's comparator does not affect the output. The output is | `salvage_comparator_mismatch_reported` |
 | `S-5` | A file whose header does not validate is still processed. Its | `salvage_invalid_header` |
 | `S-6` | For an in-order file the pointer section MUST be ignored and the | `salvage_ignores_pointer_section` |
-| `S-7` | **Resynchronisation.** On reaching a span that does not validate, | `salvage_resyncs_after_a_bad_span` |
+| `S-7` | **Resynchronisation.** On reaching a span that does not validate, | `salvage_resyncs_after_a_bad_span` , `salvage_resync_proves_its_candidate` |
 | `S-8` | The span that failed cannot be verified — its terminator is what would | `salvage_unverified_needs_the_flag` |
 | `S-8a` | An in-order file has no commitment question: it was written whole | `salvage_all_or_nothing_inorder` |
 | `S-9` | A **rolled-back** span MUST NOT be recovered under any option. | `salvage_never_recovers_rollback` |

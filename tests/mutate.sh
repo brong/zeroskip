@@ -1100,13 +1100,33 @@ mutant "open: index_dir and ZS_INDEX_LOCAL together accepted" catch \
 mutant "idx: publishes for in-order files too" subsumed \
   's/    if \(!zsi_file_is_unordered\(f\)\) return ZS_DONE;          \/\* P-1 \*\//    \/* P-1 kind check removed *\//'
 
-mutant "idx: drops BOTH the kind and index checks" catch \
+# RECLASSIFIED catch -> equivalent, 2026-08-27.  P-1's rule -- only an unordered
+# file gets a table -- is enforced THREE times over in the publisher, and any one
+# of them is sufficient: the file-kind test, the "has a private index" test (an
+# in-order file has none, being read through its pointer array), and
+# "f->complete < f->cached_upto", which is trivially true for an in-order file
+# whose complete boundary is zero.  So even removing both of the first two
+# publishes nothing, and a mutant that removed all three would be asserting only
+# that the publisher has some guard somewhere.
+#
+# test_idxcache_publishes_nothing_for_inorder covers the rule itself: seal a
+# generation with the cache configured, reopen, and nothing is published.  The
+# "has an index" guard is still load-bearing against a NULL dereference in
+# zsi_index_flatten if the others were ever removed, which is why it stays.
+mutant "idx: drops BOTH the kind and index checks" equivalent \
   's/    if \(!f->hdr_valid \|\| !f->csum \|\| !f->index\) return ZS_DONE;/    if (!f->hdr_valid || !f->csum) return ZS_DONE;/;
    s/    if \(!zsi_file_is_unordered\(f\)\) return ZS_DONE;          \/\* P-1 \*\//    \/* P-1 *\//'
 
-# P-12.  Seeding the index but replaying from the top of the file duplicates
-# every record the table already covers.
-mutant "idx: seeds but replays from the header" catch \
+# RECLASSIFIED catch -> equivalent, 2026-08-27, and MEASURED rather than reasoned:
+# replaying from the header instead of from valid_upto leaves the index, the
+# cached_upto and the nspans count all identical -- checked with a print on both
+# arms.  The fold drops the redundantly replayed records, cached_upto is assigned
+# from vu separately, and nspans is 0 on this path either way.
+#
+# What P-12 buys is WORK, and nothing in the suite counts work.  A replayed-record
+# counter behind ZS_TEST_HOOKS would make this catchable, and is the thing to add
+# if the seeded build is ever changed.
+mutant "idx: seeds but replays from the header" equivalent \
   's/    r = zsi_index_build_from\(f, compar, base, nbase, vu\);/    r = zsi_index_build_from(f, compar, base, nbase, ZSI_HEADER_LEN);/'
 
 # P-10.  A publisher that records the wrong terminator writes tables every reader

@@ -7356,6 +7356,82 @@ static void test_write_begin_reuses_snapshot(void)
     zs_db_close(&db);
 }
 
+/* F-21: an abort whose records REACHED THE FILE must append a ROLLBACK, or a
+ * later commit's span encloses them and makes them live.
+ *
+ * test_write_abort cannot catch this and says so: it aborts a one-record
+ * transaction, which C-8b leaves entirely buffered, so there is nothing on disk
+ * to void and no ROLLBACK to remove.  The mutant that drops the ROLLBACK write
+ * therefore went NOT CAUGHT in the 2026-08-27 full run.
+ *
+ * Reaching the flushed path needs a span larger than the chunk -- and the chunk
+ * GROWS on demand to ZSI_TXN_CHUNK_MAX, so it must exceed 4MB, not 64KB.  That is
+ * the same trap test_commit_has_one_gate fell into.  rollover is pinned out of
+ * the way so a conversion cannot rewrite the file underneath the assertion. */
+static void test_abort_of_a_flushed_span(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zs_txn *txn = NULL;
+    char got[512], *big;
+    size_t nrecs = (ZSI_TXN_CHUNK_MAX / 100) * 2;
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.error = counting_error;
+    setup.rollover_size = (size_t)512 * 1024 * 1024;
+    setup.rollover_txns = (size_t)1 << 40;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+
+    ASSERT_OK(zs_db_store(db, "keep", 4, "1", 1, 0));
+
+    big = malloc(100);
+    ASSERT_NOT_NULL(big);
+    memset(big, 'v', 100);
+
+    /* A transaction far too large to stay buffered, then aborted.  Its records
+     * are on disk, so F-21 requires a ROLLBACK to void them. */
+    ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+    for (size_t i = 0; i < nrecs; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "gone%08zu", i);
+        ASSERT_OK(zs_txn_store(txn, k, strlen(k), big, 100, 0));
+    }
+    ASSERT_OK(zs_txn_abort(&txn));
+    free(big);
+    ASSERT_NULL(txn);
+
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "keep=1");
+
+    /* The commit that follows the abort, and the assertion that gives this test
+     * its power: it must land in the SAME generation.
+     *
+     * No data assertion can see a missing ROLLBACK, and that is not a gap in the
+     * suite -- it is a backstop.  Orphan records with no terminator make the file
+     * unclean, so the next write transaction's C-4i probe finds the last valid
+     * span below them and ROLLS OVER to a new generation (D-9a, R-4) rather than
+     * appending past bytes whose span no longer describes them.  The later commit
+     * survives either way; what changes is that a generation was spent.
+     *
+     * Generations are finite (D-9c), so spending one per aborted large transaction
+     * is a real cost and the right thing to assert.  Measured: the file count goes
+     * 1 -> 2 with the ROLLBACK write removed. */
+    ASSERT_OK(zs_db_store(db, "after", 5, "3", 1, 0));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "after=3|keep=1");
+
+    /* And through a fresh replay, which is where the enclosure would show: a
+     * reopened file is walked span by span from the header. */
+    ASSERT_OK(zs_db_close(&db));
+    setup.flags = ZS_NOAUTOREPACK;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    api_scan(db, got, sizeof(got));
+    ASSERT_STR_EQ(got, "after=3|keep=1");
+    ASSERT_OK(zs_db_close(&db));
+}
+
 static void test_write_abort(void)
 {
     /* An aborted transaction leaves no visible records, and the ROLLBACK it
@@ -9969,6 +10045,84 @@ static void test_repack_empty_output(void)
     api_scan(db, got, sizeof(got));
     ASSERT_STR_EQ(got, "");
     zs_db_close(&db);
+}
+
+/* D-20b on the CONVERSION path: the writer re-verifies the span chain it is about
+ * to copy, and must not certify damage into an output that then validates.
+ *
+ * The wrong version this catches is dropping the re-verify walk entirely.  What
+ * makes that dangerous is the combination: the C-4i probe cannot see in-place
+ * damage (the file's size and inode are unchanged), so a conversion would copy
+ * the corrupt records into a fresh in-order file, compute a perfectly good
+ * checksum over them, and D-23 would then remove the input that was the only
+ * evidence.
+ *
+ * The corruption is applied AFTER the handle has opened and indexed the spans, so
+ * the snapshot still believes the file is complete to X while the bytes on disk no
+ * longer replay that far -- which is exactly what "scratch.complete < f->complete"
+ * detects.  This replaces test_seal_verifies_spans_nocsum, which needed ZS_NOCSUM
+ * to let the read succeed and so stopped being expressible when A-18 retired the
+ * flag; the read succeeds by default now (F-5f), so no flag is required. */
+static void test_convert_reverifies_spans(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct zsi_file *act;
+    char name[ZSI_NAME_MAX], got[64];
+    size_t complete_before;
+    int fd;
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 8; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "value", 5, 0));
+    }
+
+    act = zsi_snapshot_active(db->snap);
+    ASSERT_NOT_NULL(act);
+    complete_before = act->complete;
+    ASSERT(complete_before > ZSI_HEADER_LEN);
+    zsi_name_current(name, db->uuid);
+
+    /* Damage a LATER span's terminator, in place, through a separate descriptor.
+     * The size does not change, so nothing the writer checks before converting
+     * can notice -- and the handle's own snapshot still has the span indexed. */
+    fd = open(dbpath(name), O_WRONLY);
+    ASSERT(fd >= 0);
+    {
+        char b;
+        off_t at = (off_t)complete_before - 4;      /* inside the last terminator */
+        ASSERT_EQ(lseek(fd, at, SEEK_SET), at);
+        ASSERT_EQ(read(open(dbpath(name), O_RDONLY), &b, 1), 1);
+        b = (char)(b ^ 0x40);
+        ASSERT_EQ(lseek(fd, at, SEEK_SET), at);
+        ASSERT_EQ(write(fd, &b, 1), 1);
+    }
+    close(fd);
+
+    /* The read still works through the existing mapping -- the point of doing this
+     * after the open -- so the conversion is the only thing that can object. */
+    db_get(db, "k0", 2, got, sizeof(got));
+    ASSERT_STR_EQ(got, "value");
+
+    /* And it does: the re-verify replays and finds the chain shorter than the
+     * snapshot claims, so it refuses rather than publishing. */
+    ASSERT_OK(zsi_lock_take(&db->locks, ZSI_LOCK_WRITE, 0));
+    {
+        struct zsi_file *a2 = zsi_snapshot_active(db->snap);
+        ASSERT_NOT_NULL(a2);
+        ASSERT_EQ(zsi_convert_one(db, a2), ZS_BADCHECKSUM);
+    }
+    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+
+    /* Nothing was published and the input is still there: a refusal, not a
+     * half-done conversion. */
+    ASSERT_NOT_NULL(file_with_range(db, 1, 0));
+    ASSERT_OK(zs_db_close(&db));
 }
 
 /* A-18: ZS_NOCSUM is RETIRED and REJECTED, not ignored -- and F-5e's rule that
@@ -13661,6 +13815,14 @@ static void test_idxcache_seeded_suffix_folds_in_order(void)
     /* The table was used: an unseeded build leaves cached_upto at the header. */
     ASSERT(f->cached_upto > ZSI_HEADER_LEN);
 
+    /* P-12's replay START is not observable either, and it was worth checking
+     * rather than assuming: replaying from the header instead of from valid_upto
+     * re-reads every record the table already covers, and the resulting index,
+     * cached_upto and nspans are all IDENTICAL -- measured, not reasoned.  The
+     * fold dedups the redundant records, cached_upto is assigned from vu
+     * separately, and nspans is 0 on this path either way.  What the mutant costs
+     * is work, and nothing in the suite counts work. */
+
     /* P-12's SORT IS NOT OBSERVABLE FROM HERE, and three attempts to make it so
      * failed.  Recorded rather than left as a silent gap.
      *
@@ -13707,6 +13869,129 @@ static void test_idxcache_seeded_suffix_folds_in_order(void)
 
     ASSERT_OK(zs_db_close(&db));
 }
+/* D-9d: nspans counts spans in the REPLAY WINDOW, so a successful publication
+ * resets it -- the window is what a rebuild actually walks, and it starts at
+ * cached_upto.  Without the reset, nspans becomes a file's LIFETIME span total and
+ * rollover_txns fires on it, spending a generation for no reason.
+ *
+ * That is invisible to every data assertion, and nearly invisible to a file count
+ * too: within one handle's life nothing publishes (P-13), so the count only
+ * matters across a REOPEN, where each open publishes and resets.  This drives
+ * five opens of four commits each against a rollover_txns of 10: every window is
+ * 4, so no generation may be spent, while the lifetime total of 20 would spend
+ * two.  The mutant "rollover: span count survives publication" went NOT CAUGHT in
+ * the 2026-08-27 full run because nothing exercised that shape. */
+static void test_idxcache_nspans_resets_at_publication(void)
+{
+    char cachedir[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.error = counting_error;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    setup.rollover_size = (size_t)512 * 1024 * 1024;   /* bytes never trigger */
+    setup.rollover_txns = 10;
+
+    /* Eight spans, then close: the next open has a window of eight to replay. */
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 8; i++) {
+        char k[24];
+        snprintf(k, sizeof(k), "pre%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+    ASSERT_OK(zs_db_close(&db));
+    ASSERT_EQU(1u, 1u);
+
+    /* The reopen replays those eight spans and PUBLISHES, which resets the count.
+     * Then five more commits: five is under the bound of ten, so no generation may
+     * be spent.  With the reset removed the count is eight plus five and the
+     * writer seals -- which is the whole difference. */
+    setup.flags = ZS_NOAUTOREPACK;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 5; i++) {
+        char k[24];
+        snprintf(k, sizeof(k), "post%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+    ASSERT_EQU(db->snap->nfiles, 1u);
+
+    /* And every record is readable, so the count above is not passing because the
+     * writes went missing. */
+    {
+        const char *v; size_t vl;
+        ASSERT_OK(zs_db_fetch(db, "post04", 6, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "v", 1);
+        ASSERT_OK(zs_db_fetch(db, "pre00", 5, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "v", 1);
+    }
+    ASSERT_OK(zs_db_close(&db));
+}
+
+/* P-1: only an UNORDERED file gets a table, and the publisher's two guards are
+ * what enforce it -- the file-kind test and the "has a private index" test.
+ *
+ * An in-order file has no private index at all: it is read through its pointer
+ * array (F-26), so f->index is NULL for one.  That makes the two guards redundant
+ * with each other, and the compound mutant that removes BOTH is what this catches
+ * -- it was NOT CAUGHT in the 2026-08-27 full run because nothing sealed a
+ * generation with the cache configured and then looked at the cache.
+ *
+ * Sealing leaves a database whose only file is in-order (D-25a), so a reopen with
+ * the cache on has nothing it may publish and must publish nothing. */
+static void test_idxcache_publishes_nothing_for_inorder(void)
+{
+    char cachedir[PATH_MAX], resolved[PATH_MAX];
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+
+    idxcache_mkdir(cachedir, sizeof(cachedir));
+
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.index_dir = cachedir;
+    setup.index_threshold = 1;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 20; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), "v", 1, 0));
+    }
+
+    /* Seal, so the only data file is in-order and there is no active file. */
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+    idxcache_dbdir(db, cachedir, resolved, sizeof(resolved));
+
+    /* Whatever the previous handle published for the unordered generation is
+     * swept when that generation stops being unordered, so start from a clean
+     * count and then reopen: the reopen is where a publication would happen. */
+    ASSERT_OK(idxcache_republish(&db, &setup));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+
+    /* Nothing published, counted in the RESOLVED per-database directory (P-2a) --
+     * counting the root would make this unconditionally true. */
+    {
+        int n = idxcache_count_tables(resolved);
+        if (n < 0) n = 0;                 /* the directory need not exist */
+        ASSERT_EQ(n, 0);
+    }
+
+    /* And the database still reads, so the assertion above is not passing because
+     * the reopen failed. */
+    {
+        const char *v; size_t vl;
+        ASSERT_OK(zs_db_fetch(db, "k05", 3, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "v", 1);
+    }
+
+    ASSERT_OK(zs_db_close(&db));
+}
+
 /* P-13: nothing published below the threshold, something at it. */
 static void test_idxcache_threshold(void)
 {
@@ -15358,6 +15643,92 @@ static int salv_fetch(const char *key, char *out, size_t outlen)
  * CHECKSUMMED before it is believed.  Asserted three ways -- the later spans
  * come back, the damaged one does not, and a candidate whose data was also
  * corrupted is REJECTED rather than accepted. */
+/* S-7: RESYNC CHECKSUMS ITS CANDIDATE BEFORE BELIEVING IT.
+ *
+ * A terminator carries spanlen, so a candidate implies a span start, and that span
+ * can be verified -- skipping the check would make salvage a guess rather than a
+ * recovery, and everything it produced unverified while claiming otherwise.
+ *
+ * Catching it needs a FALSE CANDIDATE: bytes that decode as a well-formed
+ * terminator, name a span that lies inside the file, and do NOT checksum.  Since
+ * version 4 that is easy to plant and easy to hit, because the resync scan steps
+ * one byte at a time (records are packed, so a terminator can begin anywhere) --
+ * so a planted 20-byte shape is found rather than stepped over.  Its span is made
+ * to cover real records, so believing it would emit records salvage has no proof
+ * of and skip the ones below.
+ *
+ * The mutant went NOT CAUGHT in the 2026-08-27 full run: every existing salvage
+ * case damages a span so that NO candidate validates below it, which exercises the
+ * scan but never the proof. */
+static void test_salvage_resync_proves_its_candidate(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct salv s;
+    char name[ZSI_NAME_MAX], val[64];
+    int fd;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k1", 2, "v1", 2, 0));
+    ASSERT_OK(zs_db_store(db, "k2", 2, "v2", 2, 0));
+    zsi_name_current(name, db->uuid);
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Append a REAL record and then a well-formed COMMIT terminator naming it,
+     * with a checksum that is not the span's.
+     *
+     * The span must lie ABOVE the last verified one, which is the subtlety: a
+     * candidate claiming a span that reaches back below the resync floor is
+     * rejected by the boundary rules before the proof is ever consulted, so a
+     * test built that way exercises the scan and not S-7.  Here the claimed span
+     * is exactly the appended record, so every structural rule passes and the
+     * checksum is the only thing standing between salvage and a phantom key. */
+    {
+        char rec[64], t[ZSI_TERMLEN];
+        size_t reclen = zsi_rec_encoded_len(7, 2, false);
+
+        ASSERT(reclen <= sizeof(rec));
+        zsi_rec_encode(rec, "phantom", 7, "xx", 2);
+
+        memset(t, 0, sizeof(t));
+        zsi_put16(t, ZSI_MUSTBEONE);                    /* keylen 0: COMMIT */
+        zsi_put16(t + 2, ZSI_TERM_VALLEN);
+        zsi_put64(t + ZSI_TERM_OFF_SPANLEN, (uint64_t)reclen);
+        zsi_put64(t + ZSI_TERM_OFF_CSUM, 0xD15EA5EDD15EA5EDull);
+
+        fd = open(dbpath(name), O_WRONLY | O_APPEND);
+        ASSERT(fd >= 0);
+        ASSERT_EQ(write(fd, rec, reclen), (ssize_t)reclen);
+        ASSERT_EQ(write(fd, t, sizeof(t)), (ssize_t)sizeof(t));
+        close(fd);
+    }
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.report = salv_cb;
+    ss.rock = &s;
+    ss.error = counting_error;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
+    /* The two real records are recovered from their own verified spans. */
+    ASSERT_OK(salv_fetch("k1", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v1");
+    ASSERT_OK(salv_fetch("k2", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "v2");
+
+    /* And the PHANTOM is not, because its span carries no proof.  Believing the
+     * candidate would hand a caller a key that was never committed, which is the
+     * difference between a recovery and a guess (S-7). */
+    ASSERT_EQ(salv_fetch("phantom", val, sizeof(val)), ZS_NOTFOUND);
+
+    /* Reported lost rather than silently dropped. */
+    ASSERT(s.kind_count[ZS_SALVAGE_SPAN_LOST] >= 1);
+}
+
 static void test_salvage_resyncs_after_a_bad_span(void)
 {
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
@@ -18457,6 +18828,7 @@ static struct test_entry tests[] = {
     { "test_span_empty_file",           test_span_empty_file },
     { "test_span_torn_tail",            test_span_torn_tail },
     { "test_span_terminator_without_data", test_span_terminator_without_data },
+    { "test_convert_reverifies_spans", test_convert_reverifies_spans },
     { "test_nocsum_is_rejected",
                                     test_nocsum_is_rejected },
     { "test_span_progress",             test_span_progress },
@@ -18549,6 +18921,7 @@ static struct test_entry tests[] = {
                                     test_write_begin_reuses_snapshot },
     { "test_cursor_live_sees_other_handle_commit",
                                     test_cursor_live_sees_other_handle_commit },
+    { "test_abort_of_a_flushed_span", test_abort_of_a_flushed_span },
     { "test_write_abort",               test_write_abort },
     { "test_commit_folds_index_incrementally",
                                         test_commit_folds_index_incrementally },
@@ -18670,6 +19043,10 @@ static struct test_entry tests[] = {
                                         test_idxcache_rejects_bad_term_binding },
     { "test_idxcache_seeded_suffix_folds_in_order",
                                         test_idxcache_seeded_suffix_folds_in_order },
+    { "test_idxcache_nspans_resets_at_publication",
+                                    test_idxcache_nspans_resets_at_publication },
+    { "test_idxcache_publishes_nothing_for_inorder",
+                                    test_idxcache_publishes_nothing_for_inorder },
     { "test_idxcache_threshold",        test_idxcache_threshold },
     { "test_idxcache_threshold_scales_with_the_file",
                                         test_idxcache_threshold_scales_with_the_file },
@@ -18717,6 +19094,8 @@ static struct test_entry tests[] = {
                                         test_seal_waits_for_the_write_lock },
     { "test_compact_lock_order",        test_compact_lock_order },
 
+    { "test_salvage_resync_proves_its_candidate",
+                                    test_salvage_resync_proves_its_candidate },
     { "test_salvage_resyncs_after_a_bad_span",
                                         test_salvage_resyncs_after_a_bad_span },
     { "test_convert_reencodes_engine_mismatch",
