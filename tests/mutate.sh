@@ -744,13 +744,12 @@ mutant "D-9: clean ignores header validity" catch \
 mutant "D-10: invalid header replayed anyway" catch \
   's/    if \(!f->hdr_valid\) \{\n        f->complete = 0;\n        return ZS_OK;\n    \}/    if (!f->hdr_valid) { f->complete = ZSI_HEADER_LEN; }/'
 
-# Section 4.9: a pointer section cannot appear in an unordered file.
-#
-# Equivalent, because zsi_rec_decode rejects any type without HasKey too, so the
-# walk's check is a fast path over a rule enforced one level down (and that level
-# IS tested, by test_record_bounds).  Kept because the walk should not depend on
-# the decoder's error taxonomy to know that a pointer section ends a span.
-mutant "span walk: a terminator read as a record" equivalent \
+# RECLASSIFIED equivalent -> catch, 2026-08-27.  As "PTRS accepted mid-span" this
+# was equivalent: dropping the family-bit check let a pointer-section type byte
+# reach zsi_rec_decode, which rejected it anyway.  Re-aimed at format 4, where
+# keylen == 0 is the ONLY thing separating a terminator from a record, it makes
+# the span walk never recognise a terminator at all -- so no span ever completes.
+mutant "span walk: a terminator read as a record" catch \
   's/            if \(\(zsi_get16\(b\) >> ZSI_KEYLEN_SHIFT\) == 0\) \{/            if (false) {/'
 
 # F-29: the progress rule.
@@ -867,16 +866,20 @@ mutant "vallen stored at +3 not +2" catch \
 mutant "big form: keylen in its own field, not sharing the first word" catch \
   's/    if \(big\) zsi_put64\(buf, \(uint64_t\)nibble \| \(keylen << ZSI_KEYLEN_SHIFT\)\);/    if (big) { zsi_put64(buf, (uint64_t)nibble); zsi_put64(buf + 8, keylen); }/'
 
-# The explicit NUL writes are redundant with the memset that precedes them: it
-# covers the whole record, and both NUL positions are inside it.  So removing
-# either changes nothing observable.  They stay in the source because they state
-# F-13's "key NUL value NUL" structure at the point it is built, and because
-# narrowing the memset to just the padding -- a plausible future optimisation --
-# would make them load-bearing again.
-mutant "no NUL after value" equivalent \
+# RECLASSIFIED equivalent -> catch, 2026-08-27, and the reason is precise: these
+# were equivalent because format 2's encoder began with memset(buf, 0, total) --
+# the record was padded to a multiple of 8 and every byte zeroed first, so both
+# NUL positions were already zero and removing the write changed nothing.
+#
+# Format 4 records are PACKED (F-2), so there is no padding and no memset: every
+# byte the encoder writes is data, and the NULs are the only thing writing those
+# two bytes.  The old comment predicted this exactly -- "narrowing the memset
+# would make them load-bearing again" -- and removing it entirely did.
+mutant "no NUL after value" catch \
   's/        buf\[hdr \+ keylen \+ 1 \+ vallen\] = /        (void)0; \/\/ /'
 
-mutant "no NUL after key" equivalent \
+# The key half of the same reclassification; see above.
+mutant "no NUL after key" catch \
   's/    buf\[hdr \+ keylen\] = /    (void)0; \/\/ /'
 
 # ...and the pairing that proves the claim above: with the memset gone AND the
@@ -1201,11 +1204,16 @@ mutant "commit: syncs before the terminator too" catch \
 mutant "commit: no gate at all" catch \
   's/    if \(!db->nosync && !rollback\) \{\n        if \(ZS_FDATASYNC\(txn->wfd\) < 0\) return ZS_IOERROR;\n    \}/    if (false) { }/'
 
-# equivalent: merging the terminator into the chunk saves a write(2) and changes
-# no byte on disk, so nothing observable distinguishes the two paths.  Listed so
-# that the comment above the merge -- which explains why the condition is about
-# RESIDENCE rather than size -- does not read as an untested claim.
-mutant "commit: never merges the terminator into the chunk" equivalent \
+# RECLASSIFIED equivalent -> catch, 2026-08-27.  It was called equivalent on the
+# grounds that the merge is behaviourally invisible -- and that is true of BYTES:
+# bytes written and bytes synced are identical either way, which is why C-7's
+# single gate made the merge stop mattering to a committing transaction.
+#
+# It is not true of SYSCALLS, and test_txn_buffer_grows_to_one_write counts those:
+# with the merge defeated a 2620-record span takes 3 calls where it should take
+# 1 write + 1 sync.  The claim and the test were both right; only the
+# classification was wrong.
+mutant "commit: never merges the terminator into the chunk" catch \
   's/    if \(in_chunk && txn->chunklen \+ termlen <= txn->chunkcap\) \{/    if (false) {/'
 
 # D-26.  Skipping the seal leaves the active generation out of the result, so the
@@ -1501,9 +1509,16 @@ mutant "replay: rejects a record on a content test (F-33a)" catch \
 mutant "file csum: never written" catch \
   's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  0);/'
 
-# F-32c.  Copying verbatim across an engine boundary carries a checksum that
-# validates for nobody -- the A-6 trap at one remove, silent until read.
-mutant "convert: copies verbatim across engines" catch \
+# RECLASSIFIED catch -> equivalent, 2026-08-27, because F-32c is RETIRED.
+#
+# It guarded the A-6 trap at one remove: a record copied verbatim across an engine
+# boundary carried a per-record checksum that validated for nobody.  No record
+# carries a checksum since version 4 (F-32), so a verbatim copy is now correct
+# whatever the engines are -- the output file's ONE checksum is computed over
+# whatever it ends up containing (F-26e).  There is nothing left for this to
+# break, and it is kept rather than deleted so that anyone reintroducing a
+# per-record checksum finds the hazard already written down.
+mutant "convert: copies verbatim across engines" equivalent \
   's/    bool reencode = \(src->csum_id != db->create_csum_id\);/    bool reencode = false;/'
 
 # C-4i.  The original Cyrus bug, preserved: a shared begin that reuses the

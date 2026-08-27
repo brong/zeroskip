@@ -1839,16 +1839,49 @@ static void test_record_bounds(void)
     /* A record claiming an enormous keylen is rejected rather than overflowing.
      * This is G-0b's whole point: keylen + vallen + 2 must not wrap into a small
      * total that then passes a bounds check. */
+    /* keylen shares the FIRST word with the nibble, and vallen follows at +8.
+     * Writing keylen at +8 -- version 2's layout -- leaves word 0 holding
+     * keylen == 0, so the record is rejected as a terminator and the overflow
+     * arithmetic is never reached: the assertion passes while testing nothing.
+     * That is what happened here, and the mutant "decode: unchecked
+     * keylen+vallen" went NOT CAUGHT because of it. */
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                   | (0x0FFFFFFFFFFFFFFFull << ZSI_KEYLEN_SHIFT));
     zsi_put64(buf + 8, 0xFFFFFFFFFFFFFFFFull);
-    zsi_put64(buf + 16, 0xFFFFFFFFFFFFFFFFull);
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
+    /* And the near-wrap: keylen + vallen + 2 crossing SIZE_MAX by a hair, which
+     * is the exact expression G-0b is about. */
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
-    zsi_put64(buf + 8, (uint64_t)SIZE_MAX - 1);
-    zsi_put64(buf + 16, 4);
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                   | (((uint64_t)SIZE_MAX - 1) >> ZSI_KEYLEN_SHIFT
+                      << ZSI_KEYLEN_SHIFT));
+    zsi_put64(buf + 8, 4);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
+
+    /* THE CASE THAT ACTUALLY WRAPS, and it has to be constructed rather than
+     * merely made large.  Two enormous lengths sum to something still enormous,
+     * which the total-vs-len check rejects anyway -- so the overflow guard is
+     * never the thing that fired.  These two are chosen so that
+     * keylen + vallen + 2 wraps to exactly 8: the total becomes 24, passes the
+     * bounds check, and the decoder hands back a key pointer with a 60-bit
+     * length.  Without zsi_add3_sz that is a read straight off the end of the
+     * mapping.
+     *
+     *   keylen 0x0FFFFFFFFFFFFFFF + vallen 0xF000000000000007 + 2 == 8 (mod 2^64)
+     */
+    memset(buf, 0, sizeof(buf));
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                   | (0x0FFFFFFFFFFFFFFFull << ZSI_KEYLEN_SHIFT));
+    zsi_put64(buf + 8, 0xF000000000000007ull);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
+
+    /* A big DELETION with an enormous key, so the deletion branch of the size
+     * arithmetic is covered too -- it is a separate expression (F-14a). */
+    memset(buf, 0, sizeof(buf));
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE)
+                   | (0x0FFFFFFFFFFFFFFFull << ZSI_KEYLEN_SHIFT));
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     /* F-14: a key must be at least 1 byte, in every shape. */
@@ -11556,11 +11589,15 @@ static void test_malformed_never_hangs(void)
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     {
+        /* keylen shares the first word with the nibble (F-14a); writing it at
+         * +8 leaves keylen == 0, which decodes as a terminator and never
+         * reaches the overflow arithmetic at all.  Lengths chosen to WRAP:
+         * 0x0FFFFFFFFFFFFFFF + 0xF000000000000007 + 2 == 8 (mod 2^64). */
         char big[32];
         memset(big, 0, sizeof(big));
-        big[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
-        zsi_put64(big + 8, 0xFFFFFFFFFFFFFFFFull);
-        zsi_put64(big + 16, 0xFFFFFFFFFFFFFFFFull);
+        zsi_put64(big, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                       | (0x0FFFFFFFFFFFFFFFull << ZSI_KEYLEN_SHIFT));
+        zsi_put64(big + 8, 0xF000000000000007ull);
         sb_raw(&s, big, sizeof(big));
     }
     ASSERT_EQ(sb_write(&s, name), 0);

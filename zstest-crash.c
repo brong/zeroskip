@@ -812,11 +812,20 @@ static void test_commit_has_one_gate(void)
      * any small-transaction assertion: the mutant "commit: syncs before the
      * terminator too" went NOT CAUGHT until this test existed, because every
      * other sync-counting test commits a single record. */
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db;
     struct zs_txn *txn = NULL;
     char *big;
     long syncs;
-    size_t nrecs = (ZSI_TXN_CHUNK / 100) * 4;   /* comfortably over one chunk */
+    /* Sized against ZSI_TXN_CHUNK_MAX, not ZSI_TXN_CHUNK.  The chunk GROWS on
+     * demand from 64KB to 4MB, so a span sized against the initial value stays
+     * buffered and takes the MERGED path -- leaving the flushed path, which is
+     * where the old first gate lived, never executed.  This test was sized
+     * against the 64KB figure and so had lost the power it exists for: the
+     * mutant it was written to kill went NOT CAUGHT in the 2026-08-27 run, and
+     * format 4's smaller records had pushed the span further inside the buffer
+     * still.  x2 so it exceeds the ceiling even at the smallest record size. */
+    size_t nrecs = (ZSI_TXN_CHUNK_MAX / 100) * 2;
 
     total++;
 
@@ -824,8 +833,18 @@ static void test_commit_has_one_gate(void)
     hooks_reset();
     hooks_on();
 
-    db = open_db(ZS_CREATE);
-    CHECK(db != NULL, "open failed");
+    /* rollover_size and rollover_txns are PINNED out of the way, and that is
+     * what makes the flushed-path assertion mean anything.  A span big enough to
+     * exceed the 4MB chunk ceiling is also big enough to trip D-25d's seal at the
+     * 2MB default -- and a conversion carries structural syncs of its own (C-6b),
+     * which the assertion below has to tolerate.  So without this pin the escape
+     * hatch swallows the very sync the test is looking for, and the mutant lives
+     * whatever the span size. */
+    setup.flags = ZS_CREATE;
+    setup.error = quiet_error;
+    setup.rollover_size = (size_t)512 * 1024 * 1024;
+    setup.rollover_txns = (size_t)1 << 40;
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open failed");
 
     /* Merged path: one small record, so the span never leaves the chunk. */
     syncs = sync_calls;
@@ -848,14 +867,15 @@ static void test_commit_has_one_gate(void)
     CHECK(zs_txn_commit(&txn) == ZS_OK, "big commit");
     free(big);
 
-    /* A conversion may fire on the way out (D-25d) and carries structural syncs
-     * of its own (C-6b), which are not the commit's gate.  The commit is the
-     * floor: what must not happen is TWO per commit. */
-    CHECK(sync_calls - syncs >= 1,
-          "flushed path: expected at least the gate, got %ld", sync_calls - syncs);
-    CHECK(sync_calls - syncs <= 1 || db->stats.conversions > 0,
-          "flushed path: %ld syncs with no conversion to explain them",
-          sync_calls - syncs);
+    /* EXACTLY one, with no escape hatch: the pins above mean no conversion can
+     * fire, so any second sync is the commit's and the assertion is unconditional.
+     * That is the whole point of this case -- the flushed path is where the old
+     * first gate lived, so a sync re-added there is invisible to every
+     * small-transaction assertion in the suite. */
+    CHECK(db->stats.conversions == 0,
+          "flushed path: a conversion fired, so the pins did not hold");
+    CHECK(sync_calls - syncs == 1,
+          "flushed path: expected exactly 1 sync, got %ld", sync_calls - syncs);
 
     zs_db_close(&db);
     hooks_reset();
