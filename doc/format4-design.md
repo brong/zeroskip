@@ -54,15 +54,35 @@ branch to save 12 bytes on a rare record.
 bit 0   IsBig        the header is 16 bytes, not 4
 bit 1   IsDelete     a tombstone; vallen MUST be 0
 bit 2   IsRollback   defined ONLY when keylen == 0
-bit 3   reserved     written 0
+bit 3   MustBeOne    always set; a reader MUST treat it clear as malformed
 keylen == 0          not a record: a span terminator (F-14 forbids a 0-length key)
 ```
 
-`keylen == 0` as the terminator escape is what keeps bit 3 spare, and a spare bit
-is worth having: reserving `0x08` rather than recycling it is why removing the
-four `*_ANC` forms changed no golden corpus byte. The alternative assignment —
-`IsTerminator` on bit 2, `IsRollback` on bit 3 — reads more explicitly and spends
-the whole nibble.
+`keylen == 0` as the terminator escape is what pays for `MustBeOne`: without it,
+`IsTerminator` and `IsRollback` would take two bits and the nibble would be full.
+
+**`MustBeOne` exists so that a zero byte can only be padding.** Flags occupy the
+low nibble of byte 0, so a set bit 3 makes byte 0 non-zero for every record and
+terminator in either form, whatever `keylen` is. That gives one invariant with
+three uses:
+
+- padding is self-describing, so a reader that has no record count — salvage,
+  which S-6 requires to distrust the pointer region — can *recognise* the pad
+  rather than merely failing to decode it;
+- a **pointer landing on a zero byte is provably wrong**, and that is worth more
+  than it looks: the read path locates records by pointer and does not verify the
+  file checksum (verification is on demand), so every pointer it dereferences is
+  trusted. A one-byte test catches a whole class of bad pointer cheaply;
+- byte 0 clear-but-nonzero — bit 3 down with other bits up — is a *different*
+  diagnosis from byte 0 == 0: corruption rather than padding.
+
+It was initially rejected on the grounds that it spends the reserved bit, and
+that objection was weak: `version_read`/`version_write` in the header is the
+forward-compatibility channel, and a reader already refuses a file whose
+`version_read` exceeds its own. So bit 3 is not lost, it is *1 in this version
+and available to be redefined in the next*, with old readers declining the file
+at open rather than misreading records — which is how a format change is supposed
+to be gated.
 
 **`IsDelete` cannot be folded into `vallen == 0`.** An empty value and a deletion
 are distinct states (A-1), and `ZS_IFCHANGED` rests on the distinction; comparing
@@ -153,25 +173,26 @@ divergence while still reading the data.
 ## Padding and the walk
 
 Padding between the last record and the pointer array is **allowed**, so the
-array can start at a multiple of the pointer size. Pad bytes are zero, which
-keeps a file canonical and reproducible for the corpus.
+array can start at a multiple of the pointer size. **Pad bytes MUST be zero** —
+that is what makes them recognisable, given `MustBeOne`, and it also keeps a file
+canonical and reproducible for the corpus.
 
-**The record walk is bounded by `nptrs` from the trailer, not by an offset**, so
-padding is never decoded. This matters because the tempting justification for
-NUL padding is wrong: *a record header can be NUL*. With flags in the low nibble
-and `keylen` above them, byte 0 is `flags | ((keylen & 0x0F) << 4)`, so a plain
-record with no flags and a **16-byte key** has byte 0 == `0x00`. That is not an
-exotic case — 16 bytes is the benchmark default and roughly sqlite's rowid-index
-key. Putting `keylen` in the low bits moves the collision to `keylen == 256`, and
-biasing `keylen` by −1 (legal, since F-14 says ≥ 1) moves it to `keylen == 1`. No
-bit layout gets the property for free; buying it costs a must-be-one marker bit,
-which spends the reserved bit, and is not worth it.
+So there are two ways to bound the record walk and both are now correct:
 
-Salvage is the one reader that cannot use `nptrs`, because S-6 requires it to
-walk the data without trusting the pointer region. It will meet the pad and fail
-to decode it — which is correct, since the pad follows the last record, so "stop
-here" is exactly right. Worth stating in the spec as a consequence rather than
-leaving it to look like a hole.
+- **by `nptrs` from the trailer**, which is exact and cheaper, and is what an
+  in-order reader and a merge should use;
+- **by the pad**, for salvage, which S-6 requires to walk the data without
+  trusting the pointer region and therefore cannot use the count.
+
+The property that makes the second one sound is not free, and it is worth
+recording why: *without* `MustBeOne`, a record header can be NUL. With flags in
+the low nibble and `keylen` above them, byte 0 is
+`flags | ((keylen & 0x0F) << 4)`, so a plain record with no flags and a **16-byte
+key** would have byte 0 == `0x00` — not an exotic case, since 16 bytes is the
+benchmark default and roughly sqlite's rowid-index key. Putting `keylen` in the
+low bits moves the collision to `keylen == 256`; biasing `keylen` by −1 (legal,
+since F-14 says ≥ 1) moves it to `keylen == 1`. No bit layout gets the property
+for free, which is why it is bought with a flag bit rather than assumed.
 
 ## The trailer
 
@@ -278,16 +299,31 @@ about.
 
 ## Open questions
 
-- **The reserved bit's reader rule.** An old reader meeting bit 3 set can ignore
-  it and possibly misread, or reject and — under F-24 — complete the file at that
-  point and lose everything after. The same asymmetry that makes accepting
-  non-canonical records mandatory applies here, and the answer should be argued
-  rather than assumed. An in-order file has an independent structure (the pointer
-  array) to cross-check against; an unordered file does not.
-- **The 16 flag combinations should be enumerated normatively**, so
-  `zsi_type_valid` stays a `switch` over a stated table rather than becoming a
-  computed bit predicate. F-12's table is normative today for exactly this
-  reason: a computed predicate is a second specification that can drift.
+- ~~The reserved bit's reader rule.~~ **Closed:** bit 3 is `MustBeOne`, a reader
+  treats it clear as a malformed record, and forward compatibility is
+  `version_read`'s job rather than a spare bit's. In an unordered file a
+  malformed record completes the file at that point (F-24, as any invalid record
+  does today); in an in-order file it makes one record unreadable without
+  truncating anything, because records are located by pointer rather than by
+  walking.
+- **The legal nibbles should be enumerated normatively**, so `zsi_type_valid`
+  stays a `switch` over a stated table rather than becoming a computed bit
+  predicate — F-12's table is normative today for exactly that reason, since a
+  computed predicate is a second specification that can drift. `MustBeOne` makes
+  the table small: 8 of the 16 nibbles are malformed outright, and of the 8 with
+  bit 3 set only **six** are legal, which is the whole format:
+
+  | keylen | IsBig | IsDelete | IsRollback | meaning |
+  |---|---|---|---|---|
+  | ≥ 1 | 0 | 0 | 0 | small record |
+  | ≥ 1 | 1 | 0 | 0 | big record |
+  | ≥ 1 | 0 | 1 | 0 | small deletion |
+  | ≥ 1 | 1 | 1 | 0 | big deletion — only the key can force this |
+  | 0 | 0 | 0 | 0 | COMMIT terminator |
+  | 0 | 0 | 0 | 1 | ROLLBACK terminator |
+
+  `IsRollback` set with `keylen ≥ 1`, and `IsDelete` or `IsBig` set on a
+  terminator, are malformed rather than reserved.
 - **`zs_db_check_consistency` should rebuild the pointer array from the record
   stream and compare.** Self-framing records make the pointers derivable, so a
   pointer array that disagrees with the data can be caught without trusting
