@@ -10421,11 +10421,18 @@ static void test_replay_does_not_truncate_on_a_bad_record(void)
     zs_db_close(&db);
 }
 
-static void test_record_csum_engine0(void)
+static void test_engine0_reads_end_to_end(void)
 {
-    /* Engine 0: the checksum field is written as zero and the engine computes
-     * zero for every input, so verification passes with no special case --
-     * F-5c's bargain, unchanged by F-32. */
+    /* F-5c: engine 0 writes zeros and verifies nothing, so a span terminator's
+     * checksum is zero and must still validate -- with no special case anywhere.
+     *
+     * Its original subject was the per-record checksum field, which no longer
+     * exists (F-32).  What is left is not nothing: F-5e verifies a span whenever
+     * it is indexed, in every mode, so an engine-0 file's spans go through the
+     * same code path as any other and a comparison against a zero expected value
+     * has to come out equal.  An engine that special-cased empty or short input
+     * (twom's does) would break exactly this, which is why one end-to-end
+     * engine-0 read is worth keeping. */
     struct zs_db *db;
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     const char *v; size_t vl;
@@ -13318,11 +13325,11 @@ static void test_idxcache_rejection_rules(void)
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
         uint64_t tc = 0;
         uint64_t was = zsi_get64(tab + ZSI_IDX_HEADER_LEN);
-        size_t arrlen = tablen - ZSI_IDX_HEADER_LEN - 4;
+        size_t arrlen = tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN;
 
         zsi_put64(tab + ZSI_IDX_HEADER_LEN,
                   zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO) + 8);
-        zsi_put32(tab + tablen - 4,
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
                   zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -13331,7 +13338,7 @@ static void test_idxcache_rejection_rules(void)
 
         /* And below the data file's header length. */
         zsi_put64(tab + ZSI_IDX_HEADER_LEN, 8);
-        zsi_put32(tab + tablen - 4,
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
                   zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -13339,7 +13346,7 @@ static void test_idxcache_rejection_rules(void)
         ASSERT_NULL(base);
 
         zsi_put64(tab + ZSI_IDX_HEADER_LEN, was);
-        zsi_put32(tab + tablen - 4,
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
                   zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN, arrlen));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     }
@@ -13366,7 +13373,7 @@ static void test_idxcache_rejection_rules(void)
         memcpy(f->hdr.compar_name, saved, sizeof(saved));
     }
 
-    /* Truncated and padded: the size must be exactly 96 + 8n + 4. */
+    /* Truncated and padded: the size must be exactly 104 + 8n + 8. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
         uint64_t tc = 0;
@@ -13464,7 +13471,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
     struct zsi_idxcfg cfg;
     struct zs_db *db = NULL;
     struct zsi_file *f;
-    char *tab, *pristine = NULL;
+    char *tab;
     size_t tablen;
     size_t *base = NULL, nbase = 0, vu = 0, to = 0;
     size_t first_term_off;
@@ -13537,18 +13544,6 @@ static void test_idxcache_rejects_bad_term_binding(void)
     free(base);
     base = NULL;
 
-    /* A PRISTINE COPY, because the cases below doctor fields without restoring
-     * them -- valid_upto is left at 3 by the last of them.  Anything appended
-     * after that would be testing a table that is already invalid, and would pass
-     * for the wrong reason: which is what happened when the P-11 cases were first
-     * added here. */
-    {
-        char *keep = malloc(tablen);
-        ASSERT_NOT_NULL(keep);
-        memcpy(keep, tab, tablen);
-        pristine = keep;
-    }
-
     /* A term_csum that is not the terminator's. */
     zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM,
               zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
@@ -13617,120 +13612,18 @@ static void test_idxcache_rejects_bad_term_binding(void)
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
     ASSERT_NULL(base);
 
-    /* P-11's OTHER rejections, added 2026-08-27 after the full mutation run left
-     * eight idx mutants alive.  Each case starts from the PRISTINE copy, so none
-     * can pass because an earlier one left the table broken.
+    /* NOTHING MORE BELONGS HERE.  P-11's other rejections -- the verified flag,
+     * the offset range, the comparator binding, the exact size -- live in
+     * test_idxcache_rejection_rules, which is their home and which catches their
+     * mutants at its own lines.  A duplicate set was added here on 2026-08-27
+     * when that test looked dead, and removed once the real cause was found: it
+     * wrote the array checksum as 32 bits at tablen-4 after the checksum widened
+     * to 8 at tablen-8, so the table stayed invalid and every case after that one
+     * passed for the wrong reason.
      *
-     * The verified flag: a table built without checksum verification must not be
-     * handed to a verifying reader, because it may index records that reader
-     * would reject. */
-    {
-        uint16_t was;
-        memcpy(tab, pristine, tablen);
-        was = zsi_get16(tab + ZSI_IDX_OFF_FLAGS);
-        zsi_put16(tab + ZSI_IDX_OFF_FLAGS,
-                  (uint16_t)(was & ~ZSI_IDX_FLAG_CSUM_VERIFIED));
-        zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
-        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-        zsi_put16(tab + ZSI_IDX_OFF_FLAGS, was);
-    }
-
-    /* An OFFSET outside the region the table describes, both ways: below the
-     * header, and at or beyond valid_upto.  A table is an optimisation, so a
-     * corrupt one is ZS_NOTFOUND rather than an error (P-15). */
-    {
-        uint64_t was;
-        memcpy(tab, pristine, tablen);
-        was = zsi_get64(tab + ZSI_IDX_HEADER_LEN);
-
-        zsi_put64(tab + ZSI_IDX_HEADER_LEN, 8);            /* below the header */
-        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
-                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
-                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
-        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-
-        zsi_put64(tab + ZSI_IDX_HEADER_LEN,
-                  zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO));   /* at valid_upto */
-        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
-                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
-                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
-        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-
-        zsi_put64(tab + ZSI_IDX_HEADER_LEN, was);
-        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
-                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
-                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
-    }
-
-    /* A COMPARATOR name that is neither the file's nor the handle's.  The two
-     * checks are redundant with each other -- a file and a handle can never
-     * disagree, since open refuses that -- so this kills them only together, and
-     * their individual mutants are classified equivalent for that reason. */
-    {
-        char was[ZSI_COMPAR_NAME_LEN];
-        memcpy(tab, pristine, tablen);
-        memcpy(was, tab + ZSI_IDX_OFF_COMPAR, sizeof(was));
-        memset(tab + ZSI_IDX_OFF_COMPAR, 0, ZSI_COMPAR_NAME_LEN);
-        memcpy(tab + ZSI_IDX_OFF_COMPAR, "notmemcmp", 9);
-        zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
-        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-        memcpy(tab + ZSI_IDX_OFF_COMPAR, was, sizeof(was));
-    }
-
-    /* A table whose SIZE disagrees with its nptrs, in both directions.
-     *
-     * Extended matters more than truncated, and that is the whole point of an
-     * exact equality rather than a bound: a short file fails the read anyway, so
-     * truncation is caught by accident even with the size check gone.  An
-     * EXTENDED file reads perfectly -- the loader takes nptrs*8 bytes and the
-     * extra sits past them -- so nothing but the equality rejects it. */
-    {
-        char *ext = malloc(tablen + ZSI_IDX_PTR_LEN);
-        ASSERT_NOT_NULL(ext);
-
-        memcpy(tab, pristine, tablen);
-        ASSERT_OK(idxcache_spew(tabpath, tab, tablen - ZSI_IDX_PTR_LEN));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-
-        memcpy(ext, pristine, tablen);
-        memset(ext + tablen, 0, ZSI_IDX_PTR_LEN);
-        ASSERT_OK(idxcache_spew(tabpath, ext, tablen + ZSI_IDX_PTR_LEN));
-        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
-                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
-        ASSERT_NULL(base);
-        free(ext);
-    }
-
-    /* And the pristine table STILL loads, restored from the buffer -- so none of
-     * the above passed because the table had been left broken.
-     *
-     * BOTH checksums are recomputed here, not just the fields.  Restoring a field
-     * leaves the checksum that was computed over the doctored value, so a restore
-     * without this reads as corruption -- which is how this assertion failed the
-     * first time it was written. */
-    memcpy(tab, pristine, tablen);
-    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
-    ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name,
-                           &base, &nbase, &vu, &to, &tc));
-    ASSERT_EQU(nbase, 10u);
-    free(base);
-    base = NULL;
-    free(pristine);
-
+     * If a case IS added here, start it from a pristine copy of the table: the
+     * cases above doctor fields without restoring them, and the last leaves
+     * valid_upto at 3. */
     free(tab);
     ASSERT_OK(zs_db_close(&db));
 }
@@ -15845,13 +15738,26 @@ static void test_salvage_unverified_needs_the_flag(void)
     ASSERT(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED] >= 1);
 }
 
-static void test_convert_reencodes_engine_mismatch(void)
+static void test_convert_across_engines(void)
 {
-    /* F-32c: an engine-0 file sealed by an engine-1 handle.  The output
-     * file's header says engine 1, so a verbatim record copy would carry a
-     * ZERO checksum that fails under engine 1 for every record.  Conversion
-     * must re-encode.  (The reverse mismatch would pass silently -- engine 0
-     * verifies nothing -- which is why the test is this way round.) */
+    /* A-6/F-5a: an engine-0 file sealed by an engine-1 handle, which is the only
+     * cross-engine conversion the suite exercises.
+     *
+     * Its original subject -- F-32c, "a verbatim record copy carries a checksum
+     * that validates for nobody" -- is RETIRED: no record carries a checksum
+     * (F-32), so a verbatim copy is correct whatever the engines are and there is
+     * nothing to re-encode.  What survives is the hazard one level up, and it is
+     * a real one this file records: a writer that used the HANDLE's engine where
+     * it should use the FILE's produces bytes no reader can validate.  Here the
+     * output is a NEW file, so its engine is the handle's (A-6) and its one
+     * checksum must be computed under that -- while the input's spans were
+     * checksummed under engine 0 and must verify under engine 0 during D-20b's
+     * re-verify.  Getting either the wrong way round fails the consistency check
+     * below.
+     *
+     * Kept rather than dropped for that reason; the direction still matters,
+     * because the reverse mismatch would pass silently -- engine 0 verifies
+     * nothing. */
     struct zs_db *db;
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_open_data setup2 = ZS_OPEN_DATA_INITIALIZER;
@@ -18989,7 +18895,7 @@ static struct test_entry tests[] = {
                                     test_span_checksum_is_the_only_witness },
     { "test_replay_does_not_truncate_on_a_bad_record",
                                     test_replay_does_not_truncate_on_a_bad_record },
-    { "test_record_csum_engine0",       test_record_csum_engine0 },
+    { "test_engine0_reads_end_to_end",       test_engine0_reads_end_to_end },
     { "test_repack_cascade",            test_repack_cascade },
     { "test_repack_never_touches_unordered",
                                         test_repack_never_touches_unordered },
@@ -19098,8 +19004,8 @@ static struct test_entry tests[] = {
                                     test_salvage_resync_proves_its_candidate },
     { "test_salvage_resyncs_after_a_bad_span",
                                         test_salvage_resyncs_after_a_bad_span },
-    { "test_convert_reencodes_engine_mismatch",
-                                    test_convert_reencodes_engine_mismatch },
+    { "test_convert_across_engines",
+                                    test_convert_across_engines },
     { "test_check_names_the_file_not_the_record", test_check_names_the_file_not_the_record },
     { "test_salvage_all_or_nothing_inorder",
                                     test_salvage_all_or_nothing_inorder },

@@ -111,7 +111,7 @@ a spec label is missing here.
 | `F-32` | *Retired in version 4, not reused.* Every data record ended in a 4-byte checksum | `record_byte_layout`, `corpus` |
 | `F-32a` | *Retired with F-32.* | `read_serves_corrupt_bytes`, `span_checksum_is_the_only_witness` |
 | `F-32b` | *Retired with F-32*; the replay half survives as F-33a | `replay_does_not_truncate_on_a_bad_record` |
-| `F-32c` | *Retired with F-32.* | `convert_reencodes_engine_mismatch` |
+| `F-32c` | *Retired with F-32.* | `convert_across_engines` |
 | `F-33` | What replaces F-32a's protection is not equivalent, and a reader MUST NOT verify on the read path | `read_serves_corrupt_bytes`, `check_names_the_file_not_the_record` |
 | `F-33a` | An implementation MUST NOT verify a record during span replay or pointer-array load | `replay_does_not_truncate_on_a_bad_record` |
 

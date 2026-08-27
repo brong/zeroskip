@@ -61,7 +61,6 @@ compaction; zeroskip has no mutable-file operations to answer `overwrite` or
 | `full scan` | the merge cursor over whatever file set exists — but see below: its files do not overlap, so the merge never merges |
 | `full scan, interleaved` | the same scan with files that DO overlap: D-14e's re-sort moving an arm at nearly every step |
 | `full scan, shadowed` | every key in two files: duplicate suppression and the full re-sort |
-| `full scan, no verify` | the same fixture read with `ZS_NOCSUM` — what record verification costs |
 | `store, rollover Nk` | whether a writer's inline conversion really is bounded by `rollover_size` (D-12d) |
 | `repack cascade` | one unbounded cascade (D-16b, open item 1) |
 | `snapshot open` | the per-open replay cost, without a pointer table |
@@ -912,34 +911,46 @@ And when a regression does appear, `perf stat -e cycles,instructions,cache-misse
 separates the cases before any guessing: flat instructions with more cycles is a
 memory or layout effect, more instructions is real work.
 
-## What record verification costs
+## What record verification cost, and why the row is gone
 
-`full scan, no verify` opens the *same* fixture with `ZS_NOCSUM`, so the only
-difference is the read-side flag rather than the engine the file records. Paired
-within one process, five rounds, 200 000 records:
+**Retired in version 4.** No record carries a checksum (F-32), so a scan verifies
+nothing, `ZS_NOCSUM` is rejected outright (A-18), and the `full scan, no verify`
+row is gone from `zsbench` -- it would have compared two identical
+configurations.
+
+The measurement is kept because it is the size of what was removed, and because
+its method has a trap in it. Paired within one process, five rounds, 200 000
+records, 123-byte records:
 
 | | records/s |
 |---|---|
-| verify (default) | 64 681 996 |
-| `ZS_NOCSUM` | 85 580 575 |
+| verify (as version 2 did) | 64 681 996 |
+| no verification | 85 580 575 |
 
-**+32%**, or 24% of a verifying scan — 15.5 ns per record against 11.7 ns, so
-the checksum costs about 3.8 ns for a 123-byte record. That agrees with both a
-standalone microbenchmark of XXH3 at that size (3.4 ns) and the share `perf`
-attributes to it on an EPYC (20–29%), which is worth noting because the three
-methods disagreeing would have meant one of them was lying.
+**+32%**, or 24% of a verifying scan -- 15.5 ns per record against 11.7 ns, so
+the checksum cost about 3.8 ns per record. That agreed with a standalone XXH3
+microbenchmark at that size (3.4 ns) and with the share `perf` attributed to it
+on an EPYC (20-29%), which matters because three methods disagreeing would have
+meant one was lying.
 
-Do not measure this with `--csum xxh64` against `--csum null`. That builds two
-different fixtures, so the comparison spans two processes and picks up the
-run-to-run variance described above — it reported +74% for an effect that is
-+32%.
+**It was memory traffic rather than hashing**, and that is the part worth
+carrying: a key-only traversal never dereferences the values a cursor hands
+back, so verifying pulled every value byte into cache that the scan would
+otherwise never touch. Which is also why removing it is worth more than any
+faster hash would have been.
+
+**The method trap:** do not measure this kind of thing with `--csum xxh64`
+against `--csum null`. That builds two different fixtures, so the comparison
+spans two processes and picks up run-to-run variance -- it reported +74% for an
+effect that is +32%.
 
 **Span checksums are a different matter and are cheap.** They ride indexing
-(F-5e) so they run in every mode, `ZS_NOCSUM` included, but they are one pass
-over sequential bytes already in page cache: 3.2% for all checksumming on a
-24 MB single-transaction span, and unmeasurable on the replay path (0.146 ms
-against 0.148 ms at a 2 MB active file). The expensive one is the record
-checksum, because it is paid per materialisation.
+(F-5e) so they run in every mode, and they are one pass over sequential bytes
+already in page cache: 3.2% for all checksumming on a 24 MB single-transaction
+span, and unmeasurable on the replay path (0.146 ms against 0.148 ms at a 2 MB
+active file). The expensive one was the record checksum, because it was paid per
+materialisation -- which is exactly why version 4 removed that one and kept
+this one.
 
 **A faster hash is not the lever.** At 123 bytes, measured on an M5: XXH3-64
 3.69 ns, a four-lane AES-hardware bound 3.50 ns, hardware CRC32C 5.63 ns,

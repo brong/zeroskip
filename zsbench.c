@@ -1051,22 +1051,19 @@ static void bench_scan(void)
     bench_scan_once(db, "scan_compacted", "full scan, compacted");
     zs_db_close(&db);
 
-    /* The SAME fixture, read with verification off (A-?/F-32a): the only
-     * difference is the read-side flag, not the engine the file records, so
-     * this is what a caller can actually choose.
+    /* There is no "full scan, no verify" row any more.  It priced ZS_NOCSUM
+     * against a verifying scan, and since version 4 no record carries a checksum
+     * (F-32), so a scan verifies nothing and the flag is rejected outright
+     * (A-18).  The row would have measured two identical configurations, and its
+     * open now fails.
      *
-     * It is the largest single item in a scan profile, and much larger than
-     * that profile suggests: a key-only traversal never dereferences the value
-     * a cursor hands back, so without verification those bytes are never read
-     * at all, while verifying pulls every one of them into cache.  The cost is
-     * memory traffic rather than mixing -- which is also why a faster hash
-     * would buy little here, and why this line is the honest way to price the
-     * flag.  Span checksums are unaffected: they ride indexing (F-5e) and run
-     * in every mode. */
-    fixture_require(plain);
-    db = open_at(plain, ZS_NOCSUM, 0);
-    bench_scan_once(db, "scan_noverify", "full scan, no verify");
-    zs_db_close(&db);
+     * What it measured is worth remembering rather than the row: verification was
+     * the largest single item in a scan profile, and larger than the profile
+     * suggested, because a key-only traversal never dereferences the values a
+     * cursor hands back -- so verifying pulled every value byte into cache that
+     * the scan would otherwise never read.  The cost was memory traffic, not
+     * hashing, which is why removing it is worth more than a faster hash would
+     * have been. */
 
     fixture_done(plain);
     fixture_done(compacted);
