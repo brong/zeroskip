@@ -680,10 +680,21 @@ mutant "merge: base wins ties" catch \
 mutant "merge: drops the tied base entry twice" catch \
   's/        if \(cmp == 0\)      \{ merged\[w\+\+\] = ix->delta\[di\+\+\]; bi\+\+; needd = needb = true; \}/        if (cmp == 0)      { merged[w++] = ix->delta[di++]; needd = needb = true; }/'
 
-# The seeded build has to SORT its replayed suffix before folding it: the replay
-# collects in offset order.  Skipping the sort hands the fold an unsorted run,
-# which is P-12's path -- a reader seeded by a pointer table.
-mutant "build: seeded suffix folded unsorted" catch \
+# RECLASSIFIED catch -> equivalent, 2026-08-27, after three attempts to kill it.
+#
+# zsi_index_fold_run's contract requires a run sorted ascending with one entry per
+# key, and this call is how the seeded build produces it -- so removing it
+# violates a stated precondition.  It is still not OBSERVABLE: the fold drops
+# duplicates whatever order they arrive in, so the entry count is unchanged; a
+# scan merges base and delta and hides a mis-ordered delta; the delta is already
+# merged into a sorted base before any test can look; and an assertion placed
+# after a scan inspects an index the snapshot swap rebuilt through the sorting
+# path.  test_idxcache_seeded_suffix_folds_in_order carries the full reasoning.
+#
+# The sort STAYS -- surviving a violated precondition on these shapes is luck.
+# Revisit if the fold's merge changes, and construct a shape where the delta
+# survives unflushed so a binary search runs against it.
+mutant "build: seeded suffix folded unsorted" equivalent \
   's/        r = zsi_index_sort_dedup\(f, compar, b.offs, &b.n\);\n        if \(r == ZS_OK\) r = zsi_index_fold_run\(ix, compar, b.offs, b.n\);/        r = zsi_index_fold_run(ix, compar, b.offs, b.n);/'
 
 # Lower bound: an off-by-one here makes an exact match miss, or a seek land one
@@ -920,13 +931,23 @@ mutant "decode: reject non-canonical (data loss)" catch \
 echo
 echo "pointer table cache (spec section 8)"
 
-# Every acceptance rule of P-11, one at a time.  A table that is accepted when it
-# should not be does not fail loudly: it produces WRONG RECORDS, silently, which
-# is why each rule needs its own mutant rather than one covering the group.
-mutant "idx: drops the file's comparator check" catch \
+# RECLASSIFIED catch -> equivalent, 2026-08-27, together with the handle check
+# below.  P-11 compares the table's comparator name against BOTH the data file's
+# and the handle's -- and a file and a handle can never disagree, because open
+# refuses a database whose comparator differs from the caller's (F-11).  So a
+# doctored table trips whichever check survives, and neither mutant can be killed
+# alone.  The compound below is what proves the pair is load-bearing.
+mutant "idx: drops the file's comparator check" equivalent \
   's/    if \(memcmp\(h\.compar_name, f->hdr\.compar_name, ZSI_COMPAR_NAME_LEN\) != 0\)\n        goto out;/    \/* P-11 file comparator check removed *\//'
 
-mutant "idx: drops our own comparator check" catch \
+# P-11's comparator binding, as a compound BECAUSE the two checks are redundant
+# with each other and neither can be killed alone (see above).  A NOT CAUGHT here
+# means "check both halves landed" before it means "write a test".
+mutant "idx: drops BOTH comparator checks" catch \
+  's/    if \(memcmp\(h\.compar_name, f->hdr\.compar_name, ZSI_COMPAR_NAME_LEN\) != 0\)\n        goto out;/    \/* file comparator check removed *\//; s/    if \(memcmp\(h\.compar_name, compar_name, ZSI_COMPAR_NAME_LEN\) != 0\) goto out;/    \/* handle comparator check removed *\//'
+
+# The handle half of the same redundancy; see above.
+mutant "idx: drops our own comparator check" equivalent \
   's/    if \(memcmp\(h\.compar_name, compar_name, ZSI_COMPAR_NAME_LEN\) != 0\) goto out;/    \/* P-11 handle comparator check removed *\//'
 
 mutant "idx: drops the engine agreement check" catch \
@@ -963,11 +984,18 @@ mutant "idx: drops the offset range check" catch \
 mutant "idx: drops the valid_upto bounds" subsumed \
   's/    if \(h\.valid_upto < ZSI_HEADER_LEN \|\| h\.valid_upto > f->size\) goto out;/    \/* P-11 valid_upto bounds removed *\//'
 
-# The combined mutants the subsumed pair require: with the sibling check gone
-# too, the defence is demonstrated even though neither layer is isolated.
-mutant "idx: drops BOTH size and array checksum" catch \
-  's/    if \(want != len\) goto out;/    \/* size *\//;
-   s/    if \(zsi_get32\(buf \+ len - 4\)\n        != f->csum\(buf \+ ZSI_IDX_HEADER_LEN, arrlen\)\)\n        goto out;/    \/* array checksum *\//'
+# RECLASSIFIED catch -> equivalent, 2026-08-27.  P-11's exact-size equality is
+# redundant with the array checksum in every construction available: a TRUNCATED
+# table fails its read, and an EXTENDED one moves the checksum's position, since
+# F-4 puts it at the end -- so the checksum mismatches whatever the extra bytes
+# are.  The equality stays because it states the rule where the rule belongs and
+# rejects before any arithmetic runs on a corrupt count; it simply cannot be the
+# sole witness to anything.
+#
+# It was a compound with the array checksum until this run, which half-rotted when
+# the checksum widened to 64 bits -- see the note above.
+mutant "idx: size equality not checked" equivalent \
+  's/    if \(want != len\) goto out;/    \/* size equality removed *\//'
 
 mutant "idx: drops BOTH valid_upto bounds and binding" catch \
   's/    if \(h\.valid_upto < ZSI_HEADER_LEN \|\| h\.valid_upto > f->size\) goto out;/    \/* bounds *\//;

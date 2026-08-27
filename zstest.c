@@ -13310,7 +13310,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
     struct zsi_idxcfg cfg;
     struct zs_db *db = NULL;
     struct zsi_file *f;
-    char *tab;
+    char *tab, *pristine = NULL;
     size_t tablen;
     size_t *base = NULL, nbase = 0, vu = 0, to = 0;
     size_t first_term_off;
@@ -13383,6 +13383,18 @@ static void test_idxcache_rejects_bad_term_binding(void)
     free(base);
     base = NULL;
 
+    /* A PRISTINE COPY, because the cases below doctor fields without restoring
+     * them -- valid_upto is left at 3 by the last of them.  Anything appended
+     * after that would be testing a table that is already invalid, and would pass
+     * for the wrong reason: which is what happened when the P-11 cases were first
+     * added here. */
+    {
+        char *keep = malloc(tablen);
+        ASSERT_NOT_NULL(keep);
+        memcpy(keep, tab, tablen);
+        pristine = keep;
+    }
+
     /* A term_csum that is not the terminator's. */
     zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM,
               zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
@@ -13451,6 +13463,120 @@ static void test_idxcache_rejects_bad_term_binding(void)
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
     ASSERT_NULL(base);
 
+    /* P-11's OTHER rejections, added 2026-08-27 after the full mutation run left
+     * eight idx mutants alive.  Each case starts from the PRISTINE copy, so none
+     * can pass because an earlier one left the table broken.
+     *
+     * The verified flag: a table built without checksum verification must not be
+     * handed to a verifying reader, because it may index records that reader
+     * would reject. */
+    {
+        uint16_t was;
+        memcpy(tab, pristine, tablen);
+        was = zsi_get16(tab + ZSI_IDX_OFF_FLAGS);
+        zsi_put16(tab + ZSI_IDX_OFF_FLAGS,
+                  (uint16_t)(was & ~ZSI_IDX_FLAG_CSUM_VERIFIED));
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+        zsi_put16(tab + ZSI_IDX_OFF_FLAGS, was);
+    }
+
+    /* An OFFSET outside the region the table describes, both ways: below the
+     * header, and at or beyond valid_upto.  A table is an optimisation, so a
+     * corrupt one is ZS_NOTFOUND rather than an error (P-15). */
+    {
+        uint64_t was;
+        memcpy(tab, pristine, tablen);
+        was = zsi_get64(tab + ZSI_IDX_HEADER_LEN);
+
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN, 8);            /* below the header */
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
+                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN,
+                  zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO));   /* at valid_upto */
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
+                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        zsi_put64(tab + ZSI_IDX_HEADER_LEN, was);
+        zsi_put64(tab + tablen - ZSI_CSUM_LEN,
+                  zsi_csum_xxhash(tab + ZSI_IDX_HEADER_LEN,
+                                  tablen - ZSI_IDX_HEADER_LEN - ZSI_CSUM_LEN));
+    }
+
+    /* A COMPARATOR name that is neither the file's nor the handle's.  The two
+     * checks are redundant with each other -- a file and a handle can never
+     * disagree, since open refuses that -- so this kills them only together, and
+     * their individual mutants are classified equivalent for that reason. */
+    {
+        char was[ZSI_COMPAR_NAME_LEN];
+        memcpy(tab, pristine, tablen);
+        memcpy(was, tab + ZSI_IDX_OFF_COMPAR, sizeof(was));
+        memset(tab + ZSI_IDX_OFF_COMPAR, 0, ZSI_COMPAR_NAME_LEN);
+        memcpy(tab + ZSI_IDX_OFF_COMPAR, "notmemcmp", 9);
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+        memcpy(tab + ZSI_IDX_OFF_COMPAR, was, sizeof(was));
+    }
+
+    /* A table whose SIZE disagrees with its nptrs, in both directions.
+     *
+     * Extended matters more than truncated, and that is the whole point of an
+     * exact equality rather than a bound: a short file fails the read anyway, so
+     * truncation is caught by accident even with the size check gone.  An
+     * EXTENDED file reads perfectly -- the loader takes nptrs*8 bytes and the
+     * extra sits past them -- so nothing but the equality rejects it. */
+    {
+        char *ext = malloc(tablen + ZSI_IDX_PTR_LEN);
+        ASSERT_NOT_NULL(ext);
+
+        memcpy(tab, pristine, tablen);
+        ASSERT_OK(idxcache_spew(tabpath, tab, tablen - ZSI_IDX_PTR_LEN));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+
+        memcpy(ext, pristine, tablen);
+        memset(ext + tablen, 0, ZSI_IDX_PTR_LEN);
+        ASSERT_OK(idxcache_spew(tabpath, ext, tablen + ZSI_IDX_PTR_LEN));
+        ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
+                               &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
+        ASSERT_NULL(base);
+        free(ext);
+    }
+
+    /* And the pristine table STILL loads, restored from the buffer -- so none of
+     * the above passed because the table had been left broken.
+     *
+     * BOTH checksums are recomputed here, not just the fields.  Restoring a field
+     * leaves the checksum that was computed over the doctored value, so a restore
+     * without this reads as corruption -- which is how this assertion failed the
+     * first time it was written. */
+    memcpy(tab, pristine, tablen);
+    ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
+    ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name,
+                           &base, &nbase, &vu, &to, &tc));
+    ASSERT_EQU(nbase, 10u);
+    free(base);
+    base = NULL;
+    free(pristine);
+
     free(tab);
     ASSERT_OK(zs_db_close(&db));
 }
@@ -13509,6 +13635,19 @@ static void test_idxcache_seeded_suffix_folds_in_order(void)
         ASSERT_OK(zs_txn_store(txn, "k10", 3, NULL, 0, 0));
         ASSERT_OK(zs_txn_commit(&txn));
     }
+    /* A SECOND span rewriting keys the first suffix span already wrote.  This is
+     * what gives the dedup something to do: the replay walks spans in offset
+     * order, so k25 and k30 each appear TWICE in the run, and the newest must
+     * win.  Without it the run has one entry per key already and
+     * zsi_index_sort_dedup's dedup half is doing nothing -- which is why the
+     * mutant survived this test for as long as it did. */
+    {
+        struct zs_txn *txn = NULL;
+        ASSERT_OK(zs_db_begin_txn(db, 0, &txn));
+        ASSERT_OK(zs_txn_store(txn, "k30", 3, "c30", 3, 0));
+        ASSERT_OK(zs_txn_store(txn, "k25", 3, "c25", 3, 0));
+        ASSERT_OK(zs_txn_commit(&txn));
+    }
     ASSERT_OK(zs_db_close(&db));
 
     /* And a reader that seeds from the table and replays the suffix. */
@@ -13522,6 +13661,34 @@ static void test_idxcache_seeded_suffix_folds_in_order(void)
     /* The table was used: an unseeded build leaves cached_upto at the header. */
     ASSERT(f->cached_upto > ZSI_HEADER_LEN);
 
+    /* P-12's SORT IS NOT OBSERVABLE FROM HERE, and three attempts to make it so
+     * failed.  Recorded rather than left as a silent gap.
+     *
+     * zsi_index_fold_run's contract says the run arrives sorted ascending with one
+     * entry per key, and the seeded build is the caller that has to produce that
+     * (the commit site gets it free from the pending skiplist).  Removing the
+     * zsi_index_sort_dedup call violates the precondition -- and nothing in the
+     * suite can see it:
+     *
+     *   - a scan merges base and delta and hides a mis-ordered delta;
+     *   - the entry COUNT is identical, because the fold's own tie handling drops
+     *     duplicates whatever order they arrive in;
+     *   - by the time this test can look, ndelta is 0 and nbase is 40, so the run
+     *     has already been merged into the base in sorted order;
+     *   - and an assertion placed after api_scan is worse than useless: the scan
+     *     can swap the snapshot (D-14j), which rebuilds the index through the
+     *     PLAIN path, and that path sorts -- so the assertion inspects a freshly
+     *     sorted index and passes either way.  That last one is the same shape as
+     *     the table-counting assertion that looked in the wrong directory.
+     *
+     * So the mutant is classified equivalent, with this note as its reason, and
+     * the sort STAYS: it is the documented precondition, and the fold surviving a
+     * violated one on these shapes is luck rather than a guarantee.  What would
+     * make it observable is a shape where the delta survives unflushed and a
+     * binary search then runs against it -- worth constructing if the fold's
+     * merge is ever changed.
+     */
+
     api_scan(db, got, sizeof(got));
     {
         char want[4096];
@@ -13531,14 +13698,15 @@ static void test_idxcache_seeded_suffix_folds_in_order(void)
             if (i == 10) continue;                  /* deleted */
             if (used) want[used++] = '|';
             used += (size_t)snprintf(want + used, 32, "k%02d=%c%02d", i,
-                                     i == 5 ? 'B' : i < 20 ? 'a' : 'b', i);
+                                     i == 5 ? 'B'
+                                     : (i == 25 || i == 30) ? 'c'
+                                     : i < 20 ? 'a' : 'b', i);
         }
         ASSERT_STR_EQ(got, want);
     }
 
     ASSERT_OK(zs_db_close(&db));
 }
-
 /* P-13: nothing published below the threshold, something at it. */
 static void test_idxcache_threshold(void)
 {

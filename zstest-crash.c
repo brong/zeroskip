@@ -1120,20 +1120,32 @@ static void snapshot_gap(const char *dir)
 
 /* P-14: publishing a pointer table must not sync.
  *
- * Asserted by COUNTING, not by timing: a commit with the cache on performs
- * exactly the same number of fdatasync calls as one with it off.  A timing
- * assertion would be flaky, and a structural one -- grepping the source -- would
- * pass the moment the sync moved somewhere else.
+ * Asserted by COUNTING, not by timing: an operation that publishes a table
+ * performs exactly the same number of fdatasync calls as the same operation with
+ * the cache off.  A timing assertion would be flaky, and a structural one --
+ * grepping the source -- would pass the moment the sync moved somewhere else.
+ *
+ * MEASURED ACROSS AN OPEN, not across a commit, and that is what this test got
+ * wrong.  Since P-13 a commit publishes NOTHING -- D-13b's fold maintains the
+ * index incrementally, so there is no replay to amortise -- so comparing two
+ * commits compares two operations that both publish nothing, and the mutant
+ * "idx: syncs before publishing" went NOT CAUGHT in the 2026-08-27 full run.
+ * Publication happens where an index is built by REPLAY, which is an open.
+ *
+ * The old publication guard counted tables in the cache ROOT, where P-2a never
+ * puts any -- the same mis-aimed count CLAUDE.md records for
+ * test_seal_at_commit_skips_table_publish.  It counts the resolved per-uuid
+ * directory now.
  *
  * This lives in the crash harness rather than zstest because the syscall hooks
- * only exist under ZS_TEST_HOOKS, which only this target defines.  It doubles as
- * a check that C-7's single gate is still single. */
+ * only exist under ZS_TEST_HOOKS, which only this target defines. */
 static void test_idxcache_no_fsync_on_publish(void)
 {
-    char cachedir[PATH_MAX];
+    char cachedir[PATH_MAX], resolved[PATH_MAX];
     struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
     struct zs_db *db = NULL;
     long without, with;
+    char uu[ZSI_UUID_STR_LEN];
 
     total++;
 
@@ -1142,48 +1154,50 @@ static void test_idxcache_no_fsync_on_publish(void)
     hooks_on();
 
     snprintf(cachedir, sizeof(cachedir), "%s/cache", basedir);
-    {
-        char cmd[PATH_MAX + 32];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", cachedir);
-        if (system(cmd)) {}
-    }
-    CHECK(mkdir(cachedir, 0700) == 0, "mkdir cache");
+    CHECK(mkdir(cachedir, 0700) == 0 || errno == EEXIST, "mkdir cache");
 
-    /* Baseline: one commit with no cache at all. */
+    /* Records to replay at the next open, written with no cache configured. */
     setup.flags = ZS_CREATE;
     setup.error = quiet_error;
-    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open plain");
-    CHECK(zs_db_store(db, "a", 1, "1", 1, 0) == ZS_OK, "store a");
-    without = sync_calls;
-    CHECK(zs_db_store(db, "b", 1, "2", 1, 0) == ZS_OK, "store b");
-    without = sync_calls - without;
-    zs_db_close(&db);
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open");
+    for (int i = 0; i < 20; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "k%02d", i);
+        CHECK(zs_db_store(db, k, strlen(k), "v", 1, 0) == ZS_OK, "store");
+    }
+    zsi_uuid_unparse(db->uuid, uu);
+    CHECK(zs_db_close(&db) == ZS_OK, "close");
+    snprintf(resolved, sizeof(resolved), "%s/%s", cachedir, uu);
 
-    /* The same commit with the cache on and a threshold of one byte, so a table
-     * is published for certain. */
+    /* An open with NO cache: it replays and publishes nothing. */
+    setup.flags = 0;
+    setup.index_dir = NULL;
+    setup.index_threshold = 0;
+    without = sync_calls;
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open uncached");
+    without = sync_calls - without;
+    CHECK(zs_db_close(&db) == ZS_OK, "close uncached");
+
+    /* The same open WITH the cache and a threshold of one byte, so the replay
+     * publishes.  Same syscall count, or P-14 is broken. */
     setup.index_dir = cachedir;
     setup.index_threshold = 1;
-    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open cached");
-    CHECK(zs_db_store(db, "c", 1, "3", 1, 0) == ZS_OK, "store c");
     with = sync_calls;
-    CHECK(zs_db_store(db, "d", 1, "4", 1, 0) == ZS_OK, "store d");
+    CHECK(zs_db_open(dbdir, &setup, &db) == ZS_OK, "open cached");
     with = sync_calls - with;
-    /* Tables live in the per-uuid directory the open resolved (P-2a). */
     CHECK(db->index_dir != NULL, "cache resolved");
-    snprintf(cachedir, sizeof(cachedir), "%s", db->index_dir);
-    zs_db_close(&db);
+    CHECK(zs_db_close(&db) == ZS_OK, "close cached");
 
-    CHECK(without == 1, "C-7: expected 1 sync per commit, got %ld",
-          without);
     CHECK(with == without,
-          "publishing added %ld sync(s) to a commit (P-14)", with - without);
+          "publishing added %ld sync(s) to an open (P-14)", with - without);
 
-    /* And a table really was published, so the comparison meant something. */
+    /* And a table really was published, counted in the RESOLVED per-database
+     * directory (P-2a) -- so the comparison meant something. */
     {
-        DIR *d = opendir(cachedir);
+        DIR *d = opendir(resolved);
         struct dirent *de;
         int tables = 0;
-        CHECK(d != NULL, "opendir cache");
+        CHECK(d != NULL, "opendir %s", resolved);
         while ((de = readdir(d)))
             if (!strncmp(de->d_name, ZSI_IDX_NAME_PREFIX,
                          strlen(ZSI_IDX_NAME_PREFIX)))
@@ -1195,7 +1209,6 @@ static void test_idxcache_no_fsync_on_publish(void)
     passed++;
     fprintf(stderr, "  publishing adds no sync (P-14)           ok\n");
 }
-
 static void test_snapshot_gap_retry(void)
 {
     /* C-4a/C-4b: a file removed between scanning the directory and opening the
