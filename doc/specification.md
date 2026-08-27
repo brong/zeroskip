@@ -414,10 +414,19 @@ deletion                              nibble 0xA / 0xB
   +4   .  key NUL                       +16  .  key NUL
 ```
 
-- **F-14a** A record's length is
-  `hdr + keylen + 1 + (IsDelete ? 0 : vallen + 1)`, where `hdr` is 4 or 16.
+- **F-14a** A NUL follows the key if there is a key, and a NUL follows the value
+  if there is a value. So, with `hdr` being 4 or 16:
+
+  ```
+  record    (keylen >= 1, !IsDelete)   hdr + keylen + 1 + vallen + 1
+  deletion  (keylen >= 1,  IsDelete)   hdr + keylen + 1
+  terminator (keylen == 0)             hdr + vallen
+  ```
+
   **A deletion has no value and therefore no value NUL**: the NUL terminates the
-  value, and there is no value to terminate.
+  value, and there is no value to terminate. A **terminator** has neither a key
+  nor a value — its `vallen` describes a fixed payload of two 8-byte fields, not
+  a value — so it carries no NUL at all and is 20 bytes.
 - **F-14b** A reader MUST NOT consult `vallen` when framing a deletion, so a
   record never has two candidate lengths. A non-zero `vallen` on a deletion is a
   divergence reported by `zs_db_check_consistency` (T-6), not a change to the
@@ -463,8 +472,15 @@ COMMIT / ROLLBACK                     nibble 0x8 / 0xC
 - **F-19a** The span length is carried in the terminator's **payload**, not in
   `vallen`, so that a terminator is always the small form: a 16-bit `vallen`
   would cap a span at 64KB and force every larger one into the big header for no
-  reason. `vallen == 16` describes the payload — two 8-byte fields — and makes a
-  terminator's extent follow F-14a with no special case.
+  reason. `vallen == 16` describes the payload — two 8-byte fields — and a
+  terminator's extent is `4 + vallen` by F-14a's third case.
+
+  That third case **is** a special case, and it is cheaper than pretending
+  otherwise. Making a terminator carry a key NUL and a value NUL to fit one
+  formula would cost two bytes per transaction and put the payload at an odd
+  offset, to unify a branch every reader already has: a terminator and a record
+  mean entirely different things, so `keylen == 0` is tested before anything else
+  is done with either.
 - **F-20** Terminators are only ever found by scanning **forward** from the
   header. Nothing reads them backwards.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
@@ -1878,9 +1894,9 @@ unreadable one.
   over the published name. A table is never modified in place, never appended
   to, and never truncated. G-6 therefore holds for the cache directory as well
   as for the database.
-- **P-5** A table is a 96-byte header, then `nptrs` 8-byte little-endian record
+- **P-5** A table is a 104-byte header, then `nptrs` 8-byte little-endian record
   offsets, then an 8-byte checksum over those offsets. Its size is exactly
-  `96 + 8 × nptrs + 4`.
+  `104 + 8 × nptrs + 8`.
 
   | offset | size | field |
   |---|---|---|
@@ -1937,7 +1953,7 @@ unreadable one.
   - the magic matches, the header checksum validates, and the checksum over the
     offset array validates;
   - `version_read` does not exceed the reader's;
-  - the file size is exactly `96 + 8 × nptrs + 4`;
+  - the file size is exactly `104 + 8 × nptrs + 8`;
   - the recorded engine is the one the data file's header names (P-7);
   - uuid and `start` match the data file;
   - the comparator name matches both the data file's field and the reader's own;

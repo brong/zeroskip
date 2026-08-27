@@ -71,12 +71,16 @@ enum zs_ret {
 enum zs_flagspec {
     ZS_CREATE        = 1<<0,   /* open:    create the database if absent */
     ZS_SHARED        = 1<<1,   /* open,txn: read-only */
-    ZS_NOCSUM        = 1<<2,   /* open:    skip record-checksum verification
-                                  at materialization (F-5e) -- and nothing
-                                  else.  Span checksums are still verified
-                                  whenever a span is indexed, so crash
-                                  recovery and torn-tail detection (F-22,
-                                  C-4f) hold in every mode. */
+    ZS_NOCSUM        = 1<<2,   /* open:    RETIRED in version 4 and REJECTED
+                                  with ZS_BADUSAGE, not ignored (A-18).  No
+                                  record carries a checksum any more (F-32), so
+                                  there is nothing left to skip: span checksums
+                                  are still verified at indexing (F-5e) and an
+                                  in-order file's one checksum only on demand
+                                  (F-26f).  A caller passing this believes it is
+                                  weakening verification for speed and is
+                                  entitled to be told otherwise.  The bit is
+                                  reserved, not reused. */
     ZS_NOSYNC        = 1<<3,   /* open:    omit both durability gates on commit,
                                   and nothing else (C-7c).  Structure is still
                                   synced (C-6b), so a crash costs at most the
@@ -168,7 +172,12 @@ typedef int      zs_cb(void *rock, const char *key, size_t keylen,
                        const char *val, size_t vallen);
 typedef int      zs_compar(const char *a, size_t alen,
                            const char *b, size_t blen);
-typedef uint32_t zs_csum(const char *buf, size_t len);
+/* A checksum engine (F-5).  64 bits since version 4: there is one checksum over
+ * a whole in-order file rather than one per record, so the field is paid once and
+ * a 32-bit digest over hundreds of megabytes is the wrong width.  An engine
+ * narrower than 64 bits MUST place its value in the low half and zero the rest
+ * (F-5b). */
+typedef uint64_t zs_csum(const char *buf, size_t len);
 
 struct zs_open_data {
     uint32_t     flags;
@@ -411,7 +420,15 @@ enum zs_salvage_kind {
     ZS_SALVAGE_SPAN_ROLLBACK,     /* deliberately aborted; not recovered */
     ZS_SALVAGE_RESYNC,            /* a verified span found after damage */
     ZS_SALVAGE_KEY_UNVERIFIED,    /* value came from an unverifiable span */
-    ZS_SALVAGE_KEY_MAYBE_STALE    /* a newer version may have been in lost bytes */
+    ZS_SALVAGE_KEY_MAYBE_STALE,   /* a newer version may have been in lost bytes */
+
+    /* S-13: an in-order file whose one checksum (F-26e) does not verify.
+     * Reported at FILE granularity, once, with its own kind -- so a caller can
+     * tell "this key came from an unverifiable span" from "every key in this
+     * file is unverifiable".  Version 2's per-record checksum could name the
+     * damaged record; one digest over the whole file cannot, and that is the
+     * cost of the density the packed record buys. */
+    ZS_SALVAGE_REGION_UNVERIFIED
 };
 
 struct zs_salvage_event {

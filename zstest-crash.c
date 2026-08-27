@@ -948,10 +948,16 @@ static void test_sync_failure_every_point(void)
 
 static void test_crash_leaves_unaligned_length(void)
 {
-    /* T-8: "leaving a non-8-aligned file length".  A crash mid-write can leave a
-     * file whose length is not a multiple of 8, which F-2's alignment rule would
-     * never produce -- and the reader must handle it as an ordinary torn tail
-     * rather than assuming alignment. */
+    /* T-8: trailing junk bytes.  A crash mid-write can leave a file with a
+     * partial record appended after the last valid span, and the reader must
+     * handle it as an ordinary torn tail (F-24) without losing what was
+     * committed below it.
+     *
+     * This case was "a non-8-aligned file length" until version 4, when records
+     * stopped being padded to a multiple of 8 (F-2) -- so an odd length is now
+     * ordinary rather than impossible, and what is under test is the trailing
+     * garbage rather than its alignment.  The clean length is measured for the
+     * same reason. */
     total++;
 
     hooks_reset();
@@ -967,6 +973,13 @@ static void test_crash_leaves_unaligned_length(void)
     char path[DBPATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", dbdir, name);
 
+    /* The clean size, measured rather than computed: records are packed since
+     * version 4 (F-2), so a file's length is whatever its records add up to and
+     * hardcoding it here is how this test broke when the encoding changed. */
+    struct stat st;
+    CHECK(stat(path, &st) == 0, "stat");
+    off_t clean = st.st_size;
+
     for (int extra = 1; extra < 8; extra++) {
         int fd = open(path, O_WRONLY | O_APPEND);
         CHECK(fd >= 0, "reopen for append");
@@ -980,17 +993,16 @@ static void test_crash_leaves_unaligned_length(void)
         bool ok = read_state(state, sizeof(state));
         alarm(0);
 
-        CHECK(ok, "reopen with length %% 8 == %d failed",
-              (int)((72 + 24 + extra) % 8));
+        CHECK(ok, "reopen with %d junk bytes appended failed", extra);
         CHECK(strstr(state, "a=1") != NULL,
               "committed data lost at extra=%d: '%s'", extra, state);
 
         /* Truncate back for the next iteration. */
-        if (truncate(path, 96) != 0) CHECK(0, "truncate");
+        if (truncate(path, clean) != 0) CHECK(0, "truncate");
     }
 
     passed++;
-    fprintf(stderr, "  crash leaving a non-8-aligned length     ok\n");
+    fprintf(stderr, "  crash leaving trailing junk bytes        ok\n");
 }
 
 static void test_crash_after_invalid_terminator(void)
@@ -1018,11 +1030,14 @@ static void test_crash_after_invalid_terminator(void)
     snprintf(path, sizeof(path), "%s/%s", dbdir, name);
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0, "append");
-    char fake[8];
+    char fake[ZSI_TERMLEN];
     memset(fake, 0, sizeof(fake));
-    fake[0] = (char)ZSI_COMMIT;
-    zsi_put24(fake + 1, 0);
-    zsi_put32(fake + 4, 0xDEADBEEF);        /* a wrong checksum */
+    /* A well-formed COMMIT: keylen 0, vallen 16, a zero span length -- and a
+     * deliberately wrong checksum, so it decodes but does not validate. */
+    zsi_put16(fake, ZSI_MUSTBEONE);
+    zsi_put16(fake + 2, ZSI_TERM_VALLEN);
+    zsi_put64(fake + ZSI_TERM_OFF_SPANLEN, 0);
+    zsi_put64(fake + ZSI_TERM_OFF_CSUM, 0xDEADBEEFDEADBEEFull);
     if (write(fd, fake, sizeof(fake)) != (ssize_t)sizeof(fake)) {
         close(fd);
         CHECK(0, "write fake terminator");

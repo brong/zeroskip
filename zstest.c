@@ -275,26 +275,36 @@ static void test_strerror(void)
  */
 static void test_interop_constants_csum(void)
 {
-    /* XXH3_64bits with seed 0, low 32 bits, little-endian (F-5b). */
-    ASSERT_EQU(zsi_csum_xxhash("", 0),      0x38D394C2u);
-    ASSERT_EQU(zsi_csum_xxhash("a", 1),     0x1E964E1Fu);
-    ASSERT_EQU(zsi_csum_xxhash("abc", 3),   0x892F3950u);
+    /* XXH3_64bits with seed 0, ALL 64 bits, little-endian (F-5b).
+     *
+     * Version 2 stored the low 32 bits, and every one of these values still ENDS
+     * IN the old constant -- 0x2D06800538D394C2 against 0x38D394C2, and so on.
+     * That is the check worth having here: it proves the engine is the same
+     * function untruncated, rather than a different hash that happens to be
+     * 64 bits wide. */
+    ASSERT_EQU(zsi_csum_xxhash("", 0),      0x2D06800538D394C2ull);
+    ASSERT_EQU(zsi_csum_xxhash("a", 1),     0xE6C632B61E964E1Full);
+    ASSERT_EQU(zsi_csum_xxhash("abc", 3),   0x78AF5F94892F3950ull);
+
+    ASSERT_EQU(zsi_csum_xxhash("", 0)    & 0xFFFFFFFFu, 0x38D394C2u);
+    ASSERT_EQU(zsi_csum_xxhash("a", 1)   & 0xFFFFFFFFu, 0x1E964E1Fu);
+    ASSERT_EQU(zsi_csum_xxhash("abc", 3) & 0xFFFFFFFFu, 0x892F3950u);
 
     static const unsigned char magic[16] = {
         0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
-        0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
+        0x70, 0x34, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
     };
-    ASSERT_EQU(zsi_csum_xxhash((const char *)magic, 16), 0x0464B4F6u);
+    ASSERT_EQU(zsi_csum_xxhash((const char *)magic, 16), 0xA8DE45D72B173C6Eull);
 
     char big[1024];
     for (size_t i = 0; i < sizeof(big); i++) big[i] = (char)(i & 0xFF);
-    ASSERT_EQU(zsi_csum_xxhash(big, sizeof(big)), 0x84398D22u);
+    ASSERT_EQU(zsi_csum_xxhash(big, sizeof(big)), 0xA870F92984398D22ull);
 
     /* The empty input F-26g needs, called out separately because it is the one
      * an implementer is most likely to short-circuit to zero -- twom's engine
-     * does exactly that.  A zero-record in-order file stores this value for its
-     * records region, so getting it wrong makes every empty file fail its own
-     * consistency check. */
+     * does exactly that.  A zero-record in-order file checksums its 104-byte
+     * header-plus-trailer prefix, so an engine that special-cases a short input
+     * makes every empty file fail its own consistency check. */
     ASSERT(zsi_csum_xxhash("", 0) != 0);
 
     /* Engine 0 writes zeros and never verifies (F-5). */
@@ -304,10 +314,26 @@ static void test_interop_constants_csum(void)
     /* zsi_csum2 checksums two regions as though concatenated (F-19).  Assert it
      * agrees with the one-shot form rather than trusting that XXH3's streaming
      * API does, since the whole span-terminator checksum rests on it. */
-    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "ab", 2, "c", 1), 0x892F3950u);
-    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "abc", 3, "", 0), 0x892F3950u);
-    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "", 0, "abc", 3), 0x892F3950u);
-    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "", 0, "", 0),    0x38D394C2u);
+    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "ab", 2, "c", 1),
+               0x78AF5F94892F3950ull);
+    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "abc", 3, "", 0),
+               0x78AF5F94892F3950ull);
+    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "", 0, "abc", 3),
+               0x78AF5F94892F3950ull);
+    ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH, "", 0, "", 0),
+               0x2D06800538D394C2ull);
+
+    /* And zsi_csumv over three regions, which the in-order writers need: one
+     * checksum covers the header, the records and the tail, held in separate
+     * buffers (F-26e). */
+    {
+        struct zsi_region v[3];
+        v[0].p = "a"; v[0].len = 1;
+        v[1].p = "b"; v[1].len = 1;
+        v[2].p = "c"; v[2].len = 1;
+        ASSERT_EQU(zsi_csumv(NULL, ZSI_CSUM_XXHASH, v, 3),
+                   0x78AF5F94892F3950ull);
+    }
     ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_NONE, "ab", 2, "c", 1),   0u);
 
     /* Split a longer buffer at every offset; every split must agree. */
@@ -315,7 +341,7 @@ static void test_interop_constants_csum(void)
         ASSERT_EQU(zsi_csum2(NULL, ZSI_CSUM_XXHASH,
                              big, split,
                              big + split, sizeof(big) - split),
-                   0x84398D22u);
+                   0xA870F92984398D22ull);
     }
 
     /* Engine ids and the flag mapping (F-5, A-6). */
@@ -455,6 +481,9 @@ static void test_interop_constants_uuid(void)
  */
 static void test_le_accessors(void)
 {
+    /* There is no 24-bit accessor any more: it existed only for version 2's
+     * short terminator, whose 3-byte span length is gone now that a terminator
+     * carries spanlen in an 8-byte payload field (F-19a). */
     /* Little-endian, and independent of host byte order (F-1). */
     static const unsigned char buf[8] = {
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
@@ -462,7 +491,6 @@ static void test_le_accessors(void)
     const char *p = (const char *)buf;
 
     ASSERT_EQU(zsi_get16(p), 0x0201u);
-    ASSERT_EQU(zsi_get24(p), 0x030201u);
     ASSERT_EQU(zsi_get32(p), 0x04030201u);
     ASSERT_EQU(zsi_get64(p), 0x0807060504030201ull);
 
@@ -474,8 +502,6 @@ static void test_le_accessors(void)
         zsi_put16(out + off, 0xBEEF);
         ASSERT_EQU(zsi_get16(out + off), 0xBEEFu);
 
-        zsi_put24(out + off, 0xABCDEF);
-        ASSERT_EQU(zsi_get24(out + off), 0xABCDEFu);
 
         zsi_put32(out + off, 0xDEADBEEF);
         ASSERT_EQU(zsi_get32(out + off), 0xDEADBEEFu);
@@ -492,8 +518,6 @@ static void test_le_accessors(void)
     ASSERT_EQ((unsigned char)out[8], 0x5A);
 
     memset(out, 0x5A, sizeof(out));
-    zsi_put24(out + 4, 0xFFFFFF);
-    ASSERT_EQU(zsi_get24(out + 4), 0xFFFFFFu);
     ASSERT_EQ((unsigned char)out[3], 0x5A);
     ASSERT_EQ((unsigned char)out[7], 0x5A);
 }
@@ -913,9 +937,15 @@ static void test_magic(void)
     /* The 16 bytes, as literals.  Any change here is a format change. */
     static const unsigned char expect[16] = {
         0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
-        0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
+        0x70, 0x34, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00
     };
     ASSERT_MEM_EQ(zsi_magic, expect, 16);
+
+    /* The digit is the format version and AGREES with the header's version
+     * fields from version 4 on (F-7b).  It did not before -- a version-2 file
+     * carries the digit 1 -- so this assertion is what stops the two drifting
+     * apart again. */
+    ASSERT_EQ(zsi_magic[9], '0' + ZSI_VERSION_READ);
 
     /* F-6a: not valid UTF-8, and it is byte 0 alone that carries the property --
      * every byte after it is ASCII.  Asserted both ways so a future change to
@@ -945,7 +975,7 @@ static void test_magic(void)
             /* Recompute the checksum, so this tests the magic check rather than
              * incidentally tripping the checksum.  Without this the test would
              * pass even if the magic were never examined. */
-            zsi_put32(t + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(t, ZSI_HDR_OFF_CSUM));
+            zsi_put64(t + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(t, ZSI_HDR_OFF_CSUM));
             if (zsi_header_decode(t, sizeof(t), zsi_csum_xxhash, &h) == ZS_OK) {
                 fprintf(stderr, "\n    FAIL magic byte %zu = 0x%02X accepted\n",
                         pos, v);
@@ -986,7 +1016,7 @@ static void test_magic_designed_corruptions(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
         memcpy(buf, cases[i].m, 16);
-        zsi_put32(buf + ZSI_HDR_OFF_CSUM,
+        zsi_put64(buf + ZSI_HDR_OFF_CSUM,
                   zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
         if (zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h) == ZS_OK) {
             fprintf(stderr, "\n    FAIL corruption '%s' accepted\n",
@@ -1068,22 +1098,34 @@ static void test_header_roundtrip(void)
  * mismatch: if this fails, the format moved. */
 static void test_header_byte_layout(void)
 {
+    /* The 80 bytes, as literals, laid out from the spec's table in section 4.3
+     * and NOT from the encoder -- which is the whole point.  A matched
+     * encoder/decoder change round-trips perfectly, so only an independently
+     * derived literal can catch it: swap the start and end offsets in both and
+     * every other header test still passes.  That finding is why this test
+     * exists.
+     *
+     * The last 8 bytes are the checksum over [0, 72), which necessarily comes
+     * from the engine -- and the engine itself is pinned separately, by
+     * test_interop_constants_csum. */
     static const unsigned char golden[ZSI_HEADER_LEN] = {
-        /* 0  magic, all 16 bytes */
+        /* 0 magic, with the format digit 4 (F-7b) */
         0x89, 0x7A, 0x65, 0x72, 0x6F, 0x73, 0x6B, 0x69,
-        0x70, 0x31, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00,
-        /* 16 vread, 17 vwrite, 18 flags (LE), 20 reserved */
-        0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x70, 0x34, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00,
+        /* 16 vread, 17 vwrite, 18 flags, 20 reserved */
+        0x04, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
         /* 24 uuid */
         0x49, 0x41, 0xDA, 0x54, 0x94, 0x06, 0x4F, 0xAA,
         0xA4, 0x57, 0xC4, 0xB6, 0x5B, 0xEA, 0xE3, 0xEB,
-        /* 40 start = 0x01020304 LE, 44 end = 0x05060708 LE */
+        /* 40 start, 44 end */
         0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,
         /* 48 comparator name, NUL-padded to 16 */
         0x6D, 0x65, 0x6D, 0x63, 0x6D, 0x70, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        /* 64 reserved, 68 checksum of [0, 68) */
-        0x00, 0x00, 0x00, 0x00, 0x8F, 0x2D, 0xF0, 0xE0
+        /* 64 reserved (8 bytes now) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* 72 checksum of [0, 72), 8 bytes little-endian */
+        0x39, 0x73, 0x01, 0x14, 0xB3, 0x57, 0x36, 0x0B
     };
 
     static const zsi_uuid_t u = {
@@ -1093,15 +1135,15 @@ static void test_header_byte_layout(void)
     struct zsi_header h;
     char buf[ZSI_HEADER_LEN];
 
-    ASSERT_EQ(ZSI_HEADER_LEN, 72);
+    ASSERT_EQ(ZSI_HEADER_LEN, 80);
     ASSERT_EQ(ZSI_MAGIC_LEN, 16);
 
-    /* version 2, the format-flip minimum (F-32): version 1 was never
-     * released and zsi_header_decode now refuses it outright, so the golden
-     * buffer this test decodes back below must carry a version it accepts. */
+    /* Version 4: zsi_header_decode refuses anything below it outright (F-7a),
+     * so the golden buffer this test decodes back below must carry a version it
+     * accepts. */
     memset(&h, 0, sizeof(h));
-    h.version_read  = 2;
-    h.version_write = 2;
+    h.version_read  = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
     h.flags         = 1;
     memcpy(h.uuid, u, 16);
     h.start = 0x01020304;
@@ -1123,16 +1165,16 @@ static void test_header_byte_layout(void)
     /* Each field at its literal offset, so a failure names the field rather than
      * just an offset. */
     ASSERT_MEM_EQ(buf + 0, zsi_magic, 16);
-    ASSERT_EQ((unsigned char)buf[16], 2);
-    ASSERT_EQ((unsigned char)buf[17], 2);
+    ASSERT_EQ((unsigned char)buf[16], 4);
+    ASSERT_EQ((unsigned char)buf[17], 4);
     ASSERT_EQU(zsi_get16(buf + 18), 1u);
     ASSERT_EQU(zsi_get32(buf + 20), 0u);
     ASSERT_MEM_EQ(buf + 24, u, 16);
     ASSERT_EQU(zsi_get32(buf + 40), 0x01020304u);
     ASSERT_EQU(zsi_get32(buf + 44), 0x05060708u);
     ASSERT_MEM_EQ(buf + 48, "memcmp\0\0\0\0\0\0\0\0\0\0", 16);
-    ASSERT_EQU(zsi_get32(buf + 64), 0u);
-    ASSERT_EQU(zsi_get32(buf + 68), 0xE0F02D8Fu);
+    ASSERT_EQU(zsi_get64(buf + 64), 0u);
+    ASSERT_EQU(zsi_get64(buf + 72), 0x0B3657B314017339ull);
 
     /* And it decodes back to what it came from. */
     ASSERT_OK(zsi_header_decode((const char *)golden, ZSI_HEADER_LEN,
@@ -1143,8 +1185,8 @@ static void test_header_byte_layout(void)
     /* A full 16-byte comparator name, which has no NUL padding at all: the copy
      * must be the field width, not the string length. */
     memset(&h, 0, sizeof(h));
-    h.version_read = 2;
-    h.version_write = 2;
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
     h.flags = 1;
     memcpy(h.uuid, u, 16);
     h.start = 1;
@@ -1164,15 +1206,18 @@ static void test_header_versions(void)
     /* A read version above ours is refused (F-7). */
     make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
     buf[ZSI_HDR_OFF_VREAD] = (char)(ZSI_VERSION_READ + 1);
-    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    zsi_put64(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
     ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
               ZS_BADFORMAT);
 
-    /* A read version below 2 is refused too: version 1 was never released,
-     * and its records carry no trailing checksum for F-32 to verify. */
+    /* A read version below ours is refused too, and outright rather than
+     * part-parsed (F-7a): version 4 changed the record encoding, retired the
+     * per-record checksum and moved the pointer array's description into the
+     * trailer, so nothing short of a second decoder could read an older file.
+     * Version 3 must never even be seen, having been withdrawn. */
     make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
-    buf[ZSI_HDR_OFF_VREAD] = 1;
-    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    buf[ZSI_HDR_OFF_VREAD] = (char)(ZSI_VERSION_READ - 1);
+    zsi_put64(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
     ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
               ZS_BADFORMAT);
 
@@ -1181,7 +1226,7 @@ static void test_header_versions(void)
      * is the entire reason there are two version fields. */
     make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
     buf[ZSI_HDR_OFF_VWRITE] = (char)(ZSI_VERSION_WRITE + 5);
-    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    zsi_put64(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
     ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
     ASSERT_EQ(h.version_write, ZSI_VERSION_WRITE + 5);
     ASSERT_EQ(h.version_read, ZSI_VERSION_READ);
@@ -1192,7 +1237,7 @@ static void test_header_checksum(void)
     char buf[ZSI_HEADER_LEN];
     struct zsi_header h;
 
-    /* Under engine 1, flipping any byte in [0, 68) is caught.  Bytes 68..71 are
+    /* Under engine 1, flipping any byte in [0, 72) is caught.  Bytes 72..79 are
      * the checksum field itself, which F-4 excludes from its own coverage. */
     for (size_t pos = 0; pos < ZSI_HDR_OFF_CSUM; pos++) {
         make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
@@ -1219,7 +1264,7 @@ static void test_header_checksum(void)
      * be asserting the wrong thing.  A UUID is opaque, so no rule can save it --
      * which is precisely the exposure engine 0 accepts. */
     make_header(buf, 1, 0, ZSI_CSUM_NONE);
-    ASSERT_EQU(zsi_get32(buf + ZSI_HDR_OFF_CSUM), 0u);
+    ASSERT_EQU(zsi_get64(buf + ZSI_HDR_OFF_CSUM), 0u);
     buf[ZSI_HDR_OFF_UUID + 3] ^= 0x01;
     ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_none, &h));
     ASSERT_EQ(h.uuid[3], 0x54 ^ 0x01);
@@ -1249,7 +1294,7 @@ static void test_header_reserved(void)
         size_t off = which ? ZSI_HDR_OFF_RESERVED2 : ZSI_HDR_OFF_RESERVED1;
         make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
         zsi_put32(buf + off, 0xDEADBEEF);
-        zsi_put32(buf + ZSI_HDR_OFF_CSUM,
+        zsi_put64(buf + ZSI_HDR_OFF_CSUM,
                   zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
         ASSERT_OK(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h));
     }
@@ -1270,7 +1315,7 @@ static void test_header_bounds_and_ranges(void)
     /* F-9: generations start at 1, so start == 0 is never legitimate. */
     make_header(buf, 1, 0, ZSI_CSUM_XXHASH);
     zsi_put32(buf + ZSI_HDR_OFF_START, 0);
-    zsi_put32(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
+    zsi_put64(buf + ZSI_HDR_OFF_CSUM, zsi_csum_xxhash(buf, ZSI_HDR_OFF_CSUM));
     ASSERT_EQ(zsi_header_decode(buf, sizeof(buf), zsi_csum_xxhash, &h),
               ZS_BADFORMAT);
 
@@ -1290,73 +1335,83 @@ static void test_header_bounds_and_ranges(void)
  * ============================================================
  */
 
-static void test_type_byte_validity(void)
+static void test_flag_nibble_validity(void)
 {
-    /* T-2b: all 256 byte values fed as a record type, asserting exactly the
-     * ten in F-12's table are accepted and the other 246 rejected. */
-    static const uint8_t legal[] = {
-        0x01, 0x03, 0x05, 0x07,
-        0x10, 0x12, 0x14, 0x16, 0x20, 0x24
+    /* T-2b: every one of the 16 nibbles, in both roles, asserting exactly the
+     * six encodings in F-12's table are accepted.
+     *
+     * The nibble alone does not decide: keylen == 0 is what separates a
+     * terminator from a record (F-14), so three rows are legal only with a key
+     * and two only without.  zsi_flags_valid therefore takes both. */
+    struct { uint8_t nibble; bool with_key; bool without_key; } expect[] = {
+        /* MustBeOne alone: a record, or a COMMIT */
+        { ZSI_MUSTBEONE,                                    true,  true  },
+        { ZSI_MUSTBEONE | ZSI_ISBIG,                        true,  false },
+        { ZSI_MUSTBEONE | ZSI_ISDELETE,                     true,  false },
+        { ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE,         true,  false },
+        { ZSI_MUSTBEONE | ZSI_ISROLLBACK,                   false, true  },
     };
-    bool is_legal[256];
-    memset(is_legal, 0, sizeof(is_legal));
-    for (size_t i = 0; i < sizeof(legal); i++) is_legal[legal[i]] = true;
 
-    int naccepted = 0;
-    for (unsigned v = 0; v < 256; v++) {
-        bool got = zsi_type_valid((uint8_t)v);
-        if (got) naccepted++;
-        if (got != is_legal[v]) {
-            fprintf(stderr, "\n    FAIL type 0x%02X: %s, expected %s\n", v,
-                    got ? "accepted" : "rejected",
-                    is_legal[v] ? "accepted" : "rejected");
+    int nlegal_key = 0, nlegal_nokey = 0;
+
+    for (unsigned v = 0; v < 16; v++) {
+        bool want_key = false, want_nokey = false;
+        for (size_t i = 0; i < sizeof(expect)/sizeof(expect[0]); i++) {
+            if (expect[i].nibble == v) {
+                want_key   = expect[i].with_key;
+                want_nokey = expect[i].without_key;
+            }
+        }
+
+        bool got_key   = zsi_flags_valid((uint8_t)v, true);
+        bool got_nokey = zsi_flags_valid((uint8_t)v, false);
+
+        if (got_key != want_key || got_nokey != want_nokey) {
+            fprintf(stderr, "\n    FAIL nibble 0x%X: key=%d/%d nokey=%d/%d\n",
+                    v, got_key, want_key, got_nokey, want_nokey);
+            current_test_failed = 1;
+            return;
+        }
+        if (got_key) nlegal_key++;
+        if (got_nokey) nlegal_nokey++;
+    }
+
+    /* Four record shapes and two terminators: six encodings in total (F-12). */
+    ASSERT_EQ(nlegal_key, 4);
+    ASSERT_EQ(nlegal_nokey, 2);
+
+    /* MustBeOne clear is malformed in every combination (F-12b), which is also
+     * what makes byte 0 non-zero for every record and so what F-26d1's padding
+     * and F-27a's pointer check rest on.  Eight of the sixteen nibbles die here. */
+    for (unsigned v = 0; v < 8; v++) {
+        ASSERT(!zsi_flags_valid((uint8_t)v, true));
+        ASSERT(!zsi_flags_valid((uint8_t)v, false));
+    }
+
+    /* The near-misses, each a plausible single flipped bit from a valid
+     * encoding, and each rejected rather than half-interpreted.  IsRollback
+     * belongs only to a terminator; IsBig and IsDelete only to a record. */
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK, true));
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISBIG, false));
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISDELETE, false));
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISDELETE, true));
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISDELETE, false));
+    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISBIG, false));
+
+    /* And the property the whole scheme buys: a decoded record's first byte is
+     * never zero, whatever its key length.  16 is the case that would fail
+     * without MustBeOne, since keylen & 0x0F == 0 there. */
+    for (size_t kl = 1; kl <= 64; kl++) {
+        char buf[128];
+        char key[65];
+        memset(key, 'k', sizeof(key));
+        zsi_rec_encode(buf, key, kl, "v", 1);
+        if (buf[0] == 0) {
+            fprintf(stderr, "\n    FAIL keylen %zu gives a NUL first byte\n", kl);
             current_test_failed = 1;
             return;
         }
     }
-    ASSERT_EQ(naccepted, 10);
-
-    /* A bitfield admits far more values than it defines, so the near-misses
-     * matter most: each of these is a plausible single flipped bit away from a
-     * valid type, and each must be rejected rather than half-interpreted. */
-
-    /* two family bits set at once */
-    ASSERT(!zsi_type_valid(ZSI_HASKEY | ZSI_SPANTERM));       /* 0x11 */
-    ASSERT(!zsi_type_valid(ZSI_HASKEY | ZSI_POINTERS));       /* 0x21 */
-    ASSERT(!zsi_type_valid(ZSI_SPANTERM | ZSI_POINTERS));     /* 0x30 */
-    ASSERT(!zsi_type_valid(0x31));
-
-    /* The reserved 0x08, alone and on top of each shape it can combine with.
-     * F-12c reserves the bit rather than reusing it, so a peer writing any of
-     * these is rejected record by record rather than silently misread. */
-    ASSERT(!zsi_type_valid(0x08));
-    ASSERT(!zsi_type_valid(0x09));                            /* KEYVALUE_ANC */
-    ASSERT(!zsi_type_valid(0x0B));                            /* DELETION_ANC */
-    ASSERT(!zsi_type_valid(0x0D));                         /* BIGKEYVALUE_ANC */
-    ASSERT(!zsi_type_valid(0x0F));                         /* BIGDELETION_ANC */
-    ASSERT(!zsi_type_valid(0x18));
-    ASSERT(!zsi_type_valid(0x28));
-
-    /* IsDelete with Pointers */
-    ASSERT(!zsi_type_valid(ZSI_POINTERS | ZSI_ISDELETE));     /* 0x22 */
-    ASSERT(!zsi_type_valid(0x26));
-
-    /* either reserved bit set, on an otherwise valid type */
-    for (size_t i = 0; i < sizeof(legal); i++) {
-        ASSERT(!zsi_type_valid((uint8_t)(legal[i] | 0x40)));
-        ASSERT(!zsi_type_valid((uint8_t)(legal[i] | 0x80)));
-    }
-
-    /* and zero, which is what a hole in a sparse file reads as */
-    ASSERT(!zsi_type_valid(0x00));
-
-    /* The bits mean what F-12a says in isolation, checked against the table
-     * rather than assumed. */
-    ASSERT(ZSI_DELETION == (ZSI_KEYVALUE | ZSI_ISDELETE));
-    ASSERT(ZSI_BIGKEYVALUE == (ZSI_KEYVALUE | ZSI_ISBIG));
-    ASSERT(ZSI_ROLLBACK == (ZSI_COMMIT | ZSI_ISDELETE));
-    ASSERT(ZSI_COMMIT_LONG == (ZSI_COMMIT | ZSI_ISBIG));
-    ASSERT(ZSI_PTRS64 == (ZSI_PTRS32 | ZSI_ISBIG));
 }
 
 /* The record layouts, pinned against literals derived by hand from section 4.5's
@@ -1369,158 +1424,156 @@ static void test_type_byte_validity(void)
 static void test_record_byte_layout(void)
 {
     char buf[64];
-    /* Engine 0 writes a ZERO checksum field (F-32), which is what keeps these
-     * literals simple: the trailing 4 bytes are zero, exactly where the old
-     * (pre-F-32) layout already had zero padding. test_record_byte_layout_v2
-     * is what pins a real, nonzero engine's checksum against a literal. */
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
 
-    /* KEYVALUE (0x01): key "ab", value "xy".
-     *   +0 type, +1 keylen, +2 vallen(LE16), +4 key NUL value NUL,
-     *   pad, last 4 bytes checksum (F-32)
-     *   len = roundup8(4 + 2 + 1 + 2 + 1 + 4) = roundup8(14) = 16 */
-    static const unsigned char kv[16] = {
-        0x01, 0x02, 0x02, 0x00, 'a', 'b', 0x00, 'x',
-        'y',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false), 16u);
-    memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2);
-    ASSERT_MEM_EQ(buf, kv, 16);
+    /* Records carry no checksum (F-32 retired) and are PACKED (F-2), so every
+     * byte below is data and the length is exactly F-14a's expression.  That is
+     * what makes these literals short enough to read: version 2's had a
+     * roundup8 pad and a trailing 4-byte checksum field on every record.
+     *
+     * The nibble is the low half of byte 0 and keylen occupies the bits above
+     * it, so byte 0 of a record with a 2-byte key is 0x08 | (2 << 4) = 0x28. */
 
-    /* DELETION (0x03): key "ab", no value field at all.
-     *   +0 type, +1 keylen, +2 pad(2), +4 key NUL, then padding, then checksum
-     *   len = roundup8(4 + 2 + 1 + 4) = roundup8(11) = 16 */
-    static const unsigned char del[16] = {
-        0x03, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    /* A record: key "ab", value "xy".
+     *   +0 flags:4|keylen:12 (LE16), +2 vallen (LE16), +4 key NUL value NUL
+     *   len = 4 + 2 + 1 + 2 + 1 = 10 */
+    static const unsigned char kv[10] = {
+        0x28, 0x00, 0x02, 0x00, 'a', 'b', 0x00, 'x', 'y', 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 2, false), 10u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0);
-    ASSERT_MEM_EQ(buf, del, 16);
+    zsi_rec_encode(buf, "ab", 2, "xy", 2);
+    ASSERT_MEM_EQ(buf, kv, 10);
+
+    /* A deletion: key "ab", NO value and therefore NO value NUL (F-14a).
+     *   len = 4 + 2 + 1 = 7 */
+    static const unsigned char del[7] = {
+        0x2A, 0x00, 0x00, 0x00, 'a', 'b', 0x00
+    };
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, true), 7u);
+    memset(buf, 0xAA, sizeof(buf));
+    zsi_rec_encode(buf, "ab", 2, NULL, 0);
+    ASSERT_MEM_EQ(buf, del, 7);
 
     /* An empty value is legal and distinct from an absent key (F-14, A-1).
-     *   len = roundup8(4 + 2 + 1 + 0 + 1 + 4) = roundup8(12) = 16 */
-    static const unsigned char kv_empty[16] = {
-        0x01, 0x02, 0x00, 0x00, 'a', 'b', 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+     *   len = 4 + 2 + 1 + 0 + 1 = 8 */
+    static const unsigned char kv_empty[8] = {
+        0x28, 0x00, 0x00, 0x00, 'a', 'b', 0x00, 0x00
     };
-    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false), 16u);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 0, false), 8u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, "ab", 2, "", 0);
-    ASSERT_MEM_EQ(buf, kv_empty, 16);
+    zsi_rec_encode(buf, "ab", 2, "", 0);
+    ASSERT_MEM_EQ(buf, kv_empty, 8);
 
-    /* Note this is byte-distinct from DELETION above at exactly one place -- the
-     * type byte -- and identical everywhere else.  Which is the whole reason an
-     * empty value and an absent key cannot be told apart by length. */
-    ASSERT_EQ(kv_empty[0], 0x01);
-    ASSERT_EQ(del[0], 0x03);
-    ASSERT_MEM_EQ(kv_empty + 1, del + 1, 7);
+    /* An empty value and a deletion now differ in their LENGTH as well as in
+     * the IsDelete bit, because the deletion has no value NUL -- 8 bytes against
+     * 7.  In version 2 they were byte-identical apart from the type byte, both
+     * padded to 16.  The distinction still cannot be made from the length alone
+     * in general (a 1-byte value would also be 9), which is why A-1 needs the
+     * flag; but it does mean the two are never confusable here. */
+    ASSERT_EQ(kv_empty[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE | (2 << 4) & 0x0F);
+    ASSERT_EQ(kv_empty[0], 0x28);
+    ASSERT_EQ(del[0], 0x2A);
+    ASSERT_EQ(del[0] ^ kv_empty[0], ZSI_ISDELETE);
+    ASSERT_MEM_EQ(kv_empty + 1, del + 1, 6);
+
+    /* A 16-byte key: the case that would give byte 0 == 0x00 without MustBeOne
+     * (F-12b), since keylen & 0x0F is then zero.  This is the assertion that
+     * would have caught the padding-recognition hole. */
+    memset(buf, 0xAA, sizeof(buf));
+    zsi_rec_encode(buf, "0123456789abcdef", 16, "v", 1);
+    ASSERT_EQ((unsigned char)buf[0], 0x08);       /* nibble only; keylen's low
+                                                     nibble is 0 */
+    ASSERT_EQ((unsigned char)buf[1], 0x01);       /* keylen 16 = 0x010 << 4 */
+    ASSERT(buf[0] != 0);
+    ASSERT_EQU(zsi_get16(buf) >> ZSI_KEYLEN_SHIFT, 16u);
 }
 
 static void test_record_byte_layout_big(void)
 {
-    /* The big forms' fixed headers, asserted byte for byte.  The bodies are too
-     * large for a literal, so the header and the total length are pinned here and
-     * the body placement is checked by decoding.
+    /* The big form's fixed header, asserted byte for byte.  The body is too large
+     * for a literal, so the header and the total length are pinned here and the
+     * body placement is checked by reading it back.
      *
-     * The +4 for F-32's trailing checksum lands inside padding these big forms
-     * already carried (same roundup8 step, or absorbed exactly), so none of
-     * the totals below change from the pre-F-32 layout -- verified by hand
-     * for each below, not assumed. */
-    size_t keylen = 256;                 /* one past the short form's limit */
+     * The nibble and keylen share ONE 64-bit word in the big form, exactly as
+     * they share a 16-bit word in the small one: flags in the low 4 bits, keylen
+     * in the 60 above.  So the first word is 0x09 | (4096 << 4) = 0x10009 --
+     * the nibble being MustBeOne|IsBig, not MustBeOne alone. */
+    size_t keylen = 4096;                /* one past the small form's limit */
     char *key = malloc(keylen);
     ASSERT_NOT_NULL(key);
     for (size_t i = 0; i < keylen; i++) key[i] = (char)('A' + (i % 26));
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
 
-    /* BIGKEYVALUE (0x05): +0 type, +1 pad(7), +8 keylen(LE64), +16 vallen(LE64),
-     *                     +24 key NUL value NUL, then checksum (F-32)
-     *   len = roundup8(24 + 256 + 1 + 2 + 1 + 4) = roundup8(288) = 288 */
-    size_t want = 288;
+    /* A big record: +0 flags:4|keylen:60 (LE64), +8 vallen (LE64),
+     *               +16 key NUL value NUL
+     *   len = 16 + 4096 + 1 + 2 + 1 = 4116 */
+    size_t want = 16 + keylen + 1 + 2 + 1;
     ASSERT_EQU(zsi_rec_encoded_len(keylen, 2, false), want);
     char *buf = malloc(want + 16);
     ASSERT_NOT_NULL(buf);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, "xy", 2);
+    zsi_rec_encode(buf, key, keylen, "xy", 2);
 
-    static const unsigned char bkv_hdr[24] = {
-        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   /* keylen = 256 */
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    /* vallen = 2   */
+    static const unsigned char bkv_hdr[16] = {
+        0x09, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,   /* 0x09 | 4096<<4 */
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    /* vallen = 2     */
     };
-    ASSERT_MEM_EQ(buf, bkv_hdr, 24);
-    ASSERT_MEM_EQ(buf + 24, key, keylen);
-    ASSERT_EQ(buf[24 + keylen], 0);
-    ASSERT_MEM_EQ(buf + 24 + keylen + 1, "xy", 2);
-    ASSERT_EQ(buf[24 + keylen + 1 + 2], 0);
+    ASSERT_MEM_EQ(buf, bkv_hdr, 16);
+    ASSERT_EQU(zsi_get64(buf) & ZSI_FLAG_MASK, ZSI_MUSTBEONE | ZSI_ISBIG);
+    ASSERT_EQU(zsi_get64(buf) >> ZSI_KEYLEN_SHIFT, (uint64_t)keylen);
+    ASSERT_MEM_EQ(buf + 16, key, keylen);
+    ASSERT_EQ(buf[16 + keylen], 0);
+    ASSERT_MEM_EQ(buf + 16 + keylen + 1, "xy", 2);
+    ASSERT_EQ(buf[16 + keylen + 1 + 2], 0);
 
-    /* BIGDELETION (0x07): +0 type, +1 pad(7), +8 keylen, +16 key NUL, checksum
-     *   len = roundup8(16 + 256 + 1 + 4) = roundup8(277) = 280 */
-    ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true), 280u);
+    /* A big deletion: no value and so no value NUL (F-14a).
+     *   len = 16 + 4096 + 1 = 4113 */
+    ASSERT_EQU(zsi_rec_encoded_len(keylen, 0, true), 16u + keylen + 1u);
     memset(buf, 0xAA, want + 16);
-    zsi_rec_encode(buf, cs, key, keylen, NULL, 0);
+    zsi_rec_encode(buf, key, keylen, NULL, 0);
     static const unsigned char bdel_hdr[16] = {
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        0x0B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,   /* MustBeOne|IsBig
+                                                             |IsDelete      */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    /* vallen = 0     */
     };
     ASSERT_MEM_EQ(buf, bdel_hdr, 16);
-    ASSERT_MEM_EQ(buf + 16, key, keylen);
+    ASSERT_EQ(buf[16 + keylen], 0);
+
+    /* Promoted by the VALUE rather than the key, which the small form's 16-bit
+     * vallen cannot hold. */
+    ASSERT_EQ(zsi_rec_flags_for(2, 65536, false), ZSI_MUSTBEONE | ZSI_ISBIG);
+    ASSERT_EQU(zsi_rec_encoded_len(2, 65536, false), 16u + 2u + 1u + 65536u + 1u);
 
     free(buf);
     free(key);
 }
 
-/* F-32: the checksum is the LAST 4 bytes of the padded record, covering
- * [0, len-4).  Asserted against literals for the structure, and against a
- * direct call to the engine function for the checksum itself -- never
- * against zsi_rec_encode's own output for the same field, which is exactly
- * the round-trip trap test_header_byte_layout's mutation history warns
- * about (a symmetric encode/decode bug would pass that check too). */
-static void test_record_byte_layout_v2(void)
-{
-    char buf[64];
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
-
-    /* KEYVALUE "ab" -> "xy": fixed 4 + 2+1+2+1 + csum 4 = 14 -> len 16. */
-    zsi_rec_encode(buf, cs, "ab", 2, "xy", 2);
-    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 2, false), 16u);
-    ASSERT_EQ(buf[0], 0x01);
-    ASSERT_EQ(buf[1], 2);                       /* keylen */
-    ASSERT_EQU(zsi_get16(buf + 2), 2u);         /* vallen */
-    ASSERT_MEM_EQ(buf + 4, "ab\0xy\0", 6);
-    ASSERT_EQ(buf[10], 0); ASSERT_EQ(buf[11], 0);   /* pad, covered */
-    ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));   /* trailing csum */
-
-    /* DELETION "ab": fixed 4 + 2+1 + csum 4 = 11 -> len 16.  The bytes between
-     * the key's NUL and the checksum are padding and are covered by it. */
-    zsi_rec_encode(buf, cs, "ab", 2, NULL, 0);
-    ASSERT_EQ(buf[0], 0x03);
-    ASSERT_EQU((size_t)zsi_rec_encoded_len(2, 0, true), 16u);
-    ASSERT_MEM_EQ(buf + 4, "ab\0", 3);
-    ASSERT_EQU(zsi_get32(buf + 12), cs(buf, 12));
-
-    /* Engine 0 writes a ZERO field. */
-    zs_csum *cs0 = zsi_csum_for_id(ZSI_CSUM_NONE, NULL);
-    zsi_rec_encode(buf, cs0, "ab", 2, "xy", 2);
-    ASSERT_EQU(zsi_get32(buf + 12), 0u);
-}
+/* There is no test_record_byte_layout_v2 any more.  It existed to pin a real
+ * engine's per-record checksum against a literal -- and F-32 is retired, so no
+ * record carries one (F-5f).  What pins a nonzero engine's output against a
+ * literal now is test_header_byte_layout, and for a whole file the corpus. */
 
 static void test_record_roundtrip(void)
 {
-    /* Every one of the four data shapes encodes and decodes back unchanged, with
-     * a total length that is a multiple of 8 and all padding zero (F-2). */
+    /* Every one of the four record encodings round-trips unchanged.  Records are
+     * PACKED since version 4 (F-2), so the length is exactly what F-14a says and
+     * there is no padding to check -- the old "multiple of 8, all pad zero"
+     * assertions are gone because the property is gone.
+     *
+     * 4096 is the first key length that needs the big form (F-15), and a
+     * deletion at the same length proves F-14c: only the key can promote it. */
     struct {
         const char *what;
         size_t keylen, vallen;
         bool isdelete;
-        uint8_t type;
+        uint8_t nibble;
     } shapes[] = {
-        { "KEYVALUE",      2,   2, false, ZSI_KEYVALUE    },
-        { "DELETION",      2,   0, true,  ZSI_DELETION    },
-        { "BIGKEYVALUE", 300,   2, false, ZSI_BIGKEYVALUE },
-        { "BIGDELETION", 300,   0, true,  ZSI_BIGDELETION }
+        { "record",           2,    2, false, ZSI_MUSTBEONE },
+        { "deletion",         2,    0, true,  ZSI_MUSTBEONE | ZSI_ISDELETE },
+        { "big record",    4096,    2, false, ZSI_MUSTBEONE | ZSI_ISBIG },
+        { "big deletion",  4096,    0, true,  ZSI_MUSTBEONE | ZSI_ISBIG
+                                              | ZSI_ISDELETE },
+        /* promoted by the VALUE, not the key */
+        { "big by value",     2, 70000, false, ZSI_MUSTBEONE | ZSI_ISBIG }
     };
 
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
@@ -1533,15 +1586,21 @@ static void test_record_roundtrip(void)
 
         size_t len = zsi_rec_encoded_len(kl, vl, shapes[i].isdelete);
         ASSERT(len > 0);
-        ASSERT_EQU(len % 8, 0u);
+
+        /* F-14a exactly: a NUL after the key, and one after the value only when
+         * there is a value. */
+        size_t hdr = (shapes[i].nibble & ZSI_ISBIG) ? 16 : 4;
+        ASSERT_EQU(len, hdr + kl + 1 + (shapes[i].isdelete ? 0 : vl + 1));
 
         char *buf = malloc(len);
         ASSERT_NOT_NULL(buf);
         memset(buf, 0xAA, len);
-        zsi_rec_encode(buf, zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL), key, kl,
-                       shapes[i].isdelete ? NULL : val, vl);
+        zsi_rec_encode(buf, key, kl, shapes[i].isdelete ? NULL : val, vl);
 
-        ASSERT_EQ((unsigned char)buf[0], shapes[i].type);
+        /* The nibble is the low half of byte 0, and byte 0 is never NUL
+         * (F-12b). */
+        ASSERT_EQ((unsigned char)buf[0] & ZSI_FLAG_MASK, shapes[i].nibble);
+        ASSERT(buf[0] != 0);
 
         struct zsi_rec r;
         int rc = zsi_rec_decode(buf, len, &r);
@@ -1553,7 +1612,7 @@ static void test_record_roundtrip(void)
             return;
         }
 
-        ASSERT_EQ(r.type, shapes[i].type);
+        ASSERT_EQ(r.flags, shapes[i].nibble);
         ASSERT_EQU(r.len, len);
         ASSERT_EQU(r.keylen, kl);
         ASSERT_MEM_EQ(r.key, key, kl);
@@ -1578,37 +1637,46 @@ static void test_record_roundtrip(void)
 
 static void test_record_canonical(void)
 {
-    char buf[512];
-    char key[300], val[70000];
-    memset(key, 'k', sizeof(key));
-    memset(val, 'v', sizeof(val));
+    /* Heap, not stack: the big-form boundary is a 4096-byte key and the
+     * value-promoted case is 70 000 bytes, so both the buffers and the encode
+     * target have to be allocated. */
+    char *buf = malloc(80000);
+    char *key = malloc(8000), *val = malloc(70000);
+    struct zsi_rec r;
+    ASSERT_NOT_NULL(buf);
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(val);
+    memset(key, 'k', 8000);
+    memset(val, 'v', 70000);
+#define CANON_BUFLEN 80000
 
-    /* F-15: the short form is mandatory whenever the lengths fit.  Asserting the
-     * exact type byte at each boundary means a wrong threshold fails here rather
-     * than surfacing much later as a cross-implementation byte diff. */
-    ASSERT_EQ(zsi_rec_type_for(255, 0, false), ZSI_KEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(256, 0, false), ZSI_BIGKEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(1, 65535, false), ZSI_KEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(1, 65536, false), ZSI_BIGKEYVALUE);
-    ASSERT_EQ(zsi_rec_type_for(255, 0, true), ZSI_DELETION);
-    ASSERT_EQ(zsi_rec_type_for(256, 0, true), ZSI_BIGDELETION);
+    /* F-15: the small form is mandatory whenever the lengths fit.  Asserting the
+     * exact nibble at each boundary means a wrong threshold fails here rather
+     * than surfacing much later as a cross-implementation byte diff.  The
+     * boundaries moved with the format: keylen is 12 bits now, not 8. */
+    ASSERT_EQ(zsi_rec_flags_for(4095, 0, false), ZSI_MUSTBEONE);
+    ASSERT_EQ(zsi_rec_flags_for(4096, 0, false), ZSI_MUSTBEONE | ZSI_ISBIG);
+    ASSERT_EQ(zsi_rec_flags_for(1, 65535, false), ZSI_MUSTBEONE);
+    ASSERT_EQ(zsi_rec_flags_for(1, 65536, false), ZSI_MUSTBEONE | ZSI_ISBIG);
+    ASSERT_EQ(zsi_rec_flags_for(4095, 0, true), ZSI_MUSTBEONE | ZSI_ISDELETE);
+    ASSERT_EQ(zsi_rec_flags_for(4096, 0, true),
+              ZSI_MUSTBEONE | ZSI_ISDELETE | ZSI_ISBIG);
 
-    /* A deletion has no value field, so a value length cannot promote it. */
-    ASSERT_EQ(zsi_rec_type_for(1, 70000, true), ZSI_DELETION);
+    /* F-14c: a deletion has no value, so no value length can promote it. */
+    ASSERT_EQ(zsi_rec_flags_for(1, 70000, true), ZSI_MUSTBEONE | ZSI_ISDELETE);
 
-    /* Encoding at each boundary produces the type the table says. */
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
-    memset(buf, 0, sizeof(buf));
-    zsi_rec_encode(buf, cs, key, 255, "", 0);
-    ASSERT_EQ((unsigned char)buf[0], ZSI_KEYVALUE);
+    /* Encoding at each boundary produces the nibble the table says. */
+    memset(buf, 0, CANON_BUFLEN);
+    zsi_rec_encode(buf, key, 4095, "", 0);
+    ASSERT_EQ((unsigned char)buf[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE);
 
-    char *big = malloc(zsi_rec_encoded_len(256, 0, false));
+    char *big = malloc(zsi_rec_encoded_len(4096, 0, false));
     ASSERT_NOT_NULL(big);
-    zsi_rec_encode(big, cs, key, 256, "", 0);
-    ASSERT_EQ((unsigned char)big[0], ZSI_BIGKEYVALUE);
+    zsi_rec_encode(big, key, 4096, "", 0);
+    ASSERT_EQ((unsigned char)big[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE | ZSI_ISBIG);
     free(big);
 
-    /* A big record whose lengths would have fitted the short form is
+    /* A big record whose lengths would have fitted the small form is
      * non-canonical -- and MUST still decode.
      *
      * Rejecting it would be a data-loss bug: a record that fails to validate
@@ -1617,12 +1685,10 @@ static void test_record_canonical(void)
      * a canonicalisation bug would silently cost us every record after its first
      * non-canonical one.  The divergence is reported instead (T-6's precedent),
      * which is what zsi_rec_is_canonical is for. */
-    struct zsi_rec r;
-    memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_BIGKEYVALUE;
-    zsi_put64(buf + 8, 2);              /* keylen 2: fits the short form */
-    zsi_put64(buf + 16, 2);             /* vallen 2: fits too */
-    memcpy(buf + 24, "ab\0xy", 5);
+    memset(buf, 0, CANON_BUFLEN);
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG) | ((uint64_t)2 << 4));
+    zsi_put64(buf + 8, 2);              /* vallen 2: fits the small form too */
+    memcpy(buf + 16, "ab\0xy", 5);
     ASSERT_OK(zsi_rec_decode(buf, 64, &r));
     ASSERT_EQU(r.keylen, 2u);
     ASSERT_MEM_EQ(r.key, "ab", 2);      /* the data survives, which is the point */
@@ -1631,64 +1697,66 @@ static void test_record_canonical(void)
     ASSERT(!zsi_rec_is_canonical(&r));
 
     /* A big record that genuinely needs the big form decodes and is canonical. */
-    size_t n = zsi_rec_encoded_len(300, 2, false);
+    size_t n = zsi_rec_encoded_len(5000, 2, false);
     char *ok = malloc(n);
     ASSERT_NOT_NULL(ok);
-    zsi_rec_encode(ok, cs, key, 300, "xy", 2);
+    zsi_rec_encode(ok, key, 5000, "xy", 2);
     ASSERT_OK(zsi_rec_decode(ok, n, &r));
-    ASSERT_EQU(r.keylen, 300u);
+    ASSERT_EQU(r.keylen, 5000u);
     ASSERT(zsi_rec_is_canonical(&r));
     free(ok);
 
     /* And the same for a big deletion, where only keylen can justify the form. */
-    memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_BIGDELETION;
-    zsi_put64(buf + 8, 2);
+    memset(buf, 0, CANON_BUFLEN);
+    zsi_put64(buf, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE)
+                   | ((uint64_t)2 << 4));
     memcpy(buf + 16, "ab", 2);
     ASSERT_OK(zsi_rec_decode(buf, 64, &r));
     ASSERT_MEM_EQ(r.key, "ab", 2);
     ASSERT(!zsi_rec_is_canonical(&r));
 
+    /* F-14b: a DELETION carrying a non-zero vallen.  Framing ignores it by
+     * design -- so the record reads correctly and only the encoding is wrong,
+     * which is why it needs its own predicate to be reportable at all.  This is
+     * the case that would desynchronise the whole rest of the file if the length
+     * expression consulted vallen for a deletion. */
+    memset(buf, 0, CANON_BUFLEN);
+    zsi_put16(buf, (uint16_t)((ZSI_MUSTBEONE | ZSI_ISDELETE) | (2 << 4)));
+    zsi_put16(buf + 2, 9);              /* a lie: a deletion has no value */
+    memcpy(buf + 4, "ab", 2);
+    ASSERT_OK(zsi_rec_decode(buf, 64, &r));
+    ASSERT_EQU(r.len, 4u + 2u + 1u);    /* framed by F-14a, ignoring vallen */
+    ASSERT_EQU(r.vallen, 0u);
+    ASSERT_NULL(r.val);
+    ASSERT(!zsi_rec_delete_vallen_ok(&r));
+
+    /* ... and the honest version passes it. */
+    memset(buf, 0, CANON_BUFLEN);
+    zsi_rec_encode(buf, "ab", 2, NULL, 0);
+    ASSERT_OK(zsi_rec_decode(buf, 64, &r));
+    ASSERT(zsi_rec_delete_vallen_ok(&r));
+
     /* Everything this implementation writes is canonical, across all four
      * shapes -- which is the writer-side half of F-15. */
     struct { size_t kl, vl; bool del; } shapes[] = {
-        { 2, 2, false }, { 2, 0, true }, { 300, 2, false }, { 300, 0, true }
+        { 2, 2, false }, { 2, 0, true }, { 5000, 2, false }, { 5000, 0, true },
+        { 2, 70000, false }
     };
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
         size_t len = zsi_rec_encoded_len(shapes[i].kl, shapes[i].vl,
                                          shapes[i].del);
         char *b = malloc(len);
         ASSERT_NOT_NULL(b);
-        zsi_rec_encode(b, cs, key, shapes[i].kl,
+        zsi_rec_encode(b, key, shapes[i].kl,
                        shapes[i].del ? NULL : val, shapes[i].vl);
         ASSERT_OK(zsi_rec_decode(b, len, &r));
-        if (!zsi_rec_is_canonical(&r)) {
-            fprintf(stderr, "\n    FAIL shape %zu encoded non-canonically\n", i);
-            current_test_failed = 1;
-            free(b);
-            return;
-        }
+        ASSERT(zsi_rec_is_canonical(&r));
+        ASSERT(zsi_rec_delete_vallen_ok(&r));
         free(b);
     }
 
-    /* F-18: a record's bytes are a function of its own key and value, and of
-     * nothing else -- so canonicality is a property of the record alone and
-     * needs no containing file to judge it against.  The same key and value
-     * encode identically however the database around them got there, which is
-     * what makes T-12a's byte-for-byte agreement checkable at all. */
-    size_t l2 = zsi_rec_encoded_len(2, 2, false);
-    char *b2 = malloc(l2), *b3 = malloc(l2);
-    ASSERT_NOT_NULL(b2);
-    ASSERT_NOT_NULL(b3);
-    memset(b2, 0xAA, l2);
-    memset(b3, 0x55, l2);
-    zsi_rec_encode(b2, cs, "ab", 2, "xy", 2);
-    zsi_rec_encode(b3, cs, "ab", 2, "xy", 2);
-    ASSERT_MEM_EQ(b2, b3, l2);
-    ASSERT_OK(zsi_rec_decode(b2, l2, &r));
-    ASSERT(zsi_rec_is_canonical(&r));
-    free(b2);
-    free(b3);
+    free(buf); free(key); free(val);
+#undef CANON_BUFLEN
 }
 
 static void test_record_embedded_nul(void)
@@ -1700,29 +1768,29 @@ static void test_record_embedded_nul(void)
 
     const char key[] = { 'a', '\0', 'b' };
     const char val[] = { '\0', 'x', '\0' };
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
     size_t len = zsi_rec_encoded_len(3, 3, false);
-    /* roundup8(4 + 3 + 1 + 3 + 1 + 4) = roundup8(16) = 16 -- the checksum's
-     * +4 does not push this over another roundup8 step. */
-    ASSERT_EQU(len, 16u);
+    /* F-14a exactly: 4 + 3 + 1 + 3 + 1 = 12.  No rounding and no checksum. */
+    ASSERT_EQU(len, 12u);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, key, 3, val, 3);
+    zsi_rec_encode(buf, key, 3, val, 3);
     ASSERT_OK(zsi_rec_decode(buf, len, &r));
     ASSERT_EQU(r.keylen, 3u);
     ASSERT_MEM_EQ(r.key, key, 3);
     ASSERT_EQU(r.vallen, 3u);
     ASSERT_MEM_EQ(r.val, val, 3);
 
-    /* The stored length is 3, not the 1 that strlen would report. */
-    ASSERT_EQ((unsigned char)buf[1], 3);
+    /* The stored length is 3, not the 1 that strlen would report.  keylen lives
+     * above the nibble, so it is read from the whole first word rather than from
+     * a byte of its own. */
+    ASSERT_EQU(zsi_get16(buf) >> ZSI_KEYLEN_SHIFT, 3u);
     ASSERT_EQU(zsi_get16(buf + 2), 3u);
 
     /* A key that is entirely NULs. */
     const char nuls[] = { '\0', '\0', '\0', '\0' };
     len = zsi_rec_encoded_len(4, 0, false);
     memset(buf, 0xAA, sizeof(buf));
-    zsi_rec_encode(buf, cs, nuls, 4, "", 0);
+    zsi_rec_encode(buf, nuls, 4, "", 0);
     ASSERT_OK(zsi_rec_decode(buf, len, &r));
     ASSERT_EQU(r.keylen, 4u);
     ASSERT_MEM_EQ(r.key, nuls, 4);
@@ -1734,7 +1802,6 @@ static void test_record_bounds(void)
 {
     char buf[512];
     struct zsi_rec r;
-    zs_csum *cs = zsi_csum_for_id(ZSI_CSUM_XXHASH, NULL);
 
     /* For each shape, decoding with len one byte short of the true length is
      * rejected rather than reading past the end. */
@@ -1752,7 +1819,7 @@ static void test_record_bounds(void)
         char *k = malloc(shapes[i].kl);
         ASSERT_NOT_NULL(k);
         memset(k, 'k', shapes[i].kl);
-        zsi_rec_encode(b, cs, k, shapes[i].kl,
+        zsi_rec_encode(b, k, shapes[i].kl,
                        shapes[i].del ? NULL : "xy", shapes[i].vl);
 
         ASSERT_OK(zsi_rec_decode(b, len, &r));
@@ -1773,25 +1840,25 @@ static void test_record_bounds(void)
      * This is G-0b's whole point: keylen + vallen + 2 must not wrap into a small
      * total that then passes a bounds check. */
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_BIGKEYVALUE;
+    buf[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
     zsi_put64(buf + 8, 0xFFFFFFFFFFFFFFFFull);
     zsi_put64(buf + 16, 0xFFFFFFFFFFFFFFFFull);
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_BIGKEYVALUE;
+    buf[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
     zsi_put64(buf + 8, (uint64_t)SIZE_MAX - 1);
     zsi_put64(buf + 16, 4);
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     /* F-14: a key must be at least 1 byte, in every shape. */
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_KEYVALUE;
+    buf[0] = (char)ZSI_MUSTBEONE;
     buf[1] = 0;
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
     memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_BIGKEYVALUE;
+    buf[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
     zsi_put64(buf + 8, 0);
     zsi_put64(buf + 16, 70000);
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
@@ -1804,36 +1871,42 @@ static void test_record_bounds(void)
      * with no family check at all, because the zero at +1 trips F-14's minimum
      * key length instead -- which is a different rule and would leave a
      * terminator decodable as a record the moment its second byte was nonzero. */
+    /* A TERMINATOR IS NOT A RECORD, and keylen == 0 is the whole test (F-14).
+     * A plausible record body is present, so what rejects these is the framing
+     * rule rather than a short buffer. */
     memset(buf, 0, sizeof(buf));
-    buf[1] = 2;                          /* a keylen that would be valid */
-    zsi_put16(buf + 2, 2);               /* a vallen that would be valid */
-    memcpy(buf + 4, "ab\0xy", 5);
+    zsi_put16(buf + 2, 16);              /* a terminator's payload length */
+    zsi_put64(buf + 4, 64);              /* and a plausible span length */
 
-    buf[0] = 0x11;                       /* HasKey|SpanTerminator: not legal */
+    zsi_put16(buf, ZSI_MUSTBEONE);                        /* keylen 0: COMMIT */
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_COMMIT;           /* a terminator is not a data record */
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_ROLLBACK;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_COMMIT_LONG;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_PTRS32;           /* nor is a pointer section */
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_PTRS64;
-    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
-    buf[0] = 0x00;
+    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISROLLBACK);       /* ROLLBACK */
     ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
 
-    /* Symmetrically, a data type is not a terminator -- with a plausible
+    /* MustBeOne clear is malformed in either role (F-12b), and byte 0 == 0 is
+     * the case that makes padding recognisable (F-26d1). */
+    zsi_put16(buf, 0);
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
+    zsi_put16(buf, (uint16_t)(2 << 4));                   /* keylen 2, no flags */
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
+
+    /* IsRollback on a record with a real key is malformed rather than reserved
+     * (F-12): there is no future meaning waiting for it. */
+    zsi_put16(buf, (uint16_t)((ZSI_MUSTBEONE | ZSI_ISROLLBACK) | (2 << 4)));
+    ASSERT_EQ(zsi_rec_decode(buf, sizeof(buf), &r), ZS_BADFORMAT);
+
+    /* Symmetrically, a RECORD is not a terminator -- with a plausible
      * terminator body present, for the same reason. */
     memset(buf, 0, sizeof(buf));
-    zsi_put24(buf + 1, 64);
+    zsi_put16(buf + 2, 16);
+    zsi_put64(buf + 4, 64);
     struct zsi_term t;
-    buf[0] = (char)ZSI_KEYVALUE;
+
+    zsi_put16(buf, (uint16_t)(ZSI_MUSTBEONE | (2 << 4)));         /* keylen 2 */
     ASSERT_EQ(zsi_term_decode(buf, sizeof(buf), &t), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_DELETION;
+    zsi_put16(buf, (uint16_t)((ZSI_MUSTBEONE | ZSI_ISDELETE) | (2 << 4)));
     ASSERT_EQ(zsi_term_decode(buf, sizeof(buf), &t), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_PTRS32;
+    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISBIG);        /* IsBig, keylen 0 */
     ASSERT_EQ(zsi_term_decode(buf, sizeof(buf), &t), ZS_BADFORMAT);
 
     /* Zero-length buffer. */
@@ -1842,116 +1915,104 @@ static void test_record_bounds(void)
 
 static void test_terminator(void)
 {
-    char buf[32];
+    char buf[64];
     struct zsi_term t;
     char span[64];
     for (size_t i = 0; i < sizeof(span); i++) span[i] = (char)i;
 
-    /* COMMIT (0x10): +0 type, +1 span length (3 bytes), +4 checksum. */
-    ASSERT_EQU(zsi_term_encoded_len(0), 8u);
-    ASSERT_EQU(zsi_term_encoded_len(ZSI_SHORT_SPANLEN_MAX), 8u);
-    ASSERT_EQU(zsi_term_encoded_len(ZSI_SHORT_SPANLEN_MAX + 1), 24u);
+    /* ONE FORM, always 20 bytes (F-19a).  Version 2 had a short and a long form
+     * selected by span length, and the long-where-short-fits case was its only
+     * non-canonical terminator -- so zsi_term_is_canonical is gone too.
+     *
+     * The span length lives in the PAYLOAD rather than in vallen, which is what
+     * makes the length constant: a 16-bit vallen would cap a span at 64KB. */
+    ASSERT_EQU(zsi_term_encoded_len(), 20u);
 
     memset(buf, 0xAA, sizeof(buf));
     zsi_term_encode(buf, 64, false, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
-    ASSERT_EQ((unsigned char)buf[0], ZSI_COMMIT);
-    ASSERT_EQU(zsi_get24(buf + 1), 64u);
-    ASSERT_OK(zsi_term_decode(buf, 8, &t));
-    ASSERT_EQ(t.type, ZSI_COMMIT);
+
+    /* keylen == 0 is what makes it a terminator (F-14), and vallen describes the
+     * fixed payload.  A COMMIT is MustBeOne alone. */
+    ASSERT_EQU(zsi_get16(buf) >> ZSI_KEYLEN_SHIFT, 0u);
+    ASSERT_EQ((unsigned char)buf[0] & ZSI_FLAG_MASK, ZSI_MUSTBEONE);
+    ASSERT_EQU(zsi_get16(buf + 2), 16u);
+    ASSERT_EQU(zsi_get64(buf + 4), 64u);
+    ASSERT(buf[0] != 0);                    /* F-12b, as for any record */
+
+    ASSERT_OK(zsi_term_decode(buf, 20, &t));
+    ASSERT_EQ(t.flags, ZSI_MUSTBEONE);
     ASSERT_EQU(t.spanlen, 64u);
-    ASSERT_EQU(t.len, 8u);
+    ASSERT_EQU(t.len, 20u);
     ASSERT(!zsi_term_is_rollback(&t));
 
     /* F-19: the checksum covers the span's data followed by the terminator's own
-     * bytes up to the checksum field.  Verified by recomputing it the way a
-     * reader would. */
+     * bytes up to the checksum field.  Recomputed the way a reader would -- and
+     * through the SAME named constant the encoder used, because spelling the
+     * covered length here as a literal is exactly the duplication that broke
+     * replay when the checksum widened. */
     ASSERT_EQU(t.csum, zsi_csum2(zsi_csum_xxhash, ZSI_CSUM_XXHASH,
-                                 span, 64, buf, 4));
+                                 span, 64, buf, ZSI_TERM_CSUM_COVER));
+    ASSERT_EQU(ZSI_TERM_CSUM_COVER, 12u);
 
-    /* ROLLBACK (0x12) differs from COMMIT in exactly the IsDelete bit. */
+    /* A ROLLBACK differs from a COMMIT in exactly the IsRollback bit. */
     memset(buf, 0xAA, sizeof(buf));
     zsi_term_encode(buf, 64, true, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
-    ASSERT_EQ((unsigned char)buf[0], ZSI_ROLLBACK);
-    ASSERT_OK(zsi_term_decode(buf, 8, &t));
+    ASSERT_EQ((unsigned char)buf[0] & ZSI_FLAG_MASK,
+              ZSI_MUSTBEONE | ZSI_ISROLLBACK);
+    ASSERT_OK(zsi_term_decode(buf, 20, &t));
     ASSERT(zsi_term_is_rollback(&t));
 
-    /* COMMIT_LONG (0x14): +0 type, +1 pad(7), +8 span length, +16 pad(4),
-     * +20 checksum. */
-    uint64_t bigspan = (uint64_t)ZSI_SHORT_SPANLEN_MAX + 1;   /* 0x1000000 */
+    /* A span far larger than version 2's 3-byte field still uses the one form,
+     * which is the point of moving spanlen into the payload. */
+    uint64_t bigspan = ((uint64_t)1 << 40) + 12345;
     memset(buf, 0xAA, sizeof(buf));
     zsi_term_encode(buf, bigspan, false, span, zsi_csum_none, ZSI_CSUM_NONE);
-    static const unsigned char clong[20] = {
-        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,   /* spanlen 0x1000000 */
-        0x00, 0x00, 0x00, 0x00                            /* pad             */
-    };
-    ASSERT_MEM_EQ(buf, clong, 20);
-    ASSERT_OK(zsi_term_decode(buf, 24, &t));
-    ASSERT_EQ(t.type, ZSI_COMMIT_LONG);
+    ASSERT_OK(zsi_term_decode(buf, 20, &t));
     ASSERT_EQU(t.spanlen, bigspan);
-    ASSERT_EQU(t.len, 24u);
+    ASSERT_EQU(t.len, 20u);
 
+    /* Byte layout against a literal, engine 0 so the checksum is zeros.  This is
+     * the assertion that catches a symmetric encoder/decoder change, which is the
+     * bug class that round-tripping cannot see (T-12a). */
     memset(buf, 0xAA, sizeof(buf));
-    zsi_term_encode(buf, bigspan, true, span, zsi_csum_none, ZSI_CSUM_NONE);
-    ASSERT_EQ((unsigned char)buf[0], ZSI_ROLLBACK_LONG);
-    ASSERT_OK(zsi_term_decode(buf, 24, &t));
-    ASSERT(zsi_term_is_rollback(&t));
-
-    /* F-15: the short terminator is mandatory whenever the span fits, so a long
-     * terminator over a small span is non-canonical -- and MUST still decode, for
-     * the same reason as a non-canonical record.  Rejecting it would truncate the
-     * file at that span (F-24) and lose the committed data after it (G-3). */
-    memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_COMMIT_LONG;
-    zsi_put64(buf + 8, 64);
-    ASSERT_OK(zsi_term_decode(buf, 24, &t));
-    ASSERT_EQU(t.spanlen, 64u);
-    ASSERT_EQU(t.len, 24u);
-    ASSERT(!zsi_term_is_canonical(&t));
-
-    /* Everything this implementation writes is canonical, on both sides of the
-     * width boundary. */
-    zsi_term_encode(buf, ZSI_SHORT_SPANLEN_MAX, false, span,
+    zsi_term_encode(buf, 0x0102030405060708ull, true, span,
                     zsi_csum_none, ZSI_CSUM_NONE);
-    ASSERT_OK(zsi_term_decode(buf, 8, &t));
-    ASSERT(zsi_term_is_canonical(&t));
+    static const unsigned char want[20] = {
+        0x0C, 0x00,                                     /* nibble 0xC, keylen 0 */
+        0x10, 0x00,                                     /* vallen 16            */
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, /* spanlen, LE          */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  /* engine-0 checksum    */
+    };
+    ASSERT_MEM_EQ(buf, want, 20);
 
-    zsi_term_encode(buf, (uint64_t)ZSI_SHORT_SPANLEN_MAX + 1, false, span,
-                    zsi_csum_none, ZSI_CSUM_NONE);
-    ASSERT_OK(zsi_term_decode(buf, 24, &t));
-    ASSERT(zsi_term_is_canonical(&t));
-
-    /* Short buffers rejected at every length below the true one. */
+    /* Negatives (F-12): IsBig and IsDelete belong to a record, never to a
+     * terminator, and MustBeOne must be set. */
     memset(buf, 0, sizeof(buf));
-    zsi_term_encode(buf, 64, false, span, zsi_csum_none, ZSI_CSUM_NONE);
-    for (size_t l = 0; l < 8; l++)
-        ASSERT_EQ(zsi_term_decode(buf, l, &t), ZS_BADFORMAT);
+    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISBIG);
+    zsi_put16(buf + 2, 16);
+    ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
 
-    memset(buf, 0, sizeof(buf));
-    zsi_term_encode(buf, bigspan, false, span, zsi_csum_none, ZSI_CSUM_NONE);
-    for (size_t l = 0; l < 24; l++)
-        ASSERT_EQ(zsi_term_decode(buf, l, &t), ZS_BADFORMAT);
+    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISDELETE);
+    ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
 
-    /* A data type or a pointers type is not a terminator. */
-    memset(buf, 0, sizeof(buf));
-    buf[0] = (char)ZSI_KEYVALUE;
-    ASSERT_EQ(zsi_term_decode(buf, 8, &t), ZS_BADFORMAT);
-    buf[0] = (char)ZSI_PTRS32;
-    ASSERT_EQ(zsi_term_decode(buf, 8, &t), ZS_BADFORMAT);
-    buf[0] = 0x00;
-    ASSERT_EQ(zsi_term_decode(buf, 8, &t), ZS_BADFORMAT);
+    zsi_put16(buf, ZSI_ISROLLBACK);                 /* MustBeOne clear */
+    ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
+
+    /* A wrong vallen is not a terminator either: it describes a fixed payload. */
+    zsi_put16(buf, ZSI_MUSTBEONE);
+    zsi_put16(buf + 2, 15);
+    ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
+
+    /* Truncation: 19 bytes is not enough for the one form. */
+    zsi_put16(buf + 2, 16);
+    ASSERT_EQ(zsi_term_decode(buf, 19, &t), ZS_BADFORMAT);
+    ASSERT_OK(zsi_term_decode(buf, 20, &t));
+
+    /* And a terminator is not a record: zsi_rec_decode must refuse it, so a
+     * caller can never confuse the two (keylen == 0 is the whole test). */
+    struct zsi_rec r;
+    ASSERT_EQ(zsi_rec_decode(buf, 20, &r), ZS_BADFORMAT);
 }
-
-/*
- * ============================================================
- * Building unordered files by hand
- * ============================================================
- *
- * A growable buffer with span semantics, so a test can lay down exactly the
- * bytes it wants -- including the shapes a conforming writer never produces: a
- * span whose terminator claims the wrong length, a terminator whose data was
- * never written, trailing garbage after a valid span.
- */
 
 struct sb {
     char  *buf;
@@ -1993,8 +2054,7 @@ static void sb_rec(struct sb *s, const char *key, size_t keylen,
     size_t n = zsi_rec_encoded_len(keylen, vallen, val == NULL);
     assert(n > 0);
     sb_reserve(s, n);
-    zs_csum *cs = zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM);
-    zsi_rec_encode(s->buf + s->len, cs, key, keylen, val, vallen);
+    zsi_rec_encode(s->buf + s->len, key, keylen, val, vallen);
     s->len += n;
 }
 
@@ -2002,7 +2062,7 @@ static void sb_rec(struct sb *s, const char *key, size_t keylen,
 static void sb_term(struct sb *s, bool rollback)
 {
     size_t datalen = s->len - s->span_start;
-    size_t n = zsi_term_encoded_len(datalen);
+    size_t n = zsi_term_encoded_len();
     sb_reserve(s, n);
     zsi_term_encode(s->buf + s->len, datalen, rollback,
                     s->buf + s->span_start,
@@ -2016,7 +2076,7 @@ static void sb_term(struct sb *s, bool rollback)
 static void sb_term_badlen(struct sb *s, uint64_t claim)
 {
     size_t datalen = s->len - s->span_start;
-    size_t n = zsi_term_encoded_len(claim);
+    size_t n = zsi_term_encoded_len();
     sb_reserve(s, n);
     /* checksum still computed over the real data, so only the length is wrong */
     zsi_term_encode(s->buf + s->len, claim, false, s->buf + s->span_start,
@@ -2081,8 +2141,7 @@ static void ib_rec(struct ib *b, const char *key, size_t keylen,
     }
     assert(b->n < 256);
     b->offs[b->n++] = b->len;
-    zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
-    zsi_rec_encode(b->buf + b->len, cs, key, keylen, val, vallen);
+    zsi_rec_encode(b->buf + b->len, key, keylen, val, vallen);
     b->len += n;
 }
 
@@ -2090,11 +2149,16 @@ static void ib_rec(struct ib *b, const char *key, size_t keylen,
 static void ib_finish(struct ib *b)
 {
     zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
-    uint32_t rc = cs(b->buf + ZSI_HEADER_LEN, b->len - ZSI_HEADER_LEN);
     char *sec = NULL;
     size_t seclen = 0;
+    struct zsi_region pre[1];
 
-    assert(zsi_ptrs_build(b->offs, b->n, b->len, rc, cs, &sec, &seclen) == ZS_OK);
+    /* One checksum over the whole file (F-26e), so the builder is handed the
+     * bytes already produced -- header and records together, which this builder
+     * holds in one buffer -- exactly as the real writers hand it two. */
+    pre[0].p = b->buf; pre[0].len = b->len;
+    assert(zsi_ptrs_build(b->offs, b->n, b->len, pre, 1, cs, b->engine,
+                          &sec, &seclen) == ZS_OK);
     while (b->len + seclen > b->alloc) {
         b->alloc *= 2;
         b->buf = realloc(b->buf, b->alloc);
@@ -2184,16 +2248,16 @@ static void test_file_bounds(void)
     ASSERT_OK(zsi_file_open(dbdir, name, 1, NULL, &f));
 
     /* In range. */
-    ASSERT_NOT_NULL(zsi_file_at(f, 0, 72));
+    ASSERT_NOT_NULL(zsi_file_at(f, 0, ZSI_HEADER_LEN));
     ASSERT_NOT_NULL(zsi_file_at(f, 71, 1));
     ASSERT_NOT_NULL(zsi_file_at(f, 0, 0));
-    ASSERT_NOT_NULL(zsi_file_at(f, 72, 0));   /* the end itself, zero bytes */
+    ASSERT_NOT_NULL(zsi_file_at(f, ZSI_HEADER_LEN, 0)); /* the end, zero bytes */
 
     /* One byte past the end, and every larger overrun. */
-    ASSERT_NULL(zsi_file_at(f, 72, 1));
-    ASSERT_NULL(zsi_file_at(f, 71, 2));
-    ASSERT_NULL(zsi_file_at(f, 0, 73));
-    ASSERT_NULL(zsi_file_at(f, 73, 0));
+    ASSERT_NULL(zsi_file_at(f, ZSI_HEADER_LEN, 1));
+    ASSERT_NULL(zsi_file_at(f, ZSI_HEADER_LEN - 1, 2));
+    ASSERT_NULL(zsi_file_at(f, 0, ZSI_HEADER_LEN + 1));
+    ASSERT_NULL(zsi_file_at(f, ZSI_HEADER_LEN + 1, 0));
 
     /* Offsets and lengths that would overflow rather than merely exceed (G-0b).
      * This is the case that turns a bounds check into a bypass when unguarded. */
@@ -2673,50 +2737,6 @@ static void test_span_terminator_without_data(void)
     sb_free(&s);
 }
 
-/* F-5e: verification rides indexing.  ZS_NOCSUM skips the per-record verify
- * at materialization and NOTHING else -- the span checksum is checked by
- * whoever adds the span to an index, in every mode, because a post-crash
- * reopen under relaxed durability can meet a terminator whose data never
- * landed (C-7c), and a NOCSUM handle accepting it would surface garbage as
- * committed records. */
-static void test_nocsum_still_rejects_bad_span(void)
-{
-    struct sb s;
-    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
-    struct zs_db *db = NULL;
-    const char *v = NULL;
-    size_t vl = 0;
-    char name[ZSI_NAME_MAX];
-
-    /* One good committed span, then a structurally valid span whose data was
-     * altered after its terminator was computed -- only the checksum can
-     * tell. */
-    sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "a", 1, "1", 1);
-    sb_term(&s, false);
-    size_t at = s.len;
-    sb_rec(&s, "key", 3, "aaa", 3);
-    sb_term(&s, false);
-    s.buf[at + 4 + 3 + 1] = 'b';                /* first value byte: aaa -> baa */
-
-    zsi_name_current(name, test_uuid);
-    ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(sb_write(&s, name), 0);
-    sb_free(&s);
-
-    setup.flags = ZS_SHARED | ZS_NOCSUM;
-    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
-
-    /* The good prefix survives; the altered span reads as absent, exactly as
-     * it does for a verifying handle. */
-    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
-    ASSERT_EQU(vl, 1u);
-    ASSERT_MEM_EQ(v, "1", 1);
-    ASSERT_EQ(zs_db_fetch(db, "key", 3, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
-
-    ASSERT_OK(zs_db_close(&db));
-}
-
 static void test_span_progress(void)
 {
     /* F-29: iteration computes the next offset from the current record's own
@@ -2739,7 +2759,7 @@ static void test_span_progress(void)
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     char bad[8];
     memset(bad, 0, sizeof(bad));
-    bad[0] = (char)ZSI_KEYVALUE;
+    bad[0] = (char)ZSI_MUSTBEONE;
     bad[1] = 0;                                  /* keylen 0 */
     sb_raw(&s, bad, sizeof(bad));
     sb_term(&s, false);
@@ -2811,12 +2831,16 @@ static void test_span_bad_header_and_kind(void)
 
     /* Replaying an in-order file is a usage error, not a data condition: it has no
      * spans at all (section 4.9), so there is no answer to invent. */
-    char io[96];
+    /* The smallest valid in-order file: header plus the 32-byte trailer, no
+     * records, no pointers, no pad (F-26g).  112 bytes. */
+    char io[ZSI_INORDER_MIN];
     memset(io, 0, sizeof(io));
     make_header(io, 5, 5, ZSI_CSUM_XXHASH);
-    io[72] = (char)ZSI_PTRS32;
-    zsi_put64(io + 80, 72);
-    zsi_put32(io + 88, zsi_csum_xxhash(io + 72, 0));
+    zsi_put64(io + ZSI_HEADER_LEN + ZSI_TR_OFF_START, ZSI_HEADER_LEN);
+    zsi_put64(io + ZSI_HEADER_LEN + ZSI_TR_OFF_NPTRS, 0);
+    zsi_put64(io + ZSI_HEADER_LEN + ZSI_TR_OFF_PTRSIZE, 4);
+    zsi_put64(io + ZSI_HEADER_LEN + ZSI_TR_OFF_CSUM,
+              zsi_csum_xxhash(io, sizeof(io) - ZSI_CSUM_LEN));
     zsi_put32(io + 92, zsi_csum_xxhash(io + 72, 20));
     zsi_name_format(name, test_uuid, 5, 5);
     ASSERT_EQ(writefile(name, io, sizeof(io)), 0);
@@ -2841,10 +2865,14 @@ static void test_span_pointers_rejected(void)
         sb_term(&s, false);
         size_t good_end = s.len;
 
-        char ptrs[16];
-        memset(ptrs, 0, sizeof(ptrs));
-        ptrs[0] = (char)(wide ? ZSI_PTRS64 : ZSI_PTRS32);
-        sb_raw(&s, ptrs, wide ? 16 : 8);
+        /* There is no typed pointer-section header any more (F-26a), so what an
+         * unordered file must not carry is a TRAILER.  Appending trailer-shaped
+         * bytes after a span is content after the last valid span either way,
+         * which is what this asserts. */
+        char tr[ZSI_TRAILER_LEN];
+        memset(tr, 0, sizeof(tr));
+        zsi_put64(tr + ZSI_TR_OFF_PTRSIZE, wide ? 8 : 4);
+        sb_raw(&s, tr, sizeof(tr));
 
         ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
         ASSERT_EQU(c.n, 1u);
@@ -2903,18 +2931,24 @@ static void test_span_long_terminator(void)
     char val[8192];
     memset(val, 'v', sizeof(val));
     size_t n = 0;
-    while (s.len - s.span_start <= ZSI_SHORT_SPANLEN_MAX) {
+    /* A span far larger than version 2's 3-byte span-length field could hold.
+     * There is no long terminator form any more (F-19a) -- spanlen is an 8-byte
+     * payload field, so ONE form covers every span -- and what this still proves
+     * is that a span of this size replays. */
+    while (s.len - s.span_start <= 0xFFFFFF) {
         char k[32];
         snprintf(k, sizeof(k), "key%08zu", n++);
         sb_rec(&s, k, strlen(k), val, sizeof(val));
     }
-    ASSERT(s.len - s.span_start > ZSI_SHORT_SPANLEN_MAX);
+    ASSERT(s.len - s.span_start > 0xFFFFFF);
     size_t nrecs = n;
     sb_term(&s, false);
 
-    /* The terminator really is the long form. */
-    ASSERT_EQ((unsigned char)s.buf[s.span_start - ZSI_TERMLEN_LONG],
-              ZSI_COMMIT_LONG);
+    /* Still the one 20-byte form, and its spanlen field really holds the size. */
+    ASSERT_EQU(zsi_get16(s.buf + s.span_start - ZSI_TERMLEN)
+               >> ZSI_KEYLEN_SHIFT, 0u);
+    ASSERT(zsi_get64(s.buf + s.span_start - ZSI_TERMLEN + ZSI_TERM_OFF_SPANLEN)
+           > 0xFFFFFF);
 
     char name[ZSI_NAME_MAX];
     zsi_name_current(name, test_uuid);
@@ -3645,17 +3679,25 @@ static void test_inorder_empty(void)
 
     ib_init(&b, 5, 5, ZSI_CSUM_XXHASH);
     ib_finish(&b);
-    ASSERT_EQU(b.len, 96u);
+    ASSERT_EQU(b.len, (size_t)ZSI_INORDER_MIN);
 
     ASSERT_EQ(ib_load(&b, 5, 5, &f), ZS_OK);
-    ASSERT_EQU(f->size, 96u);
+    ASSERT_EQU(f->size, (size_t)ZSI_INORDER_MIN);
     ASSERT_EQU(f->nptrs, 0u);
-    ASSERT(!f->ptr_wide);
+    ASSERT_EQU(f->ptr_size, 4u);        /* F-26c holds vacuously with no offsets */
     ASSERT_EQU(f->ptr_off, (size_t)ZSI_HEADER_LEN);
-    ASSERT_EQ((unsigned char)f->base[ZSI_HEADER_LEN], ZSI_PTRS32);
 
-    /* Not zero: 0x38D394C2 is XXH3-64's low half over empty input. */
-    ASSERT_EQU(f->records_csum, 0x38D394C2u);
+    /* The whole file is header + trailer and nothing else (F-26g). */
+    ASSERT_EQU(f->size, (size_t)ZSI_INORDER_MIN);
+
+    /* F-26g: the stored checksum is the ENGINE's value over the file's first
+     * 104 bytes -- not zero, and not a special case for a short input.  Asserted
+     * as the engine's own answer rather than as a literal, because a literal here
+     * would only re-pin the header layout that test_header_byte_layout already
+     * pins, while this states the property that actually matters. */
+    ASSERT(zsi_get64(f->base + f->size - ZSI_CSUM_LEN) != 0);
+    ASSERT_EQU(zsi_get64(f->base + f->size - ZSI_CSUM_LEN),
+               zsi_csum_xxhash(f->base, f->size - ZSI_CSUM_LEN));
     ASSERT_OK(zsi_ptrs_verify_records(f));
 
     /* Searching it is an ordinary case, not a special one (D-14b). */
@@ -3683,9 +3725,9 @@ static void test_inorder_empty(void)
     struct ib b0;
     ib_init(&b0, 5, 5, ZSI_CSUM_NONE);
     ib_finish(&b0);
-    ASSERT_EQU(b0.len, 96u);
+    ASSERT_EQU(b0.len, (size_t)ZSI_INORDER_MIN);
     ASSERT_EQ(ib_load(&b0, 5, 5, &f), ZS_OK);
-    ASSERT_EQU(f->records_csum, 0u);
+    ASSERT_EQU(zsi_get64(f->base + f->size - ZSI_CSUM_LEN), 0u);
     ASSERT_OK(zsi_ptrs_verify_records(f));
     zsi_file_release(&f);
     ib_free(&b0);
@@ -3750,33 +3792,33 @@ static void test_inorder_trailer_negatives(void)
     ASSERT_NOT_NULL(orig);
     memcpy(orig, b.buf, full);
 
-    /* Re-checksum the section after damaging it, so only the structural rule can
-     * reject.  cover = [ptr_off, size-4). */
-    size_t ptr_off = zsi_get64(orig + full - 16);
+    /* NOTHING is re-checksummed in any of these cases, and that is the point:
+     * since F-26f1 nothing verifies the file checksum on open, so every rejection
+     * below comes from the trailer's own arithmetic (F-26b) or from F-27's bounds
+     * check.  Those three redundant position fields are the entire structural
+     * defence, which is why they are checked for exact agreement. */
+    size_t ptr_off = zsi_get64(orig + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_START);
 
-    struct { const char *what; long long backptr; } bad[] = {
+    struct { const char *what; long long start; } bad[] = {
         { "past the end of the file",   (long long)full + 8 },
         { "before the header",          8 },
         { "at the header",              ZSI_HEADER_LEN - 8 },
-        { "not 8-aligned",              (long long)ptr_off + 4 },
         { "inside the trailer",         (long long)full - 8 },
-        { "overlapping the trailer",    (long long)full - 16 }
+        { "overlapping the trailer",    (long long)full - ZSI_TRAILER_LEN + 8 },
+        /* one byte off: the array would run one byte past where the trailer
+         * begins, which the file-size equality catches */
+        { "one byte high",              (long long)ptr_off + 1 },
+        { "one byte low",               (long long)ptr_off - 1 }
     };
 
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         memcpy(b.buf, orig, full);
-        zsi_put64(b.buf + full - 16, (uint64_t)bad[i].backptr);
-        /* recompute the section checksum over whatever the back pointer now
-         * designates, where that is even inside the file */
-        if (bad[i].backptr >= 0 && (size_t)bad[i].backptr < full - 4) {
-            size_t cov = (full - 4) - (size_t)bad[i].backptr;
-            zsi_put32(b.buf + full - 4,
-                      zsi_csum_xxhash(b.buf + bad[i].backptr, cov));
-        }
+        zsi_put64(b.buf + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_START,
+                  (uint64_t)bad[i].start);
         ASSERT_EQ(writefile(name, b.buf, full), 0);
         ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
         if (zsi_ptrs_load(f) == ZS_OK) {
-            fprintf(stderr, "\n    FAIL back pointer %s accepted\n", bad[i].what);
+            fprintf(stderr, "\n    FAIL array start %s accepted\n", bad[i].what);
             current_test_failed = 1;
             zsi_file_release(&f);
             goto done;
@@ -3784,18 +3826,23 @@ static void test_inorder_trailer_negatives(void)
         zsi_file_release(&f);
     }
 
-    /* A back pointer to a byte that is neither PTRS32 nor PTRS64. */
-    memcpy(b.buf, orig, full);
-    zsi_put64(b.buf + full - 16, ZSI_HEADER_LEN);   /* points at a data record */
-    {
-        size_t cov = (full - 4) - ZSI_HEADER_LEN;
-        zsi_put32(b.buf + full - 4,
-                  zsi_csum_xxhash(b.buf + ZSI_HEADER_LEN, cov));
+    /* An array start that is NOT aligned to its own stated width is ACCEPTED,
+     * deliberately (F-26d, G-3).  The pad exists to align it, so this file is
+     * non-canonical -- but refusing it would make the whole file unopenable and
+     * cost every record in it, and pointers are read through explicit byte copies
+     * (F-2a) so alignment is not needed to read.  Reported by
+     * check_consistency, not rejected here.
+     *
+     * Constructed by widening to 8 while leaving the start where a width-4 array
+     * put it, so the size equality still holds. */
+    if (ptr_off % 8 == 4) {
+        memcpy(b.buf, orig, full);
+        zsi_put64(b.buf + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_START, ptr_off);
+        ASSERT_EQ(writefile(name, b.buf, full), 0);
+        ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+        ASSERT_OK(zsi_ptrs_load(f));
+        zsi_file_release(&f);
     }
-    ASSERT_EQ(writefile(name, b.buf, full), 0);
-    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
-    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
-    zsi_file_release(&f);
 
     /* A file shorter than header plus trailer, at every length. */
     for (size_t len = 0; len < ZSI_HEADER_LEN + ZSI_TRAILER_LEN; len += 8) {
@@ -3805,35 +3852,79 @@ static void test_inorder_trailer_negatives(void)
         zsi_file_release(&f);
     }
 
-    /* A corrupted pad byte inside the section is caught by the section checksum
-     * (F-26d says the checksum covers the padding). */
+    /* A corrupted byte inside the pointer array is NOT caught on open any more,
+     * and that is F-26f1 rather than an oversight: version 2's pointer-section
+     * checksum covered only the section, so verifying it on open was affordable;
+     * one checksum over the whole file is not, and F-31 keeps open O(1).
+     *
+     * So the load SUCCEEDS -- what stands in its place is the trailer arithmetic
+     * (F-26b), the per-pointer bounds check (F-27) and F-27a -- and the damage is
+     * found on demand instead.  A corrupt array that still satisfies all three is
+     * the accepted consequence of one digest per file. */
     memcpy(b.buf, orig, full);
-    ASSERT(full - ZSI_TRAILER_LEN > ptr_off + 8);
-    b.buf[full - ZSI_TRAILER_LEN - 1] ^= 0x01;
+    ASSERT(full - ZSI_TRAILER_LEN >= ptr_off + 4);   /* at least one pointer */
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] ^= 0x01;      /* a VALUE byte */
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
-    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADCHECKSUM);
+    ASSERT_OK(zsi_ptrs_load(f));
+    ASSERT_EQ(zsi_ptrs_verify_records(f), ZS_BADCHECKSUM);
     zsi_file_release(&f);
 
-    /* A corrupted count: caught by the section checksum, and if the checksum is
-     * recomputed, by the section-length equality. */
+    /* Damage to a POINTER, by contrast, is still caught on open -- not by a
+     * checksum but by F-27's bounds check, and by F-27a when the corrupted value
+     * happens to address a zero byte.  So the structural defence and the
+     * integrity check catch different things, which is why both exist. */
     memcpy(b.buf, orig, full);
-    zsi_put32(b.buf + ptr_off + 4, 9999);
-    {
-        size_t cov = (full - 4) - ptr_off;
-        zsi_put32(b.buf + full - 4, zsi_csum_xxhash(b.buf + ptr_off, cov));
-    }
+    b.buf[full - ZSI_TRAILER_LEN - 1] ^= 0x40;
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
     zsi_file_release(&f);
 
-    /* A pointer outside the records region (F-27), with the checksum fixed up. */
+    /* A corrupted COUNT is caught by F-26b's exact agreement, and this is what
+     * that redundancy is for: nptrs is individually plausible, but the file size
+     * no longer equals ptr_start + nptrs*ptrsize + trailer.  Note the checksum is
+     * NOT fixed up here and does not need to be -- nothing verifies it on open,
+     * so the arithmetic is doing all the work. */
     memcpy(b.buf, orig, full);
-    zsi_put32(b.buf + ptr_off + 8, (uint32_t)(full - 8));   /* into the trailer */
+    zsi_put64(b.buf + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_NPTRS, 9999);
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_release(&f);
+
+    /* A corrupted WIDTH, likewise: 4 and 8 are the only legal values, and a legal
+     * one that disagrees with the file size fails the same equality. */
+    memcpy(b.buf, orig, full);
+    zsi_put64(b.buf + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_PTRSIZE, 3);
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_release(&f);
+
+    memcpy(b.buf, orig, full);
+    zsi_put64(b.buf + full - ZSI_TRAILER_LEN + ZSI_TR_OFF_PTRSIZE, 8);
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_release(&f);
+
+    /* A pointer outside the records region (F-27). */
+    memcpy(b.buf, orig, full);
+    zsi_put32(b.buf + ptr_off, (uint32_t)(full - 8));       /* into the trailer */
+    ASSERT_EQ(writefile(name, b.buf, full), 0);
+    ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
+    ASSERT_EQ(zsi_ptrs_load(f), ZS_BADFORMAT);
+    zsi_file_release(&f);
+
+    /* F-27a: a pointer addressing a ZERO byte.  MustBeOne makes a record's first
+     * byte non-zero (F-12b), so this is the one cheap validity test available on
+     * a pointer the read path is otherwise trusting -- it dereferences pointers
+     * without having verified the file checksum. */
+    memcpy(b.buf, orig, full);
     {
-        size_t cov = (full - 4) - ptr_off;
-        zsi_put32(b.buf + full - 4, zsi_csum_xxhash(b.buf + ptr_off, cov));
+        uint32_t at = zsi_get32(b.buf + ptr_off);
+        b.buf[at] = 0;
     }
     ASSERT_EQ(writefile(name, b.buf, full), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
@@ -3913,9 +4004,11 @@ static void test_inorder_widths_and_padding(void)
     struct ib b;
     struct zsi_file *f = NULL;
 
-    /* F-26c: a file whose offsets all fit is written as PTRS32.  F-26d: the
-     * narrow section pads to a multiple of 8, so the pad is 4 bytes for an odd
-     * count and 0 for an even one.  Both cases round-trip. */
+    /* F-26c: a file whose offsets all fit is written at width 4.  F-26d: the
+     * RECORDS region is padded so the array starts at a multiple of the width --
+     * which since version 4 depends on where the records end, not on the count,
+     * because records are packed (F-2) and end at an arbitrary offset.  Every pad
+     * length 0..3 therefore appears across these cases, and each round-trips. */
     for (size_t n = 1; n <= 4; n++) {
         ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
         for (size_t i = 0; i < n; i++) {
@@ -3926,20 +4019,23 @@ static void test_inorder_widths_and_padding(void)
         size_t records_end = b.len;
         ib_finish(&b);
 
-        /* section = 8 + 4n, rounded up to 8 */
-        size_t expect_sec = ((8 + 4 * n) + 7) & ~(size_t)7;
-        ASSERT_EQU(b.len, records_end + expect_sec + ZSI_TRAILER_LEN);
-        ASSERT_EQ((unsigned char)b.buf[records_end], ZSI_PTRS32);
+        /* The tail is pad + 4n + trailer, and the pad is whatever it takes to
+         * align the array.  Computed here the way the format defines it rather
+         * than restated as a literal -- the whole point of one canonical
+         * description is that the test can use it too. */
+        size_t pad = (4 - (records_end % 4)) % 4;
+        ASSERT_EQU(b.len, records_end + pad + 4 * n + ZSI_TRAILER_LEN);
+        ASSERT_EQU((records_end + pad) % 4, 0u);
 
-        /* the pad, where there is one, is zero */
-        if ((8 + 4 * n) % 8 != 0) {
-            ASSERT_EQ((unsigned char)b.buf[records_end + 8 + 4 * n], 0);
-            ASSERT_EQ((unsigned char)b.buf[records_end + 8 + 4 * n + 3], 0);
-        }
+        /* F-26d: every pad byte is zero, which is what makes it recognisable
+         * given MustBeOne (F-26d1). */
+        for (size_t j = 0; j < pad; j++)
+            ASSERT_EQ((unsigned char)b.buf[records_end + j], 0);
 
         ASSERT_EQ(ib_load(&b, 1, 1, &f), ZS_OK);
         ASSERT_EQU(f->nptrs, n);
-        ASSERT(!f->ptr_wide);
+        ASSERT_EQU(f->ptr_size, 4u);
+        ASSERT_EQU(f->ptr_off, records_end + pad);
         ASSERT_OK(zsi_ptrs_verify_records(f));
         zsi_file_release(&f);
         ib_free(&b);
@@ -3958,33 +4054,38 @@ static void test_inorder_ptrs64(void)
     ASSERT_EQ(mkdbdir(), 0);
     zsi_name_format(name, test_uuid, 1, 1);
 
-    /* Two records, then a wide section by hand. */
+    /* Two records, then an 8-byte-wide array by hand.  A file this small would
+     * canonically use width 4 (F-26c), and a reader MUST honour the width the
+     * trailer states rather than the width the file ought to have used -- because
+     * refusing it would make the whole file unopenable over a canonicality
+     * question, which G-3 forbids.  So this covers the wide form AND the
+     * accept-non-canonical rule in one file. */
     size_t reclen = zsi_rec_encoded_len(1, 1, false);
     size_t records_end = ZSI_HEADER_LEN + 2 * reclen;
-    size_t seclen = 16 + 2 * 8;
-    size_t total = records_end + seclen + ZSI_TRAILER_LEN;
+    size_t pad = (8 - (records_end % 8)) % 8;
+    size_t ptr_start = records_end + pad;
+    size_t arrlen = 2 * 8;
+    size_t total = ptr_start + arrlen + ZSI_TRAILER_LEN;
 
     char *buf = calloc(1, total);
     ASSERT_NOT_NULL(buf);
     make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
-    zsi_rec_encode(buf + ZSI_HEADER_LEN, zsi_csum_xxhash, "a", 1, "1", 1);
-    zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, zsi_csum_xxhash, "b", 1,
-                   "2", 1);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN, "a", 1, "1", 1);
+    zsi_rec_encode(buf + ZSI_HEADER_LEN + reclen, "b", 1, "2", 1);
 
-    buf[records_end] = (char)ZSI_PTRS64;
-    zsi_put64(buf + records_end + 8, 2);
-    zsi_put64(buf + records_end + 16, ZSI_HEADER_LEN);
-    zsi_put64(buf + records_end + 24, ZSI_HEADER_LEN + reclen);
+    zsi_put64(buf + ptr_start,     ZSI_HEADER_LEN);
+    zsi_put64(buf + ptr_start + 8, ZSI_HEADER_LEN + reclen);
 
-    zsi_put64(buf + records_end + seclen, (uint64_t)records_end);
-    zsi_put32(buf + records_end + seclen + 8,
-              zsi_csum_xxhash(buf + ZSI_HEADER_LEN, records_end - ZSI_HEADER_LEN));
-    zsi_put32(buf + total - 4, zsi_csum_xxhash(buf + records_end, seclen + 12));
+    zsi_put64(buf + ptr_start + arrlen + ZSI_TR_OFF_START, (uint64_t)ptr_start);
+    zsi_put64(buf + ptr_start + arrlen + ZSI_TR_OFF_NPTRS, 2);
+    zsi_put64(buf + ptr_start + arrlen + ZSI_TR_OFF_PTRSIZE, 8);
+    zsi_put64(buf + total - ZSI_CSUM_LEN,
+              zsi_csum_xxhash(buf, total - ZSI_CSUM_LEN));
 
     ASSERT_EQ(writefile(name, buf, total), 0);
     ASSERT_OK(zsi_file_open(dbdir, name, 1, TEST_EXTERNAL_CSUM, &f));
     ASSERT_OK(zsi_ptrs_load(f));
-    ASSERT(f->ptr_wide);
+    ASSERT_EQU(f->ptr_size, 8u);        /* the width the file states, honoured */
     ASSERT_EQU(f->nptrs, 2u);
     ASSERT_EQU(zsi_ptrs_at(f, 0), (uint64_t)ZSI_HEADER_LEN);
     ASSERT_EQU(zsi_ptrs_at(f, 1), (uint64_t)(ZSI_HEADER_LEN + reclen));
@@ -5765,7 +5866,7 @@ static void test_open_create(void)
 
     char name[ZSI_NAME_MAX];
     zsi_name_current(name, db->uuid);
-    ASSERT_EQ(filesize(name), 72);
+    ASSERT_EQ(filesize(name), ZSI_HEADER_LEN);
     ASSERT_EQU(db->snap->nfiles, 1u);
     ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
     ASSERT(zsi_unordered_is_clean(db->snap->files[0]));
@@ -5809,7 +5910,7 @@ static void test_open_with_uuid(void)
 
     char name[ZSI_NAME_MAX];
     zsi_name_current(name, test_uuid);
-    ASSERT_EQ(filesize(name), 72);
+    ASSERT_EQ(filesize(name), ZSI_HEADER_LEN);
     ASSERT_OK(zs_db_close(&db));
 
     /* Reopening with a DIFFERENT uuid string ignores it rather than renaming. */
@@ -7894,7 +7995,7 @@ static void test_write_record_is_self_contained(void)
         struct zsi_file *f = db->snap->files[0];
         ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
         ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
-        ASSERT_EQ(r.type, ZSI_KEYVALUE);
+        ASSERT_EQ(r.flags, ZSI_MUSTBEONE);
         ASSERT(r.len <= sizeof(first));
         firstlen = r.len;
         memcpy(first, r.base, r.len);
@@ -7933,7 +8034,7 @@ static void test_write_record_is_self_contained(void)
         struct zsi_file *f = db->snap->files[db->snap->nfiles - 1];
         ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
         ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
-        ASSERT_EQ(r.type, ZSI_KEYVALUE);        /* NOT a distinct "update" form */
+        ASSERT_EQ(r.flags, ZSI_MUSTBEONE);        /* NOT a distinct "update" form */
         ASSERT(r.len <= sizeof(older));
         olderlen = r.len;
         memcpy(older, r.base, r.len);
@@ -7943,7 +8044,7 @@ static void test_write_record_is_self_contained(void)
         f = db->snap->files[db->snap->nfiles - 1];
         ASSERT_OK(zsi_index_find(f->index, zsi_compar_default, "k", 1, &off));
         ASSERT_OK(zsi_rec_decode(zsi_file_at(f, off, 1), f->size - off, &r));
-        ASSERT_EQ(r.type, ZSI_DELETION);
+        ASSERT_EQ(r.flags, (ZSI_MUSTBEONE | ZSI_ISDELETE));
         ASSERT_NULL(r.val);
         zs_db_close(&db);
     }
@@ -9457,7 +9558,7 @@ static void test_repack_version_order(void)
     ASSERT_EQU(out->nptrs, 1u);                     /* D-17: one record per key */
     ASSERT(rec_at_key(out, "k", 1, &r));
     ASSERT_MEM_EQ(r.val, "aaa", 3);                 /* V3's value, generation 3 */
-    ASSERT_EQ(r.type, ZSI_KEYVALUE);                /* the only value form now */
+    ASSERT_EQ(r.flags, ZSI_MUSTBEONE);                /* the only value form now */
     zs_db_close(&db);
 }
 
@@ -9499,7 +9600,7 @@ static void test_repack_d18_table(void)
     ASSERT_NOT_NULL(out);
     ASSERT(rec_at_key(out, "k", 1, &r));
     ASSERT_MEM_EQ(r.val, "v2", 2);
-    ASSERT_EQ(r.type, ZSI_KEYVALUE);
+    ASSERT_EQ(r.flags, ZSI_MUSTBEONE);
     zs_db_close(&db);
 
     /* Row 2: V3 is a deletion and a VALUE lies below -> the tombstone is kept.
@@ -9529,7 +9630,7 @@ static void test_repack_d18_table(void)
     ASSERT_EQU(out->nptrs, 1u);
     ASSERT(rec_at_key(out, "k", 1, &r));
     ASSERT_NULL(r.val);                             /* the tombstone survives */
-    ASSERT_EQ(r.type, ZSI_DELETION);
+    ASSERT_EQ(r.flags, (ZSI_MUSTBEONE | ZSI_ISDELETE));
     zs_db_close(&db);
 
     /* Row 3: V3 is a deletion and a DELETION lies below -> dropped.  That
@@ -9823,7 +9924,7 @@ static void test_repack_empty_output(void)
     ASSERT_NOT_NULL(out);
     ASSERT_EQU(out->nptrs, 0u);                     /* empty, and written */
     zsi_name_format(name, test_uuid, 1, 2);
-    ASSERT_EQ(filesize(name), 96);                  /* F-26g's exact form */
+    ASSERT_EQ(filesize(name), ZSI_INORDER_MIN);     /* F-26g's exact form */
     ASSERT_OK(zsi_ptrs_verify_records(out));
 
     /* The set still tiles, and the database reads as empty. */
@@ -9835,6 +9936,67 @@ static void test_repack_empty_output(void)
     api_scan(db, got, sizeof(got));
     ASSERT_STR_EQ(got, "");
     zs_db_close(&db);
+}
+
+/* A-18: ZS_NOCSUM is RETIRED and REJECTED, not ignored -- and F-5e's rule that
+ * span verification rides indexing now holds unconditionally, there being no mode
+ * left in which to skip it.
+ *
+ * Version 2 used this flag to prove the two were separate: a NOCSUM handle
+ * skipped record checksums and still rejected a bad span.  With no record
+ * checksums the flag has nothing to skip, and silently accepting it would tell a
+ * caller its request for less verification had been honoured. */
+static void test_nocsum_is_rejected(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    struct sb s;
+    char name[ZSI_NAME_MAX];
+    const char *v; size_t vl;
+
+    clear_db();
+    setup.flags = ZS_CREATE;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "k", 1, "v", 1, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* Rejected outright, with the error a caller can act on -- and rejected
+     * before anything is opened, so it cannot half-succeed. */
+    setup.flags = ZS_NOCSUM;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    ASSERT_NULL(db);
+
+    /* Combined with other flags, still rejected: it is the flag that is retired,
+     * not a particular combination. */
+    setup.flags = ZS_NOCSUM | ZS_SHARED;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+    setup.flags = ZS_NOCSUM | ZS_CREATE;
+    ASSERT_EQ(zs_db_open(dbdir, &setup, &db), ZS_BADUSAGE);
+
+    /* Without it, the database opens as normal -- so the rejection above is the
+     * flag's doing and not a broken fixture. */
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_OK(zs_db_close(&db));
+
+    /* And F-5e still holds with no flag in sight: a span whose checksum does not
+     * validate reads as absent, in the only mode there is. */
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "value", 5);
+    sb_term(&s, false);
+    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';        /* after the terminator */
+    zsi_name_current(name, test_uuid);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    setup.flags = 0;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_close(&db));
 }
 
 static void test_repack_verifies_inputs(void)
@@ -9868,12 +10030,13 @@ static void test_repack_verifies_inputs(void)
     db = open_db(0);
     ASSERT_NOT_NULL(db);
 
-    /* Since F-32a the READ sees the damage too -- the record's own checksum
-     * fails at materialization.  D-20b's merge gate remains load-bearing for
-     * what reads never reach: a NOCSUM handle, and shadowed or unread bytes
-     * that a merge copies anyway. */
+    /* The READ does not see the damage at all (F-5f), which is exactly why
+     * D-20b's merge gate is load-bearing rather than a second line of defence:
+     * it is the ONLY thing standing between corrupt input bytes and a freshly
+     * published output that would then carry them with a valid checksum of its
+     * own.  Version 2 had the record's own checksum here as well. */
     db_get(db, "a", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "-");
+    ASSERT_STR_EQ(got, "Value");
 
     ASSERT_EQ(zsi_repack_merge(db, db->snap, 0, 2), ZS_BADCHECKSUM);
 
@@ -9885,131 +10048,39 @@ static void test_repack_verifies_inputs(void)
     zs_db_close(&db);
 }
 
-static void test_repack_verifies_inputs_nocsum(void)
+/* F-5f and F-33: A READ VERIFIES NOTHING, and this test says so on purpose.
+ *
+ * Version 2 gave every record its own checksum and verified it at
+ * materialization, so a value corrupted in place failed the fetch.  Since
+ * version 4 no record carries one, and the file's single checksum (F-26e) is
+ * verified only on demand -- so between consistency checks corrupt bytes are
+ * SERVED TO THE CALLER without complaint.
+ *
+ * That is the trade the packed record buys, and it is asserted rather than merely
+ * tolerated: a future reader "fixing" it by verifying on the read path would put
+ * a hash back on every materialization, which is exactly what was removed.  What
+ * still catches the damage is zs_db_check_consistency, at FILE granularity
+ * (S-13) -- it cannot name the record, and that is asserted too.
+ *
+ * The corruption lands BETWEEN ib_rec and ib_finish, so the file checksum is
+ * computed over the corrupt bytes and therefore VALIDATES.  A second case below
+ * corrupts after ib_finish, which is what the checksum does catch. */
+static void test_read_serves_corrupt_bytes(void)
 {
-    /* D-20b under ZS_NOCSUM: the flag is scoped to READS (F-5e).  A repack
-     * writes a fresh checksum over whatever it copies, so it verifies its
-     * inputs no matter how the handle was opened -- a NOCSUM handle that
-     * repacked without checking would certify corrupt bytes as good. */
-    struct zs_db *db;
-    struct ib b;
-    char name[ZSI_NAME_MAX];
-
-    clear_db();
-
-    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5);
-    ib_finish(&b);
-    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
-    zsi_name_format(name, test_uuid, 1, 1);
-    ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-
-    put_inorder_kv(2, 2, (const struct kv[]){ {"b","other"}, {NULL,NULL} });
-    put_unordered_kv(3, (const struct kv[]){ {NULL,NULL} });
-
-    db = open_db(ZS_NOCSUM);
-    ASSERT_NOT_NULL(db);
-    ASSERT_EQ(zsi_repack_merge(db, db->snap, 0, 2), ZS_BADCHECKSUM);
-
-    ASSERT_OK(zsi_db_refresh(db));
-    ASSERT_NOT_NULL(file_with_range(db, 1, 1));
-    ASSERT_NOT_NULL(file_with_range(db, 2, 2));
-    ASSERT_NULL(file_with_range(db, 1, 2));
-    zs_db_close(&db);
-}
-
-static void test_seal_verifies_spans_nocsum(void)
-{
-    /* D-20b on the conversion path.  Since span verification rides indexing
-     * in every mode (F-5e), no handle -- NOCSUM included -- ever ADMITS a
-     * span whose checksum fails.  What IS reachable is time: in-place damage
-     * AFTER the snapshot admitted the span changes neither the name set nor the
-     * file size, so the C-4i probe cannot see it, and a commit-driven
-     * conversion (D-25d, D-12) runs against the pre-damage snapshot.
-     * D-20b's re-verify is what stands between that and an in-order file
-     * that validates perfectly while D-23 removes the evidence.  Driven at
-     * the unit level -- zsi_convert_one under the write lock, exactly the
-     * commit path's call -- because zs_db_seal refreshes first and so
-     * rejects the span before ever reaching the walk. */
-    struct zs_db *db;
-    struct sb s;
-    char name[ZSI_NAME_MAX];
-    char got[64];
-    size_t voff = 0;
-
-    clear_db();
-
-    sb_init(&s, 1, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "k", 1, "value", 5);
-    sb_term(&s, false);
-    for (size_t i = ZSI_HEADER_LEN; i + 5 <= s.len; i++)
-        if (memcmp(s.buf + i, "value", 5) == 0) { voff = i; break; }
-    ASSERT(voff != 0);
-    zsi_name_current(name, test_uuid);
-    ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(sb_write(&s, name), 0);
-    sb_free(&s);
-
-    /* Admitted while intact: the replay verified this span. */
-    db = open_db(ZS_NOCSUM);
-    ASSERT_NOT_NULL(db);
-    db_get(db, "k", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "value");
-
-    /* Damage a value byte ON DISK, behind the admitted snapshot. */
-    {
-        int fd = open(dbpath(name), O_RDWR);
-        ASSERT(fd >= 0);
-        ASSERT_EQ(pwrite(fd, "V", 1, (off_t)voff), 1);
-        close(fd);
-    }
-
-    /* The NOCSUM handle keeps reading the damaged bytes through its mapping
-     * (F-5e's bargain at the record level)... */
-    db_get(db, "k", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "Value");
-
-    /* ...but a conversion re-verifies the chain it is about to copy, and
-     * must not certify it. */
-    ASSERT_OK(zsi_lock_take(&db->locks, ZSI_LOCK_WRITE, 0));
-    {
-        struct zsi_file *act = zsi_snapshot_active(db->snap);
-        ASSERT_NOT_NULL(act);
-        ASSERT_EQ(zsi_convert_one(db, act), ZS_BADCHECKSUM);
-    }
-    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
-
-    /* The file is still unordered, still present, still readable. */
-    ASSERT_NOT_NULL(file_with_range(db, 1, 0));
-    db_get(db, "k", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "Value");
-    zs_db_close(&db);
-}
-
-static void test_read_verifies_record_csum(void)
-{
-    /* F-32a: a value byte flipped in place in an in-order file fails THAT key
-     * at materialization; sibling keys still read; a ZS_NOCSUM handle still
-     * reads the corrupt value (F-5e).
-     *
-     * The corruption lands BETWEEN ib_rec and ib_finish, so the trailer's
-     * records-region checksum is computed over the corrupt bytes and
-     * validates -- the record's own checksum is the ONLY witness.  Corrupting
-     * after ib_finish would leave both stale and prove nothing about which
-     * one fired. */
     struct zs_db *db;
     struct ib b;
     char name[ZSI_NAME_MAX];
     char got[64];
     const char *v; size_t vl;
 
+    /* Case 1: corrupt before the checksum is computed.  Nothing can detect it,
+     * and the read returns the corrupt bytes. */
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
     ib_rec(&b, "a", 1, "value", 5);
     ib_rec(&b, "b", 1, "other", 5);
-    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';    /* first value byte of "a" */
+    /* first value byte of "a": 4 header + 1 key + 1 key NUL */
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     ib_finish(&b);
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
@@ -10019,29 +10090,55 @@ static void test_read_verifies_record_csum(void)
 
     db = open_db(0);
     ASSERT_NOT_NULL(db);
-    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_BADCHECKSUM);
+    db_get(db, "a", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");                /* the corrupt bytes, served */
     ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "other", 5);
+
+    /* And the file is self-consistent, because the checksum covers the damage. */
+    ASSERT_OK(zs_db_check_consistency(db));
     zs_db_close(&db);
 
-    db = open_db(ZS_NOCSUM);
+    /* Case 2: corrupt AFTER the checksum is computed.  The read still succeeds
+     * and still serves the corrupt bytes -- but check_consistency now fails, at
+     * file granularity. */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_finish(&b);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(0);
     ASSERT_NOT_NULL(db);
     db_get(db, "a", 1, got, sizeof(got));
-    ASSERT_STR_EQ(got, "Value");
+    ASSERT_STR_EQ(got, "Value");                /* still served (F-5f) */
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
     zs_db_close(&db);
 }
 
-static void test_read_verifies_record_csum_unordered(void)
+/* F-22a: IN AN UNORDERED FILE THE SPAN CHECKSUM IS THE ONLY THING COVERING THE
+ * BYTES, now that no record carries one -- so the granularity of detection moved
+ * from the record to the SPAN, and both halves of that are asserted.
+ *
+ * Corrupt a record BEFORE the terminator is written and the span checksum covers
+ * the damage: nothing detects it and the corrupt value is served (F-5f), exactly
+ * as for an in-order file.  Corrupt it AFTER, and the span fails verification and
+ * reads as ABSENT -- taking its sibling records with it, which is the cost of
+ * span-granular detection and is why F-5e's rule is load-bearing rather than
+ * belt-and-braces. */
+static void test_span_checksum_is_the_only_witness(void)
 {
-    /* F-32a in an unordered file: corrupt ONE record inside a span BEFORE the
-     * terminator is written, so the span checksum covers the corrupt bytes
-     * and the span validates -- pure record-level corruption, invisible to
-     * replay, caught only at materialization. */
     struct zs_db *db;
     struct sb s;
     char name[ZSI_NAME_MAX];
+    char got[64];
     const char *v; size_t vl;
 
+    /* Case 1: damage inside the checksum's coverage.  Undetectable, served. */
     clear_db();
     sb_init(&s, 1, ZSI_CSUM_XXHASH);
     sb_rec(&s, "a", 1, "value", 5);
@@ -10055,19 +10152,48 @@ static void test_read_verifies_record_csum_unordered(void)
 
     db = open_db(0);
     ASSERT_NOT_NULL(db);
-    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_BADCHECKSUM);
+    db_get(db, "a", 1, got, sizeof(got));
+    ASSERT_STR_EQ(got, "Value");
     ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "other", 5);
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+
+    /* Case 2: damage AFTER the terminator's checksum was computed.  The span
+     * fails F-19's verification, so it reads as absent -- and "b", which was
+     * never touched, goes with it.  That is F-24 doing its job on a span rather
+     * than on a record. */
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "value", 5);
+    sb_rec(&s, "b", 1, "other", 5);
+    sb_term(&s, false);
+    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
     zs_db_close(&db);
 }
 
-static void test_record_csum_replay_no_truncate(void)
+/* F-33a, the G-3 half, which SURVIVES the retirement of F-32 because it is a rule
+ * about REPLAY rather than about record checksums.
+ *
+ * Replay completes a file at its first invalid record (F-24), so anything
+ * verified there turns one flipped byte into the loss of every record after it.
+ * With no record checksums there is nothing left to verify per record -- so what
+ * this now pins is that a record which merely LOOKS wrong to a caller does not
+ * truncate the span, and that a whole span walks and yields in order.
+ *
+ * "b" was stored after the corrupt "a" in the SAME span, and both must appear:
+ * the span's own checksum covers the damage (it was applied before the terminator
+ * was written), so the span is valid and every record in it is live. */
+static void test_replay_does_not_truncate_on_a_bad_record(void)
 {
-    /* F-32b, the G-3 half: a record checksum failure must NOT make replay
-     * complete the file early.  "b" was stored AFTER the corrupt "a" in the
-     * SAME span; a replay that verified record checksums would discard it
-     * (F-24).  A scan must also survive: the corrupt record fails its own
-     * yield and only its own yield. */
     struct zs_db *db;
     struct sb s;
     char name[ZSI_NAME_MAX];
@@ -10089,13 +10215,20 @@ static void test_record_csum_replay_no_truncate(void)
     ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
     ASSERT_MEM_EQ(v, "other", 5);
 
-    /* A cursor walk hits the corrupt record first and reports it, rather
-     * than skipping it silently or truncating the traversal semantics. */
+    /* A cursor walks the whole span and yields BOTH records in key order, the
+     * corrupt one included and serving its corrupt bytes (F-5f).  Version 2
+     * reported ZS_BADCHECKSUM from the first step here. */
     {
         struct zs_cursor *c = NULL;
         struct zsi_rec r;
         ASSERT_OK(zsi_cursor_open(db, NULL, db->snap, NULL, 0, 0, &c));
-        ASSERT_EQ(zsi_cursor_next(c, &r), ZS_BADCHECKSUM);
+        ASSERT_OK(zsi_cursor_next(c, &r));
+        ASSERT_MEM_EQ(r.key, "a", 1);
+        ASSERT_MEM_EQ(r.val, "Value", 5);
+        ASSERT_OK(zsi_cursor_next(c, &r));
+        ASSERT_MEM_EQ(r.key, "b", 1);
+        ASSERT_MEM_EQ(r.val, "other", 5);
+        ASSERT_EQ(zsi_cursor_next(c, &r), ZS_DONE);
         zsi_cursor_free(c);
     }
     zs_db_close(&db);
@@ -10290,42 +10423,6 @@ static void test_check_out_of_order_pointers(void)
     zs_db_close(&db);
 }
 
-static void test_check_records_checksum(void)
-{
-    /* F-26e/F-26f: a record body corrupted in place is detected here and nowhere
-     * else, since an in-order file has no span terminators to notice. */
-    struct zs_db *db;
-    struct ib b;
-    char name[ZSI_NAME_MAX];
-
-    clear_db();
-    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
-    ib_rec(&b, "a", 1, "value", 5);
-    ib_rec(&b, "b", 1, "other", 5);
-    ib_finish(&b);
-    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';        /* flip a value byte */
-    zsi_name_format(name, test_uuid, 1, 1);
-    ASSERT_EQ(mkdbdir(), 0);
-    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
-    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
-
-    db = open_db_reporting(0);
-    ASSERT_NOT_NULL(db);
-
-    /* Opening succeeded -- the check is on demand, so open stays O(1) (F-26f). */
-    ASSERT_EQ(report_count, 0);
-    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
-    ASSERT(report_count > 0);
-
-    /* And ZS_NOCSUM skips it, which is what that flag means (F-5e). */
-    zs_db_close(&db);
-    db = open_db_reporting(ZS_NOCSUM);
-    ASSERT_NOT_NULL(db);
-    ASSERT_OK(zs_db_check_consistency(db));
-    zs_db_close(&db);
-}
-
 static void test_check_noncanonical(void)
 {
     /* T-6's negative: a hand-built file whose records use the wrong ENCODING
@@ -10351,20 +10448,25 @@ static void test_check_noncanonical(void)
         size_t reclen;
         memset(buf, 0, sizeof(buf));
         make_header(buf, 5, 5, ZSI_CSUM_XXHASH);
-        buf[ZSI_HEADER_LEN] = (char)ZSI_BIGDELETION;
-        zsi_put64(buf + ZSI_HEADER_LEN + 8, 1);          /* keylen 1: fits */
+        /* The nibble and keylen share the FIRST 64-bit word in the big form,
+         * exactly as they share a 16-bit word in the small one -- flags in the
+         * low 4 bits, keylen in the 60 above.  vallen follows at +8. */
+        zsi_put64(buf + ZSI_HEADER_LEN,
+                  (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE)
+                  | ((uint64_t)1 << ZSI_KEYLEN_SHIFT));   /* keylen 1: fits */
+        zsi_put64(buf + ZSI_HEADER_LEN + 8, 0);            /* vallen */
         buf[ZSI_HEADER_LEN + 16] = 'k';
         buf[ZSI_HEADER_LEN + 17] = '\0';
-        reclen = 24;                        /* roundup8(16 + 1 + 1 + 4) */
-        zsi_put32(buf + ZSI_HEADER_LEN + reclen - 4,
-                  zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen - 4));
+        reclen = 16 + 1 + 1;                /* F-14a: hdr + keylen + key NUL */
 
         uint64_t ptr = ZSI_HEADER_LEN;
         char *sec = NULL;
         size_t seclen = 0;
-        uint32_t rc = zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen);
-        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, rc,
-                                 zsi_csum_xxhash, &sec, &seclen));
+        struct zsi_region pre[1];
+        pre[0].p = buf; pre[0].len = ZSI_HEADER_LEN + reclen;
+        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, pre, 1,
+                                 zsi_csum_xxhash, ZSI_CSUM_XXHASH,
+                                 &sec, &seclen));
         memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
         free(sec);
 
@@ -10392,28 +10494,28 @@ static void test_check_noncanonical(void)
         size_t reclen;
         memset(buf, 0, sizeof(buf));
         make_header(buf, 1, 1, ZSI_CSUM_XXHASH);
-        /* BIGKEYVALUE with keylen 1, vallen 1 -- both fit the short form */
-        buf[ZSI_HEADER_LEN] = (char)ZSI_BIGKEYVALUE;
-        zsi_put64(buf + ZSI_HEADER_LEN + 8, 1);
-        zsi_put64(buf + ZSI_HEADER_LEN + 16, 1);
-        buf[ZSI_HEADER_LEN + 24] = 'k';
-        buf[ZSI_HEADER_LEN + 25] = '\0';
-        buf[ZSI_HEADER_LEN + 26] = 'v';
-        buf[ZSI_HEADER_LEN + 27] = '\0';
-        reclen = 32;                        /* roundup8(24 + 1+1+1+1 + 4) */
-        /* F-32: the trailing checksum, honest even though the FORM is
-         * non-canonical -- the divergence under test is the shape, and a
-         * stale checksum would make the fetch below fail for the wrong
-         * reason. */
-        zsi_put32(buf + ZSI_HEADER_LEN + reclen - 4,
-                  zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen - 4));
-
+        /* A big record with keylen 1 and vallen 1 -- both fit the small form. */
+        zsi_put64(buf + ZSI_HEADER_LEN,
+                  (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                  | ((uint64_t)1 << ZSI_KEYLEN_SHIFT));
+        zsi_put64(buf + ZSI_HEADER_LEN + 8, 1);            /* vallen */
+        buf[ZSI_HEADER_LEN + 16] = 'k';
+        buf[ZSI_HEADER_LEN + 17] = '\0';
+        buf[ZSI_HEADER_LEN + 18] = 'v';
+        buf[ZSI_HEADER_LEN + 19] = '\0';
+        reclen = 16 + 1 + 1 + 1 + 1;        /* F-14a, packed */
+        /* The FILE checksum is computed over these bytes by zsi_ptrs_build
+         * below, so it is honest even though the FORM is non-canonical: the
+         * divergence under test is the shape, and a stale checksum would make
+         * the fetch below fail for the wrong reason. */
         uint64_t ptr = ZSI_HEADER_LEN;
         char *sec = NULL;
         size_t seclen = 0;
-        uint32_t rc = zsi_csum_xxhash(buf + ZSI_HEADER_LEN, reclen);
-        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, rc,
-                                 zsi_csum_xxhash, &sec, &seclen));
+        struct zsi_region pre[1];
+        pre[0].p = buf; pre[0].len = ZSI_HEADER_LEN + reclen;
+        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, pre, 1,
+                                 zsi_csum_xxhash, ZSI_CSUM_XXHASH,
+                                 &sec, &seclen));
         memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
         free(sec);
 
@@ -11419,7 +11521,7 @@ static void test_malformed_never_hangs(void)
     {
         char junk[4096];
         for (size_t i = 0; i < sizeof(junk); i += 8) {
-            junk[i] = (char)ZSI_KEYVALUE;
+            junk[i] = (char)ZSI_MUSTBEONE;
             junk[i + 1] = 0;
             memset(junk + i + 2, 0, 6);
         }
@@ -11456,7 +11558,7 @@ static void test_malformed_never_hangs(void)
     {
         char big[32];
         memset(big, 0, sizeof(big));
-        big[0] = (char)ZSI_BIGKEYVALUE;
+        big[0] = (char)(ZSI_MUSTBEONE | ZSI_ISBIG);
         zsi_put64(big + 8, 0xFFFFFFFFFFFFFFFFull);
         zsi_put64(big + 16, 0xFFFFFFFFFFFFFFFFull);
         sb_raw(&s, big, sizeof(big));
@@ -12090,7 +12192,7 @@ static void test_mp_reader_sees_torn_span(void)
          * never read as valid data, but salvage walks it, and a wrong-engine
          * checksum here would read as record corruption rather than the
          * missing terminator this test is about. */
-        zsi_rec_encode(rec, zsi_csum_xxhash, "partial", 7, "no!", 3);
+        zsi_rec_encode(rec, "partial", 7, "no!", 3);
         int fd = open(dbpath(name), O_WRONLY | O_APPEND);
         ASSERT(fd >= 0);
         ASSERT_EQ(write(fd, rec, n), (ssize_t)n);
@@ -12116,7 +12218,7 @@ static void test_mp_reader_sees_torn_span(void)
      * only thing that can tell. */
     {
         size_t datalen = (size_t)(filesize(name) - before);
-        char term[ZSI_TERMLEN_LONG];
+        char term[ZSI_TERMLEN];
         char *data = malloc(datalen);
         ASSERT_NOT_NULL(data);
 
@@ -12138,8 +12240,8 @@ static void test_mp_reader_sees_torn_span(void)
         ASSERT_NOT_NULL(zeros);
         ASSERT_EQ(write(fd, zeros, datalen), (ssize_t)datalen);
         ASSERT_EQ(lseek(fd, 0, SEEK_END), (off_t)filesize(name));
-        ASSERT_EQ(write(fd, term, zsi_term_encoded_len(datalen)),
-                  (ssize_t)zsi_term_encoded_len(datalen));
+        ASSERT_EQ(write(fd, term, zsi_term_encoded_len()),
+                  (ssize_t)zsi_term_encoded_len());
         close(fd);
         free(data);
         free(zeros);
@@ -12622,8 +12724,10 @@ static void test_idxcache_header_byte_layout(void)
         0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         /* 80 nptrs = 7 LE */
         0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        /* 88 term_csum = 0xDEADBEEF LE, 92 checksum of [0, 92) */
-        0xEF, 0xBE, 0xAD, 0xDE, 0x30, 0x10, 0x2D, 0x0D
+        /* 88 term_csum = 0xDEADBEEF LE, 8 bytes now that a checksum is 64-bit */
+        0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00,
+        /* 96 checksum of [0, 96), 8 bytes little-endian */
+        0x5D, 0xFE, 0x41, 0xA0, 0x2A, 0x98, 0xCE, 0x17
     };
 
     static const zsi_uuid_t u = {
@@ -12633,7 +12737,7 @@ static void test_idxcache_header_byte_layout(void)
     struct zsi_idxhdr h;
     char buf[ZSI_IDX_HEADER_LEN];
 
-    ASSERT_EQ(ZSI_IDX_HEADER_LEN, 96);
+    ASSERT_EQ(ZSI_IDX_HEADER_LEN, 104);
     ASSERT_EQ(ZSI_IDX_MAGIC_LEN, 16);
 
     /* Different from the data-file magic, so the two artefacts are told apart by
@@ -12678,8 +12782,8 @@ static void test_idxcache_header_byte_layout(void)
     ASSERT_EQU(zsi_get64(buf + 64), 0x1122334455667788ULL);
     ASSERT_EQU(zsi_get64(buf + 72), 200u);
     ASSERT_EQU(zsi_get64(buf + 80), 7u);
-    ASSERT_EQU(zsi_get32(buf + 88), 0xDEADBEEFu);
-    ASSERT_EQU(zsi_get32(buf + 92), zsi_csum_xxhash(buf, 92));
+    ASSERT_EQU(zsi_get64(buf + 88), 0xDEADBEEFull);
+    ASSERT_EQU(zsi_get64(buf + 96), zsi_csum_xxhash(buf, 96));
 
     /* Round-trip, including the engine read as plain data first (F-5a). */
     {
@@ -12726,7 +12830,7 @@ static void test_idxcache_header_byte_layout(void)
     {
         struct zsi_idxhdr back;
         buf[ZSI_IDX_OFF_VREAD] = (char)(ZSI_IDX_VERSION_READ + 1);
-        zsi_put32(buf + ZSI_IDX_OFF_CSUM,
+        zsi_put64(buf + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(buf, ZSI_IDX_OFF_CSUM));
         ASSERT_EQ(zsi_idxhdr_decode(buf, sizeof(buf), zsi_csum_xxhash, &back),
                   ZS_BADFORMAT);
@@ -12925,7 +13029,7 @@ static void test_idxcache_rejection_rules(void)
     /* Baseline: the pristine table loads, and describes every key. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name,
                                &base, &nbase, &vu, &to, &tc));
         ASSERT_EQU(nbase, 30u);
@@ -12949,7 +13053,7 @@ static void test_idxcache_rejection_rules(void)
 
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-            uint32_t tc = 0;
+            uint64_t tc = 0;
             size_t off = cases[i].off;
 
             tab[off] = (char)((unsigned char)tab[off] ^ 0x01);
@@ -12957,7 +13061,7 @@ static void test_idxcache_rejection_rules(void)
             /* Fields the header checksum covers need it recomputed, or every
              * case would only ever exercise the checksum rule. */
             if (off < ZSI_IDX_OFF_CSUM)
-                zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                           zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
 
             ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
@@ -12975,7 +13079,7 @@ static void test_idxcache_rejection_rules(void)
 
             tab[off] = (char)((unsigned char)tab[off] ^ 0x01);
             if (off < ZSI_IDX_OFF_CSUM)
-                zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+                zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                           zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         }
     }
@@ -12983,7 +13087,7 @@ static void test_idxcache_rejection_rules(void)
     /* The checksum over the offset array. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         tab[tablen - 1] = (char)((unsigned char)tab[tablen - 1] ^ 0x01);
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -12998,11 +13102,11 @@ static void test_idxcache_rejection_rules(void)
      * never run and the case would assert nothing. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         uint32_t was = zsi_get32(tab + ZSI_IDX_OFF_START);
 
         zsi_put32(tab + ZSI_IDX_OFF_START, was + 7);
-        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -13010,7 +13114,7 @@ static void test_idxcache_rejection_rules(void)
         ASSERT_NULL(base);
 
         zsi_put32(tab + ZSI_IDX_OFF_START, was);
-        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     }
@@ -13021,7 +13125,7 @@ static void test_idxcache_rejection_rules(void)
      * reached -- which is a case that reads as coverage and provides none. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         uint64_t was = zsi_get64(tab + ZSI_IDX_HEADER_LEN);
         size_t arrlen = tablen - ZSI_IDX_HEADER_LEN - 4;
 
@@ -13057,7 +13161,7 @@ static void test_idxcache_rejection_rules(void)
      * behind the handle-side one. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         char saved[ZSI_COMPAR_NAME_LEN];
 
         memcpy(saved, f->hdr.compar_name, sizeof(saved));
@@ -13074,7 +13178,7 @@ static void test_idxcache_rejection_rules(void)
     /* Truncated and padded: the size must be exactly 96 + 8n + 4. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
 
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen - 1));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -13100,12 +13204,12 @@ static void test_idxcache_rejection_rules(void)
      * verifying reader, and IS acceptable to a non-verifying one. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         uint16_t fl = zsi_get16(tab + ZSI_IDX_OFF_FLAGS);
 
         zsi_put16(tab + ZSI_IDX_OFF_FLAGS,
                   (uint16_t)(fl & ~ZSI_IDX_FLAG_CSUM_VERIFIED));
-        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
 
@@ -13117,7 +13221,7 @@ static void test_idxcache_rejection_rules(void)
         ASSERT_NULL(base);
 
         zsi_put16(tab + ZSI_IDX_OFF_FLAGS, fl);
-        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     }
@@ -13126,7 +13230,7 @@ static void test_idxcache_rejection_rules(void)
      * agrees with the table.  Constructed by asking with a different name. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         char other[ZSI_COMPAR_NAME_LEN];
 
         memset(other, 0, sizeof(other));
@@ -13140,7 +13244,7 @@ static void test_idxcache_rejection_rules(void)
      * all is the same. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         struct zsi_idxcfg off = { NULL, 0, false };
 
         ASSERT_EQ(zsi_idx_load(f, &off, db->compar_name,
@@ -13173,7 +13277,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
     size_t tablen;
     size_t *base = NULL, nbase = 0, vu = 0, to = 0;
     size_t first_term_off;
-    uint32_t tc = 0, first_term_csum;
+    uint64_t tc = 0, first_term_csum;
 
     idxcache_mkdir(cachedir, sizeof(cachedir));
 
@@ -13230,7 +13334,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
         ASSERT_NOT_NULL(tb);
         ASSERT_OK(zsi_term_decode(tb, f->size - rec_off, &term));
         ASSERT_EQU(rec_off + term.len, rec_vu);
-        ASSERT_EQU(term.csum, zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM));
+        ASSERT_EQU(term.csum, zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM));
     }
 
     /* The PRISTINE table loads.  Without this baseline, a load that fails for
@@ -13243,15 +13347,15 @@ static void test_idxcache_rejects_bad_term_binding(void)
     base = NULL;
 
     /* A term_csum that is not the terminator's. */
-    zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
-              zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
-    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM,
+              zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
+    zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
     ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
     ASSERT_NULL(base);
-    zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM,
-              zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
+    zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM,
+              zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM) ^ 0xFFFFFFFFu);
 
     /* A term_off naming an EARLIER span's terminator, with its real checksum.
      * Everything about it is genuine except that it does not end at valid_upto,
@@ -13259,11 +13363,11 @@ static void test_idxcache_rejects_bad_term_binding(void)
      * publisher recording the wrong boundary would leave behind. */
     {
         uint64_t was_off = zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF);
-        uint32_t was_csum = zsi_get32(tab + ZSI_IDX_OFF_TERM_CSUM);
+        uint32_t was_csum = zsi_get64(tab + ZSI_IDX_OFF_TERM_CSUM);
 
         zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF, (uint64_t)first_term_off);
-        zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM, first_term_csum);
-        zsi_put32(tab + ZSI_IDX_OFF_CSUM,
+        zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM, first_term_csum);
+        zsi_put64(tab + ZSI_IDX_OFF_CSUM,
                   zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
         ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
         ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
@@ -13271,13 +13375,13 @@ static void test_idxcache_rejects_bad_term_binding(void)
         ASSERT_NULL(base);
 
         zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF, was_off);
-        zsi_put32(tab + ZSI_IDX_OFF_TERM_CSUM, was_csum);
+        zsi_put64(tab + ZSI_IDX_OFF_TERM_CSUM, was_csum);
     }
 
     /* A term_off that is not a terminator at all. */
     zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
               zsi_get64(tab + ZSI_IDX_OFF_TERM_OFF) - 8);
-    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
     ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
@@ -13288,7 +13392,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
     /* term_off at or beyond valid_upto. */
     zsi_put64(tab + ZSI_IDX_OFF_TERM_OFF,
               zsi_get64(tab + ZSI_IDX_OFF_VALID_UPTO));
-    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
     ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
@@ -13296,7 +13400,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
 
     /* valid_upto past the end of the data file. */
     zsi_put64(tab + ZSI_IDX_OFF_VALID_UPTO, (uint64_t)f->size + 4096);
-    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
     ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
@@ -13304,7 +13408,7 @@ static void test_idxcache_rejects_bad_term_binding(void)
 
     /* And below the data file's header length. */
     zsi_put64(tab + ZSI_IDX_OFF_VALID_UPTO, 3);
-    zsi_put32(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
+    zsi_put64(tab + ZSI_IDX_OFF_CSUM, zsi_csum_xxhash(tab, ZSI_IDX_OFF_CSUM));
     ASSERT_OK(idxcache_spew(tabpath, tab, tablen));
     ASSERT_EQ(zsi_idx_load(f, &cfg, db->compar_name,
                            &base, &nbase, &vu, &to, &tc), ZS_NOTFOUND);
@@ -14083,7 +14187,7 @@ static void test_corpus_index_table(void)
         struct zsi_idxcfg cfg;
         char *txt, *line, sub[64];
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
 
         XSNPRINTF(src, CORPUS_DIR "/%s", cases[i]);
         XSNPRINTF(txtpath, "%s/case.txt", src);
@@ -14218,7 +14322,7 @@ static void test_idxcache_uses_file_engine(void)
      * handle's engine: the engine check compares against the file's. */
     {
         size_t *base = NULL, nbase = 0, vu = 0, to = 0;
-        uint32_t tc = 0;
+        uint64_t tc = 0;
         ASSERT_OK(zsi_idx_load(f, &cfg, db->compar_name,
                                &base, &nbase, &vu, &to, &tc));
         ASSERT_EQU(nbase, 2u);
@@ -15192,59 +15296,80 @@ static void test_convert_reencodes_engine_mismatch(void)
     zs_db_close(&db);
 }
 
-static void test_check_reports_record_csum(void)
+/* What check_consistency can and cannot NAME since version 4, asserted as a pair
+ * because the loss of granularity is the point (S-13, F-33).
+ *
+ * Version 2 verified a per-record checksum here and named the damaged record in
+ * both file kinds.  Now: an in-order file has one checksum, so the report names
+ * the FILE; and an unordered file's damage is caught by its SPAN, or not at all
+ * when the damage predates the terminator.  Neither can name a record. */
+static void test_check_names_the_file_not_the_record(void)
 {
-    /* F-32a in check, both file kinds, both isolated so ONLY the per-record
-     * checksum can fire: the in-order corruption lands before ib_finish so
-     * the region checksum covers the corrupt bytes and validates; the
-     * unordered corruption lands before sb_term so the span validates.  T-6
-     * style -- reported, while the healthy key still reads. */
     struct zs_db *db;
     struct ib b;
-    struct sb s;
     char name[ZSI_NAME_MAX];
     const char *v; size_t vl;
 
+    /* In-order, damaged AFTER the checksum was computed: reported, at file
+     * granularity, and the healthy key still reads (F-5f). */
     clear_db();
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
     ib_rec(&b, "a", 1, "value", 5);
     ib_rec(&b, "b", 1, "other", 5);
-    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     ib_finish(&b);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
     ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
 
-    sb_init(&s, 2, ZSI_CSUM_XXHASH);
-    sb_rec(&s, "c", 1, "third", 5);
-    s.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'T';
-    sb_term(&s, false);
-    zsi_name_current(name, test_uuid);
-    ASSERT_EQ(sb_write(&s, name), 0);
-    sb_free(&s);
-
-    db = open_db(0);
+    db = open_db_reporting(0);
     ASSERT_NOT_NULL(db);
+    report_count = 0;
     ASSERT_EQ(zs_db_check_consistency(db), ZS_BADCHECKSUM);
+    ASSERT(report_count > 0);
     ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "other", 5);
     zs_db_close(&db);
 
-    /* F-5e: a NOCSUM handle's check skips the verification, like every other
-     * read-side check it skips. */
-    db = open_db(ZS_NOCSUM);
+    /* In-order, damaged BEFORE the checksum was computed: NOTHING is reported,
+     * because the checksum covers the damage and no record carries one of its
+     * own.  Version 2 caught this case; that is what was given up. */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5);
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
+    ib_finish(&b);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+    put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db_reporting(0);
     ASSERT_NOT_NULL(db);
+    report_count = 0;
     ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_EQ(report_count, 0);
     zs_db_close(&db);
 }
 
-static void test_salvage_verifies_records_inorder(void)
+/* S-13: SALVAGING AN IN-ORDER FILE IS ALL OR NOTHING, and this is the test that
+ * changed most in version 4.
+ *
+ * Version 2 gave every record its own checksum, so salvage verified per record,
+ * recovered everything, and reported only the damaged key as KEY_UNVERIFIED.  One
+ * checksum over the whole file cannot name a record -- so a single flipped bit
+ * makes every key in the file unverifiable, and:
+ *
+ *   - without ZS_SALVAGE_UNVERIFIED the file contributes NOTHING;
+ *   - with it, every key is recovered and the FILE is reported once, with its own
+ *     kind, because two million per-key events is not a report.
+ *
+ * That is the cost of the density the packed record buys, and it is asserted in
+ * both directions rather than assumed. */
+static void test_salvage_all_or_nothing_inorder(void)
 {
-    /* F-32 sharpens S-6's honesty: an in-order file's records were committed
-     * by construction (published whole by rename, D-21), so byte-proof is
-     * the only open question and the record checksum answers it per record.
-     * The corrupt record is still recovered -- salvage never discards what
-     * it can read -- but it alone is reported KEY_UNVERIFIED. */
     struct zs_salvage_data ss = ZS_SALVAGE_DATA_INITIALIZER;
     struct salv s;
     struct ib b;
@@ -15254,25 +15379,59 @@ static void test_salvage_verifies_records_inorder(void)
     ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
     ib_rec(&b, "a", 1, "value", 5);
     ib_rec(&b, "b", 1, "other", 5);
-    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     ib_finish(&b);
+    /* AFTER ib_finish, so the file checksum no longer covers these bytes.  The
+     * damage is confined to one value, and the point is that it condemns the
+     * whole file anyway. */
+    b.buf[ZSI_HEADER_LEN + 4 + 1 + 1] = 'V';
     zsi_name_format(name, test_uuid, 1, 1);
     ASSERT_EQ(mkdbdir(), 0);
     ASSERT_EQ(writefile(name, b.buf, b.len), 0);
-    ib_free(&b);
 
+    /* Without the flag: nothing recovered, and the file reported once. */
     memset(&s, 0, sizeof(s));
     salv_reset_out();
     ss.report = salv_cb;
     ss.rock = &s;
     ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
 
-    /* Both keys recovered; only the corrupt one reported. */
+    ASSERT_EQ(salv_fetch("a", val, sizeof(val)), ZS_NOTFOUND);
+    ASSERT_EQ(salv_fetch("b", val, sizeof(val)), ZS_NOTFOUND);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_REGION_UNVERIFIED], 1);
+    /* Reported at FILE granularity, so NOT per key -- which is the distinction
+     * the separate kind exists to make (S-13). */
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 0);
+
+    /* With the flag: every key recovered, and still ONE file-level report. */
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.flags = ZS_SALVAGE_UNVERIFIED;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+
     ASSERT_OK(salv_fetch("a", val, sizeof(val)));
-    ASSERT_STR_EQ(val, "Value");
+    ASSERT_STR_EQ(val, "Value");            /* the corrupt bytes, as recovered */
     ASSERT_OK(salv_fetch("b", val, sizeof(val)));
     ASSERT_STR_EQ(val, "other");
-    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 1);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_REGION_UNVERIFIED], 1);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 0);
+
+    /* And an UNDAMAGED file needs no flag and produces no report at all, so the
+     * above is not simply "salvage reports everything". */
+    clear_db();
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "a", 1, "value", 5);
+    ib_finish(&b);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.flags = 0;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+    ASSERT_OK(salv_fetch("a", val, sizeof(val)));
+    ASSERT_STR_EQ(val, "value");
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_REGION_UNVERIFIED], 0);
 }
 
 /* Run a shell command and collect its stdout, for comparing a directory before
@@ -15563,10 +15722,20 @@ static void test_salvage_ignores_pointer_section(void)
                     db->snap->files[0]->hdr.end);
     ASSERT_OK(zs_db_close(&db));
 
-    /* Wreck the 16-byte trailer, which is how the pointer section is found. */
+    /* Wreck the trailer's pointers_start, which is how the array is found.
+     *
+     * NOTE WHAT THIS COSTS SINCE VERSION 4: the one checksum covers the trailer's
+     * position fields (F-26e), so structural damage IS checksum damage -- there is
+     * no way to break the pointer array while leaving the file verifiable.  S-6's
+     * case therefore cannot be separated from S-13's any more, and salvage needs
+     * ZS_SALVAGE_UNVERIFIED to recover anything here.  Version 2 could tell the
+     * two apart, because its pointer-section checksum was separate from its
+     * records checksum; that distinction is gone, and this is where it shows. */
     fd = open(dbpath(name), O_WRONLY);
     ASSERT(fd >= 0);
-    ASSERT_EQ(lseek(fd, (off_t)(fsize - 16), SEEK_SET), (off_t)(fsize - 16));
+    ASSERT_EQ(lseek(fd, (off_t)(fsize - ZSI_TRAILER_LEN + ZSI_TR_OFF_START),
+                    SEEK_SET),
+              (off_t)(fsize - ZSI_TRAILER_LEN + ZSI_TR_OFF_START));
     ASSERT_EQ(write(fd, "\xff\xff\xff\xff\xff\xff\xff\xff", 8), 8);
     close(fd);
 
@@ -15579,13 +15748,28 @@ static void test_salvage_ignores_pointer_section(void)
     ss.report = salv_cb;
     ss.rock = &s;
     ss.error = counting_error;
+    ss.flags = ZS_SALVAGE_UNVERIFIED;
     ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
 
+    /* S-6 still holds: the pointer region is ignored and order is rescanned. */
     ASSERT(s.kind_count[ZS_SALVAGE_PTRS_IGNORED] >= 1);
     ASSERT_OK(salv_fetch("k1", val, sizeof(val)));
     ASSERT_STR_EQ(val, "v1");
     ASSERT_OK(salv_fetch("k2", val, sizeof(val)));
     ASSERT_STR_EQ(val, "v2");
+
+    /* And the file is reported once, at file granularity, not per key (S-13). */
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_REGION_UNVERIFIED], 1);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_KEY_UNVERIFIED], 0);
+
+    /* Without the flag, nothing at all -- which is the half a caller has to know
+     * about, since version 2 recovered these records unconditionally. */
+    memset(&s, 0, sizeof(s));
+    salv_reset_out();
+    ss.flags = 0;
+    ASSERT_OK(zs_db_salvage(dbdir, salv_out(), &ss));
+    ASSERT_EQ(salv_fetch("k1", val, sizeof(val)), ZS_NOTFOUND);
+    ASSERT_EQ(s.kind_count[ZS_SALVAGE_REGION_UNVERIFIED], 1);
 }
 
 /* S-10: only keys that COULD have been superseded by lost bytes are reported.
@@ -18048,10 +18232,9 @@ static struct test_entry tests[] = {
     { "test_header_reserved",           test_header_reserved },
     { "test_header_bounds_and_ranges",  test_header_bounds_and_ranges },
 
-    { "test_type_byte_validity",        test_type_byte_validity },
+    { "test_flag_nibble_validity",      test_flag_nibble_validity },
     { "test_record_byte_layout",        test_record_byte_layout },
     { "test_record_byte_layout_big",    test_record_byte_layout_big },
-    { "test_record_byte_layout_v2",     test_record_byte_layout_v2 },
     { "test_record_roundtrip",          test_record_roundtrip },
     { "test_record_canonical",          test_record_canonical },
     { "test_record_embedded_nul",       test_record_embedded_nul },
@@ -18069,8 +18252,8 @@ static struct test_entry tests[] = {
     { "test_span_empty_file",           test_span_empty_file },
     { "test_span_torn_tail",            test_span_torn_tail },
     { "test_span_terminator_without_data", test_span_terminator_without_data },
-    { "test_nocsum_still_rejects_bad_span",
-                                    test_nocsum_still_rejects_bad_span },
+    { "test_nocsum_is_rejected",
+                                    test_nocsum_is_rejected },
     { "test_span_progress",             test_span_progress },
     { "test_span_bad_header_and_kind",  test_span_bad_header_and_kind },
     { "test_span_pointers_rejected",    test_span_pointers_rejected },
@@ -18223,13 +18406,11 @@ static struct test_entry tests[] = {
     { "test_repack_d19a_resurrection",  test_repack_d19a_resurrection },
     { "test_repack_empty_output",       test_repack_empty_output },
     { "test_repack_verifies_inputs",    test_repack_verifies_inputs },
-    { "test_repack_verifies_inputs_nocsum", test_repack_verifies_inputs_nocsum },
-    { "test_seal_verifies_spans_nocsum", test_seal_verifies_spans_nocsum },
-    { "test_read_verifies_record_csum",  test_read_verifies_record_csum },
-    { "test_read_verifies_record_csum_unordered",
-                                    test_read_verifies_record_csum_unordered },
-    { "test_record_csum_replay_no_truncate",
-                                    test_record_csum_replay_no_truncate },
+    { "test_read_serves_corrupt_bytes",  test_read_serves_corrupt_bytes },
+    { "test_span_checksum_is_the_only_witness",
+                                    test_span_checksum_is_the_only_witness },
+    { "test_replay_does_not_truncate_on_a_bad_record",
+                                    test_replay_does_not_truncate_on_a_bad_record },
     { "test_record_csum_engine0",       test_record_csum_engine0 },
     { "test_repack_cascade",            test_repack_cascade },
     { "test_repack_never_touches_unordered",
@@ -18237,7 +18418,6 @@ static struct test_entry tests[] = {
 
     { "test_check_clean_database",      test_check_clean_database },
     { "test_check_out_of_order_pointers", test_check_out_of_order_pointers },
-    { "test_check_records_checksum",    test_check_records_checksum },
     { "test_check_noncanonical",        test_check_noncanonical },
     { "test_check_unclean_reported",    test_check_unclean_reported },
     { "test_dump_line_format",          test_dump_line_format },
@@ -18336,9 +18516,9 @@ static struct test_entry tests[] = {
                                         test_salvage_resyncs_after_a_bad_span },
     { "test_convert_reencodes_engine_mismatch",
                                     test_convert_reencodes_engine_mismatch },
-    { "test_check_reports_record_csum", test_check_reports_record_csum },
-    { "test_salvage_verifies_records_inorder",
-                                    test_salvage_verifies_records_inorder },
+    { "test_check_names_the_file_not_the_record", test_check_names_the_file_not_the_record },
+    { "test_salvage_all_or_nothing_inorder",
+                                    test_salvage_all_or_nothing_inorder },
     { "test_salvage_unverified_needs_the_flag",
                                         test_salvage_unverified_needs_the_flag },
     { "test_salvage_never_recovers_rollback",

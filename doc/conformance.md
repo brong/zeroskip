@@ -46,36 +46,48 @@ a spec label is missing here.
 |---|---|---|
 | `F-1` | Integers are little-endian. | `le_accessors` |
 | `F-2` | Every record begins at an offset that is a multiple of 8 and | `crash/crash_leaves_unaligned_length`, `overflow_guards`, `record_roundtrip` |
+| `F-2a` | Nothing on disk may be read or written through a struct; explicit byte copy at literal offsets | `header_byte_layout`, `record_byte_layout`, `corpus` |
+| `F-2b` | Alignment was required until format 4 and was removed | `record_byte_layout`, `inorder_widths_and_padding` |
 | `F-3` | Offsets and pointers are absolute byte offsets from the file start. | `header_byte_layout, inorder_ptrs64` |
+| `F-3a` | The header keeps its own checksum so it can be validated without hashing the file | `header_checksum`, `salvage_invalid_header` |
 | `F-4` | The checksum field is always the **last 4 bytes** of the structure | `header_checksum` |
 | `F-5` | Exactly three checksum engines exist: | `corpus`, `interop_constants_csum` |
 | `F-5a` | The engine id is recorded in each file header, so every file is | `corpus_engine_from_file_not_config`, `file_engine_from_header`, `open_engine_selection` |
 | `F-5b` | Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the | `interop_constants_csum` |
 | `F-5c` | Engine 0 weakens G-2 and G-3, because F-22's property — that a | `header_checksum`, `span_engine_zero` |
 | `F-5d` | Engine 2 makes a file readable only by a caller supplying the same | `corpus` |
-| `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_records_checksum`, `span_terminator_without_data`, `nocsum_still_rejects_bad_span`, `idxcache_rejection_rules` |
+| `F-5e` | `ZS_NOCSUM` is distinct from engine 0: it skips verification of | `check_names_the_file_not_the_record`, `span_terminator_without_data`, `nocsum_is_rejected`, `idxcache_rejection_rules` |
+| `F-5f` | Since version 4 a read verifies nothing; corrupt bytes are served between checks | `read_serves_corrupt_bytes`, `span_checksum_is_the_only_witness` |
 | `F-6` | A reader MUST validate all 16 bytes, not a prefix. | `magic` |
 | `F-6a` | The magic is **not valid UTF-8**: `0x89` lies in the continuation-byte | `magic`, `staging_names` |
 | `F-7` | Split read and write versions let an older library determine that it | `header_versions` |
 | `F-7a` | Version 2 is the first published version: a conforming writer | `header_versions` |
+| `F-7b` | The magic's digit and the version fields agree from version 4 on | `magic`, `header_byte_layout` |
 | `F-8` | Reserved fields MUST be written as zero and MUST be ignored on read. | `header_reserved` |
 | `F-9` | Generations start at 1, so `end == 0` is never a legitimate | `filename_rejections`, `header_bounds_and_ranges`, `header_checksum` |
 | `F-10` | An unordered file holds **exactly one** generation: `start` is that | `header_roundtrip` |
 | `F-11` | Every file of a database MUST carry the same UUID and the same | `open_comparator_agreement` |
 | `F-11a` | The default comparator. Compare `min(alen, blen)` bytes as | `index_binary_keys`, `index_ordered_traversal`, `interop_constants_compar`, +1 more |
 | `F-11b` | The default comparator's recorded name is the ASCII string | `corpus`, `header_roundtrip`, `interop_constants_compar`, +2 more |
-| `F-12` | The table above is normative: any byte not in it is invalid, | `span_progress`, `type_byte_validity` |
-| `F-12a` | Each bit is meaningful in isolation: `type & IsBig` selects the wide | `type_byte_validity` |
+| `F-12` | The table above is normative: any byte not in it is invalid, | `span_progress`, `flag_nibble_validity` |
+| `F-12a` | Each bit is meaningful in isolation: `type & IsBig` selects the wide | `flag_nibble_validity` |
 | `F-12b` | Each data shape has exactly one form. Nothing distinguishes a | `record_roundtrip` |
-| `F-12c` | Bit `0x08` was `HasAncestor`, and each data shape had a second form | `type_byte_validity` |
+| `F-12c` | Bit `0x08` was `HasAncestor`, and each data shape had a second form | `flag_nibble_validity` |
+| `F-12d` | Each data shape has exactly one form; a record describes only itself | `write_record_is_self_contained`, `corpus` |
+| `F-12e` | Version 2's type-byte values have no meaning in version 4 and MUST NOT be accepted | `flag_nibble_validity`, `header_versions` |
 | `F-13` | Lengths are authoritative; keys and values MAY contain NUL bytes, | `corpus`, `index_binary_keys`, `interop_constants_compar`, +4 more |
 | `F-14` | A key MUST be at least 1 byte. An empty value is legal and distinct | `malformed_never_hangs`, `record_bounds`, `record_byte_layout`, +2 more |
+| `F-14a` | A NUL follows the key if there is a key and the value if there is a value; a terminator has neither | `record_byte_layout`, `record_byte_layout_big`, `terminator` |
+| `F-14b` | A reader MUST NOT consult vallen when framing a deletion | `record_canonical` |
+| `F-14c` | A deletion's vallen does not participate in form selection | `record_canonical`, `record_byte_layout_big` |
 | `F-15` | Encoding is canonical: an implementation MUST use the short form | `corpus`, `dump_shows_rollback`, `header_roundtrip`, +5 more |
-| `F-18` | A record MUST NOT carry any reference to another record. In | `write_record_is_self_contained`, `record_canonical`, `type_byte_validity` |
+| `F-18` | A record MUST NOT carry any reference to another record. In | `write_record_is_self_contained`, `record_canonical`, `flag_nibble_validity` |
 | `F-19` | The checksum covers the span's data bytes followed by the | `interop_constants_csum`, `mp_reader_sees_torn_span`, `terminator` |
+| `F-19a` | The span length is carried in the terminator's payload, so a terminator is always the small form | `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
 | `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` |
 | `F-22` | Because the checksum covers the span **and** the terminator, a | `crash/crash_nosync_mode`, `mp_reader_sees_torn_span`, `span_terminator_without_data`, +2 more |
+| `F-22a` | A span's terminator checksum is the only thing covering an unordered file's bytes | `span_checksum_is_the_only_witness` |
 | `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_basic`, `span_engine_zero` |
 | `F-24` | An unordered file is **complete** at its last valid span, whether | `check_noncanonical`, `check_unclean_reported`, `corpus_engine_from_file_not_config`, +3 more |
 | `F-24a` | An in-order file has no equivalent notion, because it is written | `inorder_kind_rules` |
@@ -85,19 +97,23 @@ a spec label is missing here.
 | `F-26b` | The pointer-section checksum covers everything from the start of the | **none** |
 | `F-26c` | Encoding is canonical: `PTRS32` MUST be used when every record | `corpus`, `dump_shows_rollback`, `inorder_empty`, +1 more |
 | `F-26d` | The narrow section is padded with zeroes to a multiple of 8 so the | `inorder_trailer_negatives`, `inorder_widths_and_padding` |
-| `F-26e` | The records checksum covers the region from the end of the header to | `check_records_checksum`, `inorder_records_checksum` |
-| `F-26f` | The records checksum is verified lazily — by | `check_records_checksum`, `inorder_records_checksum`, `open_is_o1_in_records` |
+| `F-26e` | The records checksum covers the region from the end of the header to | `check_names_the_file_not_the_record`, `inorder_records_checksum` |
+| `F-26f` | The records checksum is verified lazily — by | `check_names_the_file_not_the_record`, `inorder_records_checksum`, `open_is_o1_in_records` |
 | `F-26g` | `count` MAY be **zero**. An in-order file with no records is legal | `fcur_empty_sources`, `inorder_empty`, `interop_constants_csum`, +2 more |
 | `F-26h` | An **unordered** file may equally hold no records: an active file | `fcur_empty_sources`, `open_create`, `span_empty_file`, +1 more |
 | `F-27` | Every pointer MUST be 8-aligned and lie between the header and the | `inorder_trailer_negatives` |
+| `F-27a` | A pointer that addresses a zero byte is invalid | `inorder_trailer_negatives` |
 | `F-28` | `zs_db_check_consistency` MUST verify that an in-order file's | `check_out_of_order_pointers` |
+| `F-28a` | check_consistency SHOULD rebuild the pointer array and compare | **none** — gap, see below |
 | `F-29` | Progress rule. Iteration computes the next offset from the current | `corpus_engine_from_file_not_config`, `malformed_never_hangs`, `span_progress` |
 | `F-30` | Every length, offset and pointer MUST be bounds-checked against the | **none** |
 | `F-31` | Opening an in-order file is O(1): validate the header, read the | `open_is_o1_in_records` |
-| `F-32` | Every data record ends in a 4-byte checksum: the last 4 bytes of | `record_byte_layout_v2`, `corpus` |
-| `F-32a` | A record's checksum MUST be verified when the record is | `read_verifies_record_csum`, `read_verifies_record_csum_unordered`, `record_csum_engine0` |
-| `F-32b` | A record's checksum MUST NOT be verified during span replay | `record_csum_replay_no_truncate` |
-| `F-32c` | A record copied byte-for-byte keeps a valid checksum only when | `convert_reencodes_engine_mismatch` |
+| `F-32` | *Retired in version 4, not reused.* Every data record ended in a 4-byte checksum | `record_byte_layout`, `corpus` |
+| `F-32a` | *Retired with F-32.* | `read_serves_corrupt_bytes`, `span_checksum_is_the_only_witness` |
+| `F-32b` | *Retired with F-32*; the replay half survives as F-33a | `replay_does_not_truncate_on_a_bad_record` |
+| `F-32c` | *Retired with F-32.* | `convert_reencodes_engine_mismatch` |
+| `F-33` | What replaces F-32a's protection is not equivalent, and a reader MUST NOT verify on the read path | `read_serves_corrupt_bytes`, `check_names_the_file_not_the_record` |
+| `F-33a` | An implementation MUST NOT verify a record during span replay or pointer-array load | `replay_does_not_truncate_on_a_bad_record` |
 
 ## Database layout (`D-n`)
 
@@ -171,7 +187,7 @@ a spec label is missing here.
 | `D-19c` | The test MAY err toward **retention**, never toward dropping. A | **none** |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
 | `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
-| `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs`, `repack_verifies_inputs_nocsum`, `seal_verifies_spans_nocsum` |
+| `D-20b` | Before writing the output, the writer MUST verify the checksums | `repack_verifies_inputs` |
 | `D-21` | The output is written to `zeroskip.tmp.<pid>.<n>` and `rename`d to | `repack_selection` |
 | `D-22` | The output may legitimately contain **zero records**, in the form | `inorder_empty`, `repack_empty_output` |
 | `D-23` | Removing a data file is permitted only for a file whose range is enclosed | `convert_basic`, `convert_remove_refuses_when_needed`, `mp_racing_removers`, +1 more |
@@ -280,11 +296,12 @@ a spec label is missing here.
 | `S-6` | For an in-order file the pointer section MUST be ignored and the | `salvage_ignores_pointer_section` |
 | `S-7` | **Resynchronisation.** On reaching a span that does not validate, | `salvage_resyncs_after_a_bad_span` |
 | `S-8` | The span that failed cannot be verified — its terminator is what would | `salvage_unverified_needs_the_flag` |
-| `S-8a` | An in-order file has no commitment question: it was written whole | `salvage_verifies_records_inorder` |
+| `S-8a` | An in-order file has no commitment question: it was written whole | `salvage_all_or_nothing_inorder` |
 | `S-9` | A **rolled-back** span MUST NOT be recovered under any option. | `salvage_never_recovers_rollback` |
 | `S-10` | Salvage MUST report, per key, where the record it recovered may be | `salvage_reports_maybe_stale` |
 | `S-11` | Reporting MUST be structured — a kind, a location, and a key where | `salvage_event_fields` |
 | `S-12` | Salvage MUST NOT reconstruct a missing generation's contents, invent | `salvage_never_writes_the_source` |
+| `S-13` | Verifying an in-order file is all or nothing; the file is reported once, never per key | `salvage_all_or_nothing_inorder`, `salvage_ignores_pointer_section` |
 
 ## C binding (`A-n`)
 
@@ -315,6 +332,7 @@ a spec label is missing here.
 | `A-15` | `rollover_txns` is D-9d's span bound. Zero selects an | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` |
 | `A-16` | `repack_max_size` is the size above which an in-order file stops | `repack_max_size` |
 | `A-17` | `zs_db_stats` reports what **this handle has rewritten** since it was | `db_stats_separates_repack_from_conversion` |
+| `A-18` | `ZS_NOCSUM` is retired and MUST be rejected with `ZS_BADUSAGE` rather than ignored | `nocsum_is_rejected` |
 
 ## Conformance suite (`T-n`)
 
@@ -326,7 +344,7 @@ a spec label is missing here.
 | `T-1` | to T-11 are per-implementation tests , run | `corpus`, `dump_shows_rollback`, `open_with_uuid`, +1 more |
 | `T-2` | Magic and versions. All 16 magic bytes required (F-6); each | `magic_designed_corruptions`, `staging_names` |
 | `T-2a` | The trailer. Opening an in-order file depends entirely on it, so: the | `inorder_trailer_negatives` |
-| `T-2b` | Type byte validity. All 256 byte values fed as a record type, asserting | `header_bounds_and_ranges`, `type_byte_validity` |
+| `T-2b` | Type byte validity. All 256 byte values fed as a record type, asserting | `header_bounds_and_ranges`, `flag_nibble_validity` |
 | `T-2c` | Interoperability constants. The values two implementations must agree on | `filenames`, `overflow_guards`, `strerror` |
 | `T-3` | Malformed input. Every golden file truncated at *every byte offset*, | `corpus_engine_from_file_not_config`, `malformed_bitflips`, `malformed_truncation`, +1 more |
 | `T-4` | Behavioural. Ordering, prefix scans, cursor replace, | `header_bounds_and_ranges`, `read_model`, `span_long_terminator`, +1 more |
