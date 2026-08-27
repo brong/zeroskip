@@ -150,12 +150,22 @@ whether a pointer section must be present.
 ### 4.1 Conventions
 
 - **F-1** Integers are little-endian.
-- **F-2** Every record begins at an offset that is a multiple of 8 and
-  occupies a whole multiple of 8 bytes. Padding bytes MUST be zero. Fields are
-  naturally aligned: 8-byte fields on 8-byte boundaries, 4-byte fields on
-  4-byte boundaries.
+- **F-2** Records are **packed**: a record begins immediately after its
+  predecessor, and no field is aligned or padded. An implementation MUST NOT
+  insert padding between records, since a reader computing the next offset from
+  the length fields (F-29) would desynchronise. The single exception is F-26d's
+  pad before the pointer array.
+- **F-2a** Nothing on disk may be read or written through a struct. Every field
+  is accessed by explicit byte copy at a literal offset, which is what makes
+  F-2's packing safe and keeps `sizeof` and `offsetof` describing nothing a file
+  depends on (G-0).
+- **F-2b** Alignment was required until format 4, which rounded every record up
+  to a multiple of 8. The density of the records region is what a lookup's
+  working set is made of, and the cost of an unaligned 2- or 8-byte load is
+  below the cache miss that precedes it, so the padding bought nothing and was
+  removed.
 - **F-3** Offsets and pointers are absolute byte offsets from the file start.
-- **F-4** The checksum field is always the **last 4 bytes** of the structure
+- **F-4** The checksum field is always the **last 8 bytes** of the structure
   it protects, covering every byte from the start of the protected region up
   to (not including) the field. There is no field-zeroing anywhere.
 - **F-5** Exactly three checksum engines exist:
@@ -163,7 +173,7 @@ whether a pointer section must be present.
   | Id | Engine | Behaviour |
   |---|---|---|
   | 0 | none | write zeros, never verify |
-  | 1 | xxHash | XXH3-64 truncated to its low 32 bits (default) |
+  | 1 | xxHash | XXH3-64, all 64 bits (default) |
   | 2 | external | a function supplied by the caller at open time |
 
 - **F-5a** The engine id is recorded in each file header, so every file is
@@ -171,10 +181,13 @@ whether a pointer section must be present.
   there is no bootstrapping problem, and files written under different engines
   may coexist.
 - **F-5b** Engine 1 is **`XXH3_64bits` with the default seed of 0**, and the
-  stored checksum is the **low 32 bits** of the 64-bit result — that is,
-  `(uint32_t)(h & 0xFFFFFFFF)` — written little-endian like every other integer
-  (F-1). Both the seed and which half is kept must be pinned or two
-  implementations would produce different bytes from the same input.
+  stored checksum is **all 64 bits**, written little-endian like every other
+  integer (F-1). The seed must be pinned or two implementations would produce
+  different bytes from the same input. Format 4 widened this from the low 32
+  bits: there is now one checksum over a whole file rather than one per record,
+  so the field is paid once and a 32-bit digest over hundreds of megabytes is
+  the wrong width. A caller-supplied engine (id 2) narrower than 64 bits MUST
+  place its value in the low half and zero the rest.
 - **F-5b1** xxHash is used through its vendored reference implementation, whose
   scalar path is portable C; any SIMD acceleration within it is an internal
   optimisation of the same function, not a separate code path that could be
@@ -186,12 +199,7 @@ whether a pointer section must be present.
   testing and for callers with durability guarantees elsewhere.
 - **F-5d** Engine 2 makes a file readable only by a caller supplying the same
   function, so the conformance corpus covers engines 0 and 1 only.
-- **F-5e** `ZS_NOCSUM` is distinct from engine 0: it skips verification of
-  **record** checksums at materialization (F-32a) — checksums that are
-  nonetheless written — and nothing else. It is a **read-path** flag only: an
-  operation that writes a new file from existing records MUST still verify its
-  inputs (D-20b). Span and terminator checksums are outside its reach:
-  **verification rides indexing**. A span's checksum MUST be verified by
+- **F-5e** **Verification rides indexing.** A span's checksum MUST be verified by
   whoever adds that span to an index — the replay of C-4 step 4 — in every
   mode, because the replay is what decides which records exist, and a
   post-crash reopen under relaxed durability (C-7c) can meet a terminator
@@ -201,14 +209,29 @@ whether a pointer section must be present.
   pointer table carries its builder's verification (P-11's flags bit 4), and
   a writer's own fold (D-13b) indexes spans whose checksums it computed
   itself.
+- **F-5e1** Verifying **only the last** span a replay meets is NOT sufficient,
+  and MUST NOT be implemented. Nothing orders write-back under relaxed
+  durability (C-7c), so after a crash a middle span's terminator may be present
+  while its own data pages never landed, with later spans intact above it. The
+  per-span check is what locates the truncation point that F-24 then applies.
+  The bound on the work is the replay window, not the file's history: spans
+  below `cached_upto` are covered by the table that records them (P-11), so a
+  reader verifies what it replays and a table lets it replay less.
+- **F-5f** Since format 4 no records carry checksums, so a **read** verifies
+  nothing: an in-order file's single checksum (F-26e) is verified only on
+  demand, and between those checks corrupt bytes are served to the caller
+  without complaint. That is the cost of one digest over a whole file, accepted
+  deliberately, and it makes F-5e load-bearing rather than belt-and-braces —
+  for an unordered file the span checksum is now the only thing protecting the
+  bytes.
 
 ### 4.2 Magic
 
 Every file begins with the same 16 bytes:
 
 ```
-89 7A 65 72 6F 73 6B 69 70 31 0D 0A 1A 0A 00 00
-\x89  z  e  r  o  s  k  i  p  1 \r \n ^Z \n \0 \0
+89 7A 65 72 6F 73 6B 69 70 34 0D 0A 1A 0A 00 00
+\x89  z  e  r  o  s  k  i  p  4 \r \n ^Z \n \0 \0
 ```
 
 The parts, following the PNG signature convention:
@@ -217,7 +240,7 @@ The parts, following the PNG signature convention:
 |---|---|
 | `89` | high bit set, so no text file can be mistaken for a database and a transfer that strips the eighth bit is detected; also **invalid UTF-8** (F-6a) |
 | `zeroskip` | human-readable in a hex dump and to `file(1)` |
-| `1` | major format version *in the magic*, so an incompatible future format is distinguishable without parsing |
+| `4` | format version *in the magic*, so an incompatible format is distinguishable without parsing; it matches the header's version fields (F-7b) |
 | `0D 0A` | CR-LF trap: newline translation in either direction alters it |
 | `1A` | DOS end-of-file, so accidentally `type`-ing a file stops early |
 | `0A` | bare LF, catching the inverse newline translation |
@@ -232,7 +255,7 @@ The parts, following the PNG signature convention:
   corrupting the body. Every byte after the first is ASCII, so byte 0 alone
   carries the property.
 
-### 4.3 File header (72 bytes)
+### 4.3 File header (80 bytes)
 
 | Off | Size | Field |
 |---|---|---|
@@ -245,24 +268,44 @@ The parts, following the PNG signature convention:
 | 40 | 4 | start generation |
 | 44 | 4 | end generation, or `0` for an unordered file |
 | 48 | 16 | comparator name, NUL-padded |
-| 64 | 4 | reserved, written as zero |
-| 68 | 4 | checksum of bytes `[0, 68)` |
+| 64 | 8 | reserved, written as zero |
+| 72 | 8 | checksum of bytes `[0, 72)` |
+
+The header carries **no section lengths**, and that is what lets a writer emit
+one complete before its first record: everything an in-order file's structure
+needs is in the trailer (§4.9), which is written last. Version 3's header
+carried the lengths of its two data regions, which forced every length to be
+known before the first byte was written.
+
+- **F-3a** The header keeps its own checksum even though one checksum now
+  covers the whole file (F-26e), because a header must be validated *without*
+  hashing the file: discovering a file's generation range (D-1b), deciding
+  whether a file participates in the set at all (D-10), and salvage all read it
+  on files they have no intention of verifying.
 
 - **F-7** Split read and write versions let an older library determine that it
   may still read a newer file even when it must not write to it. A reader MUST
   refuse to read above its read version and MUST refuse to write above its
   write version.
-- **F-7a** Version 2 is the first published version: a conforming writer
-  writes `version_read = version_write = 2`, and a reader MUST refuse
-  `version_read` below 2 as well as above its own. Version 1 was never
-  released, so this is a pre-release clean break — not a compatibility path
-  dropped for a format that shipped — made necessary by the per-record
-  checksum (F-32): a version-1 record has no trailing checksum field to read.
+- **F-7a** **Version 4** is the current version: a conforming writer writes
+  `version_read = version_write = 4`, and a reader MUST refuse `version_read`
+  below 4 as well as above its own. There is no compatibility path to an earlier
+  version: format 4 changes the record encoding, retires the per-record
+  checksum, widens every checksum to 64 bits and moves the pointer array's
+  description into the trailer, so nothing short of a separate decoder could
+  read a version-2 file. A reader meeting one MUST refuse the file rather than
+  attempt it.
 
-  D-1b's active-file rename is a second pre-release break and likewise carries
-  **no version bump**. A version-2 file written before that change would name
-  the active file for its generation; that case is not specified and MUST NOT be
-  implemented as a fallback.
+  Version 3 is **skipped and MUST NOT be written.** It was assigned to an
+  unreleased format in which an in-order file held a dense array of key entries
+  pointing into a region of bare values; that format was measured against
+  version 2 and withdrawn, but files carrying it exist outside this repository,
+  so reusing the number would make two different layouts indistinguishable.
+- **F-7b** The magic's digit and the version fields **agree** from version 4
+  on. They did not before: a version-2 file carries the digit `1`, because the
+  digit was introduced as a count of incompatible formats rather than as the
+  version. Aligning them costs nothing at a break and removes a permanent
+  off-by-one; a reader MUST NOT infer one from the other for an older file.
 - **F-8** Reserved fields MUST be written as zero and MUST be ignored on read.
   Compatibility decisions belong to the version fields, not to reserved bytes.
 - **F-9** Generations start at 1, so `end == 0` is never a legitimate
@@ -290,54 +333,64 @@ The parts, following the PNG signature convention:
 
 ### 4.4 Record types
 
-The type byte is a bitfield of five independent properties:
+A record begins with a **4-bit flag nibble** in the low half of byte 0. There is
+no type byte: the nibble plus `keylen` determines everything about the record's
+shape.
 
 | Bit | Name | Meaning |
 |---|---|---|
-| `0x01` | `HasKey` | a data record: carries a key |
-| `0x02` | `IsDelete` | negation — of a key, or of a span |
-| `0x04` | `IsBig` | wide length fields |
-| `0x10` | `SpanTerminator` | ends a span |
-| `0x20` | `Pointers` | begins a pointer section |
+| `0x01` | `IsBig` | wide length fields: a 16-byte header, not 4 |
+| `0x02` | `IsDelete` | a tombstone; `vallen` MUST be 0 |
+| `0x04` | `IsRollback` | voids the span; defined ONLY when `keylen == 0` |
+| `0x08` | `MustBeOne` | always set |
 
-Every legal combination, and no others:
+`keylen == 0` is not a record but a **span terminator**, which F-14 makes free by
+forbidding a zero-length key.
 
-| Value | Type | Header | Bits |
-|---|---|---|---|
-| `0x01` | `KEYVALUE` | 4 | `HasKey` |
-| `0x05` | `BIGKEYVALUE` | 24 | `HasKey IsBig` |
-| `0x03` | `DELETION` | 4 | `HasKey IsDelete` |
-| `0x07` | `BIGDELETION` | 16 | `HasKey IsDelete IsBig` |
-| `0x10` | `COMMIT` | 8 | `SpanTerminator` |
-| `0x14` | `COMMIT_LONG` | 24 | `SpanTerminator IsBig` |
-| `0x12` | `ROLLBACK` | 8 | `SpanTerminator IsDelete` |
-| `0x16` | `ROLLBACK_LONG` | 24 | `SpanTerminator IsDelete IsBig` |
-| `0x20` | `PTRS32` | 8 | `Pointers` |
-| `0x24` | `PTRS64` | 16 | `Pointers IsBig` |
+Every legal encoding, and no others:
 
-- **F-12** The table above is normative: any byte not in it is invalid,
-  including `0x00`. It is structured rather than arbitrary — exactly one of
-  `HasKey`, `SpanTerminator` and `Pointers` is set, since they select the
-  family; `IsDelete` appears with `HasKey` or `SpanTerminator` but never with
-  `Pointers`; `IsBig` may appear with any family; and bits `0x08`, `0x40` and
-  `0x80` are reserved and always zero.
-- **F-12a** Each bit is meaningful in isolation: `type & IsBig` selects the wide
-  layout in all three families, and `type & IsDelete` means negation, whether of
-  a key or of a span. A decoder reads a record's shape from the bits.
-- **F-12b** Each data shape has exactly one form. Nothing distinguishes a
+| `keylen` | `IsBig` | `IsDelete` | `IsRollback` | Nibble | Meaning | Header |
+|---|---|---|---|---|---|---|
+| ≥ 1 | 0 | 0 | 0 | `0x8` | record | 4 |
+| ≥ 1 | 1 | 0 | 0 | `0x9` | big record | 16 |
+| ≥ 1 | 0 | 1 | 0 | `0xA` | deletion | 4 |
+| ≥ 1 | 1 | 1 | 0 | `0xB` | big deletion | 16 |
+| 0 | 0 | 0 | 0 | `0x8` | `COMMIT` | 4 |
+| 0 | 0 | 0 | 1 | `0xC` | `ROLLBACK` | 4 |
+
+- **F-12** The table above is normative: any other combination is invalid. In
+  particular `IsRollback` with `keylen >= 1`, and `IsBig` or `IsDelete` on a
+  terminator, are **malformed rather than reserved** — there is no future
+  meaning waiting for them.
+- **F-12a** A reader MUST implement F-12 as an enumeration of the table, not as
+  a computation over bit properties. A computed predicate is a second
+  specification of the same thing and can drift from it.
+- **F-12b** `MustBeOne` MUST be set on every record and terminator, and a reader
+  MUST treat it clear as a malformed record. Since the nibble occupies the low
+  half of byte 0, this makes byte 0 **non-zero for every record in either
+  form**, whatever `keylen` is — which is the property F-26d's padding and F-27a's
+  pointer check both rest on. Without it a plain record with a 16-byte key would
+  have byte 0 == `0x00`.
+- **F-12c** `MustBeOne` is not a reserved bit and MUST NOT be treated as an
+  extension point by a *reader*. A future version may redefine it, and the
+  mechanism that makes that safe is the version fields (F-7): an old reader
+  refuses a file whose `version_read` exceeds its own, so it never sees the bit
+  at all. A reader that instead ignored an unexpected nibble would misread
+  records it cannot understand.
+- **F-12d** Each data shape has exactly one form. Nothing distinguishes a
   "create" at the record level, and nothing records where a key's previous
   version lives: a record describes only itself. Whether a repack may drop a
   tombstone is derived at repack time (D-19).
-- **F-12c** Bit `0x08` was `HasAncestor`, and each data shape had a second form
-  carrying a 32-bit ancestor generation. It is reserved rather than reused so
-  that the surviving values keep their meanings; a record carrying it MUST be
-  rejected like any other invalid type.
+- **F-12e** Version 2's type byte was a bitfield of five properties across ten
+  legal values, including separate long forms for terminators and two typed
+  pointer-section headers. Those values have no meaning in version 4 and MUST
+  NOT be accepted; the version fields (F-7a) are what keeps the two apart.
 
 ### 4.5 Data records
 
 Key and value are contiguous, separated by a NUL, with a further NUL after the
-value, then zero padding to the next multiple of 8. Both are therefore usable
-in place as C strings.
+value. Both are therefore usable in place as C strings. Records are packed:
+there is no padding and no alignment (F-2).
 
 - **F-13** Lengths are authoritative; keys and values MAY contain NUL bytes,
   and stored lengths MUST NOT include the terminators.
@@ -348,48 +401,37 @@ A record describes only itself. It carries no reference to any other record,
 and in particular nothing about where the key's previous version lives.
 
 ```
-KEYVALUE (0x01)
-  +0      1  type
-  +1      1  keylen
-  +2      2  vallen
-  +4      .  key NUL value NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(4 + keylen + 1 + vallen + 1 + 4)
+record                                nibble 0x8 / 0x9
+  small                                 big
+  +0   2  flags:4 | keylen:12           +0   8  flags:4 | keylen:60
+  +2   2  vallen                        +8   8  vallen
+  +4   .  key NUL value NUL             +16  .  key NUL value NUL
 
-DELETION (0x03)
-  +0      1  type
-  +1      1  keylen
-  +2      2  pad
-  +4      .  key NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(4 + keylen + 1 + 4)
-
-BIGKEYVALUE (0x05)
-  +0      1  type
-  +1      7  pad
-  +8      8  keylen
-  +16     8  vallen
-  +24     .  key NUL value NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(24 + keylen + 1 + vallen + 1 + 4)
-
-BIGDELETION (0x07)
-  +0      1  type
-  +1      7  pad
-  +8      8  keylen
-  +16     .  key NUL pad->8
-  +len-4  4  csum      covers [0, len-4)
-  len = roundup8(16 + keylen + 1 + 4)
+deletion                              nibble 0xA / 0xB
+  small                                 big
+  +0   2  flags:4 | keylen:12           +0   8  flags:4 | keylen:60
+  +2   2  vallen, MUST be 0             +8   8  vallen, MUST be 0
+  +4   .  key NUL                       +16  .  key NUL
 ```
 
-- **F-15** Encoding is canonical: an implementation MUST use the short form
-  whenever `keylen <= 255` and `vallen <= 65535`; MUST use the short terminator
-  whenever the span is `<= 0xFFFFFF` bytes; MUST choose the pointer width by
-  F-26c; and the stored checksum (F-32) MUST be correct under the containing
-  file's engine — a checksum that does not match is corruption, never an
-  alternative encoding of the same record. Output bytes are therefore
-  determined by the logical contents together with what the file already holds.
-  The big form is chosen by key or value length, and by nothing else.
+- **F-14a** A record's length is
+  `hdr + keylen + 1 + (IsDelete ? 0 : vallen + 1)`, where `hdr` is 4 or 16.
+  **A deletion has no value and therefore no value NUL**: the NUL terminates the
+  value, and there is no value to terminate.
+- **F-14b** A reader MUST NOT consult `vallen` when framing a deletion, so a
+  record never has two candidate lengths. A non-zero `vallen` on a deletion is a
+  divergence reported by `zs_db_check_consistency` (T-6), not a change to the
+  record's extent.
+- **F-14c** A deletion's `vallen` does not participate in form selection either:
+  only `keylen` can promote a deletion to the big form.
+- **F-15** Encoding is canonical: an implementation MUST use the small form
+  whenever `keylen <= 4095` and — for a record, per F-14c — `vallen <= 65535`;
+  MUST choose the pointer width by F-26c; and the file checksum (F-26e) MUST be
+  correct under the file's engine. A big form that would have fitted the small
+  one is **non-canonical but readable**: a reader MUST accept it and report it
+  (T-6) rather than reject it, because rejecting a record completes the file at
+  that point (F-24) and so turns a writer's canonicalisation bug into the loss
+  of every record after it.
 
 ### 4.6 Self-contained records
 
@@ -405,26 +447,26 @@ BIGDELETION (0x07)
 
 ### 4.7 Terminators
 
-```
-short (8 bytes)                       COMMIT / ROLLBACK
-  +0   1  type
-  +1   3  span length
-  +4   4  checksum
+A terminator is a record with `keylen == 0`, always in the small form, always 20
+bytes:
 
-long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
-  +0   1  type
-  +1   7  pad
-  +8   8  span length
-  +16  4  pad
-  +20  4  checksum
+```
+COMMIT / ROLLBACK                     nibble 0x8 / 0xC
+  +0   2  flags:4 | keylen:12, keylen == 0
+  +2   2  vallen == 16
+  +4   8  span length
+  +12  8  checksum
 ```
 
 - **F-19** The checksum covers the span's data bytes followed by the
   terminator's own bytes up to the checksum field.
+- **F-19a** The span length is carried in the terminator's **payload**, not in
+  `vallen`, so that a terminator is always the small form: a 16-bit `vallen`
+  would cap a span at 64KB and force every larger one into the big header for no
+  reason. `vallen == 16` describes the payload — two 8-byte fields — and makes a
+  terminator's extent follow F-14a with no special case.
 - **F-20** Terminators are only ever found by scanning **forward** from the
-  header. Nothing reads them backwards, because the pointer section is located
-  by its own trailer (§4.9), so a long terminator needs no marker in its second
-  half.
+  header. Nothing reads them backwards.
 - **F-21** A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit
   that says "ignore the records in this span", voiding them. An aborted
   transaction whose records reached the file appends a `ROLLBACK`; without one, a
@@ -437,6 +479,10 @@ long (24 bytes)                       COMMIT_LONG / ROLLBACK_LONG
   concurrent reading (C-4f) and the single gate of C-7 all depend on. C-7 orders
   nothing within a commit, so detection alone is what makes a partial one safe;
   durability is separate and is what the gate provides.
+- **F-22a** Since no record carries a checksum (F-5f), a span's terminator
+  checksum is the **only** thing covering the bytes of an unordered file. F-5e's
+  rule that verification rides indexing is therefore load-bearing, and F-5e1
+  forbids the shortcut of verifying only the last span.
 
 ### 4.8 The span chain
 
@@ -460,129 +506,152 @@ Spans exist only in **unordered** files. An in-order file has none (§4.9).
 
 ### 4.9 The pointer section
 
-An in-order file always ends with a pointer section followed by a 16-byte
-trailer; an unordered file never has either. So the whole layout is:
+An in-order file ends with an optional pad, a pointer array, and a 32-byte
+trailer; an unordered file has none of them. So the whole layout is:
 
 ```
-in-order   [header][records][pointer section][trailer]
+in-order   [header][records][pad][pointers][trailer]
 unordered  [header](span)*
 ```
 
 An in-order file has no spans and no terminators. Every record in it is live by
 construction, and it is written whole under a temporary name and renamed only
 once finished (D-21), so a commit record would assert nothing that is not
-already guaranteed.
+already guaranteed. Its span, for the purpose of the one checksum, is the whole
+file.
 
-The section is self-describing — its own type states whether it is narrow or
-wide, and the count matches that width:
-
-```
-PTRS32 (0x20)                         narrow
-  +0    1      type
-  +1    3      pad
-  +4    4      count (uint32)
-  +8    4×N    record offsets (uint32)
-        .      pad with zeroes to a multiple of 8
-
-PTRS64 (0x24)                         wide
-  +0    1      type
-  +1    7      pad
-  +8    8      count (uint64)
-  +16   8×N    record offsets (uint64)
-```
-
-The trailer is a **fixed 16 bytes**, always, so it can be read without knowing
-anything else about the file:
+The pointer array is **not** a typed structure: it is a bare array of offsets,
+and everything needed to find and interpret it is in the trailer. The trailer is
+a **fixed 32 bytes**, always, so it can be read without knowing anything else
+about the file:
 
 ```
-filesize-16   8   offset of the start of the pointer section
-filesize-8    4   checksum of the records region
-filesize-4    4   checksum of the pointer section
+filesize-32   8   offset of the start of the pointer array
+filesize-24   8   number of pointers
+filesize-16   8   width of one pointer, 4 or 8
+filesize-8    8   checksum of bytes [0, filesize-8)
 ```
 
 - **F-26** Pointers reference every record in the file, sorted by key
   ascending. Because a repack emits exactly one record per key (D-17), keys in
   an in-order file are unique and the array is a strict ordering.
-- **F-26a** The trailer's back pointer is what locates the section, so nothing
-  needs to be found by scanning backwards through records. The trailer's size is
-  fixed and its back pointer is always 8 bytes wide even in a narrow file,
-  because a variable-size trailer could not be read without first knowing which
-  size it was.
-- **F-26b** The pointer-section checksum covers everything from the start of the
-  section up to the checksum field itself — the section, its padding, the back
-  pointer, and the records checksum — following F-4 with no special case. The
-  back pointer is read as plain data first, so there is no circularity.
-- **F-26c** Encoding is canonical: `PTRS32` MUST be used when every record
-  offset fits in 32 bits, and `PTRS64` otherwise. Since all records precede the
-  section, that is equivalent to the section's own offset fitting in 32 bits.
-- **F-26d** The narrow section is padded with zeroes to a multiple of 8 so the
-  trailer begins 8-aligned (F-2). The pad is 0 or 4 bytes and the checksum
-  covers it.
-- **F-26e** The records checksum covers the region from the end of the header to
-  the start of the pointer section, so a record body corrupted in place is
-  detectable. F-26b covers the field itself.
-- **F-26f** The records checksum is verified lazily — by
-  `zs_db_check_consistency`, or by a caller that chooses to — never on open,
-  which stays O(1) (F-31). The pointer-section checksum *is* verified on open,
-  because everything the file's structure depends on lives inside it.
-- **F-26g** `count` MAY be **zero**. An in-order file with no records is legal
-  and expected — a repack that drops every key produces one (D-22) — and its
-  layout is simply `[header][pointer section][trailer]` with an empty records
-  region. Specifically:
+- **F-26a** The trailer is fixed in size and position so it can be read first,
+  and its fields are plain data read before any verification, so there is no
+  circularity. Version 2 carried a typed pointer-section header for the count
+  and width; moving both into the trailer is what allows the array to be a bare
+  run of offsets and what removes the last thing a writer had to know before it
+  began.
+- **F-26b** The three position fields are **deliberately redundant** and a
+  reader MUST check that they agree exactly:
 
-  - the smallest valid in-order file is **96 bytes**: a 72-byte header, an
-    8-byte `PTRS32` section with `count == 0`, and the 16-byte trailer. A file
-    shorter than that cannot be a valid in-order file;
-  - the width is `PTRS32`, since F-26c's condition holds vacuously when there
-    are no offsets. An empty file is therefore byte-identical every time it is
-    produced;
-  - the records checksum covers zero bytes, so it takes the engine's value for
-    empty input, not zero. Engine 0 writes zeros as always.
+  ```
+  filesize - 32 - nptrs * ptrsize == pointers_start
+  80 <= pointers_start <= filesize - 32
+  ptrsize is 4 or 8
+  ```
+
+  A file failing any of these MUST be rejected rather than read short. The
+  redundancy is the point: a truncated or extended file fails the arithmetic even
+  though every individual field is in range.
+- **F-26c** Encoding is canonical: `ptrsize` MUST be 4 when every record offset
+  fits in 32 bits, and 8 otherwise. Since all records precede the array, that is
+  equivalent to `pointers_start` fitting in 32 bits. The width is **chosen after
+  the records are written**, which is why it needs no fixed-point iteration: the
+  trailer is written last, so the maximum offset is already known.
+- **F-26d** The records region MAY be followed by a pad so the pointer array
+  begins at a multiple of `ptrsize`. **Pad bytes MUST be zero**, and the pad is
+  the format's only padding (F-2). It is 0..7 bytes and the file checksum covers
+  it.
+- **F-26d1** The pad is recognisable rather than merely skippable, because
+  `MustBeOne` (F-12b) makes a record's first byte non-zero: a zero byte where a
+  record would begin can only be pad. A reader with the count SHOULD bound its
+  walk by `nptrs` and never look at the pad; a reader without the count —
+  salvage, which S-6 forbids from trusting the pointer array — MUST use the pad
+  to stop.
+- **F-26e** **One checksum covers the whole file**: bytes `[0, filesize-8)` —
+  header, records, pad, pointer array and the trailer's three position fields.
+  The data plus the pointers is the file. Covering the header as well costs 80
+  bytes of hashing and binds a header to its body, so a valid header cannot be
+  grafted onto a different one.
+- **F-26f** The file checksum is verified **only on demand**: by
+  `zs_db_check_consistency`, by a merge reading the file as an input (D-20b), and
+  by salvage (S-13). Never on open, which stays O(1) (F-31), and never on a read
+  (F-5f). A merge verifies its inputs for two reasons at once — it establishes
+  that the bytes it is about to copy are sound, and the pass faults them in
+  immediately before they are read again.
+- **F-26f1** Nothing about an in-order file's **structure** is verified on open.
+  Version 2 verified its pointer section there, which was affordable because that
+  checksum covered only the section; one checksum over the whole file cannot be.
+  What stands in its place is F-26b's arithmetic, F-27's bounds check on every
+  pointer, and F-27a. A corrupt pointer that satisfies all three yields a wrong
+  record, which is the accepted consequence of one digest per file.
+- **F-26g** `nptrs` MAY be **zero**. An in-order file with no records is legal
+  and expected — a repack that drops every key produces one (D-22) — and its
+  layout is simply `[header][trailer]`. Specifically:
+
+  - the smallest valid in-order file is **112 bytes**: an 80-byte header and the
+    32-byte trailer. A file shorter than that cannot be a valid in-order file;
+  - `ptrsize` is 4, since F-26c's condition holds vacuously when there are no
+    offsets, and there is no pad. An empty file is therefore byte-identical every
+    time it is produced;
+  - the checksum covers 104 bytes, and takes the engine's value for that input.
+    An engine MUST NOT special-case an empty or short region.
 - **F-26h** An **unordered** file may equally hold no records: an active file
   that is only a header, or one whose every span was rolled back. Neither is an
   error.
-- **F-27** Every pointer MUST be 8-aligned and lie between the header and the
-  pointer section. With `count == 0` there are no pointers and the requirement is
-  vacuous.
+- **F-27** Every pointer MUST lie between the header and the start of the
+  pointer array, and MUST be bounds-checked before any dereference. Pointers are
+  **not** required to be aligned, since records are packed (F-2). With
+  `nptrs == 0` there are no pointers and the requirement is vacuous.
+- **F-27a** A pointer that addresses a **zero byte** is invalid, by F-12b. A
+  reader SHOULD apply this check, because the read path dereferences pointers
+  without having verified the file checksum (F-26f), so it is the one cheap test
+  available on a pointer it is otherwise trusting.
 - **F-28** `zs_db_check_consistency` MUST verify that an in-order file's
   pointer array is strictly increasing by key, which both confirms the sort and
   catches a repack that emitted a key twice (D-17).
+- **F-28a** `zs_db_check_consistency` SHOULD also **rebuild** the pointer array
+  by walking the records and compare it with the stored one. Records are
+  self-framing, so the array is derivable, and a disagreement between the two is
+  detectable without trusting either — which is what makes a single whole-file
+  checksum tolerable. Version 2 could not do this, since its records could only
+  be enumerated through the section it would have been checking.
 
 ### 4.10 Validation
 
 - **F-29 Progress rule.** Iteration computes the next offset from the current
-  record's own length fields and MUST verify it is strictly greater than the
-  current offset and within bounds. Otherwise the file is complete at that
+  record's own length fields (F-14a) and MUST verify it is strictly greater than
+  the current offset and within bounds. Otherwise the file is complete at that
   point (F-24). Non-termination is impossible by construction.
 - **F-30** Every length, offset and pointer MUST be bounds-checked against the
   file size before any dereference.
 - **F-31** Opening an in-order file is O(1): validate the header, read the
-  16-byte trailer, verify the pointer-section checksum, use the pointers.
-  Records are bounds-checked on access, and their checksum is verified only on
-  demand (F-26f).
-- **F-32** Every data record ends in a 4-byte checksum: the last 4 bytes of
-  the padded record, computed by the containing file's engine (F-5a) over
-  `[0, len-4)` — type, lengths, key, value, and padding. This is
-  the format's one checksum convention, stated once: **every checksum is the
-  last field of the thing it covers, and covers everything before it**
-  (header F-4, terminator F-19, trailer F-26b, records F-32).
-- **F-32a** A record's checksum MUST be verified when the record is
-  materialized for a caller — a lookup result or a cursor yield — unless the
-  handle was opened `ZS_NOCSUM` (F-5e). The failure is reported for that
-  record alone; other records remain readable. A cursor verifies the record
-  it takes from the head of the merge even when a bound (such as a prefix)
-  then ends the scan instead of yielding it, so that a corrupt record does not
-  become a silent early end of traversal.
-- **F-32b** A record's checksum MUST NOT be verified during span replay
-  (F-24) or pointer-section load. Replay completes a file at its first
-  invalid record, discarding everything after it — so verifying there turns
-  one flipped byte into the loss of every later record, a G-3 violation. A
-  record inside a valid span whose own checksum fails is in-place corruption,
-  detected at materialization.
-- **F-32c** A record copied byte-for-byte keeps a valid checksum only when
-  the output file's engine matches the input's. A writer copying records
-  into a file under a different engine MUST re-encode them (D-20b already
-  requires the source be verified first).
+  32-byte trailer, check F-26b's arithmetic, use the pointers. Records are
+  bounds-checked on access, and the file checksum is verified only on demand
+  (F-26f).
+- **F-32** *Retired in version 4, and not reused.* Every data record ended in a
+  4-byte checksum over its own bytes. One checksum per record cost 4 bytes on
+  every record and a hash on every materialization, and it is replaced by one
+  checksum per file (F-26e) for an in-order file and by the span terminator
+  (F-19) for an unordered one.
+- **F-32a**, **F-32b**, **F-32c** *Retired with F-32.* They governed when a
+  record's own checksum was and was not verified — at materialization, never
+  during replay, and re-encoding when copying between engines. With no record
+  checksum there is nothing for them to say. The label numbers are not reused, so
+  that a reader of an older document is not silently redirected.
+- **F-33** What replaces F-32a's protection is **not** equivalent, and the
+  difference is stated rather than glossed: between consistency checks, corrupt
+  bytes in an in-order file are served to a caller without complaint (F-5f), and
+  a single flipped bit makes the whole file unverifiable rather than naming one
+  record. That is the cost of the density the packed record buys, and a reader
+  MUST NOT "improve" it by verifying on the read path — doing so reintroduces a
+  hash per materialization, which is precisely what was removed.
+- **F-33a** An implementation MUST NOT verify a record during span replay (F-24)
+  or while loading a pointer array. Replay completes a file at its first invalid
+  record, discarding everything after it, so verifying there would turn one
+  flipped byte into the loss of every later record — a G-3 violation. This
+  survives F-32b's retirement because it is a rule about *replay*, not about
+  record checksums, and F-5e's span verification is what replay does instead.
 
 ## 5. Database layout
 
@@ -742,7 +811,7 @@ without opening a single file.
   not an error: it is an older snapshot.
 - **D-8a Creating a database.** With `ZS_CREATE` and no existing directory, or a
   directory holding no data files, an implementation creates the directory, the
-  lock file (D-3a), generates a UUID, and creates generation 1 as the active file — a 72-byte header
+  lock file (D-3a), generates a UUID, and creates generation 1 as the active file — an 80-byte header
   and no spans, which F-26h makes a legal empty file. Without `ZS_CREATE` this is
   `ZS_NOTFOUND`. The UUID's value is arbitrary and opaque; only its 16-byte
   encoding (F-11) and its textual form in filenames (D-0) are fixed.
@@ -1215,7 +1284,7 @@ The per-file cursors are held in an array kept sorted by:
   covering every input record it will copy: the records-region checksum
   (F-26e) of each in-order input, and the span checksums (F-22) of an
   unordered input's chain. This applies to conversion, sealing, repack and
-  compaction alike, and it applies **regardless of `ZS_NOCSUM`** (F-5e), which
+  compaction alike, and it applies in **every** durability and verification mode (F-5e), which
   affects only reads. The output is written under fresh checksums, so copying
   unverified input would launder corruption into a file that validates
   perfectly — and D-23 then removes the failing input, the only evidence a
@@ -1810,7 +1879,7 @@ unreadable one.
   to, and never truncated. G-6 therefore holds for the cache directory as well
   as for the database.
 - **P-5** A table is a 96-byte header, then `nptrs` 8-byte little-endian record
-  offsets, then a 4-byte checksum over those offsets. Its size is exactly
+  offsets, then an 8-byte checksum over those offsets. Its size is exactly
   `96 + 8 × nptrs + 4`.
 
   | offset | size | field |
@@ -1996,17 +2065,32 @@ must and must not do.
 - **S-8** The span that failed cannot be verified — its terminator is what would
   prove it — and neither can a trailing region with no valid terminator. Their
   records MUST NOT be recovered unless explicitly requested, and every record so
-  recovered MUST be reported. A record's own checksum (F-32) does not change
-  this: it proves the record's **bytes**, while the terminator is what proves
-  the transaction was **committed** — a torn tail with pristine record
-  checksums was still never acknowledged to anyone, so salvage MUST NOT treat
-  byte-proof as commitment-proof in a span walk.
+  recovered MUST be reported. Byte-proof would not change this even if it were
+  available: the terminator is what proves the transaction was **committed**, and
+  a torn tail whose bytes are intact was still never acknowledged to anyone, so
+  salvage MUST NOT treat byte-proof as commitment-proof in a span walk. Since
+  version 4 the question does not arise — no record carries a checksum (F-32),
+  so a span's terminator is the only proof of anything about it.
 - **S-8a** An in-order file has no commitment question: it was written whole
   and published by a single `rename` (D-21), so every record in it belongs to
-  committed history. Salvage of an in-order file therefore verifies **per
-  record** against F-32, and reports as unverified exactly the records that
-  cannot be proved: every record of an engine-0 file, and any record whose
-  checksum fails.
+  committed history. What it has instead is an **all-or-nothing** verification
+  question (S-13).
+- **S-13** Verifying an in-order file is **all or nothing**, and that is the cost
+  of one checksum per file (F-26e). Version 2 could name the damaged record and
+  recover the rest; a single digest over the whole body cannot, so one flipped
+  bit makes every key in the file unverifiable. Therefore:
+
+  - without an explicit unverified option the file contributes **nothing**;
+  - with one, every key is recovered and the **file** is reported once — never
+    per key, since two million events is not a report. The report MUST carry a
+    kind distinct from S-8's per-span and S-10's per-key kinds, so a caller can
+    tell "this key came from an unverifiable span" from "every key in this file
+    is unverifiable".
+
+  What survives of the old granularity is structural rather than cryptographic:
+  records are self-framing, so the walk of S-6 can still say *where* decoding
+  stopped, and F-28a can still say that the pointer array disagrees with the
+  records. Neither proves bytes.
 - **S-9** A **rolled-back** span MUST NOT be recovered under any option. F-21
   and F-25 make it deliberately aborted, and no conforming reader has ever shown
   its records; recovering them would resurrect a transaction that did not
@@ -2116,7 +2200,7 @@ different calls, though not every flag is meaningful everywhere:
 |---|---|---|
 | `ZS_CREATE` | open | create the database if absent |
 | `ZS_SHARED` | open, txn | read-only (A-5) |
-| `ZS_NOCSUM` | open | skip record-checksum verification at materialization (F-5e); span checksums are still verified at indexing |
+| `ZS_NOCSUM` | open | **retired in version 4 and MUST be rejected** with `ZS_BADUSAGE` (A-18). No record carries a checksum, so it has nothing to skip; a caller passing it believes it is weakening verification and is entitled to be told the request is meaningless. The bit is reserved, not reused. |
 | `ZS_NOSYNC` | open | omit both durability gates on commit, and nothing else (C-7c, C-6b) |
 | `ZS_NONBLOCKING` | open, txn | fail with `ZS_LOCKED` rather than wait for a lock |
 | `ZS_NOAUTOREPACK` | open | do not run D-16e's cascade from a write transaction (A-14) |
@@ -2402,6 +2486,15 @@ different calls, though not every flag is meaningful everywhere:
   conforming, since selection is not normative (D-16). Time MAY be zero where no
   monotonic clock is available. Nothing here is on disk or observable by a peer.
 
+- **A-18** `ZS_NOCSUM` is **retired** and MUST be rejected with `ZS_BADUSAGE`
+  rather than ignored. Since version 4 no record carries a checksum (F-32), so
+  the flag has nothing left to skip: the span checksums it never reached are
+  still verified at indexing (F-5e), and an in-order file's one checksum is
+  verified only on demand in every mode (F-26f). Rejecting rather than ignoring
+  is the point — a caller passing it believes it is weakening verification for
+  speed, and is entitled to be told the request is meaningless rather than have
+  it silently succeed. The flag's bit is reserved, not reused.
+
 ## 11. Conformance suite
 
 The suite has two halves. **T-1 to T-11 are per-implementation tests**, run
@@ -2465,7 +2558,7 @@ readable but not writable accepted read-only (F-7).
 16-byte trailer read without prior knowledge of the file, the back pointer
 locating the section, and the checksum verified over section-through-back-pointer
 (F-26b). Negatively — a back pointer past the end of the file, before the
-header, not 8-aligned, or pointing at a byte that is not a `PTRS32`/`PTRS64`
+header, past the start of the pointer array, or pointing at a zero byte (F-27a)
 type; a file shorter than header plus trailer; and a corrupted pad byte — each
 rejected rather than read. The records checksum verified on demand and asserted
 to catch a record body corrupted in place (F-26e), which nothing else would
@@ -2539,19 +2632,29 @@ below the first and above the last.
 **T-6 File states and encoding.** That `end == 0` and `end != 0` files are
 recognised solely from the header and that a pointers block is present exactly
 when `end != 0`; that an in-order file's pointers are strictly increasing by key
-(F-28); that `PTRS32` and `PTRS64` are each honoured for the width they state,
-including a hand-constructed `PTRS64` file so the wide form is covered without
-writing 4GB of real data, and that a file whose offsets all fit is written as
-`PTRS32` (F-26c), plus the 0-and-4-byte padding cases (F-26d); that a zero-record
-in-order file round-trips as exactly 96 bytes, is written as `PTRS32`, and
-carries the engine's empty-input checksum for its records region (F-26g); that a
-database consisting only of such a file reads as empty and iterates to zero
-records; and that a record's encoded bytes are a function of its own key and
-value alone (F-18), unchanged by what else the file holds — the same key and
-value written as a create, as an update within one file, and as an update across
-files MUST produce identical bytes. Negatively, a hand-built record carrying the
-reserved `0x08` bit is rejected as an invalid type rather than read as a record
-with something extra.
+(F-28), and that rebuilding the array from the records reproduces it (F-28a);
+that both pointer widths are honoured for the width the trailer states,
+including a hand-constructed 8-byte-width file so that form is covered without
+writing 4GB of real data, and that a file whose offsets all fit is written with
+width 4 (F-26c), plus every pad length 0..7 (F-26d); that the trailer's three
+position fields are checked for exact agreement, so a truncated and an extended
+file are both rejected rather than read short (F-26b); that a zero-record
+in-order file round-trips as exactly 112 bytes with width 4 and no pad, and
+carries the engine's value for its 104-byte input (F-26g); that a database
+consisting only of such a file reads as empty and iterates to zero records; and
+that a record's encoded bytes are a function of its own key and value alone
+(F-18), unchanged by what else the file holds — the same key and value written as
+a create, as an update within one file, and as an update across files MUST
+produce identical bytes.
+
+Encoding negatives, all hand-built: a record with `MustBeOne` clear is rejected
+as malformed (F-12b); `IsRollback` set on a record with a real key, and `IsBig`
+or `IsDelete` set on a terminator, are rejected rather than read as something
+extra (F-12); a big form that would have fitted the small one is **accepted** and
+reported, not rejected (F-15); a deletion carrying a non-zero `vallen` is framed
+by F-14a regardless and reported (F-14b); and a pointer addressing a zero byte is
+rejected (F-27a). A version-2 file is refused on its `version_read` rather than
+part-parsed (F-7a).
 
 **T-7 Tombstone retention across repacks.** For every arrangement of create,
 update and delete spread across generations: exactly one record per key is
