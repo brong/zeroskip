@@ -302,12 +302,44 @@ Two things to read from it:
   a general-purpose optimisation; it is for databases that have deleted a lot,
   or that want to be a single file.
 
-**Compaction is unbounded** (D-29). These timings are for a 2 MB database; the
-cost is linear in total size, and one call rewrites all of it while writers
-continue. That is spec open item 1's unboundedness made a deliberate API entry
-point rather than an emergent property of D-16's cascade. `zs_db_seal` is the
-bounded half — at most `rollover_size` of work — and is what to reach for if the
-goal is only to stop readers replaying the active file.
+**Compaction is unbounded in bytes and in duration, and bounded in MEMORY**
+(D-29). These timings are for a 2 MB database; the cost is linear in total size,
+and one call rewrites all of it while writers continue. That is spec open item
+1's unboundedness made a deliberate API entry point rather than an emergent
+property of D-16's cascade. `zs_db_seal` is the bounded half — at most
+`rollover_size` of work — and is what to reach for if the goal is only to stop
+readers replaying the active file.
+
+Memory is the part that had to be measured rather than reasoned about, because
+both writers used to accumulate the whole records region in a doubling buffer
+before checksumming it — O(output), which for a compaction is O(database), and
+downstream reported **9.6 GB peak RSS for a 2M-record VACUUM**. Since 2026-08-28
+they stream, holding one 8-byte offset per record. Peak RSS from
+`/usr/bin/time -l`, `zstool <dir> compact`, three rounds each with identical
+figures:
+
+| database | files in | output | 4.0.0 buffered | streaming |
+|---|---|---|---|---|
+| 300 000 records, 1 KB values | 3 × 102 MB | 306 MB | 1 192 MB | **619 MB** |
+| 2 000 000 records, 8-byte values | 2 × 30 MB | 60 MB | 232 MB | **140 MB** |
+
+**Read the remainder as mappings, not as allocation**, and check the arithmetic
+before believing any of it: `zstool <dir> check` on the 306 MB output reports
+307 MB of RSS in 0.02 s, having touched almost none of it, because a mapping of
+a file already in the page cache counts in full. So the streaming column is
+input mapping + output mapping + the pointer array — 60 + 60 + 16 = 136 against
+140 measured on the second row, and 306 + 306 + 2.4 against 619 on the first.
+That is the check that turns "the buffer is gone" from an argument into a
+measurement: the two rows have the same byte sizes as each other's mappings
+would suggest but a 10× difference in record count, and only the pointer array
+moves.
+
+Wall time improved as well, and not for the reason the change was made. Streaming
+each record with its own `write(2)` was **slower** than buffering the lot — 0.40 s
+to 0.82 s on the 306 MB compaction — so the sink batches into a fixed 256 KB
+buffer, which lands at 0.18 s. Three rounds, no overlap. The buffer is fixed
+rather than growing on purpose: a growing one would make the footprint a second
+function of the output, which is the thing being removed.
 
 ## Publishing during a load is the writer's cost, and it is nearly all waste
 

@@ -2231,6 +2231,82 @@ static inline int zsi_ptrs_rec(struct zsi_file *f, uint64_t i,
 #define ZSI_PROBE_ENDS 1
 #endif
 
+/* The lower bound within [lo, hi).  Both search entry points below finish here,
+ * so there is one bisection in the file and the galloping form cannot drift from
+ * the plain one about what "first key >= key" means. */
+static int zsi_ptrs_bisect(struct zsi_file *f, zs_compar *compar,
+                           const char *key, size_t keylen,
+                           uint64_t lo, uint64_t hi,
+                           uint64_t *idx, bool *exact)
+{
+    struct zsi_rec r;
+
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if (zsi_ptrs_rec(f, mid, &r) != ZS_OK) return ZS_BADFORMAT;
+        if (zsi_cmp(compar, r.key, r.keylen, key, keylen) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    *idx = lo;
+    *exact = false;
+    if (lo < f->nptrs) {
+        if (zsi_ptrs_rec(f, lo, &r) != ZS_OK) return ZS_BADFORMAT;
+        *exact = (zsi_cmp(compar, r.key, r.keylen, key, keylen) == 0);
+    }
+
+    return ZS_OK;
+}
+
+/* A lower bound with a FLOOR: the caller knows nothing below `from` can match,
+ * because it is asking in ascending key order.  A merge's history cursor (D-19a)
+ * is that caller, and a plain binary search costs it log2(nptrs) record decodes
+ * per tombstone however small the step actually was.
+ *
+ * GALLOPING is what the floor buys.  Double the reach from `from` until a record
+ * lands at or above the key, then bisect inside that bracket: the cost becomes
+ * log2(DISTANCE MOVED) rather than log2(array), so a dense forward walk pays a
+ * constant few comparisons per step and a sparse one pays no more than the plain
+ * search would.  Summed over a whole merge the history costs O(records below)
+ * decodes at worst, which is the bound the whole two-cursor design rests on.
+ *
+ * It cannot answer differently from zsi_ptrs_search: the keys are a strict
+ * ordering (D-17), so the lower bound is unique, and the caller's promise is
+ * exactly that it lies at or above `from`. */
+static int zsi_ptrs_search_from(struct zsi_file *f, zs_compar *compar,
+                                const char *key, size_t keylen, uint64_t from,
+                                uint64_t *idx, bool *exact)
+{
+    struct zsi_rec r;
+    uint64_t lo = from, hi, step = 1;
+    int c;
+
+    *idx = f->nptrs;
+    *exact = false;
+    if (from >= f->nptrs) return ZS_OK;
+
+    /* The commonest case by far, and the reason this exists at all: the key asked
+     * for is the one the previous seek already landed on, or the next above it. */
+    if (zsi_ptrs_rec(f, lo, &r) != ZS_OK) return ZS_BADFORMAT;
+    c = zsi_cmp(compar, key, keylen, r.key, r.keylen);
+    if (c <= 0) { *idx = lo; *exact = (c == 0); return ZS_OK; }
+
+    for (;;) {
+        hi = from + step;
+        if (hi >= f->nptrs) { hi = f->nptrs; break; }
+
+        if (zsi_ptrs_rec(f, hi, &r) != ZS_OK) return ZS_BADFORMAT;
+        c = zsi_cmp(compar, key, keylen, r.key, r.keylen);
+        if (c == 0) { *idx = hi; *exact = true; return ZS_OK; }
+        if (c < 0) break;
+
+        lo = hi + 1;                    /* hi's key is below, so exclude it */
+        step *= 2;
+    }
+
+    return zsi_ptrs_bisect(f, compar, key, keylen, lo, hi, idx, exact);
+}
+
 /* Binary search for key.  Sets *idx to the first index whose key is >= key, and
  * *exact to whether it matches.
  *
@@ -2272,98 +2348,207 @@ static int zsi_ptrs_search(struct zsi_file *f, zs_compar *compar,
     }
 #endif
 
-    uint64_t lo = 0, hi = f->nptrs;
-    while (lo < hi) {
-        uint64_t mid = lo + (hi - lo) / 2;
-        if (zsi_ptrs_rec(f, mid, &r) != ZS_OK) return ZS_BADFORMAT;
-        if (zsi_cmp(compar, r.key, r.keylen, key, keylen) < 0) lo = mid + 1;
-        else hi = mid;
-    }
-
-    *idx = lo;
-    if (lo < f->nptrs) {
-        if (zsi_ptrs_rec(f, lo, &r) != ZS_OK) return ZS_BADFORMAT;
-        *exact = (zsi_cmp(compar, r.key, r.keylen, key, keylen) == 0);
-    }
-
-    return ZS_OK;
+    return zsi_ptrs_bisect(f, compar, key, keylen, 0, f->nptrs, idx, exact);
 }
 
-/* Build a pointer section and trailer for records already laid down.
+/* ONE APPEND-ONLY OUTPUT for an in-order file, with F-26e's digest accumulated as
+ * the bytes pass by.
  *
- * offs must be sorted by key ascending, and records_end is where the section
- * begins -- the offset just past the last record.  Returns a malloc'd buffer the
- * caller writes and frees.
+ * This is what the layout is for.  The file is written in strictly ascending
+ * offset order -- header, records, pad, pointer array, trailer (section 4.9) --
+ * so a single sink covers all of it and NOTHING has to be held in order to be
+ * checksummed.  Both writers used to accumulate the whole records region in a
+ * doubling realloc buffer and write it in one call, which made a merge O(output)
+ * and therefore a compaction O(DATABASE): measured downstream at 9.6GB peak RSS
+ * for a 2M-record VACUUM.  The 8-byte offsets are the only per-record state a
+ * merge now keeps.
  *
- * Width by F-26c: PTRS32 when every record offset fits in 32 bits, and since all
- * records precede the section, that is equivalent to the section's own offset
- * fitting.  Canonical, so two implementations produce identical bytes. */
-static int zsi_ptrs_build(const uint64_t *offs, size_t n, size_t records_end,
-                          const struct zsi_region *pre, size_t npre,
-                          zs_csum *csum, unsigned csum_id,
-                          char **out, size_t *outlen)
+ * A verbatim record does not even get copied: its bytes go from the input's
+ * mapping straight to the fd.
+ *
+ * Engine 2 cannot stream, because a caller-supplied engine checksums one run in
+ * one call (F-5d), so its output is held and hashed at the end -- the same
+ * exception the withdrawn version 3 carried, and the same path an fd of -1 takes
+ * when a test wants the bytes rather than a file. */
+/* Defined in the WRITE PATH section; the sink needs it here. */
+static int zsi_write_all(int fd, const char *buf, size_t len);
+
+/* A FIXED buffer, so the sink's footprint is a constant and not a function of the
+ * output.  Its only job is to keep a merge from issuing a write(2) per record --
+ * 300 000 of them doubled a 306MB compaction's wall time when the sink wrote
+ * straight through.  It does not need to grow: unlike the writer's chunk buffer,
+ * nothing here is trying to make a span and its terminator one write. */
+#define ZSI_OUT_BUF (256 * 1024)
+
+struct zsi_out {
+    int           fd;                /* < 0: hold everything, write nothing */
+    zs_csum      *csum;
+    unsigned      csum_id;
+    XXH3_state_t  st;                /* engine 1 */
+    char         *buf;               /* fd >= 0: the fixed write buffer */
+    size_t        buflen;
+    char         *hold;              /* engine 2, or fd < 0 */
+    size_t        holdlen, holdalloc;
+    size_t        len;               /* bytes emitted so far == the file offset */
+    int           err;
+};
+
+static bool zsi_out_holds(const struct zsi_out *o)
 {
-    /* F-26d: pad the records region so the array starts at a multiple of the
-     * pointer size.  The width is chosen from where the records END, which is
-     * known now -- so unlike version 2's F-26c this settles in one step with no
-     * iteration, because the trailer is written after the array rather than
-     * before it.
-     *
-     * The width is decided before the pad, and the pad cannot change it: padding
-     * only ever pushes the array's start higher, and a records_end that fits in
-     * 32 bits leaves at least 4 bytes of headroom below 4GB. */
+    return o->fd < 0 || o->csum_id == ZSI_CSUM_EXTERNAL;
+}
+
+static void zsi_out_init(struct zsi_out *o, int fd, zs_csum *csum, unsigned id)
+{
+    memset(o, 0, sizeof(*o));
+    o->fd = fd;
+    o->csum = csum;
+    o->csum_id = id;
+    o->err = ZS_OK;
+    if (id == ZSI_CSUM_XXHASH) XXH3_64bits_reset(&o->st);
+}
+
+static void zsi_out_fini(struct zsi_out *o)
+{
+    free(o->hold);
+    free(o->buf);
+    o->hold = NULL;
+    o->buf = NULL;
+}
+
+/* Push whatever is buffered at the fd.  Every exit from the sink runs through
+ * here, including zsi_ptrs_emit's final checksum, or the tail of the file would
+ * be lost -- silently, since the bytes were counted into o->len either way. */
+static void zsi_out_flush(struct zsi_out *o)
+{
+    if (o->err != ZS_OK || !o->buflen) return;
+
+    o->err = zsi_write_all(o->fd, o->buf, o->buflen);
+    o->buflen = 0;
+}
+
+/* Emit n bytes at the current offset.  `hash` is false for exactly one run -- the
+ * trailing checksum field, which F-4 excludes from its own digest -- and there is
+ * one emit rather than two so the buffering and the engine-2 hold cannot come to
+ * disagree about where the file's last eight bytes went. */
+static void zsi_out_emit(struct zsi_out *o, const char *p, size_t n, bool hash)
+{
+    if (o->err != ZS_OK) return;
+    if (!n) return;
+
+    if (hash && o->csum_id == ZSI_CSUM_XXHASH) XXH3_64bits_update(&o->st, p, n);
+
+    if (zsi_out_holds(o)) {
+        if (o->holdlen + n > o->holdalloc) {
+            size_t want = o->holdalloc ? o->holdalloc : 8192;
+            char *q;
+            while (want < o->holdlen + n) {
+                if (want > SIZE_MAX / 2) { o->err = ZS_INTERNAL; return; }
+                want *= 2;
+            }
+            q = realloc(o->hold, want);
+            if (!q) { o->err = ZS_INTERNAL; return; }
+            o->hold = q;
+            o->holdalloc = want;
+        }
+        memcpy(o->hold + o->holdlen, p, n);
+        o->holdlen += n;
+    }
+
+    if (o->fd >= 0) {
+        if (!o->buf) {
+            o->buf = malloc(ZSI_OUT_BUF);
+            if (!o->buf) { o->err = ZS_INTERNAL; return; }
+        }
+
+        if (o->buflen + n > ZSI_OUT_BUF) {
+            zsi_out_flush(o);
+            if (o->err != ZS_OK) return;
+        }
+
+        /* A record too big for the buffer at all goes straight through -- the
+         * buffer is empty at this point, so ordering is preserved. */
+        if (n > ZSI_OUT_BUF) {
+            o->err = zsi_write_all(o->fd, p, n);
+            if (o->err != ZS_OK) return;
+        } else {
+            memcpy(o->buf + o->buflen, p, n);
+            o->buflen += n;
+        }
+    }
+
+    o->len += n;
+}
+
+static void zsi_out_put(struct zsi_out *o, const char *p, size_t n)
+{
+    zsi_out_emit(o, p, n, true);
+}
+
+/* The digest over everything emitted so far, which is F-26e's [0, filesize-8). */
+static uint64_t zsi_out_digest(struct zsi_out *o)
+{
+    if (o->csum_id == ZSI_CSUM_NONE) return 0;
+    if (o->csum_id == ZSI_CSUM_XXHASH) return XXH3_64bits_digest(&o->st);
+    return o->csum(o->hold ? o->hold : "", o->holdlen);
+}
+
+/* Emit the pad, the pointer array and the trailer, closing the file (F-26).
+ *
+ * Replaces the old zsi_ptrs_build, which returned the tail as a buffer for the
+ * caller to write and took the preceding bytes as regions to hash -- both of
+ * which existed only because the records region was held.  The layout is still
+ * described in exactly one place: zsi_tail_layout, which this emits from and
+ * zsi_ptrs_load checks against. */
+static int zsi_ptrs_emit(struct zsi_out *o, const uint64_t *offs, size_t n)
+{
     struct zsi_tail t;
-    size_t pad, arrlen, total;
+    size_t records_end = o->len;
+    char tr[ZSI_TRAILER_LEN];
+    static const char zeros[8] = { 0 };
+    size_t i;
+
+    if (o->err != ZS_OK) return o->err;
 
     if (zsi_tail_layout(records_end, (uint64_t)n,
                         zsi_ptrsize_for(records_end), &t) != ZS_OK)
         return ZS_INTERNAL;
 
-    pad = t.pad; arrlen = t.arrlen; total = t.tail_len;
+    /* F-26d: the pad is zero, and it is the format's only padding. */
+    if (t.pad) zsi_out_put(o, zeros, t.pad);
 
-    char *buf = zsi_zmalloc(total);      /* zeroed: F-26d requires a zero pad */
-    if (!buf) return ZS_INTERNAL;
+    for (i = 0; i < n; i++) {
+        char e[8];
+        if (t.ptrsize == 8) zsi_put64(e, offs[i]);
+        else                zsi_put32(e, (uint32_t)offs[i]);
+        zsi_out_put(o, e, t.ptrsize);
+    }
+    if (o->err != ZS_OK) return o->err;
 
-    if (t.ptrsize == 8)
-        for (size_t i = 0; i < n; i++)
-            zsi_put64(buf + pad + i * 8, offs[i]);
-    else
-        for (size_t i = 0; i < n; i++)
-            zsi_put32(buf + pad + i * 4, (uint32_t)offs[i]);
+    /* The trailer's three position fields are covered by the checksum; the
+     * checksum field itself is not (F-4), so it is emitted separately after the
+     * digest is taken. */
+    memset(tr, 0, sizeof(tr));
+    zsi_put64(tr + ZSI_TR_OFF_START,   (uint64_t)t.ptr_start);
+    zsi_put64(tr + ZSI_TR_OFF_NPTRS,   (uint64_t)n);
+    zsi_put64(tr + ZSI_TR_OFF_PTRSIZE, (uint64_t)t.ptrsize);
+    zsi_out_put(o, tr, ZSI_TR_OFF_CSUM);
+    if (o->err != ZS_OK) return o->err;
 
-    /* Trailer: where the array starts, how many, how wide, then the checksum
-     * over everything before it (F-4).  The three position fields are redundant
-     * on purpose (F-26b). */
-    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_START, (uint64_t)t.ptr_start);
-    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_NPTRS, (uint64_t)n);
-    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_PTRSIZE, (uint64_t)t.ptrsize);
-
-    /* F-26e: ONE checksum, over [0, filesize-8) -- header, records, pad, the
-     * array, and the trailer's three position fields.  The data plus the pointers
-     * is the file.  Covering the header binds it to this body, so a valid header
-     * cannot be grafted onto a different one.
-     *
-     * `pre` describes the file bytes already produced -- the header and the
-     * records region, which a writer holds in separate buffers -- and this
-     * function owns only the tail.  The regions are hashed in FILE ORDER, which
-     * is the order they are written in, so a streaming digest and a one-shot over
-     * the concatenation agree. */
     {
-        struct zsi_region v[8];
-        size_t nv = 0, i;
-
-        if (npre > 7) { free(buf); return ZS_INTERNAL; }
-        for (i = 0; i < npre; i++) v[nv++] = pre[i];
-        v[nv].p = buf; v[nv].len = pad + arrlen + ZSI_TR_OFF_CSUM; nv++;
-
-        zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_CSUM,
-                  zsi_csumv(csum, csum_id, v, nv));
+        char cb[ZSI_CSUM_LEN];
+        zsi_put64(cb, zsi_out_digest(o));
+        /* Past the digest, so this must NOT feed it (F-4). */
+        zsi_out_emit(o, cb, ZSI_CSUM_LEN, false);
     }
 
-    *out = buf;
-    *outlen = total;
-    return ZS_OK;
+    /* The file is complete, so this is the last chance to reach the fd. */
+    zsi_out_flush(o);
+    if (o->err != ZS_OK) return o->err;
+
+    return t.filesize == o->len ? ZS_OK : ZS_INTERNAL;
 }
+
 
 /********** PRIVATE INDEX *************/
 
@@ -3858,6 +4043,30 @@ static int zsi_fcur_seek(struct zsi_fcur *fc, const char *key, size_t keylen)
     return zsi_fcur_load(fc);
 }
 
+/* zsi_fcur_seek with a FLOOR: the caller promises the target key is at or above
+ * the cursor's current position, which a monotone forward walk (D-19a's history
+ * cursor) is by construction.
+ *
+ * Only the in-order source has a cheaper form to offer -- zsi_ptrs_search_from's
+ * gallop.  The private index and the pending skiplist both descend from the top
+ * and would need their own bounded entry points, which nothing asks for: files
+ * below a repack's range are in-order (D-16c), so the fallback is reached only in
+ * a set conversion has not caught up with. */
+static int zsi_fcur_seek_fwd(struct zsi_fcur *fc, const char *key, size_t keylen)
+{
+    if (fc->kind == ZSI_SRC_INORDER && !fc->reverse) {
+        uint64_t idx;
+        bool exact;
+        int r = zsi_ptrs_search_from(fc->file, fc->compar, key, keylen,
+                                     fc->u.f.pi, &idx, &exact);
+        if (r != ZS_OK) { fc->exhausted = true; return r; }
+        fc->u.f.pi = idx;
+        return zsi_fcur_load(fc);
+    }
+
+    return zsi_fcur_seek(fc, key, keylen);
+}
+
 static int zsi_fcur_seek_first(struct zsi_fcur *fc)
 {
     switch (fc->kind) {
@@ -4607,6 +4816,18 @@ static struct zsi_file *zsi_snapshot_active(struct zsi_snapshot *s)
 
     struct zsi_file *last = s->files[s->nfiles - 1];
     return zsi_file_is_unordered(last) ? last : NULL;
+}
+
+/* Whether ANY file in the set is unordered -- the active file or a straggler
+ * D-12's conversion has not caught up with yet.  Not the same question as
+ * zsi_snapshot_active, which asks only about the newest, and the difference is
+ * what C-1m turns on: a compaction may skip the write lock only when there is
+ * nothing at all for a seal to convert. */
+static bool zsi_snapshot_has_unordered(struct zsi_snapshot *s)
+{
+    for (size_t i = 0; i < s->nfiles; i++)
+        if (zsi_file_is_unordered(s->files[i])) return true;
+    return false;
 }
 
 /* C-4: take a snapshot.
@@ -6140,8 +6361,8 @@ static int zsi_cursor_next(struct zs_cursor *c, struct zsi_rec *out)
 
 /********** WRITE PATH *************/
 
-/* Defined further down this section; the streaming store needs them first. */
-static int zsi_write_all(int fd, const char *buf, size_t len);
+/* Defined further down this section; the streaming store needs it first.
+ * zsi_write_all is declared beside struct zsi_out, which needs it earlier. */
 static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp);
 
 /* A transaction's own uncommitted records: an ordered KEY -> OFFSET index over
@@ -7793,8 +8014,9 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
     char hdr[ZSI_HEADER_LEN];
     struct zsi_header h;
     uint64_t *ptrs = NULL;
-    char *recs = NULL;
-    size_t recslen = 0, alloc = 0;
+    char *scratch = NULL;            /* ONE record, only when re-encoding */
+    size_t scratchlen = 0;
+    struct zsi_out out;
     int fd = -1, r;
 
     zs_csum *cs = zsi_csum_for_id(db->create_csum_id, db->external_csum);
@@ -7804,16 +8026,40 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         ptrs = malloc(n * sizeof(*ptrs));
         if (!ptrs) return ZS_INTERNAL;
     }
+    /* The header first, because the file is written in ascending offset order and
+     * the sink hashes as it goes.  It carries no section lengths (section 4.3),
+     * which is precisely what lets it be emitted before a single record is
+     * known. */
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = start;
+    h.end = end;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+    zsi_header_encode(hdr, &h, cs);
 
-    /* F-32c: a record's checksum is under its FILE's engine.  While the
-     * output engine matches the source's, a byte-for-byte copy carries a
-     * valid checksum with it; when the two differ -- an engine-0 file sealed
-     * by an engine-1 handle, say -- the copied checksum validates for
-     * nobody, so every record is re-encoded under the output engine instead.
-     * D-20b verified the source before this ran.  Re-encoding canonicalises
-     * the form (F-15), and since a record's bytes are a function of its key and
-     * value alone (F-18) that is all it can change. */
-    bool reencode = (src->csum_id != db->create_csum_id);
+    r = zsi_staging_open(db, sname, &fd);
+    if (r != ZS_OK) { free(ptrs); return r; }
+
+    zsi_out_init(&out, fd, cs, db->create_csum_id);
+    zsi_out_put(&out, hdr, ZSI_HEADER_LEN);
+    if (out.err != ZS_OK) { r = out.err; goto fail; }
+
+    /* Re-encode only to CANONICALISE, never for the engine.  F-32c is retired:
+     * no record carries a checksum (F-32), so a byte-for-byte copy is valid
+     * whatever the two engines are -- the output's single checksum is computed
+     * over whatever it ends up containing (F-26e).  What a copy can still carry
+     * is a peer's non-canonical form (F-15), which decoding accepts and this
+     * normalises; a record's bytes are a function of its key and value alone
+     * (F-18), so that is all re-encoding can change.
+     *
+     * Decided PER RECORD, because that is the granularity the question has: one
+     * non-canonical record from a peer does not make its neighbours worth
+     * rewriting, and zsi_rec_is_canonical answers it from the decode already
+     * done.  The old test was per FILE and compared engines, which since F-32c's
+     * retirement asks nothing. */
 
     /* Lay the records out contiguously, recording each one's offset in the
      * output.
@@ -7831,6 +8077,8 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         if (zsi_rec_decode(b, src->size - offs[i], &rec)
             != ZS_OK) { r = ZS_BADFORMAT; goto fail; }
 
+        bool reencode = !zsi_rec_is_canonical(&rec);
+
         outlen = rec.len;
         if (reencode) {
             outlen = zsi_rec_encoded_len(rec.keylen, rec.vallen,
@@ -7838,55 +8086,29 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
             if (!outlen) { r = ZS_BADFORMAT; goto fail; }
         }
 
-        if (recslen + outlen > alloc) {
-            size_t want = alloc ? alloc * 2 : 8192;
-            while (want < recslen + outlen) want *= 2;
-            char *q = realloc(recs, want);
-            if (!q) { r = ZS_INTERNAL; goto fail; }
-            recs = q;
-            alloc = want;
+        ptrs[i] = (uint64_t)out.len;
+
+        if (reencode) {
+            /* ONE record's scratch, grown to the largest that needs it -- not a
+             * buffer proportional to the output. */
+            if (outlen > scratchlen) {
+                char *q = realloc(scratch, outlen);
+                if (!q) { r = ZS_INTERNAL; goto fail; }
+                scratch = q;
+                scratchlen = outlen;
+            }
+            zsi_rec_encode(scratch, rec.key, rec.keylen, rec.val, rec.vallen);
+            zsi_out_put(&out, scratch, outlen);
+        } else {
+            /* Straight from the input's mapping to the fd: no copy at all. */
+            zsi_out_put(&out, b, rec.len);
         }
-
-        ptrs[i] = (uint64_t)(ZSI_HEADER_LEN + recslen);
-        if (reencode)
-            zsi_rec_encode(recs + recslen, rec.key, rec.keylen,
-                           rec.val, rec.vallen);
-        else
-            memcpy(recs + recslen, b, rec.len);
-        recslen += outlen;
+        if (out.err != ZS_OK) { r = out.err; goto fail; }
     }
 
-    memset(&h, 0, sizeof(h));
-    h.version_read = ZSI_VERSION_READ;
-    h.version_write = ZSI_VERSION_WRITE;
-    h.flags = (uint16_t)db->create_csum_id;
-    memcpy(h.uuid, db->uuid, 16);
-    h.start = start;
-    h.end = end;
-    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
-    zsi_header_encode(hdr, &h, cs);
-
-    char *sec = NULL;
-    size_t seclen = 0;
-    {
-        /* F-26e's checksum covers the whole file, so the builder is handed the
-         * bytes already produced -- the header and the records region -- in file
-         * order.  There is no separate records checksum any more. */
-        struct zsi_region pre[2];
-        pre[0].p = hdr;  pre[0].len = ZSI_HEADER_LEN;
-        pre[1].p = recs; pre[1].len = recslen;
-        r = zsi_ptrs_build(ptrs, n, ZSI_HEADER_LEN + recslen, pre, 2,
-                           cs, db->create_csum_id, &sec, &seclen);
-    }
-    if (r != ZS_OK) goto fail;
-
-    r = zsi_staging_open(db, sname, &fd);
-    if (r != ZS_OK) { free(sec); goto fail; }
-
-    r = zsi_write_all(fd, hdr, sizeof(hdr));
-    if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
-    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
-    free(sec);
+    /* The pad, the array and the trailer, through the same sink -- so F-26e's
+     * digest covers the whole file without any of it having been held. */
+    r = zsi_ptrs_emit(&out, ptrs, n);
 
     /* The file's contents durable BEFORE the rename, or the name could exist
      * pointing at a partial file after a crash -- in every durability mode
@@ -7912,7 +8134,7 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
      * caller is a conversion, which is why this lands in convert_* -- a second
      * caller would have to say which bucket it belongs in. */
     db->stats.convert_records += (uint64_t)n;
-    db->stats.convert_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;
+    db->stats.convert_bytes += (uint64_t)out.len;
 
     /* C-6: fdatasync the DIRECTORY after renaming an output into place, otherwise
      * the name may be absent after a crash even though the contents are durable.
@@ -7928,13 +8150,24 @@ static int zsi_write_inorder(struct zs_db *db, struct zsi_file *src,
         }
     }
 
-    free(recs);
+    zsi_out_fini(&out);
+    free(scratch);
     free(ptrs);
     return ZS_OK;
 
 fail:
-    if (fd >= 0) close(fd);
-    free(recs);
+    /* An fd still open means the output was abandoned part-written, which since
+     * the writer streams is now reachable from inside the record loop.  The
+     * staging name is invisible to a reader either way (C-3), so this is disk
+     * space and a staging slot rather than correctness -- but nothing else ever
+     * cleans one up. */
+    if (fd >= 0) {
+        close(fd);
+        snprintf(spath, sizeof(spath), "%s/%s", db->dir, sname);
+        ZS_UNLINK(spath);
+    }
+    zsi_out_fini(&out);
+    free(scratch);
     free(ptrs);
     return r;
 }
@@ -8084,29 +8317,32 @@ static int zsi_seal_locked(struct zs_db *db)
 
     act = zsi_snapshot_active(db->snap);
 
-    /* D-25b's three no-ops, none of them errors. */
-    if (!act) goto out;                             /* already sealed */
-
-    if (!act->hdr_valid) {                          /* D-10 */
+    /* D-25b's three no-ops, none of them errors: no active file, an active file
+     * whose header did not survive, and one holding no valid span. */
+    if (act && !act->hdr_valid)                     /* D-10 */
         db->error("active file has an invalid header; nothing to seal",
                   "file=<%s>", act->fname);
-        goto out;
+    else if (act && act->complete > ZSI_HEADER_LEN) {
+        r = zsi_convert_one(db, act);
+        if (r != ZS_OK) return r;
+
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) return r;
     }
-
-    if (act->complete <= ZSI_HEADER_LEN) goto out;  /* no valid spans */
-
-    r = zsi_convert_one(db, act);
-    if (r != ZS_OK) goto out;
-
-    r = zsi_db_refresh(db);
 
     /* A seal is a natural moment to catch up any stranded unordered file, and
      * costs nothing when there is none (D-12).  Not fatal for the same reason it
      * is not fatal at commit: the data is already durable and an unconverted
-     * file is a performance matter. */
-    if (r == ZS_OK) (void)zsi_convert_pending(db);
+     * file is a performance matter.
+     *
+     * Runs even when there was no active file to seal, which it did NOT until
+     * 2026-08-28.  Reaching it only through a successful conversion made the
+     * catch-up conditional on there being something else to do, so a set whose
+     * newest file was in-order and whose middle held a straggler was left exactly
+     * as it was found -- and that is the case C-1m's condition asks about, so a
+     * compaction would take the write lock, call this, and get nothing for it. */
+    (void)zsi_convert_pending(db);
 
-out:
     return r;
 }
 
@@ -8285,38 +8521,117 @@ struct zsi_merge_key {
  * retained tombstone redundant, never make a dropped one unsafe.  Looking up
  * would also cost a lookup per KEY rather than per tombstone, which is D-19a's
  * argument for writing a shadowed record rather than proving it is shadowed. */
-static bool zsi_repack_value_below(struct zs_db *db, struct zsi_snapshot *snap,
-                                   size_t first, const char *key, size_t keylen)
-{
-    for (size_t i = first; i-- > 0; ) {
-        struct zsi_fcur fc;
-        struct zsi_rec r;
+/* THE HISTORY CURSOR: one merge cursor over every generation BELOW the range
+ * being merged, seeked forward as tombstones are met.
+ *
+ * D-19 asks, per surviving tombstone, whether the newest record for its key below
+ * the output range is a VALUE.  That used to be answered by building a fresh
+ * per-file cursor for every file below the range, for EVERY tombstone, carrying
+ * no state between them -- O(tombstones x files below), each with a binary search
+ * and a record decode per comparison.
+ *
+ * A merge walks keys in ascending order, so the tombstones arrive in ascending
+ * order too and the history only ever needs to move FORWARD.  One cursor, seeked
+ * monotonically, answers every tombstone -- and the arms are the same per-file
+ * cursors the read path uses, so this is reuse rather than new machinery.
+ *
+ * The arms are ordered oldest-to-newest and the newest wins a tie, exactly as
+ * D-17b orders the merge above, because "the newest record below the range" is
+ * precisely what a merge cursor yields first for a key. */
+struct zsi_history {
+    struct zsi_fcur *arm;
+    size_t           narms;
+    zs_compar       *compar;
+};
 
-        zsi_fcur_init_file(&fc, snap->files[i], db->compar);
-        {
-            bool found = (zsi_fcur_find(&fc, key, keylen, &r) == ZS_OK);
-            bool isval = found && !zsi_rec_is_delete(&r);
-            zsi_fcur_fini(&fc);
-            if (found) return isval;
-        }
+static void zsi_history_fini(struct zsi_history *h)
+{
+    for (size_t i = 0; i < h->narms; i++) zsi_fcur_fini(&h->arm[i]);
+    free(h->arm);
+    h->arm = NULL;
+    h->narms = 0;
+}
+
+/* Arms over files [0, first).  With first == 0 there is nothing below and every
+ * tombstone is droppable -- which is the COMPACTION case, falling out of the
+ * structure rather than being special-cased. */
+static int zsi_history_init(struct zsi_history *h, struct zs_db *db,
+                           struct zsi_snapshot *snap, size_t first)
+{
+    memset(h, 0, sizeof(*h));
+    h->compar = db->compar;
+    if (!first) return ZS_OK;
+
+    h->arm = zsi_zmalloc(first * sizeof(*h->arm));
+    if (!h->arm) return ZS_INTERNAL;
+    h->narms = first;
+
+    for (size_t i = 0; i < first; i++) {
+        int r;
+        zsi_fcur_init_file(&h->arm[i], snap->files[i], db->compar);
+        r = zsi_fcur_seek_first(&h->arm[i]);
+        if (r != ZS_OK) { zsi_history_fini(h); return r; }
     }
 
-    /* Nothing below holds the key, so its whole lifespan is in the inputs. */
-    return false;
+    return ZS_OK;
+}
+
+/* D-19's question for one key.  Advances every arm to the first key >= this one,
+ * which is monotone because the caller asks in ascending key order -- so the
+ * total work is one forward pass over the part of the history the tombstones
+ * actually reach, not a fresh descent per tombstone. */
+static int zsi_history_value_at(struct zsi_history *h, const char *key,
+                                size_t keylen, bool *isval)
+{
+    *isval = false;
+
+    for (size_t i = 0; i < h->narms; i++) {
+        struct zsi_fcur *a = &h->arm[i];
+        int r;
+
+        /* Forward only, and from where the arm already sits: zsi_fcur_seek_fwd
+         * gallops from its position, so a step of one costs one comparison and a
+         * long jump costs log2 of the jump -- never log2 of the whole file.
+         *
+         * UNCONDITIONALLY, and that matters: a guard here comparing the arm's
+         * current key first would answer "has it already moved far enough" in two
+         * places, and the copy inside the seek -- its cheap path, the commonest
+         * case by far -- would then be unreachable from its only caller.  One home
+         * for the question, the same rule zsi_cursor_refresh's split follows. */
+        r = zsi_fcur_seek_fwd(a, key, keylen);
+        if (r != ZS_OK) return r;
+
+        if (a->exhausted) continue;
+        if (zsi_cmp(h->compar, a->cur.key, a->cur.keylen, key, keylen) != 0)
+            continue;
+
+        /* Ascending i is oldest to newest, so the last match wins -- the same
+         * rule D-17b applies to the merge itself.  No key at all leaves *isval
+         * false, which is D-19's answer for a key that never existed below. */
+        *isval = !zsi_rec_is_delete(&a->cur);
+    }
+
+    return ZS_OK;
 }
 
 static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
                             size_t first, size_t count)
 {
     struct zsi_fcur *fc = NULL;
-    char *recs = NULL;
+    struct zsi_history hist;
+    struct zsi_out out;
+    char *scratch = NULL;            /* ONE record */
     uint64_t *ptrs = NULL;
-    size_t recslen = 0, alloc = 0, nptrs = 0, aptrs = 0;
-    char sname[ZSI_NAME_MAX], fname[ZSI_NAME_MAX];
+    size_t scratchlen = 0, nptrs = 0, aptrs = 0;
+    char sname[ZSI_NAME_MAX] = { 0 }, fname[ZSI_NAME_MAX];
     char spath[PATH_MAX], fpath[PATH_MAX];
     char hdr[ZSI_HEADER_LEN];
     struct zsi_header h;
     int fd = -1, r = ZS_OK;
+
+    /* Zeroed before anything can `goto out`, which frees both. */
+    memset(&hist, 0, sizeof(hist));
+    zsi_out_init(&out, -1, NULL, ZSI_CSUM_NONE);
 
     uint32_t out_start = snap->files[first]->hdr.start;
     uint32_t out_end   = snap->files[first + count - 1]->hdr.end;
@@ -8345,12 +8660,37 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     fc = zsi_zmalloc(count * sizeof(*fc));
     if (!fc) return ZS_INTERNAL;
 
-    /* Inputs are iterated in key order, from the pointer section (D-20). */
+    /* Inputs are iterated in key order, from the pointer array (D-20). */
     for (size_t i = 0; i < count; i++) {
         zsi_fcur_init_file(&fc[i], snap->files[first + i], db->compar);
         r = zsi_fcur_seek_first(&fc[i]);
         if (r != ZS_OK) goto out;
     }
+
+    /* And the HISTORY cursor over everything below the range, for D-19. */
+    r = zsi_history_init(&hist, db, snap, first);
+    if (r != ZS_OK) goto out;
+
+    /* The output is opened NOW and written as the merge produces it: the header
+     * carries no section lengths (section 4.3) and the pointer array follows the
+     * data (F-26a), so the whole file goes out in ascending offset order and the
+     * only per-record state is an 8-byte offset. */
+    memset(&h, 0, sizeof(h));
+    h.version_read = ZSI_VERSION_READ;
+    h.version_write = ZSI_VERSION_WRITE;
+    h.flags = (uint16_t)db->create_csum_id;
+    memcpy(h.uuid, db->uuid, 16);
+    h.start = out_start;
+    h.end = out_end;
+    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
+    zsi_header_encode(hdr, &h, cs);
+
+    r = zsi_staging_open(db, sname, &fd);
+    if (r != ZS_OK) goto out;
+
+    zsi_out_init(&out, fd, cs, db->create_csum_id);
+    zsi_out_put(&out, hdr, ZSI_HEADER_LEN);
+    if (out.err != ZS_OK) { r = out.err; goto out; }
 
     for (;;) {
         /* The least key still present across the inputs. */
@@ -8396,23 +8736,23 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
          * newer file shadows a key needs a lookup per KEY, where the test below
          * needs one per surviving tombstone -- but the rule is unchanged, and
          * T-7 constructs the resurrection that follows from removing it. */
-        if (zsi_rec_is_delete(&mk.v3)
-            && !zsi_repack_value_below(db, snap, first,
-                                       mk.v3.key, mk.v3.keylen))
-            continue;                           /* drop the key */
+        if (zsi_rec_is_delete(&mk.v3)) {
+            bool isval = false;
+            r = zsi_history_value_at(&hist, mk.v3.key, mk.v3.keylen, &isval);
+            if (r != ZS_OK) goto out;
+            if (!isval) continue;               /* drop the key */
+        }
 
         const char *val = mk.v3.val;
         size_t vallen = mk.v3.vallen;
         size_t n = zsi_rec_encoded_len(mk.v3.keylen, vallen, val == NULL);
         if (!n) { r = ZS_INTERNAL; goto out; }
 
-        if (recslen + n > alloc) {
-            size_t want = alloc ? alloc * 2 : 8192;
-            while (want < recslen + n) want *= 2;
-            char *q = realloc(recs, want);
+        if (n > scratchlen) {
+            char *q = realloc(scratch, n);
             if (!q) { r = ZS_INTERNAL; goto out; }
-            recs = q;
-            alloc = want;
+            scratch = q;
+            scratchlen = n;
         }
         if (nptrs == aptrs) {
             size_t want = aptrs ? aptrs * 2 : 256;
@@ -8422,10 +8762,10 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
             aptrs = want;
         }
 
-        ptrs[nptrs++] = (uint64_t)(ZSI_HEADER_LEN + recslen);
-        zsi_rec_encode(recs + recslen, mk.v3.key, mk.v3.keylen, val,
-                       vallen);
-        recslen += n;
+        ptrs[nptrs++] = (uint64_t)out.len;
+        zsi_rec_encode(scratch, mk.v3.key, mk.v3.keylen, val, vallen);
+        zsi_out_put(&out, scratch, n);
+        if (out.err != ZS_OK) { r = out.err; goto out; }
     }
 
     /* D-22: the output may legitimately contain ZERO records, in F-26g's form --
@@ -8434,36 +8774,10 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * short-lived: an empty file violates D-16's size relation maximally, so the
      * next repack absorbs it. */
 
-    memset(&h, 0, sizeof(h));
-    h.version_read = ZSI_VERSION_READ;
-    h.version_write = ZSI_VERSION_WRITE;
-    h.flags = (uint16_t)db->create_csum_id;
-    memcpy(h.uuid, db->uuid, 16);
-    h.start = out_start;
-    h.end = out_end;
-    memcpy(h.compar_name, db->compar_name, ZSI_COMPAR_NAME_LEN);
-    zsi_header_encode(hdr, &h, cs);
-
-    char *sec = NULL;
-    size_t seclen = 0;
-    {
-        /* As in the conversion: one checksum over the whole file (F-26e), so the
-         * builder gets the header and the records region in file order. */
-        struct zsi_region pre[2];
-        pre[0].p = hdr;  pre[0].len = ZSI_HEADER_LEN;
-        pre[1].p = recs; pre[1].len = recslen;
-        r = zsi_ptrs_build(ptrs, nptrs, ZSI_HEADER_LEN + recslen, pre, 2,
-                           cs, db->create_csum_id, &sec, &seclen);
-    }
+    /* The pad, the pointer array and the trailer, through the same sink. */
+    r = zsi_ptrs_emit(&out, ptrs, nptrs);
     if (r != ZS_OK) goto out;
 
-    r = zsi_staging_open(db, sname, &fd);
-    if (r != ZS_OK) { free(sec); goto out; }
-
-    r = zsi_write_all(fd, hdr, sizeof(hdr));
-    if (r == ZS_OK && recslen) r = zsi_write_all(fd, recs, recslen);
-    if (r == ZS_OK) r = zsi_write_all(fd, sec, seclen);
-    free(sec);
     /* Durable before the rename, in every durability mode (C-6b). */
     if (r == ZS_OK && ZS_FDATASYNC(fd) < 0) r = ZS_IOERROR;
     close(fd);
@@ -8483,7 +8797,7 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
      * asking "how much did I rewrite" means, and counting it would make the
      * numbers move on failures that changed nothing. */
     db->stats.repack_records += (uint64_t)nptrs;
-    db->stats.repack_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;
+    db->stats.repack_bytes += (uint64_t)out.len;
 
     {                                           /* C-6, every mode (C-6b) */
         int dfd = open(db->dir, O_RDONLY);
@@ -8496,8 +8810,16 @@ static int zsi_repack_merge(struct zs_db *db, struct zsi_snapshot *snap,
     }
 
 out:
-    if (fd >= 0) close(fd);
-    free(recs);
+    /* Same as the conversion's: a still-open fd is a part-written staging file,
+     * and nothing else removes one. */
+    if (fd >= 0) {
+        close(fd);
+        snprintf(spath, sizeof(spath), "%s/%s", db->dir, sname);
+        ZS_UNLINK(spath);
+    }
+    zsi_history_fini(&hist);
+    zsi_out_fini(&out);
+    free(scratch);
     free(ptrs);
     free(fc);
     return r;
@@ -8600,41 +8922,81 @@ out:
  *
  * Releasing write while still holding repack is out of order and is safe: a
  * cycle needs two actors each ACQUIRING what the other holds, so only
- * acquisition is ordered. */
+ * acquisition is ordered.
+ *
+ * And steps 1 and 2 are SKIPPED when the set is already wholly in-order (C-1m),
+ * in which case the write lock is never taken at all and a concurrent writer
+ * keeps appending for the whole compaction.  The seal exists only to bring the
+ * active generation into the in-order set; with no unordered file there is
+ * nothing for it to do, and merging within that set touches neither the active
+ * file nor any straggler. */
 static int zsi_compact(struct zs_db *db)
 {
     size_t first, count;
+    bool seal, force_seal = false;
     int r = zsi_check_writable(db);
     if (r != ZS_OK) return r;
 
     /* zsi_seal_locked does not make this check for itself, and the reason it
      * must be made is the same: sealing under an open write transaction would
-     * convert a file that transaction is about to append to. */
+     * convert a file that transaction is about to append to.  It applies on the
+     * no-seal path too: zsi_db_refresh would swap the snapshot out from under
+     * the caller's own open transaction. */
     if (db->write_txn) return ZS_BADUSAGE;
 
-    r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
-                      db->nonblocking ? ZS_NONBLOCKING : 0);
-    if (r != ZS_OK) return r;
+    /* Decide which locks are needed, then take them.  The read of the file set is
+     * unlocked and therefore a HINT: losing the race costs a lock acquisition,
+     * never correctness, because the condition is re-checked below. */
+    for (;;) {
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) return r;
 
-    r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
-                      db->nonblocking ? ZS_NONBLOCKING : 0);
-    if (r != ZS_OK) {
-        zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
-        return r;
+        seal = force_seal || zsi_snapshot_has_unordered(db->snap);
+
+        if (seal) {
+            r = zsi_lock_take(&db->locks, ZSI_LOCK_WRITE,
+                              db->nonblocking ? ZS_NONBLOCKING : 0);
+            if (r != ZS_OK) return r;
+        }
+
+        r = zsi_lock_take(&db->locks, ZSI_LOCK_REPACK,
+                          db->nonblocking ? ZS_NONBLOCKING : 0);
+        if (r != ZS_OK) {
+            if (seal) zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+            return r;
+        }
+
+        if (seal) break;
+
+        /* Re-check under the repack lock: a writer may have started a generation
+         * while we waited for it.  C-1d forbids the upgrade -- write sits BELOW
+         * repack in the order, so waiting for it here is exactly the cycle the
+         * order exists to forbid -- so drop repack and take both in order.
+         * `force_seal` bounds this at one retry; a seal with nothing to seal is a
+         * no-op (D-25b), so forcing it is always safe. */
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) goto out;
+
+        if (!zsi_snapshot_has_unordered(db->snap)) break;
+
+        zsi_lock_release(&db->locks, ZSI_LOCK_REPACK);
+        force_seal = true;
     }
 
-    /* Steps 1 and 2: seal the active generation, and convert any straggler.  The
-     * write lock is already held, so this is the inner form; it converts pending
-     * files on its way out. */
-    r = zsi_seal_locked(db);
+    if (seal) {
+        /* Steps 1 and 2: seal the active generation, and convert any straggler.
+         * The write lock is already held, so this is the inner form; it converts
+         * pending files on its way out. */
+        r = zsi_seal_locked(db);
 
-    /* C-1d: drop WRITE before the merge, whatever the seal returned. */
-    zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+        /* C-1d: drop WRITE before the merge, whatever the seal returned. */
+        zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
 
-    if (r != ZS_OK) goto out;
+        if (r != ZS_OK) goto out;
 
-    r = zsi_db_refresh(db);
-    if (r != ZS_OK) goto out;
+        r = zsi_db_refresh(db);
+        if (r != ZS_OK) goto out;
+    }
 
     /* Step 3: merge every maximal RUN of adjacent in-order files, largest job
      * first, until none of two or more remains.

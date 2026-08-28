@@ -1283,6 +1283,16 @@ The per-file cursors are held in an array kept sorted by:
   Nothing about the choice is visible on disk, so unlike the ancestor it
   replaced (§4.6) it is not interoperability surface and implementations need
   not agree on it.
+
+  What the choices differ in is COST, and D-29's memory bound constrains it. The
+  test is asked once per surviving tombstone in ASCENDING KEY ORDER, because that
+  is the order a merge produces keys in, so the single merged pass is a cursor
+  over the files below the range advanced **forward only** — one pass over the
+  part of the history the tombstones actually reach, with no per-tombstone
+  descent and no index of the keys below. Whatever the means, two things are
+  normative about the answer: it is the newest record for the key **below the
+  range**, so where several files below hold the key the newest wins, exactly as
+  D-17b orders the merge itself; and it distinguishes a value from a deletion.
 - **D-19c** The test MAY err toward **retention**, never toward dropping. A
   retained-but-unnecessary tombstone costs space and is collected by a later
   repack or by compaction; a wrongly dropped one resurrects a deleted value and
@@ -1362,6 +1372,15 @@ The per-file cursors are held in an array kept sorted by:
 - **D-25b** Sealing is a no-op, and NOT an error, when there is no active file,
   when the active file holds no valid spans, or when its header does not
   validate (D-10). The last MUST be reported.
+
+  A no-op for the ACTIVE FILE, which is not the same as doing nothing: an
+  implementation that also catches up D-12's pending conversions at a seal MUST
+  do so in all three cases, not only after a conversion it performed itself.
+  Reaching the catch-up only through a successful active-file conversion makes it
+  conditional on there being an unrelated thing to do, so the one layout that
+  needs it most — an unordered file in the middle of the set, with an in-order
+  file above it, where there is no active file at all — is the layout it is
+  skipped on. D-26b then finds two runs of one file each and merges nothing.
 - **D-25c** An unclean active file (D-9) MAY be sealed. The conversion reads to
   the complete point (F-24), so content past it does not survive into the
   output — the same outcome R-4 already produces, reached sooner.
@@ -1388,7 +1407,7 @@ The per-file cursors are held in an array kept sorted by:
   unordered file (D-12), then merge in-order files until no two adjacent ones
   remain. It acquires **write before repack** (C-1d) and releases write before
   the merge, which is the acquisition order C-1l forces on everything holding
-  both.
+  both — except where C-1m applies, in which case it never acquires write at all.
 - **D-26a** A repacker's size-based selection does NOT apply to compaction: any
   such policy exists to keep a repack amortised, and compaction is explicitly
   the unamortised case. Every other repack rule applies unchanged, D-17 through
@@ -1409,9 +1428,27 @@ The per-file cursors are held in an array kept sorted by:
   failure only if the result is not a single file. A non-active file with an
   invalid header is the case that blocks it — D-10a tolerates such a file, but
   it can be neither converted nor merged.
-- **D-29** Compaction is unbounded: it rewrites the whole database in one
-  invocation while writers continue. Unlike D-16b's cascade this unboundedness is
-  a deliberate entry point; open item 1's mitigations apply to it equally.
+- **D-29** Compaction is unbounded in the BYTES it rewrites and in its duration:
+  it rewrites the whole database in one invocation while writers continue. Unlike
+  D-16b's cascade this unboundedness is a deliberate entry point; open item 1's
+  mitigations apply to it equally.
+
+  It MUST NOT be unbounded in MEMORY. A merge's working set MUST be O(records in
+  the output) and MUST NOT be O(bytes in the output): the whole point of the
+  format-4 layout is that an in-order file is written in strictly ascending offset
+  order (F-26a), so a writer holds one 8-byte offset per record and streams each
+  record's bytes as it produces them. The obvious implementation — accumulate the
+  records region in a growing buffer, checksum it, write it once — is O(bytes),
+  and for a compaction that is O(DATABASE): measured at 9.6GB peak for a
+  2M-record compaction before this was stated. The single exception is a
+  caller-supplied checksum engine (F-5d), which checksums one run in one call and
+  therefore has to hold what it will hash.
+
+  D-19's retention test MUST NOT reintroduce the bound by another route. It is
+  asked once per surviving tombstone, in ascending key order, so an implementation
+  SHOULD answer it with one cursor over the files below the range, seeked forward
+  — never a fresh descent per tombstone, and never an index of the keys below
+  (D-19b).
 
 ## 6. Concurrency and durability
 
@@ -1590,6 +1627,30 @@ The per-file cursors are held in an array kept sorted by:
 
   This was a three-lock chain, write → repack → remove, until the remove lock was
   shown unnecessary (C-1c).
+- **C-1m A compaction with nothing to seal takes the repack lock ALONE.** D-26's
+  steps 1 and 2 exist to bring unordered files into the in-order set; when the set
+  holds no unordered file there is nothing for them to do, and a merge within that
+  set touches neither the active file nor any straggler. An implementation SHOULD
+  therefore skip them and acquire repack alone, so a concurrent writer keeps
+  appending for the compaction's whole duration rather than being blocked for it.
+
+  The condition is "does ANY file in the set lack an `end`", not "is the newest
+  file unordered": a straggler in the middle needs step 2 as much as an active file
+  needs step 1 (D-25b).
+
+  The condition MUST be re-evaluated under the repack lock, because a writer may
+  start a generation while the lock is awaited. C-1d forbids the upgrade — write
+  sits below repack, so waiting for it while holding repack is exactly the cycle
+  the order exists to forbid — so an implementation that finds one MUST release
+  repack and re-acquire both in order, and MUST NOT wait for write while holding
+  repack. The re-acquisition MUST be bounded; forcing the seal path on the retry
+  is sufficient, since a seal with nothing to seal is a no-op (D-25b).
+
+  The unlocked read is therefore only a hint: getting it wrong costs one lock
+  acquisition, never correctness.
+
+  Skipping the seal does not weaken D-28. With no unordered file in the set,
+  merging every run (D-26b) leaves the single file D-28 requires.
 - **C-1h Locks across databases.** C-1d orders the locks within one database.
   The library cannot see across two, so a caller that holds locks on several
   while writing MUST impose its own consistent order.

@@ -24,6 +24,27 @@ existing data must dump and reload.
   single pass, and it removes the requirement to know every section length
   before writing the first byte.
 
+- **A merge's memory is 8 bytes per record, not the size of its output** (D-29).
+  Both writers stream: the header goes out before the first record is read, each
+  record is written as it is produced, and the checksum is accumulated as the
+  bytes pass. Measured on a 306MB compaction of three files, peak RSS
+  **1192MB → 619MB**, of which the remainder is the input and output mappings —
+  a 2M-record compaction of 60MB files is 140MB, being 60 in, 60 out and the
+  16MB pointer array. A caller-supplied checksum engine still holds its input,
+  since it hashes one run in one call (F-5d).
+
+- **A compaction of an already-packed set takes the repack lock alone** (C-1m),
+  so writers keep appending for its whole duration instead of being blocked for
+  it. When any file in the set is still unordered it takes write then repack as
+  before.
+
+- **D-19's tombstone test uses one forward cursor over the files below the
+  range** (D-19b), rather than a fresh search per tombstone.
+
+- A seal now catches up D-12's pending conversions even when there was no active
+  file to seal (D-25b). Without that, a compaction of a set whose newest file is
+  in-order and whose middle holds a straggler merged nothing at all.
+
 - **No record carries a checksum, so a read verifies nothing.** An in-order
   file's single checksum is verified only by `zs_db_check_consistency`, by a
   merge reading the file as an input, and by salvage — never on open, never on a

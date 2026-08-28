@@ -523,7 +523,7 @@ echo "pointer section (Task 9)"
 # prefix, not zero -- which is the short-circuit an implementer is most likely to
 # add (twom's engine does exactly that).
 mutant "empty file: file csum forced to zero" catch \
-  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  n ? zsi_csumv(csum, csum_id, v, nv) : 0);/'
+  's/        zsi_put64\(cb, zsi_out_digest\(o\)\);/        zsi_put64(cb, n ? zsi_out_digest(o) : 0);/'
 
 mutant "empty file: width 8 when there are no offsets" catch \
   's/    return records_end > 0xFFFFFFFFu \? 8 : 4;/    return 8;/'
@@ -531,7 +531,7 @@ mutant "empty file: width 8 when there are no offsets" catch \
 # F-26b: the section checksum covers section + padding + back pointer + records
 # checksum, up to the checksum field itself.
 mutant "file csum: covers the tail only, not the records" catch \
-  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  zsi_csumv(csum, csum_id, v + npre, 1));/'
+  's/    if \(zsi_tail_layout\(records_end, \(uint64_t\)n,/    XXH3_64bits_reset(\&o->st);\n    if (zsi_tail_layout(records_end, (uint64_t)n,/'
 
 mutant "file csum: verified on open, breaking F-31's O(1)" catch \
   's/    const char \*tr = zsi_file_at\(f, f->size - ZSI_TRAILER_LEN, ZSI_TRAILER_LEN\);\n    if \(!tr\) return ZS_BADFORMAT;/    const char *tr = zsi_file_at(f, f->size - ZSI_TRAILER_LEN, ZSI_TRAILER_LEN);\n    if (!tr) return ZS_BADFORMAT;\n    { const char *ab = zsi_file_at(f, 0, f->size);\n      if (!ab || f->csum(ab, f->size - ZSI_CSUM_LEN)\n                 != zsi_get64(ab + f->size - ZSI_CSUM_LEN))\n          return ZS_BADCHECKSUM; }/'
@@ -577,7 +577,7 @@ mutant "F-27a: a pointer at a zero byte accepted" catch \
 
 # F-26d: the narrow section pads to a multiple of 8 so the trailer is aligned.
 mutant "F-26d: no pad before the pointer array" catch \
-  's/    pad = t.pad; arrlen = t.arrlen; total = t.tail_len;/    pad = 0; arrlen = t.arrlen; total = t.arrlen + ZSI_TRAILER_LEN;/'
+  's/    if \(t.pad\) zsi_out_put\(o, zeros, t.pad\);/    \/* no pad emitted *\//'
 
 # The search must be a lower bound over a strictly ordered array.
 mutant "search: probe returns wrong end" catch \
@@ -1146,12 +1146,19 @@ echo "seal and compact (D-25..D-29)"
 # time, and generations are finite (D-9c).  Only the generation assertion tells
 # them apart, which is why test_seal_creates_no_new_generation exists.
 mutant "seal: leaves a new active generation" catch \
-  's/    if \(r == ZS_OK\) \(void\)zsi_convert_pending\(db\);/    if (r == ZS_OK) (void)zsi_convert_pending(db);\n    if (r == ZS_OK) { int fd_ = -1; uint32_t g_ = 0;\n        if (zsi_writer_active(db, \&fd_, \&g_) == ZS_OK) close(fd_); }/'
+  's/    \(void\)zsi_convert_pending\(db\);\n\n    return r;/    (void)zsi_convert_pending(db);\n\n    if (r == ZS_OK) { int fd_ = -1; uint32_t g_ = 0;\n        if (zsi_writer_active(db, \&fd_, \&g_) == ZS_OK) close(fd_); }\n\n    return r;/'
 
 # D-25b.  Sealing an active file with no spans writes an empty in-order file and
 # consumes a generation for nothing.
+# D-26 step 2.  The catch-up used to be reached only THROUGH a successful
+# active-file conversion, so a set whose newest file was in-order and whose middle
+# held a straggler was left exactly as found -- and then a compaction merges
+# nothing, because the straggler splits the set into two runs of one (D-26b).
+mutant "seal: the catch-up runs only after a conversion" catch \
+  's/    \(void\)zsi_convert_pending\(db\);\n\n    return r;/    if (act) (void)zsi_convert_pending(db);\n\n    return r;/'
+
 mutant "seal: seals a file with no spans" catch \
-  's/    if \(act->complete <= ZSI_HEADER_LEN\) goto out;  \/\* no valid spans \*\//    \/* D-25b removed *\//'
+  's/    else if \(act && act->complete > ZSI_HEADER_LEN\) \{/    else if (act) {/'
 
 # The write lock is the ONLY thing making it safe to convert the active file:
 # without it another writer may be appending to the file being converted.
@@ -1472,7 +1479,7 @@ echo "rewrite counters (A-17)"
 # structural and no setting touches it -- and it is the mistake a single
 # "bytes rewritten" figure would institutionalise.
 mutant "stats: a conversion counted as a repack" catch \
-  's/    db->stats.convert_records \+= \(uint64_t\)n;\n    db->stats.convert_bytes \+= \(uint64_t\)ZSI_HEADER_LEN \+ recslen \+ seclen;/    db->stats.repack_records += (uint64_t)n;\n    db->stats.repack_bytes += (uint64_t)ZSI_HEADER_LEN + recslen + seclen;/'
+  's/    db->stats.convert_records \+= \(uint64_t\)n;\n    db->stats.convert_bytes \+= \(uint64_t\)out.len;/    db->stats.repack_records += (uint64_t)n;\n    db->stats.repack_bytes += (uint64_t)out.len;/'
 
 mutant "stats: repacks not counted" catch \
   's/    db->stats.repacks\+\+;/    \/* not counted *\//'
@@ -1481,7 +1488,7 @@ mutant "stats: conversions not counted" catch \
   's/    db->stats.conversions\+\+;/    \/* not counted *\//'
 
 mutant "stats: bytes never accumulated" catch \
-  's/    db->stats.repack_bytes \+= \(uint64_t\)ZSI_HEADER_LEN \+ recslen \+ seclen;/    \/* not accumulated *\//'
+  's/    db->stats.repack_bytes \+= \(uint64_t\)out.len;/    \/* not accumulated *\//'
 
 # Time is the one field A-17 allows to read zero, so it needs its own mutant
 # rather than riding on the counts.
@@ -1500,28 +1507,28 @@ mutant "repack: emits V1's value, not V3's" catch \
 # a live value below the output range resurrects that value.  This is the whole
 # reason the test exists, and it is what the retired ancestor used to answer.
 mutant "repack: drops every tombstone" catch \
-  's/    for \(size_t i = first; i-- > 0; \) \{/    return false;\n    for (size_t i = first; i-- > 0; ) {/'
+  's/            if \(!isval\) continue;               \/\* drop the key \*\//            continue;                          \/* drop the key *\//'
 
 # ... and the direction that merely LEAKS: retaining every tombstone is safe,
 # so nothing about a read can see it.  It needs a mutant precisely because it
 # is invisible to correctness tests -- a rule that never drops would otherwise
 # read as passing while reclaiming nothing.
 mutant "repack: retains every tombstone" catch \
-  's/    for \(size_t i = first; i-- > 0; \) \{/    return true;\n    for (size_t i = first; i-- > 0; ) {/'
+  's/            if \(!isval\) continue;               \/\* drop the key \*\//            (void)isval;                       \/* never dropped *\//'
 
 # D-19 looks BELOW the output range.  Searching the whole set instead finds
 # newer files too, so a key re-created above the range keeps a tombstone that
 # should have gone -- and, worse, makes the answer depend on files the range
 # has no business consulting.
 mutant "repack: searches above the range too" catch \
-  's/    for \(size_t i = first; i-- > 0; \) \{/    for (size_t i = snap->nfiles; i-- > 0; ) {/'
+  's/    r = zsi_history_init\(&hist, db, snap, first\);/    r = zsi_history_init(\&hist, db, snap, snap->nfiles);/'
 
 # The refinement that is free: the search stops at the first file holding the
 # key, so it already knows whether that record is a value or a deletion.
 # Treating a deletion below as "present" retains a tombstone that is redundant
 # with it.  Safe, and so invisible without a mutant.
 mutant "repack: a deletion below counts as a value" catch \
-  's/            bool isval = found && !zsi_rec_is_delete\(&r\);/            bool isval = found;/'
+  's/        \*isval = !zsi_rec_is_delete\(&a->cur\);/        *isval = true;/'
 
 mutant "repack: inputs not verified before merge" catch \
   's/        r = zsi_ptrs_verify_records\(snap->files\[first \+ i\]\);/        r = ZS_OK;/'
@@ -1555,19 +1562,21 @@ mutant "replay: rejects a record on a content test (F-33a)" catch \
 # everywhere, so every engine-1 read fails -- unmissable, which is the point:
 # it proves the read tests depend on the WRITTEN value, not on a round-trip.
 mutant "file csum: never written" catch \
-  's/                  zsi_csumv\(csum, csum_id, v, nv\)\);/                  0);/'
+  's/        zsi_put64\(cb, zsi_out_digest\(o\)\);/        zsi_put64(cb, 0);/'
 
-# RECLASSIFIED catch -> equivalent, 2026-08-27, because F-32c is RETIRED.
+# RETARGETED 2026-08-28, and no longer equivalent, because the SUBJECT changed
+# with the code.  This used to read `src->csum_id != db->create_csum_id` and
+# guarded the A-6 trap at one remove: a record copied verbatim across an engine
+# boundary carried a per-record checksum that validated for nobody.  F-32c is
+# retired -- no record carries a checksum since version 4 -- so the engines no
+# longer decide anything and the test became per-record CANONICALITY (F-15).  The
+# hazard note is kept here so that anyone reintroducing a per-record checksum
+# finds it: a verbatim copy would then be wrong again, and for a different reason.
 #
-# It guarded the A-6 trap at one remove: a record copied verbatim across an engine
-# boundary carried a per-record checksum that validated for nobody.  No record
-# carries a checksum since version 4 (F-32), so a verbatim copy is now correct
-# whatever the engines are -- the output file's ONE checksum is computed over
-# whatever it ends up containing (F-26e).  There is nothing left for this to
-# break, and it is kept rather than deleted so that anyone reintroducing a
-# per-record checksum finds the hazard already written down.
-mutant "convert: copies verbatim across engines" equivalent \
-  's/    bool reencode = \(src->csum_id != db->create_csum_id\);/    bool reencode = false;/'
+# What the mutant now does: carry a peer's non-canonical record into an in-order
+# file, where check_consistency reports it for the life of the data.
+mutant "convert: copies a non-canonical record verbatim" catch \
+  's/        bool reencode = !zsi_rec_is_canonical\(&rec\);/        bool reencode = false;/'
 
 # C-4i.  The original Cyrus bug, preserved: a shared begin that reuses the
 # handle's snapshot reads the world as of the handle's last write, forever.
@@ -1604,7 +1613,7 @@ mutant "cursor: LIVE step stops looking" catch \
 # assertion catches it from the other side, which is the only thing that can:
 # test_compact_lock_order completes under either order (see its comment).
 mutant "compact: takes the repack lock outermost" catch \
-  's/    r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) return r;\n\n    r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking \? ZS_NONBLOCKING : 0\);\n    if \(r != ZS_OK\) \{\n        zsi_lock_release\(&db->locks, ZSI_LOCK_WRITE\);\n        return r;\n    \}/    r = zsi_lock_take(\&db->locks, ZSI_LOCK_REPACK,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) return r;\n\n    r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                      db->nonblocking ? ZS_NONBLOCKING : 0);\n    if (r != ZS_OK) {\n        zsi_lock_release(\&db->locks, ZSI_LOCK_REPACK);\n        return r;\n    }/'
+  's/        if \(seal\) \{\n            r = zsi_lock_take\(&db->locks, ZSI_LOCK_WRITE,\n                              db->nonblocking \? ZS_NONBLOCKING : 0\);\n            if \(r != ZS_OK\) return r;\n        \}\n\n        r = zsi_lock_take\(&db->locks, ZSI_LOCK_REPACK,\n                          db->nonblocking \? ZS_NONBLOCKING : 0\);\n        if \(r != ZS_OK\) \{\n            if \(seal\) zsi_lock_release\(&db->locks, ZSI_LOCK_WRITE\);\n            return r;\n        \}/        r = zsi_lock_take(\&db->locks, ZSI_LOCK_REPACK,\n                          db->nonblocking ? ZS_NONBLOCKING : 0);\n        if (r != ZS_OK) return r;\n\n        if (seal) {\n            r = zsi_lock_take(\&db->locks, ZSI_LOCK_WRITE,\n                              db->nonblocking ? ZS_NONBLOCKING : 0);\n            if (r != ZS_OK) {\n                zsi_lock_release(\&db->locks, ZSI_LOCK_REPACK);\n                return r;\n            }\n        }/'
 
 # C-1d again, from the assertion side: restoring the pre-C-1l direction in
 # zsi_lock_take makes the assertion contradict the code it guards, so compaction
@@ -2182,23 +2191,23 @@ mutant "F-19a: terminator vallen not the payload length" catch \
 # extended file fails the equality even though each field is in range.  Writing a
 # start that disagrees with where the array actually is exercises that.
 mutant "F-26b: trailer start disagrees with the array" catch \
-  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_START, \(uint64_t\)t.ptr_start\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_START, (uint64_t)records_end);/'
+  's/    zsi_put64\(tr \+ ZSI_TR_OFF_START,   \(uint64_t\)t.ptr_start\);/    zsi_put64(tr + ZSI_TR_OFF_START,   (uint64_t)t.ptr_start + 8);/'
 
 mutant "F-26b: trailer nptrs disagrees with the array" catch \
-  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_NPTRS, \(uint64_t\)n\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_NPTRS, (uint64_t)n + 1);/'
+  's/    zsi_put64\(tr \+ ZSI_TR_OFF_NPTRS,   \(uint64_t\)n\);/    zsi_put64(tr + ZSI_TR_OFF_NPTRS,   (uint64_t)n + 1);/'
 
 mutant "F-26b: trailer ptrsize disagrees with the array" catch \
-  's/    zsi_put64\(buf \+ pad \+ arrlen \+ ZSI_TR_OFF_PTRSIZE, \(uint64_t\)t.ptrsize\);/    zsi_put64(buf + pad + arrlen + ZSI_TR_OFF_PTRSIZE, (uint64_t)(t.ptrsize == 4 ? 8 : 4));/'
+  's/    zsi_put64\(tr \+ ZSI_TR_OFF_PTRSIZE, \(uint64_t\)t.ptrsize\);/    zsi_put64(tr + ZSI_TR_OFF_PTRSIZE, (uint64_t)(t.ptrsize == 4 ? 8 : 4));/'
 
 # F-26d.  Pad bytes MUST be zero -- that is what makes them recognisable given
 # MustBeOne, and it is what salvage stops on when it has no pointer count (S-6).
 mutant "F-26d: the pad is not zeroed" catch \
-  's/    char \*buf = zsi_zmalloc\(total\);      \/\* zeroed: F-26d requires a zero pad \*\//    char *buf = malloc(total); if (buf) memset(buf, 0xAB, total);/'
+  's/    static const char zeros\[8\] = \{ 0 \};/    static const char zeros[8] = { (char)0xAB, (char)0xAB, (char)0xAB, (char)0xAB,\n                                   (char)0xAB, (char)0xAB, (char)0xAB, (char)0xAB };/'
 
 # F-26e.  The one checksum covers the HEADER too, which binds a header to its
 # body so a valid header cannot be grafted onto a different one.
 mutant "F-26e: the checksum skips the header" catch \
-  's/        for \(i = 0; i < npre; i\++\) v\[nv\++\] = pre\[i\];/        for (i = 1; i < npre; i++) v[nv++] = pre[i];/'
+  's/    zsi_out_put\(&out, hdr, ZSI_HEADER_LEN\);/    zsi_out_emit(\&out, hdr, ZSI_HEADER_LEN, false);/'
 
 # S-13.  The file is reported ONCE, never per key -- two million events is not a
 # report, and the distinct kind is what lets a caller tell the two apart.
@@ -2220,6 +2229,98 @@ mutant "A-18: ZS_NOCSUM silently ignored" catch \
 # multiple of 8.
 mutant "salvage: resync scans 8 bytes at a time" catch \
   's/    for \(size_t p = from; p < f->size; p\++\) \{/    for (size_t p = (from + 7u) \& ~(size_t)7; p < f->size; p += 8) {/'
+
+echo
+echo "bounded merges: the streaming sink, the history cursor, the galloping seek"
+
+# The sink's whole purpose.  Holding the output instead of streaming it is the
+# 9.6GB compaction, and no assertion in the suite can see memory -- so this is
+# NOT the mutant for that, and there deliberately is none.  What IS catchable is
+# forgetting the final flush: the trailing checksum stays in the buffer, the file
+# is eight bytes short of what the trailer describes, and every reader rejects it.
+mutant "out: the last buffered bytes are never flushed" catch \
+  's/    \/\* The file is complete, so this is the last chance to reach the fd. \*\/\n    zsi_out_flush\(o\);/    \/* final flush removed *\//'
+
+# The buffer must not reorder anything.  A record too big for it goes straight
+# through, which is sound only because the buffer was just flushed; skipping that
+# flush writes the big record BEFORE the bytes that precede it, so every offset in
+# the pointer array is wrong while the file is still exactly the right length.
+mutant "out: a big record jumps the buffered bytes" catch \
+  's/        if \(o->buflen \+ n > ZSI_OUT_BUF\) \{\n            zsi_out_flush\(o\);\n            if \(o->err != ZS_OK\) return;\n        \}/        if (o->buflen + n > ZSI_OUT_BUF \&\& n <= ZSI_OUT_BUF) {\n            zsi_out_flush(o);\n            if (o->err != ZS_OK) return;\n        }/'
+
+# F-4: the checksum field is not covered by its own checksum -- and this mutant
+# is EQUIVALENT, which took a NOT CAUGHT to notice and is worth writing down.
+# Feeding the digest state changes nothing, because zsi_out_digest has already
+# been called and nothing ever reads the state again.  What enforces F-4 is the
+# ORDER -- digest, then emit -- and the flag says so at the point the format
+# requires it rather than being what makes it true.  Reversing the order IS
+# catchable and is the mutant below.  Do not write a test chasing this one.
+mutant "out: the checksum feeds its own digest" equivalent \
+  's/        zsi_out_emit\(o, cb, ZSI_CSUM_LEN, false\);/        zsi_out_emit(o, cb, ZSI_CSUM_LEN, true);/'
+
+# F-4 from the side that does bite: emit the checksum field BEFORE taking the
+# digest and it covers itself, so every file fails its own validation.
+mutant "out: the digest is taken after the checksum is emitted" catch \
+  's/        char cb\[ZSI_CSUM_LEN\];\n        zsi_put64\(cb, zsi_out_digest\(o\)\);\n        \/\* Past the digest, so this must NOT feed it \(F-4\)\. \*\/\n        zsi_out_emit\(o, cb, ZSI_CSUM_LEN, false\);/        char cb[ZSI_CSUM_LEN];\n        memset(cb, 0, sizeof(cb));\n        zsi_out_emit(o, cb, ZSI_CSUM_LEN, true);\n        zsi_put64(cb, zsi_out_digest(o));\n        if (o->fd >= 0) { zsi_out_flush(o); (void)zsi_write_all(o->fd, cb, ZSI_CSUM_LEN); }/'
+
+# D-19a.  The history cursor answers "the newest record below the range", so its
+# arms are ordered oldest to newest and the LAST match wins.  Taking the first
+# instead answers with a generation the database moved past, which is exactly the
+# D-17b mistake one level down -- and it is invisible unless two files below the
+# range both hold the key.
+# ONE substitution, deliberately: the two-part version of this mutant (declare a
+# `haveone` flag, then guard the assignment with it) HALF-ROTTED on its first
+# run -- the declaration landed, the guard did not, and the result built, behaved
+# identically and reported NOT CAUGHT.  Reversing the arm order says the same
+# thing in one place: ascending i stops being oldest-to-newest, so the last match
+# becomes the oldest.
+mutant "history: the oldest match wins, not the newest" catch \
+  's/        zsi_fcur_init_file\(&h->arm\[i\], snap->files\[i\], db->compar\);/        zsi_fcur_init_file(\&h->arm[i], snap->files[first - 1 - i], db->compar);/'
+
+# The history only ever moves FORWARD, which is what makes a whole merge cost one
+# pass over the files below it.  Re-seeking from the top per tombstone is a
+# performance bug and nothing else -- same answer, log2(file) decodes per
+# tombstone instead of a handful -- so it is equivalent, and listed so nobody
+# writes a test chasing it.
+mutant "history: re-seeks from the top each time" equivalent \
+  's/        r = zsi_fcur_seek_fwd\(a, key, keylen\);/        r = zsi_fcur_seek(a, key, keylen);/'
+
+# Same for the floor itself: a gallop from 0 is the plain binary search with two
+# extra probes.  Correct, slower, and untestable.
+mutant "fcur: the forward seek ignores its floor" equivalent \
+  's/                                     fc->u.f.pi, &idx, &exact\);/                                     0, \&idx, \&exact);/'
+
+# ... but a gallop that gets the BOUND wrong is not.  The fast path returns the
+# record it landed on; returning the one above skips a key whenever the floor is
+# already the answer, which for a dense forward walk is nearly every call.
+mutant "search_from: the fast path lands one past the key" catch \
+  's/    if \(c <= 0\) \{ \*idx = lo; \*exact = \(c == 0\); return ZS_OK; \}/    if (c <= 0) { *idx = lo + 1; *exact = false; return ZS_OK; }/'
+
+# The bracket the gallop hands to the bisect must EXCLUDE the record it proved is
+# below the key and INCLUDE everything above it.  Advancing the low end past hi's
+# successor drops a key silently.
+mutant "search_from: the gallop skips a record" catch \
+  's/        lo = hi \+ 1;                    \/\* hi.s key is below, so exclude it \*\//        lo = hi + 2;/'
+
+# C-1m.  Sealing unconditionally is what the code did before, and it is safe --
+# but it takes the WRITE lock for a merge that needs no such thing, so a
+# compaction of an already-packed set blocks every writer for its duration.
+mutant "compact: seals even when the set is already in order" catch \
+  's/        seal = force_seal \|\| zsi_snapshot_has_unordered\(db->snap\);/        seal = true;/'
+
+# C-1m again, the other half, and it is EQUIVALENT -- which is the answer to
+# "how much does the unlocked read have to get right", and I expected the
+# opposite.  zsi_snapshot_active asks only about the NEWEST file, so a straggler
+# D-12 has not converted yet slips past it and the write lock is not taken; but
+# the RECHECK under the repack lock still asks the right question, finds the
+# straggler, drops repack and retries with force_seal, and the compaction
+# completes correctly one lock acquisition later.  So the first read really is
+# only a hint, as its comment claims, and this mutant costs performance and
+# nothing else.  (Mutate the recheck instead and the retry is what breaks --
+# which is a race no single-process test can produce, so there is no mutant for
+# it; the retry is guarded by review and by C-1m's spec text.)
+mutant "compact: only the active file counts as unordered" equivalent \
+  's/        seal = force_seal \|\| zsi_snapshot_has_unordered\(db->snap\);/        seal = force_seal \|\| zsi_snapshot_active(db->snap) != NULL;/'
 
 if [ "$ROTONLY" -eq 1 ]; then
     printf '%d patterns intact, %d ROTTED (no mutant was built or run)\n' \

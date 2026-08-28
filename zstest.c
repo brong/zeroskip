@@ -2182,28 +2182,31 @@ static void ib_rec(struct ib *b, const char *key, size_t keylen,
     b->len += n;
 }
 
-/* Close the file: append the pointer section and trailer. */
+/* Close the file: append the pad, the pointer array and the trailer.
+ *
+ * Goes through the real writers' sink with fd == -1, which holds the bytes rather
+ * than writing them -- the path that exists so a caller wanting the bytes and an
+ * engine that cannot stream (F-5d) share one implementation of the layout.  So
+ * this builder cannot disagree with a conversion or a repack about where anything
+ * goes, which a second copy of the arithmetic could. */
 static void ib_finish(struct ib *b)
 {
     zs_csum *cs = zsi_csum_for_id(b->engine, TEST_EXTERNAL_CSUM);
-    char *sec = NULL;
-    size_t seclen = 0;
-    struct zsi_region pre[1];
+    struct zsi_out out;
 
-    /* One checksum over the whole file (F-26e), so the builder is handed the
-     * bytes already produced -- header and records together, which this builder
-     * holds in one buffer -- exactly as the real writers hand it two. */
-    pre[0].p = b->buf; pre[0].len = b->len;
-    assert(zsi_ptrs_build(b->offs, b->n, b->len, pre, 1, cs, b->engine,
-                          &sec, &seclen) == ZS_OK);
-    while (b->len + seclen > b->alloc) {
+    zsi_out_init(&out, -1, cs, b->engine);
+    zsi_out_put(&out, b->buf, b->len);
+    assert(out.err == ZS_OK);
+    assert(zsi_ptrs_emit(&out, b->offs, b->n) == ZS_OK);
+
+    while (out.holdlen > b->alloc) {
         b->alloc *= 2;
         b->buf = realloc(b->buf, b->alloc);
         assert(b->buf);
     }
-    memcpy(b->buf + b->len, sec, seclen);
-    b->len += seclen;
-    free(sec);
+    memcpy(b->buf, out.hold, out.holdlen);
+    b->len = out.holdlen;
+    zsi_out_fini(&out);
 }
 
 /* Write, open and load.  Leaves the open file in *fp. */
@@ -9951,6 +9954,98 @@ static void test_repack_d19_newer_file_recreates(void)
     zs_db_close(&db);
 }
 
+/* D-19a's HISTORY CURSOR: the newest arm wins, and the forward seek that gets
+ * there must land on the key rather than beside it.
+ *
+ * Every assertion here is the same one -- "k" stays absent -- and the layout is
+ * what makes three different faults produce it.  That is deliberate: the history
+ * is consulted once per surviving tombstone and answers with a single bool, so
+ * there is nothing else to observe, and the only way to aim at its internals is
+ * to build a file set where each internal is load-bearing.
+ *
+ *   gen1 (oldest below)  k = DELETE
+ *   gen2 (newest below)  c d e k=NEWER y        -- "k" at pointer index 3
+ *   gen3, gen4 (merged)  f = DELETE, k = DELETE ; zz
+ *
+ * D-19's answer for "k" is gen2's, because gen2 is the NEWEST below the range: a
+ * value, so the tombstone is retained and "k" stays absent.  Three ways to get
+ * that wrong, each of which drops the tombstone and lets gen2's value back:
+ *
+ *  - taking the OLDEST matching arm answers with gen1's deletion (the D-17b
+ *    mistake one level down, invisible unless two files below both hold the key);
+ *  - a galloping seek whose bracket excludes the record it is looking for walks
+ *    past index 3 -- which is why gen2 has five keys with "k" at 3, the position
+ *    a doubling reach lands one short of;
+ *  - and the seek's cheap path, taken when the arm already sits ON the key, must
+ *    return that record and not its successor -- which is why "f" is repacked
+ *    too, and BEFORE "k": looking "f" up leaves gen2's arm parked exactly on "k".
+ *
+ * So the order of the two tombstones is part of the test, not incidental. */
+static void test_repack_history_cursor(void)
+{
+    struct zs_db *db;
+    struct ib b;
+    char name[ZSI_NAME_MAX];
+    const char *v;
+    size_t vl;
+
+    clear_db();
+
+    ib_init(&b, 1, 1, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "k", 1, NULL, 0);                    /* gen1: a deletion */
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 1, 1);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    /* gen2, in key order: "k" is the fourth of five. */
+    put_inorder_kv(2, 2, (const struct kv[]){
+        {"c","1"}, {"d","1"}, {"e","1"}, {"k","NEWER"}, {"y","1"}, {NULL,NULL} });
+
+    ib_init(&b, 3, 3, ZSI_CSUM_XXHASH);
+    ib_rec(&b, "f", 1, NULL, 0);                    /* the range's tombstones */
+    ib_rec(&b, "k", 1, NULL, 0);
+    ib_finish(&b);
+    zsi_name_format(name, test_uuid, 3, 3);
+    ASSERT_EQ(writefile(name, b.buf, b.len), 0);
+    ib_free(&b);
+
+    put_inorder_kv(4, 4, (const struct kv[]){ {"zz","4"}, {NULL,NULL} });
+    put_unordered_kv(5, (const struct kv[]){ {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->nfiles, 5u);
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+
+    /* Merge gens 3..4, so the history is gens 1 and 2. */
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 2, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    {
+        struct zsi_file *out = file_with_range(db, 3, 4);
+        ASSERT_NOT_NULL(out);
+        /* "k"'s tombstone survived and "f"'s did not -- nothing below holds "f",
+         * so its whole lifespan was inside the inputs (D-18). */
+        ASSERT_EQU(out->nptrs, 2u);
+    }
+
+    ASSERT_EQ(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_EQ(zs_db_fetch(db, "f", 1, NULL, NULL, &v, &vl, 0), ZS_NOTFOUND);
+    ASSERT_OK(zs_db_fetch(db, "zz", 2, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "4", 1);
+
+    /* And the keys the history walked past on its way are untouched. */
+    for (const char *k = "cdey"; *k; k++) {
+        ASSERT_OK(zs_db_fetch(db, k, 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, "1", 1);
+    }
+
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
 /* D-19a: a record is emitted even when a NEWER file already shadows the key.
  *
  * Being shadowed does not permit dropping it -- only D-19 does, and D-19 asks
@@ -10657,20 +10752,19 @@ static void test_check_noncanonical(void)
         buf[ZSI_HEADER_LEN + 17] = '\0';
         reclen = 16 + 1 + 1;                /* F-14a: hdr + keylen + key NUL */
 
+        /* Through the writers' own sink with fd == -1, so this file's layout
+         * cannot disagree with a real one. */
         uint64_t ptr = ZSI_HEADER_LEN;
-        char *sec = NULL;
-        size_t seclen = 0;
-        struct zsi_region pre[1];
-        pre[0].p = buf; pre[0].len = ZSI_HEADER_LEN + reclen;
-        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, pre, 1,
-                                 zsi_csum_xxhash, ZSI_CSUM_XXHASH,
-                                 &sec, &seclen));
-        memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
-        free(sec);
+        struct zsi_out out;
+
+        zsi_out_init(&out, -1, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
+        zsi_out_put(&out, buf, ZSI_HEADER_LEN + reclen);
+        ASSERT_OK(zsi_ptrs_emit(&out, &ptr, 1));
 
         zsi_name_format(name, test_uuid, 5, 5);
         ASSERT_EQ(mkdbdir(), 0);
-        ASSERT_EQ(writefile(name, buf, ZSI_HEADER_LEN + reclen + seclen), 0);
+        ASSERT_EQ(writefile(name, out.hold, out.holdlen), 0);
+        zsi_out_fini(&out);
     }
     put_unordered_kv(6, (const struct kv[]){ {NULL,NULL} });
 
@@ -10706,20 +10800,19 @@ static void test_check_noncanonical(void)
          * below, so it is honest even though the FORM is non-canonical: the
          * divergence under test is the shape, and a stale checksum would make
          * the fetch below fail for the wrong reason. */
+        /* Through the writers' own sink with fd == -1, so this file's layout
+         * cannot disagree with a real one. */
         uint64_t ptr = ZSI_HEADER_LEN;
-        char *sec = NULL;
-        size_t seclen = 0;
-        struct zsi_region pre[1];
-        pre[0].p = buf; pre[0].len = ZSI_HEADER_LEN + reclen;
-        ASSERT_OK(zsi_ptrs_build(&ptr, 1, ZSI_HEADER_LEN + reclen, pre, 1,
-                                 zsi_csum_xxhash, ZSI_CSUM_XXHASH,
-                                 &sec, &seclen));
-        memcpy(buf + ZSI_HEADER_LEN + reclen, sec, seclen);
-        free(sec);
+        struct zsi_out out;
+
+        zsi_out_init(&out, -1, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
+        zsi_out_put(&out, buf, ZSI_HEADER_LEN + reclen);
+        ASSERT_OK(zsi_ptrs_emit(&out, &ptr, 1));
 
         zsi_name_format(name, test_uuid, 1, 1);
         ASSERT_EQ(mkdbdir(), 0);
-        ASSERT_EQ(writefile(name, buf, ZSI_HEADER_LEN + reclen + seclen), 0);
+        ASSERT_EQ(writefile(name, out.hold, out.holdlen), 0);
+        zsi_out_fini(&out);
     }
     put_unordered_kv(2, (const struct kv[]){ {NULL,NULL} });
 
@@ -10755,6 +10848,70 @@ static void test_check_unclean_reported(void)
     ASSERT_NOT_NULL(db);
     ASSERT_OK(zs_db_check_consistency(db));     /* reported, not an error */
     ASSERT(report_count > 0);
+    zs_db_close(&db);
+}
+
+/* F-15: a conversion CANONICALISES, per record.
+ *
+ * Decoding accepts a peer's non-canonical record rather than rejecting it (F-24
+ * plus G-3), so the form can enter the database from outside -- and this is where
+ * it leaves again, because a conversion is the one moment every record is
+ * rewritten.  Copying verbatim would carry the divergence into an in-order file,
+ * where zs_db_check_consistency keeps reporting it for the life of the data.
+ *
+ * The test is that check_consistency goes from reporting to silent across a
+ * SEAL, with the value still readable either side.  Per RECORD rather than per
+ * file: the canonical record beside it must still take the verbatim path, which
+ * is what the second key is for -- a per-file test would pass under a rule that
+ * re-encodes everything, and that rule is the one this replaced. */
+static void test_convert_canonicalises_a_record(void)
+{
+    struct sb s;
+    struct zs_db *db;
+    char name[ZSI_NAME_MAX];
+    char rec[24];
+    const char *v;
+    size_t vl;
+
+    clear_db();
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+
+    /* A big-form record whose lengths both fit the short form (F-15). */
+    memset(rec, 0, sizeof(rec));
+    zsi_put64(rec, (uint64_t)(ZSI_MUSTBEONE | ZSI_ISBIG)
+                   | ((uint64_t)1 << ZSI_KEYLEN_SHIFT));
+    zsi_put64(rec + 8, 1);                      /* vallen */
+    rec[16] = 'k'; rec[17] = '\0';
+    rec[18] = 'v'; rec[19] = '\0';
+    sb_raw(&s, rec, 20);                        /* F-14a: 16 + 1+1 + 1+1 */
+
+    sb_rec(&s, "m", 1, "2", 1);                 /* and one canonical neighbour */
+    sb_term(&s, false);
+    zsi_name_current(name, test_uuid);
+    ASSERT_EQ(mkdbdir(), 0);
+    ASSERT_EQ(sb_write(&s, name), 0);
+    sb_free(&s);
+
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
+    ASSERT_EQ(zs_db_check_consistency(db), ZS_BADFORMAT);
+    ASSERT(report_count > 0);
+
+    ASSERT_OK(zs_db_seal(db));
+    zs_db_close(&db);
+
+    report_count = 0;
+    db = open_db_reporting(0);
+    ASSERT_NOT_NULL(db);
+    ASSERT_NULL(zsi_snapshot_active(db->snap));  /* it really did convert */
+    ASSERT_OK(zs_db_fetch(db, "k", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "v", 1);
+    ASSERT_OK(zs_db_fetch(db, "m", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "2", 1);
+    ASSERT_OK(zs_db_check_consistency(db));
+    ASSERT_EQ(report_count, 0);
     zs_db_close(&db);
 }
 
@@ -14866,6 +15023,78 @@ static void test_seal_converts_the_active_file(void)
     ASSERT_OK(zs_db_close(&db));
 }
 
+/* A record larger than the output sink's write buffer, through both writers.
+ *
+ * The sink batches records into a fixed buffer so a merge does not issue a
+ * write(2) per record, and one bigger than the buffer has to go straight through
+ * -- which is only sound because the buffer is FLUSHED first.  Skip that flush
+ * and the big record lands ahead of the bytes that precede it: every offset in
+ * the pointer array is then wrong while the file is exactly the right length and
+ * its checksum still validates, because the sink hashed the bytes in the order it
+ * was given them rather than the order it wrote them.  So the file passes every
+ * structural check and answers lookups with the wrong record.
+ *
+ * Nothing else in the suite writes a record this large, which is why the two
+ * write paths are both exercised here: a conversion (the seal) and a merge (the
+ * repack), with a small record on either side of the big one so there is
+ * something for it to jump in front of. */
+static void test_big_record_through_the_sink(void)
+{
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    size_t big = 400 * 1024;                    /* > ZSI_OUT_BUF */
+    char *val = malloc(big);
+    const char *v;
+    size_t vl;
+
+    ASSERT_NOT_NULL(val);
+    for (size_t i = 0; i < big; i++) val[i] = (char)('A' + (i % 26));
+
+    clear_db();
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_size = 64 * 1024 * 1024;     /* one generation, no rollover */
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    ASSERT_OK(zs_db_store(db, "a", 1, "before", 6, 0));
+    ASSERT_OK(zs_db_store(db, "m", 1, val, big, 0));
+    ASSERT_OK(zs_db_store(db, "z", 1, "after", 5, 0));
+
+    ASSERT_OK(zs_db_seal(db));                  /* the conversion writer */
+    zs_db_close(&db);
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "before", 6);
+    ASSERT_OK(zs_db_fetch(db, "m", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, big);
+    ASSERT_MEM_EQ(v, val, big);
+    ASSERT_OK(zs_db_fetch(db, "z", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "after", 5);
+    ASSERT_OK(zs_db_check_consistency(db));
+
+    /* And now the merge writer, over the same record. */
+    ASSERT_OK(zs_db_store(db, "b", 1, "second", 6, 0));
+    ASSERT_OK(zs_db_seal(db));
+    ASSERT_EQU(db->snap->nfiles, 2u);
+    ASSERT_OK(zsi_repack_merge(db, db->snap, 0, 2));
+    ASSERT_OK(zsi_db_refresh(db));
+
+    ASSERT_OK(zs_db_fetch(db, "a", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "before", 6);
+    ASSERT_OK(zs_db_fetch(db, "b", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "second", 6);
+    ASSERT_OK(zs_db_fetch(db, "m", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_EQU(vl, big);
+    ASSERT_MEM_EQ(v, val, big);
+    ASSERT_OK(zs_db_fetch(db, "z", 1, NULL, NULL, &v, &vl, 0));
+    ASSERT_MEM_EQ(v, "after", 5);
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+
+    free(val);
+}
+
 /* D-25a: repeated sealing must not consume generations.  This is the assertion
  * that separates converting in place from rolling over and then converting --
  * both reach one in-order file, only one of them burns a generation each time,
@@ -15452,6 +15681,198 @@ static void test_compact_lock_order(void)
     ASSERT_EQU(db->snap->nfiles, 1u);
     ASSERT_EQ(reap(holder), 0);
 
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        const char *v;
+        size_t vl;
+        snprintf(k, sizeof(k), "seed%02d", i);
+        ASSERT_OK(zs_db_fetch(db, k, strlen(k), NULL, NULL, &v, &vl, 0));
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
+/* D-26 step 2 and C-1m's condition, on the layout that tells them apart: an
+ * unordered file in the MIDDLE, with an in-order file above it.
+ *
+ * zsi_snapshot_active answers about the newest file only, so it reports "already
+ * sealed" here -- and a compaction that asked it would skip the seal, never
+ * convert the straggler, and then find two runs of one file each and merge
+ * nothing at all.  D-28 would fail on a database that was merely behind on D-12.
+ * `zsi_snapshot_has_unordered` is the different question C-1m has to ask, and
+ * this is the only layout in the suite where the two answers differ.
+ *
+ * It also pins the seal's catch-up: until 2026-08-28 zsi_convert_pending was
+ * reached only THROUGH a successful active-file conversion, so with no active
+ * file the straggler was left exactly where it was found. */
+static void test_compact_converts_a_straggler(void)
+{
+    struct zs_db *db;
+    const char *v;
+    size_t vl;
+
+    clear_db();
+    put_inorder_kv(1, 1, (const struct kv[]){ {"a","1"}, {NULL,NULL} });
+    put_unordered_kv(2, (const struct kv[]){ {"b","2"}, {NULL,NULL} });
+    put_inorder_kv(3, 3, (const struct kv[]){ {"c","3"}, {NULL,NULL} });
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQU(db->snap->nfiles, 3u);
+    ASSERT_NULL(zsi_snapshot_active(db->snap));      /* the newest is in-order */
+    ASSERT(zsi_file_is_unordered(db->snap->files[1]));
+
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    ASSERT(!zsi_file_is_unordered(db->snap->files[0]));
+
+    for (const char *k = "abc"; *k; k++) {
+        char want[2] = { (char)('1' + (k[0] - 'a')), 0 };
+        ASSERT_OK(zs_db_fetch(db, k, 1, NULL, NULL, &v, &vl, 0));
+        ASSERT_MEM_EQ(v, want, 1);
+    }
+    ASSERT_OK(zs_db_check_consistency(db));
+    zs_db_close(&db);
+}
+
+/* C-1m: a compaction of an already-in-order set takes the REPACK LOCK ALONE.
+ *
+ * Detected by ZS_NONBLOCKING rather than by a clock, which is what makes this a
+ * test rather than a guess: with a peer holding the write lock, a nonblocking
+ * compaction that wants it fails IMMEDIATELY with ZS_LOCKED, and one that does
+ * not want it succeeds.  No timing, no sleep to tune.
+ *
+ * The second half is the control, and without it the first half proves nothing:
+ * store one record so the set has an unordered file again, and the SAME call
+ * against the SAME held lock must now fail.  So the difference between the two
+ * outcomes is the condition C-1m turns on and nothing else. */
+static void test_compact_in_order_set_needs_no_write_lock(void)
+{
+    SKIP_IF_NO_FORK();
+
+    struct zs_open_data setup = ZS_OPEN_DATA_INITIALIZER;
+    struct zs_db *db = NULL;
+    char pad[150];
+    pid_t holder;
+    int pipefd[2];
+    char go;
+
+    clear_db();
+    memset(pad, 'p', sizeof(pad));
+    setup.flags = ZS_CREATE | ZS_NOAUTOREPACK;
+    setup.rollover_size = 400;
+    setup.error = counting_error;
+    ASSERT_OK(zs_db_open(dbdir, &setup, &db));
+    for (int i = 0; i < 12; i++) {
+        char k[16];
+        snprintf(k, sizeof(k), "seed%02d", i);
+        ASSERT_OK(zs_db_store(db, k, strlen(k), pad, sizeof(pad), 0));
+    }
+    ASSERT_OK(zs_db_seal(db));                  /* no unordered file left */
+    ASSERT_NULL(zsi_snapshot_active(db->snap));
+    ASSERT(db->snap->nfiles > 1);
+    zs_db_close(&db);
+
+    /* A peer holding the write lock until we tell it to let go. */
+    ASSERT_EQ(pipe(pipefd), 0);
+    holder = fork();
+    ASSERT(holder >= 0);
+    if (holder == 0) {
+        struct zs_open_data s2 = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *hdb = NULL;
+        struct zs_txn *txn = NULL;
+        char c;
+        close(pipefd[1]);
+        s2.error = counting_error;
+        if (zs_db_open(dbdir, &s2, &hdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(hdb, 0, &txn) != ZS_OK) _exit(2);
+        (void)read(pipefd[0], &c, 1);           /* held until the pipe closes */
+        zs_txn_abort(&txn);
+        zs_db_close(&hdb);
+        _exit(0);
+    }
+    close(pipefd[0]);
+
+    /* Wait for the child to actually hold it: a nonblocking write begin here
+     * fails exactly while it does, so this is a handshake and not a sleep. */
+    for (int tries = 0; ; tries++) {
+        struct zs_db *probe = open_db(ZS_NONBLOCKING);
+        struct zs_txn *txn = NULL;
+        int r;
+        ASSERT_NOT_NULL(probe);
+        r = zs_db_begin_txn(probe, 0, &txn);
+        if (r == ZS_OK) zs_txn_abort(&txn);
+        zs_db_close(&probe);
+        if (r == ZS_LOCKED) break;
+        ASSERT(tries < 2000);
+        usleep(1000);
+    }
+
+    /* The whole point: this needs no write lock, so it goes through. */
+    db = open_db(ZS_NONBLOCKING | ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_compact(db));
+    ASSERT_EQU(db->snap->nfiles, 1u);
+    zs_db_close(&db);
+
+    /* The control.  The child still holds the write lock, so add an unordered
+     * file through a THIRD handle -- which needs the lock the child has, so the
+     * store has to wait for it; release the child first and re-take instead. */
+    go = 'x';
+    (void)write(pipefd[1], &go, 1);
+    close(pipefd[1]);
+    ASSERT_EQ(reap(holder), 0);
+
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_OK(zs_db_store(db, "later", 5, pad, sizeof(pad), 0));
+    ASSERT_NOT_NULL(zsi_snapshot_active(db->snap));
+    zs_db_close(&db);
+
+    ASSERT_EQ(pipe(pipefd), 0);
+    holder = fork();
+    ASSERT(holder >= 0);
+    if (holder == 0) {
+        struct zs_open_data s2 = ZS_OPEN_DATA_INITIALIZER;
+        struct zs_db *hdb = NULL;
+        struct zs_txn *txn = NULL;
+        char c;
+        close(pipefd[1]);
+        s2.error = counting_error;
+        if (zs_db_open(dbdir, &s2, &hdb) != ZS_OK) _exit(1);
+        if (zs_db_begin_txn(hdb, 0, &txn) != ZS_OK) _exit(2);
+        (void)read(pipefd[0], &c, 1);
+        zs_txn_abort(&txn);
+        zs_db_close(&hdb);
+        _exit(0);
+    }
+    close(pipefd[0]);
+
+    for (int tries = 0; ; tries++) {
+        struct zs_db *probe = open_db(ZS_NONBLOCKING);
+        struct zs_txn *txn = NULL;
+        int r;
+        ASSERT_NOT_NULL(probe);
+        r = zs_db_begin_txn(probe, 0, &txn);
+        if (r == ZS_OK) zs_txn_abort(&txn);
+        zs_db_close(&probe);
+        if (r == ZS_LOCKED) break;
+        ASSERT(tries < 2000);
+        usleep(1000);
+    }
+
+    db = open_db(ZS_NONBLOCKING | ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(zs_db_compact(db), ZS_LOCKED);
+    zs_db_close(&db);
+
+    (void)write(pipefd[1], &go, 1);
+    close(pipefd[1]);
+    ASSERT_EQ(reap(holder), 0);
+
+    /* And everything still reads. */
+    db = open_db(ZS_NOAUTOREPACK);
+    ASSERT_NOT_NULL(db);
     for (int i = 0; i < 12; i++) {
         char k[16];
         const char *v;
@@ -18890,6 +19311,7 @@ static struct test_entry tests[] = {
     { "test_repack_version_order",       test_repack_version_order },
     { "test_repack_d19_newer_file_recreates",
                                     test_repack_d19_newer_file_recreates },
+    { "test_repack_history_cursor",     test_repack_history_cursor },
     { "test_repack_d19a_shadowed",      test_repack_d19a_shadowed },
     { "test_repack_d18_table",          test_repack_d18_table },
     { "test_repack_d19a_resurrection",  test_repack_d19a_resurrection },
@@ -18908,6 +19330,8 @@ static struct test_entry tests[] = {
     { "test_check_clean_database",      test_check_clean_database },
     { "test_check_out_of_order_pointers", test_check_out_of_order_pointers },
     { "test_check_noncanonical",        test_check_noncanonical },
+    { "test_convert_canonicalises_a_record",
+                                        test_convert_canonicalises_a_record },
     { "test_check_unclean_reported",    test_check_unclean_reported },
     { "test_dump_line_format",          test_dump_line_format },
     { "test_dump_shows_rollback",       test_dump_shows_rollback },
@@ -18984,6 +19408,8 @@ static struct test_entry tests[] = {
 
     { "test_seal_converts_the_active_file",
                                         test_seal_converts_the_active_file },
+    { "test_big_record_through_the_sink",
+                                        test_big_record_through_the_sink },
     { "test_seal_creates_no_new_generation",
                                         test_seal_creates_no_new_generation },
     { "test_commit_seals_oversized_active",
@@ -19004,6 +19430,10 @@ static struct test_entry tests[] = {
     { "test_seal_waits_for_the_write_lock",
                                         test_seal_waits_for_the_write_lock },
     { "test_compact_lock_order",        test_compact_lock_order },
+    { "test_compact_converts_a_straggler",
+                                        test_compact_converts_a_straggler },
+    { "test_compact_in_order_set_needs_no_write_lock",
+                                        test_compact_in_order_set_needs_no_write_lock },
 
     { "test_salvage_resync_proves_its_candidate",
                                     test_salvage_resync_proves_its_candidate },

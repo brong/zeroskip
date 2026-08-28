@@ -183,7 +183,7 @@ a spec label is missing here.
 | `D-18` | Per key, where **below** means "in a file whose range lies entirely | `repack_d18_table` |
 | `D-19` | A tombstone is retained **if and only if the newest record for its | `repack_d18_table`, `repack_d19a_resurrection`, `repack_d19_newer_file_recreates` |
 | `D-19a` | The emitted record MUST be written even when a newer file already | `repack_d19a_shadowed` |
-| `D-19b` | D-19 states a **predicate, not an algorithm**. An implementation MAY | **none** |
+| `D-19b` | D-19 states a **predicate, not an algorithm**. An implementation MAY | `repack_history_cursor` |
 | `D-19c` | The test MAY err toward **retention**, never toward dropping. A | **none** |
 | `D-20` | Inputs are iterated in key order: from the pointer section where present, | `convert_basic, repack_one_record_per_key` |
 | `D-20a` | A staging file MUST be created with `O_CREAT\|O_EXCL`, advancing `<n>` | `convert_staging_exclusive` |
@@ -226,6 +226,7 @@ a spec label is missing here.
 | `C-1j` | **Same-process exclusion.** An implementation SHOULD exclude two handles | `lock_two_handles_one_process`, `lock_registry_keys_on_inode`, `lock_registry_is_per_database` |
 | `C-1k` | What a lock entitles you to. A lock is a claim over **named files**, | `convert_basic`, `seal_creates_no_new_generation`, `fileset_next_gen` |
 | `C-1l` | The compacting seal. A writer holding the **write** lock MAY | **none** |
+| `C-1m` | A compaction with nothing to seal takes the repack lock ALONE. D-26's | `compact_in_order_set_needs_no_write_lock`, `compact_converts_a_straggler` |
 | `C-2` | Readers take **no lock**. | `mp_two_writers`, `mp_writer_and_readers` |
 | `C-3` | A file is published by writing it under a staging name, then | `convert_basic, mp_reader_across_repack` |
 | `C-4` | Taking a snapshot. The protocol is: | `crash/crash_after_invalid_terminator`, `file_open_failures`, `fileset_gaps`, +1 more |
@@ -374,7 +375,6 @@ Each of these is a deliberate, explained absence rather than an oversight.
 - **`F-26b`** — Not yet attributed.
 - **`F-30`** — Not yet attributed.
 - **`D-14g`** — Not yet attributed.
-- **`D-19b`** — Permissive: it states what an implementation MAY do (any means of evaluating D-19's predicate), so there is nothing to enforce. What *is* enforced is the predicate itself, by `repack_d18_table`.
 - **`D-19c`** — Permissive in the same way, and the direction it permits is the safe one. A test could show that repacking two ranges in either order leaves a conforming result, but it would be asserting the absence of a constraint.
 - **`C-1l`** — Permissive, and not yet implemented: it states an option a writer MAY take, and this implementation does not take it, so its seal always produces `[N..N]`. Its `MUST NOT` half — a repack-lock holder acquiring the write lock — is enforced by the assertion in `zsi_lock_take`, which no test can trip precisely because nothing in the library acquires the wrong way round; it is guarded by the mutants `compact: takes the repack lock outermost` and `lock: order asserted as repack before write` instead. Note that `compact_lock_order` does not cover the direction either, and says so in its own comment.
 - **`C-1h`** — Documentation only: the library cannot see across two databases, so a caller holding locks on several must impose its own order. Stated in zeroskip.h and CLAUDE.md; nothing here can enforce it.
