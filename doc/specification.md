@@ -1973,8 +1973,8 @@ unreadable one.
   | 64 | 8 | valid_upto |
   | 72 | 8 | term_off |
   | 80 | 8 | nptrs |
-  | 88 | 4 | term_csum |
-  | 92 | 4 | checksum, covering [0, 92) |
+  | 88 | 8 | term_csum |
+  | 96 | 8 | checksum, covering [0, 96) |
 
 - **P-6** The magic is the 16 bytes
 

@@ -271,7 +271,7 @@ a spec label is missing here.
 | `P-2b` | With A-8a's flag, the cache directory is `zeroskip.cache` inside | `index_local_publishes`, `index_local_readonly_creates_the_cache`, `index_local_sweeps_foreign_uuid` |
 | `P-3` | A published table is named `zeroskip.index-<uuid>-<GEN8hex>`, using | `idxcache_published_name` |
 | `P-4` | A table is published by writing a complete file under a staging name | `idxcache_publishes_by_rename` |
-| `P-5` | A table is a 96-byte header, then `nptrs` 8-byte little-endian record | `idxcache_header_byte_layout` |
+| `P-5` | A table is a 104-byte header, then `nptrs` 8-byte little-endian record | `idxcache_header_byte_layout` |
 | `P-6` | The magic is the 16 bytes | `idxcache_header_byte_layout` |
 | `P-7` | A table's checksums use **the engine named by the covered data file's | `idxcache_uses_file_engine` |
 | `P-8` | `valid_upto` is the data-file offset the table covers. It MUST be a | `idxcache_valid_upto_is_span_boundary` |
