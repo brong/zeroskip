@@ -5394,6 +5394,13 @@ struct zs_db {
     bool         nosync;            /* ZS_NOSYNC (C-7c) */
     bool         nonblocking;
 
+    /* C-7d: a durability gate failed, so this active file must be sealed before
+     * anything else is appended to it.  Handle state and nothing else -- no
+     * examination of the FILE can establish it, which is the whole point: the
+     * page cache can serve bytes the device will never hold, so a rebuild sees a
+     * perfectly clean file and appends to it. */
+    bool         seal_before_write;
+
     struct zsi_locks     locks;
     struct zsi_snapshot *snap;
 
@@ -7237,6 +7244,10 @@ static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 static int zsi_remove_file(struct zs_db *db, const char *name);
 static int zsi_convert_one(struct zs_db *db, struct zsi_file *f);
 
+/* C-7d: a write begin seals the generation a failed gate left behind, before it
+ * appends anything.  Declared here because SEALING lives in CONVERSION, below. */
+static int zsi_seal_locked(struct zs_db *db);
+
 /* Append bytes to a file descriptor, retrying a short write. */
 static int zsi_write_all(int fd, const char *buf, size_t len)
 {
@@ -7503,7 +7514,17 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
      * pages were discarded.  Retrying a failed syscall is the reflex, which
      * is why this says so at the call site rather than only in the spec. */
     if (!db->nosync && !rollback) {
-        if (ZS_FDATASYNC(txn->wfd) < 0) return ZS_IOERROR;
+        if (ZS_FDATASYNC(txn->wfd) < 0) {
+            /* C-7d: this file must be sealed before anything else is appended to
+             * it.  The span just written may be readable and not durable, and no
+             * later inspection can tell -- so a rebuild would find the file clean
+             * and append, and a recovery that then rejects this span completes
+             * the file below every later commit (F-22, F-24), including ones
+             * whose own gate succeeded.  This flag is the only record that the
+             * question arose. */
+            db->seal_before_write = true;
+            return ZS_IOERROR;
+        }
     }
 
     /* Where the terminator landed and what checksum it carries (P-10).  Handed
@@ -7648,6 +7669,36 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
             zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
             free(txn);
             return r;
+        }
+
+        /* C-7d: a durability gate failed on this active file, so seal it before
+         * appending anything.  D-25a creates no replacement, so the set simply
+         * has no active file afterwards and the first store below allocates the
+         * next generation (D-9b) -- the rollover falls out rather than being
+         * arranged.
+         *
+         * What this buys is a NEW FILE: fresh blocks, and on a copy-on-write
+         * filesystem a fresh transaction group, synced before the rename that
+         * publishes it (C-6b) and the directory synced after (C-6).  Whatever the
+         * seal could read is then durable somewhere the failed file's own history
+         * can no longer truncate, which is the half of C-7d that is a recovery
+         * rather than a refusal.
+         *
+         * A failure leaves the flag set and blocks every subsequent write, which
+         * is what C-7d asks for.  The interesting case is D-20b: the seal replays
+         * the span chain from disk and refuses to convert if that disagrees with
+         * what this handle admitted, which is exactly the discarded-pages state --
+         * so it declines to launder unreadable bytes into a file carrying a fresh
+         * valid checksum, and a reopen recovers instead (the file is unclean by
+         * then, so D-9a rolls over). */
+        if (db->seal_before_write) {
+            r = zsi_seal_locked(db);
+            if (r != ZS_OK) {
+                zsi_lock_release(&db->locks, ZSI_LOCK_WRITE);
+                free(txn);
+                return r;
+            }
+            db->seal_before_write = false;
         }
     } else {
         /* C-4i: freshness is a property of BEGIN, not of open.  Without it a
@@ -10203,6 +10254,12 @@ int zs_db_sync(struct zs_db *db)
     if (fd < 0) return ZS_IOERROR;
     int r = ZS_FDATASYNC(fd) < 0 ? ZS_IOERROR : ZS_OK;
     close(fd);
+    /* C-7d: the caller's own gate, and a failure means the same thing here as it
+     * does inside a commit -- this file may hold bytes that are readable and not
+     * durable, so it must be sealed before it is appended to again.  This is the
+     * durability point a ZS_NOSYNC caller nominated for itself (C-7c), so it is
+     * the one place the rule reaches a handle that has no commit gate at all. */
+    if (r != ZS_OK) db->seal_before_write = true;
     return r;
 }
 

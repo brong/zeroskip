@@ -1257,7 +1257,28 @@ mutant "commit: syncs before the terminator too" catch \
 # assertion can see -- the bytes are identical and only a crash tells the
 # difference -- so the sync COUNT is what catches it.
 mutant "commit: no gate at all" catch \
-  's/    if \(!db->nosync && !rollback\) \{\n        if \(ZS_FDATASYNC\(txn->wfd\) < 0\) return ZS_IOERROR;\n    \}/    if (false) { }/'
+  's/    if \(!db->nosync && !rollback\) \{/    if (false) {/'
+
+# C-7d, the two halves.  A gate failure leaves a span that may be readable and
+# not durable, and NOTHING ON DISK can tell -- so a later rebuild finds the file
+# clean and appends, and a recovery rejecting that span completes the file below
+# every commit above it (F-22, F-24), including ones whose own gate returned OK.
+#
+# Both are caught by the rename count rather than by data: on a machine that did
+# not really lose the pages every store still succeeds and still reads back, and
+# the only observable difference is whether the generation was published before
+# the next one began.  Two mutants because the flag and the seal fail
+# independently -- and one substitution each, so neither can half-rot.
+mutant "commit: a failed gate does not require a seal" catch \
+  's/            db->seal_before_write = true;\n            return ZS_IOERROR;/            return ZS_IOERROR;/'
+
+mutant "begin: writes resume without the C-7d seal" catch \
+  's/        if \(db->seal_before_write\) \{/        if (false) {/'
+
+# The third site: ZS_NOSYNC has no commit gate at all, so zs_db_sync is the only
+# durability point such a caller has, and a failure there leaves the same tail.
+mutant "sync: an explicit gate failure needs no seal" catch \
+  's/    if \(r != ZS_OK\) db->seal_before_write = true;\n    return r;/    return r;/'
 
 # RECLASSIFIED equivalent -> catch, 2026-08-27.  It was called equivalent on the
 # grounds that the merge is behaviourally invisible -- and that is true of BYTES:

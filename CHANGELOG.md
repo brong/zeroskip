@@ -3,6 +3,14 @@
 Semver: MAJOR for an ABI break, MINOR for features and for observable changes in
 behaviour, PATCH for fixes.
 
+## Unreleased
+
+- **A failed durability gate now seals the generation before the next write is
+  accepted**, and blocks writes on that handle until it succeeds. Previously a
+  writer appended to the same active file, which could lose a *later* commit
+  that returned `ZS_OK`. A failed `zs_db_sync` engages it too, which is the
+  durability point a `ZS_NOSYNC` caller nominates for itself. See C-7d.
+
 ## 4.0.0 — 2026-08-27
 
 **Format 4. An ABI break and an on-disk break: a version-4 build cannot read a

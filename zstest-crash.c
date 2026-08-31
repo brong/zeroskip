@@ -800,6 +800,102 @@ static void test_sync_failure_gate(void)
     fprintf(stderr, "  sync failure at the gate                 ok\n");
 }
 
+static void test_sync_failure_seals(void)
+{
+    /* C-7d: after a gate failure the SAME HANDLE must seal the generation before
+     * it appends anything, and the seal must be a published file -- synced,
+     * renamed, directory synced.
+     *
+     * test_sync_failure_gate closes the handle and reopens, which is why it never
+     * saw this: the bug is entirely in continuing.  Nothing on disk distinguishes
+     * readable from durable, so the failed commit's span is still servable from
+     * the page cache; the next begin's C-4i probe sees the size change, rebuilds,
+     * replays, finds every span VALID and the file CLEAN, and happily appends.
+     * A recovery that then rejects that span completes the file below it (F-22,
+     * F-24) and takes the later commit with it -- and the later commit returned
+     * ZS_OK.  Only the writer knows a gate failed, so only the writer can stop it.
+     *
+     * The discriminating assertion is the RENAME, not the data: without the seal
+     * every store below still succeeds and still reads back, on a machine where
+     * the pages were never really lost.  What changes is whether generation N was
+     * published as an in-order file before generation N+1 began. */
+    total++;
+
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    struct zs_db *db = open_db(ZS_CREATE);
+    CHECK(db != NULL, "open failed");
+    CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
+
+    fail_sync_at = sync_calls + 1;
+    int r = zs_db_store(db, "maybe", 5, "2", 1, 0);
+    CHECK(r != ZS_OK, "the gate failure was not reported (got %s)", zs_strerror(r));
+
+    /* Everything from here is the NEXT write on the SAME handle. */
+    long renames_before = renames_seen;
+    long dirsyncs_before = dir_syncs;
+
+    CHECK(zs_db_store(db, "after", 5, "3", 1, 0) == ZS_OK,
+          "a write after a gate failure must still succeed once the seal is done");
+
+    CHECK(renames_seen > renames_before,
+          "no file was published after the gate failure -- the generation was "
+          "appended to rather than sealed (C-7d)");
+    CHECK(dir_syncs > dirsyncs_before,
+          "the seal's output was published without a directory sync (C-6)");
+
+    /* C-6b's ordering, applied to this rename: the output is synced BEFORE it is
+     * published, or the name points at a file that may be torn. */
+    CHECK(syncs_at_first_rename > 0,
+          "the seal renamed before it synced its output (C-6b)");
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    /* And the earlier commit survives.  "maybe" is C-7a's unknown outcome and may
+     * legally be either -- the seal resolves it, and which way depends on whether
+     * the bytes survived to be copied (D-20b), which on a machine that did not
+     * really lose the pages means it did. */
+    char state[512];
+    CHECK(read_state(state, sizeof(state)), "reopen after a gate failure");
+    CHECK(strstr(state, "before=1") != NULL,
+          "the earlier commit was lost: '%s'", state);
+    CHECK(strstr(state, "after=3") != NULL,
+          "the commit after the seal was lost: '%s'", state);
+
+    /* Phase 2: the same rule reached through zs_db_sync under ZS_NOSYNC.  That
+     * mode has no commit gate at all (C-7c), so the caller's own durability point
+     * is the only gate there is -- and a failure there leaves exactly the same
+     * readable-but-not-durable tail.  The seal still publishes, because its syncs
+     * are structural and no flag relaxes them (C-6b). */
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    db = open_db(ZS_CREATE | ZS_NOSYNC);
+    CHECK(db != NULL, "nosync open failed");
+    CHECK(zs_db_store(db, "n1", 2, "1", 1, 0) == ZS_OK, "nosync store");
+
+    fail_sync_at = sync_calls + 1;
+    CHECK(zs_db_sync(db) != ZS_OK, "the injected zs_db_sync failure was not reported");
+
+    renames_before = renames_seen;
+    CHECK(zs_db_store(db, "n2", 2, "2", 1, 0) == ZS_OK, "nosync store after a failed sync");
+    CHECK(renames_seen > renames_before,
+          "a failed zs_db_sync did not force a seal before the next write (C-7d)");
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    CHECK(read_state(state, sizeof(state)), "reopen after a failed zs_db_sync");
+    CHECK(strstr(state, "n2=2") != NULL, "the post-seal commit was lost: '%s'", state);
+
+    passed++;
+    fprintf(stderr, "  a failed gate seals before writing       ok\n");
+}
+
 static void test_commit_has_one_gate(void)
 {
     /* C-7: one sync per commit, on BOTH commit paths.
@@ -1360,6 +1456,7 @@ int main(int argc, char **argv)
         { "txn_buffer_grows",               test_txn_buffer_grows_to_one_write },
         { "torn_flush_then_abort",          test_torn_flush_then_abort },
         { "sync_failure_gate",              test_sync_failure_gate },
+        { "sync_failure_seals",             test_sync_failure_seals },
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },
         { "crash_after_invalid_terminator", test_crash_after_invalid_terminator },
