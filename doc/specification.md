@@ -1804,6 +1804,40 @@ any point.
   In particular an implementation MUST NOT retry a failed sync and treat success as
   evidence the data survived: a second call can succeed after the dirty pages were
   discarded.
+
+  "Does nothing else" is about the *failing* commit. What the writer may do next
+  is C-7d, which is not a licence but a requirement.
+- **C-7d A failed gate seals the generation.** After a gate failure the active
+  file MUST NOT be appended to again. Before accepting another write a writer
+  MUST seal it (D-25) — the output synced and renamed, the directory synced
+  (C-6, C-6b) — and MUST NOT proceed if the seal fails.
+
+  The reason is that C-7a's discarded pages are the *next* transaction's problem
+  as much as this one's, and **nothing on disk distinguishes readable from
+  durable**. A failed gate can leave span *k*'s bytes perfectly readable through
+  the page cache while they will never reach the device: a rebuild then replays
+  the file, finds every span valid, finds it clean (D-9), and appends span *k+1*
+  to it. If *k*'s data is absent at recovery, F-22 rejects its terminator and
+  F-24 completes the file below it — discarding *k+1*, whose own commit returned
+  success. That is a G-2 violation reached entirely through conforming steps, and
+  the writer's own knowledge that a gate failed is the only thing that can
+  prevent it. It is C-7a's hazard one transaction downstream, wearing the next
+  commit's sync instead of a retry of its own.
+
+  Sealing rather than merely refusing is what makes this a recovery. The output
+  is a **new file** — a fresh allocation, and on a copy-on-write filesystem a
+  fresh transaction group — synced before its publishing rename, so everything
+  the seal can read becomes durable somewhere the failed file's history can no
+  longer truncate. It also resolves C-7a's unknown outcome, into "happened"
+  where the bytes survived to be copied and "did not happen" where they did not,
+  which is more than the caller was promised. D-20b is what decides which: a
+  seal whose verification of the input fails MUST abort with the input in place
+  rather than convert the part it can. The writer then stays blocked, which is
+  correct — and a reopen recovers, since the file is by then unclean and D-9a
+  moves the next writer to a new generation.
+
+  `ZS_NOSYNC` has no gate (C-7c), so nothing here applies to it. An explicit
+  `zs_db_sync` failure engages it exactly as a commit gate does.
 - **C-7b** The cost is one sync per commit. It is paid per *transaction*, not per
   record, so a caller that batches many operations into one transaction amortises
   it — which is the reason `zs_txn_*` exists alongside the single-operation
