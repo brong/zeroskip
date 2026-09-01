@@ -198,6 +198,51 @@ if [ "$SKIP" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3b. sealed-active: a SEAL terminator, and what a writer must do about it.
+#
+# The marker is INJECTED for the same reason the rolled-back span above is: it is
+# written by C-7e after a failed durability gate, which no driver subcommand can
+# reproduce and no conforming writer can be required to produce on demand.  What
+# IS normative is everything after it -- F-21a's encoding, that the records below
+# stay live and the file stays CLEAN, and that a writer meeting the marker MUST
+# NOT append to that file.
+#
+# The store after the injection is what makes this a test rather than a byte
+# dump: a writer that ignored the marker would append to generation 1 and leave
+# no in-order file at all, so `expect files` is what separates the two.
+#
+# The 20 bytes are a SEAL for engine 1: nibble 0xA with keylen 0 (0a 00), vallen
+# 16 (10 00), a span length of 0, and the F-19 checksum over the empty span
+# followed by the terminator's own first 12 bytes.
+# ---------------------------------------------------------------------------
+SEAL_TERM=0a001000000000000000000016dd693933f6c2e8
+begin_case sealed-active
+if [ "$SKIP" -eq 0 ]; then
+    hdr "A SEAL terminator ending the active file (F-21a, C-7e).
+#
+# The marker is injected as raw bytes, not produced by a writer: C-7e writes one
+# only after a durability gate has failed, and no driver subcommand can make that
+# happen.  What the case pins is the reader's and the next writer's side.
+#
+# A SEAL is an ordinary empty span -- zero records, span length 0, an F-19
+# checksum like any other terminator -- so the file remains CLEAN and every
+# record below it stays live.  The marker is not a truncation, which is what the
+# scan below asserts.
+#
+# What it changes is that the file MUST NOT be appended to (F-21a, D-9).  So the
+# store that follows cannot extend generation 1: a writer converts it to its
+# in-order form and starts generation 2, which is what the file list shows.  An
+# implementation that ignored the marker would leave one .current file and no
+# in-order file at all." 1
+    TOOL "$DB" create --uuid "$UUID"
+    TOOL "$DB" store 61 3031; emit "op store 61 3031"
+    printf "$(echo "$SEAL_TERM" | sed 's/../\\x&/g')" >> "$DB/$(newest_file "$DB")"
+    emit "op garbage $SEAL_TERM"
+    TOOL "$DB" store 62 3032; emit "op store 62 3032"
+    finish_case
+fi
+
+# ---------------------------------------------------------------------------
 # 4. deletion: a tombstone, and an empty value beside it (A-1).
 # ---------------------------------------------------------------------------
 begin_case deletion

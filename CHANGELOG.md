@@ -11,6 +11,18 @@ behaviour, PATCH for fixes.
   that returned `ZS_OK`. A failed `zs_db_sync` engages it too, which is the
   durability point a `ZS_NOSYNC` caller nominates for itself. See C-7d.
 
+- **A failed gate also writes a `SEAL` terminator, so the rule outlives the
+  writer.** A seventh encoding in F-12's nibble table: `keylen == 0` with
+  `IsDelete`, an empty span meaning the file must not be appended to. It is
+  deliberately never synced. Without it C-7d stopped at the handle that
+  experienced the failure, and a writer that exited took the only record of it
+  along. See F-21a and C-7e.
+
+  An implementation predating this reads every record in such a file correctly
+  and misreads only the marker, as a torn tail — which converts the file and
+  starts a new generation, the same recovery one generation more expensive.
+  `version_read` is unchanged at 4.
+
 ## 4.0.0 — 2026-08-27
 
 **Format 4. An ABI break and an on-disk break: a version-4 build cannot read a

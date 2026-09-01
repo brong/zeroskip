@@ -743,7 +743,7 @@ mutant "F-24: complete advanced before validation" catch \
   's/        size_t datalen = p - span_start;/        f->complete = p;\n        size_t datalen = p - span_start;/'
 
 mutant "F-24: complete set past the terminator" catch \
-  's/        f->complete = after;\n        f->nspans\+\+;                            \/\* D-9d \*\/\n        f->last_term_off  = p;/        f->complete = f->size;\n        f->nspans++;\n        f->last_term_off  = p;/'
+  's/        f->complete = after;\n        f->nspans\+\+;                            \/\* D-9d \*\//        f->complete = f->size;\n        f->nspans++;/'
 
 # D-9: clean requires a VALID HEADER as well as nothing after the last span.  A
 # zero-length file has complete == size == 0 and would otherwise look clean, so a
@@ -920,7 +920,7 @@ mutant "terminator csum: span only, not terminator" catch \
   's/              zsi_csum2\(csum, csum_id, spandata, \(size_t\)spanlen,\n                        buf, ZSI_TERM_CSUM_COVER\)\);/              csum(spandata, (size_t)spanlen));/'
 
 mutant "terminator: rollback bit dropped" catch \
-  's/    uint8_t nibble = ZSI_MUSTBEONE \| \(rollback \? ZSI_ISROLLBACK : 0\);/    uint8_t nibble = ZSI_MUSTBEONE;/'
+  's/    uint8_t nibble = ZSI_MUSTBEONE \| kind;/    uint8_t nibble = ZSI_MUSTBEONE;/'
 
 # The data-loss bug this task originally shipped with: rejecting a decodable but
 # non-canonical record.  Combined with F-24 that discards every committed record
@@ -1292,6 +1292,57 @@ mutant "begin: writes resume without the C-7d seal" catch \
 # durability point such a caller has, and a failure there leaves the same tail.
 mutant "sync: an explicit gate failure needs no seal" catch \
   's/    if \(r != ZS_OK\) db->seal_before_write = true;\n    return r;/    return r;/'
+
+# C-7e.  db->seal_before_write is MEMORY, so a writer that exits between the
+# failed gate and its next write takes C-7d's only record with it and the next
+# writer to open the database appends to a file that is clean by every test it
+# can apply.  The marker is what crosses that gap; without it the whole rule
+# stops at the handle boundary.
+mutant "seal marker: no marker after a failed gate" catch \
+  's/            zsi_seal_marker_append\(txn->wfd, txn->wcs, txn->wcsum_id\);\n//'
+
+# ...and the same at the zs_db_sync site, which is the only gate a ZS_NOSYNC
+# caller has (C-7c).
+mutant "seal marker: none after a failed explicit sync" catch \
+  's/    if \(r != ZS_OK\) zsi_seal_marker_append\(fd, act->csum, act->csum_id\);\n//'
+
+# C-7e forbids syncing the marker: that is a retry of the sync that just failed,
+# and C-7a says a retry's success proves nothing about what survived.  No data
+# assertion can see this -- the bytes are identical either way -- so the sync
+# COUNT is what catches it, the same shape as "commit: no gate at all".
+mutant "seal marker: synced after it is written" catch \
+  's/    zsi_term_encode\(term, 0, ZSI_TERM_SEAL, "", cs, csum_id\);\n    \(void\)zsi_write_all\(fd, term, sizeof\(term\)\);/    zsi_term_encode(term, 0, ZSI_TERM_SEAL, "", cs, csum_id);\n    (void)zsi_write_all(fd, term, sizeof(term));\n    (void)ZS_FDATASYNC(fd);/'
+
+# C-7e's rule 2: neither the marker's success nor its failure may change what the
+# failed commit reports.  Turning the marker into the commit's return value makes
+# a machine where the write happens to succeed report success for a transaction
+# whose gate failed -- C-7a's unknown outcome laundered into a promise.
+mutant "seal marker: its outcome becomes the commit's" catch \
+  's/            zsi_seal_marker_append\(txn->wfd, txn->wcs, txn->wcsum_id\);\n            db->seal_before_write = true;\n            return ZS_IOERROR;/            zsi_seal_marker_append(txn->wfd, txn->wcs, txn->wcsum_id);\n            db->seal_before_write = true;\n            return ZS_OK;/'
+
+# F-12 / F-21a: the reader half.  Reject the SEAL nibble and a marker becomes a
+# malformed terminator -- which is exactly what a pre-SEAL implementation does,
+# and is why the extension is safe against one: F-24 completes the file below the
+# marker, D-9 finds it unclean and D-12b converts it and starts a new generation.
+# The DATA outcome is therefore identical, which is the trap; what differs is
+# that the file is no longer clean, and a generation is spent.
+mutant "flags: SEAL rejected on a terminator" catch \
+  's/    case ZSI_MUSTBEONE \| ZSI_ISDELETE:                      \/\* deletion, or SEAL \*\/\n        return true;/    case ZSI_MUSTBEONE | ZSI_ISDELETE:\n        return haskey;/'
+
+# F-21b.  Let the SEAL advance the boundary a pointer table records and a table
+# can be published PAST the marker; a P-12 seeded reader then walks zero spans,
+# never learns the file is sealed, and appends to a generation C-7d closed.
+mutant "seal marker: seeds a pointer table past itself" catch \
+  's/        if \(zsi_term_is_seal\(&term\)\) \{\n            f->sealed = true;\n        \} else \{\n            f->last_term_off  = p;\n            f->last_term_csum = term.csum;\n        \}/        f->sealed = f->sealed || zsi_term_is_seal(\&term);\n        f->last_term_off  = p;\n        f->last_term_csum = term.csum;/'
+
+# D-9e's single home, and it really is single: this is the ONLY thing that stops
+# a handle which did not experience the gate failure from appending to a sealed
+# file.  A begin-time check on act->sealed was written first and removed after
+# the mutants disagreed with the reasoning behind it -- it was the redundant one,
+# because D-12b's rollover converts the sealed generation and creates the next,
+# reaching the same file set as the seal it was trying to arrange.
+mutant "writer: a sealed file is still appendable" catch \
+  's/    return zsi_unordered_is_clean\(f\) && !f->sealed;/    return zsi_unordered_is_clean(f);/'
 
 # RECLASSIFIED equivalent -> catch, 2026-08-27.  It was called equivalent on the
 # grounds that the merge is behaviourally invisible -- and that is true of BYTES:

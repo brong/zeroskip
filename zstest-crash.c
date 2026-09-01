@@ -896,6 +896,173 @@ static void test_sync_failure_seals(void)
     fprintf(stderr, "  a failed gate seals before writing       ok\n");
 }
 
+static void test_seal_marker_survives_handle_death(void)
+{
+    /* C-7e: the marker is what carries C-7d past the end of the process.
+     *
+     * db->seal_before_write is memory.  A writer that exits -- or is killed --
+     * between the failed gate and its next write takes it with it, and the next
+     * writer to open the database finds an active file that is clean by every
+     * test it can apply and appends to it.  That is the same G-2 loss C-7d
+     * describes, arriving through a second process instead of a second
+     * transaction, and test_sync_failure_seals cannot see it because it never
+     * lets go of the handle.
+     *
+     * So the handle dies here on purpose.  Everything C-7d knew is on disk or
+     * nowhere.
+     *
+     * The assertion is the RENAME, for the reason C-7d's test already records:
+     * on a machine that did not really lose the pages every store below succeeds
+     * and reads back either way, so the only observable difference is whether
+     * generation N was published before N+1 began.  ZS_NOAUTOREPACK because a
+     * cascade would also rename, and a rename is the whole assertion. */
+    total++;
+
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    struct zs_db *db = open_db(ZS_CREATE | ZS_NOAUTOREPACK);
+    CHECK(db != NULL, "open failed");
+    CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
+
+    fail_sync_at = sync_calls + 1;
+    int r = zs_db_store(db, "maybe", 5, "2", 1, 0);
+    CHECK(r != ZS_OK, "the gate failure was not reported (got %s)", zs_strerror(r));
+
+    zs_db_close(&db);                   /* the only record of C-7d dies here */
+
+    long renames_before = renames_seen;
+
+    db = open_db(ZS_NOAUTOREPACK);
+    CHECK(db != NULL, "cannot reopen");
+    CHECK(zs_db_store(db, "after", 5, "3", 1, 0) == ZS_OK,
+          "a write after a gate failure must still succeed once the seal is done");
+
+    CHECK(renames_seen > renames_before,
+          "a fresh handle appended to the generation whose gate failed -- the "
+          "SEAL marker did not outlive the writer that wrote it (C-7e)");
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    char state[512];
+    CHECK(read_state(state, sizeof(state)), "reopen after the seal");
+    CHECK(strstr(state, "before=1") != NULL,
+          "the earlier commit was lost: '%s'", state);
+    CHECK(strstr(state, "after=3") != NULL,
+          "the commit after the seal was lost: '%s'", state);
+
+    /* Phase 2: the same rule reached through zs_db_sync under ZS_NOSYNC, and
+     * again across the handle's death.  That mode has no commit gate at all
+     * (C-7c), so the caller's own durability point is the only gate there is,
+     * and a failure there leaves the same readable-but-not-durable tail.
+     *
+     * This phase exists because the mutant that removes the marker from the
+     * zs_db_sync site went NOT CAUGHT without it: test_sync_failure_seals covers
+     * that site only through the SAME handle, where db->seal_before_write does
+     * the work and the marker is never consulted. */
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    db = open_db(ZS_CREATE | ZS_NOSYNC | ZS_NOAUTOREPACK);
+    CHECK(db != NULL, "nosync open failed");
+    CHECK(zs_db_store(db, "n1", 2, "1", 1, 0) == ZS_OK, "nosync store");
+
+    fail_sync_at = sync_calls + 1;
+    CHECK(zs_db_sync(db) != ZS_OK, "the injected zs_db_sync failure was not reported");
+
+    zs_db_close(&db);                   /* again, the handle's knowledge dies */
+
+    renames_before = renames_seen;
+
+    db = open_db(ZS_NOSYNC | ZS_NOAUTOREPACK);
+    CHECK(db != NULL, "cannot reopen after a failed zs_db_sync");
+    CHECK(zs_db_store(db, "n2", 2, "2", 1, 0) == ZS_OK, "nosync store after the seal");
+    CHECK(renames_seen > renames_before,
+          "a fresh handle appended to the generation whose explicit sync failed "
+          "-- no SEAL was left by zs_db_sync (C-7e)");
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    CHECK(read_state(state, sizeof(state)), "reopen after a failed zs_db_sync");
+    CHECK(strstr(state, "n2=2") != NULL, "the post-seal commit was lost: '%s'", state);
+
+    passed++;
+    fprintf(stderr, "  the seal marker outlives the writer      ok\n");
+}
+
+static void test_seal_marker_is_written_and_not_synced(void)
+{
+    /* C-7e's two mechanical rules, which no data assertion can see.
+     *
+     * The marker is DELIBERATELY NOT SYNCED: a sync here is a retry of the sync
+     * that just failed, and C-7a forbids drawing any conclusion from a retry's
+     * success.  Counted rather than reasoned about, exactly as C-7a's own rule
+     * is -- syncs_after_failure covers both, since the marker is written after
+     * the failure and inside the same library call.
+     *
+     * And the marker must actually be there.  Asserted by decoding the last 20
+     * bytes of the active file rather than by a size arithmetic, because a size
+     * check passes for any 20 bytes and the thing that matters is that a reader
+     * will accept it: the nibble, and a checksum computed with the ACTIVE FILE'S
+     * engine (A-6, F-5a) rather than the handle's.  A marker checksummed under
+     * the wrong engine validates for nobody, so every reader would silently
+     * ignore it and the whole mechanism would do nothing while appearing to. */
+    total++;
+
+    hooks_reset();
+    hooks_on();
+    fresh_dir();
+
+    struct zs_db *db = open_db(ZS_CREATE | ZS_NOAUTOREPACK);
+    CHECK(db != NULL, "open failed");
+    CHECK(zs_db_store(db, "before", 6, "1", 1, 0) == ZS_OK, "first store");
+
+    char name[ZSI_NAME_MAX];
+    zsi_name_current(name, db->uuid);
+
+    fail_sync_at = sync_calls + 1;
+    int r = zs_db_store(db, "maybe", 5, "2", 1, 0);
+    CHECK(r != ZS_OK, "the gate failure was not reported (got %s)", zs_strerror(r));
+
+    CHECK(syncs_after_failure == 0,
+          "%ld fdatasync calls after the failure -- the marker must not be "
+          "synced (C-7e)", syncs_after_failure);
+
+    /* Read it back from the file, not from memory: what another process sees is
+     * the only thing the marker is for. */
+    char path[DBPATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dbdir, name);
+
+    struct stat st;
+    CHECK(stat(path, &st) == 0, "stat %s", path);
+    CHECK(st.st_size >= (off_t)ZSI_TERMLEN, "active file is too short");
+
+    char tail[ZSI_TERMLEN];
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0, "open %s", path);
+    ssize_t got = pread(fd, tail, sizeof(tail), st.st_size - (off_t)sizeof(tail));
+    close(fd);
+    CHECK(got == (ssize_t)sizeof(tail), "short read of the file's tail");
+
+    struct zsi_term t;
+    CHECK(zsi_term_decode(tail, sizeof(tail), &t) == ZS_OK,
+          "the file does not end in a terminator -- no SEAL was written (C-7e)");
+    CHECK(zsi_term_is_seal(&t),
+          "the file's last terminator is not a SEAL (C-7e, F-21a)");
+    CHECK(t.spanlen == 0, "the SEAL claims a span of %llu bytes (F-21a)",
+          (unsigned long long)t.spanlen);
+
+    zs_db_close(&db);
+    hooks_reset();
+
+    passed++;
+    fprintf(stderr, "  the seal marker is written, not synced   ok\n");
+}
+
 static void test_commit_has_one_gate(void)
 {
     /* C-7: one sync per commit, on BOTH commit paths.
@@ -1457,6 +1624,8 @@ int main(int argc, char **argv)
         { "torn_flush_then_abort",          test_torn_flush_then_abort },
         { "sync_failure_gate",              test_sync_failure_gate },
         { "sync_failure_seals",             test_sync_failure_seals },
+        { "seal_marker_survives_handle_death", test_seal_marker_survives_handle_death },
+        { "seal_marker_is_written_and_not_synced", test_seal_marker_is_written_and_not_synced },
         { "sync_failure_every_point",       test_sync_failure_every_point },
         { "crash_leaves_unaligned_length",  test_crash_leaves_unaligned_length },
         { "crash_after_invalid_terminator", test_crash_after_invalid_terminator },

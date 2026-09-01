@@ -1066,17 +1066,23 @@ static unsigned zsi_header_engine_id(const char *buf)
 #define ZSI_TERM_OFF_SPANLEN ZSI_HDRLEN_SMALL                     /* 4 */
 #define ZSI_TERM_OFF_CSUM   ZSI_TERM_CSUM_COVER                   /* 12 */
 
-/* True for exactly the six legal encodings (F-12) and nothing else.
+/* True for exactly the seven legal encodings (F-12) and nothing else.
  *
  * Written as an explicit enumeration rather than as a bit-property computation,
  * which F-12a requires: the table in F-12 is normative and a computed predicate
  * would be a second specification that can drift from it.  The near-misses are
  * what matter, and each is a plausible single flipped bit -- MustBeOne clear,
- * IsRollback set on a record with a real key, IsBig or IsDelete set on a
- * terminator.  Each must be rejected rather than half-interpreted (T-2b).
+ * IsRollback set on a record with a real key, IsBig set on a terminator.  Each
+ * must be rejected rather than half-interpreted (T-2b).
  *
  * Takes keylen as well as the nibble, because keylen == 0 is what distinguishes a
- * terminator from a record and three of the six rows depend on it.
+ * terminator from a record and three of the seven rows depend on it.
+ *
+ * MustBeOne|IsDelete is the one nibble legal BOTH ways and meaning something
+ * different in each: a deletion with a key, a SEAL without one (F-21a).  It is
+ * the row to check in both directions, because a reader that tests the nibble
+ * without the keylen it is paired with reads a SEAL as a deletion and goes
+ * looking for a key that is not there.
  *
  * `inline` for the reason zsi_cur_order gives -- called once per record decoded,
  * and GCC leaves it out of line otherwise. */
@@ -1085,8 +1091,9 @@ static inline bool zsi_flags_valid(uint8_t nibble, bool haskey)
     switch (nibble) {
     case ZSI_MUSTBEONE:                                     /* record, or COMMIT */
         return true;
+    case ZSI_MUSTBEONE | ZSI_ISDELETE:                      /* deletion, or SEAL */
+        return true;
     case ZSI_MUSTBEONE | ZSI_ISBIG:                         /* big record */
-    case ZSI_MUSTBEONE | ZSI_ISDELETE:                      /* deletion */
     case ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE:          /* big deletion */
         return haskey;
     case ZSI_MUSTBEONE | ZSI_ISROLLBACK:                    /* ROLLBACK */
@@ -1333,6 +1340,13 @@ static size_t zsi_term_encoded_len(void)
     return ZSI_TERMLEN;
 }
 
+/* The three terminator kinds, as the flag bits F-12's table pairs with keylen == 0.
+ * Named so a caller says which one it means rather than passing a bool that only
+ * covers two of them. */
+#define ZSI_TERM_COMMIT     0
+#define ZSI_TERM_SEAL       ZSI_ISDELETE      /* F-21a */
+#define ZSI_TERM_ROLLBACK   ZSI_ISROLLBACK
+
 /* Encode a terminator over a span whose data bytes are spandata[0..spanlen).
  *
  * The checksum covers the span's data followed by the terminator's own bytes up
@@ -1348,10 +1362,10 @@ static size_t zsi_term_encoded_len(void)
  * F-5e -- verification rides indexing -- load-bearing rather than
  * belt-and-braces, and F-5e1 forbids the shortcut of checking only the last
  * span. */
-static void zsi_term_encode(char *buf, uint64_t spanlen, bool rollback,
+static void zsi_term_encode(char *buf, uint64_t spanlen, uint8_t kind,
                             const char *spandata, zs_csum *csum, unsigned csum_id)
 {
-    uint8_t nibble = ZSI_MUSTBEONE | (rollback ? ZSI_ISROLLBACK : 0);
+    uint8_t nibble = ZSI_MUSTBEONE | kind;
 
     /* keylen == 0 is what makes this a terminator (F-14), and vallen describes
      * the fixed payload rather than a value. */
@@ -1390,6 +1404,15 @@ static int zsi_term_decode(const char *buf, size_t len, struct zsi_term *out)
 static bool zsi_term_is_rollback(const struct zsi_term *t)
 {
     return (t->flags & ZSI_ISROLLBACK) != 0;
+}
+
+/* F-21a: this file MUST NOT be appended to.  Written by C-7e after a failed
+ * durability gate, and the only thing that carries C-7d's knowledge to a writer
+ * that did not experience the failure -- including one in another process, or
+ * this one after a restart. */
+static bool zsi_term_is_seal(const struct zsi_term *t)
+{
+    return (t->flags & ZSI_ISDELETE) != 0;
 }
 
 /* Whether a decoded record uses the encoding F-15 requires for its contents.
@@ -1478,6 +1501,13 @@ struct zsi_file {
     /* unordered (hdr.end == 0), filled by the UNORDERED FILE section */
     size_t            complete;   /* F-24 complete point */
     struct zsi_index *index;      /* private, built by replay */
+
+    /* F-21a: the replay found a valid SEAL, so this file MUST NOT be appended
+     * to.  It is still CLEAN -- every record below is live and a reader treats
+     * the file exactly as before -- so this is deliberately not folded into
+     * `complete` (D-9e).  Set only by the replay, so it is a fact read from the
+     * file rather than a belief held by whoever wrote the marker. */
+    bool              sealed;
 
     /* The span boundary at `complete`, and the checksum the terminator ending
      * there carries (P-10).  Recorded by the replay so publishing a pointer
@@ -1833,6 +1863,7 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
     if (pos > f->size) pos = ZSI_HEADER_LEN;
 
     f->complete = pos;
+    f->sealed   = false;
 
     /* D-9d: `pos` is the window's base, so the count starts here.  This is the
      * one place the window is established -- the other assignments to
@@ -1962,8 +1993,25 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
 
         f->complete = after;
         f->nspans++;                            /* D-9d */
-        f->last_term_off  = p;
-        f->last_term_csum = term.csum;
+
+        /* F-21b: a SEAL must NOT become the boundary a pointer table records.
+         * P-12 lets an index build start at a table's valid_upto and skip the
+         * replay below it, so a table published past the marker would leave a
+         * seeded reader walking zero spans and never learning the file is
+         * sealed -- appending to a generation C-7d closed.  Stopping the
+         * boundary here makes every seeded walk re-cross the marker, which is a
+         * property of the structure rather than a check somebody has to
+         * remember at each publish site.
+         *
+         * The SEAL is still a valid span for F-23 and F-24: `complete` and the
+         * span count advance over it, so the file stays CLEAN and its records
+         * stay live.  Only appendability changes (D-9e). */
+        if (zsi_term_is_seal(&term)) {
+            f->sealed = true;
+        } else {
+            f->last_term_off  = p;
+            f->last_term_csum = term.csum;
+        }
         pos = after;
     }
 
@@ -1980,6 +2028,19 @@ static int zsi_unordered_replay(struct zsi_file *f, size_t from,
 static bool zsi_unordered_is_clean(const struct zsi_file *f)
 {
     return f->hdr_valid && f->complete == f->size;
+}
+
+/* Whether the active file may be appended to (D-9).
+ *
+ * Clean and appendable were the same property until SEAL existed, and D-9e
+ * requires exactly ONE place to answer this.  Two sites deciding it separately
+ * can disagree, and the disagreement is silent: both read the file correctly
+ * while one appends to a generation the other has closed, which is the G-2 loss
+ * C-7d exists to prevent.  So every caller that is about to append comes here,
+ * and nobody open-codes `clean && !sealed`. */
+static bool zsi_unordered_is_appendable(const struct zsi_file *f)
+{
+    return zsi_unordered_is_clean(f) && !f->sealed;
 }
 
 /********** POINTER SECTION *************/
@@ -7297,7 +7358,7 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
     struct zsi_file *act = zsi_snapshot_active(db->snap);
     char name[ZSI_NAME_MAX], path[PATH_MAX];
 
-    if (act && zsi_unordered_is_clean(act) && !zsi_active_full(db, act)) {
+    if (act && zsi_unordered_is_appendable(act) && !zsi_active_full(db, act)) {
         /* The descriptor the last transaction handed back, if it is for THIS
          * generation.  O_APPEND means every write lands at the true EOF
          * regardless of which transaction opened the descriptor. */
@@ -7372,6 +7433,45 @@ static int zsi_writer_active(struct zs_db *db, int *fdp, uint32_t *genp)
     *fdp = fd;
     *genp = next;
     return ZS_OK;
+}
+
+/* C-7e: append a SEAL (F-21a) to the active file after a failed durability gate.
+ *
+ * C-7d as stated reaches only the handle that wrote the span, because
+ * db->seal_before_write is memory: a writer that exits -- or is killed --
+ * between the failed gate and its next write takes it along, and the next writer
+ * to open the database finds an active file that is clean by every test it can
+ * apply, and appends.  Same G-2 loss, arriving through a second process instead
+ * of a second transaction.  This marker is the only thing that crosses that gap.
+ *
+ * IT IS DELIBERATELY NOT SYNCED, AND MUST NOT BE.  A sync here is a retry of the
+ * sync that just failed, and C-7a forbids drawing any conclusion from a retry's
+ * success -- the pages may already have been discarded.  What the marker is for
+ * is being READABLE, in the boot where the ambiguity exists, which is the only
+ * place it does exist: after a reboot what can be read IS what is durable, so
+ * either the span survived and appending is genuinely safe, or it did not and
+ * F-22 rejects its terminator, F-24 completes the file below it, and D-9a and
+ * D-12b convert it and start a new generation.  Both arms are already correct
+ * with no marker, which is exactly why losing it costs nothing.
+ *
+ * That also bounds what it is worth: if the marker's own page goes with the
+ * span's, the next writer sees a clean file and appends.  It narrows the window;
+ * the seal C-7d requires is what closes it.
+ *
+ * Returns nothing on purpose.  Neither the write's success nor its failure may
+ * change what the failed commit reports -- that stays C-7a's unknown outcome --
+ * and the caller sets its in-memory C-7d state either way. */
+static void zsi_seal_marker_append(int fd, zs_csum *cs, unsigned csum_id)
+{
+    char term[ZSI_TERMLEN];
+
+    /* Engine 2 with no function supplied cannot checksum anything (F-5d), and an
+     * unchecksummed marker is one every reader rejects.  A handle in that state
+     * has never written a record either, so nothing is given up. */
+    if (csum_id == ZSI_CSUM_EXTERNAL && !cs) return;
+
+    zsi_term_encode(term, 0, ZSI_TERM_SEAL, "", cs, csum_id);
+    (void)zsi_write_all(fd, term, sizeof(term));
 }
 
 /* Commit: one gate (C-7).
@@ -7470,7 +7570,8 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
 
     /* The engine is the ACTIVE FILE'S, not this handle's (A-6, F-5a) --
      * recorded at the first store, where the file was chosen. */
-    zsi_term_encode(term, (uint64_t)spanlen, rollback, span,
+    zsi_term_encode(term, (uint64_t)spanlen,
+                    rollback ? ZSI_TERM_ROLLBACK : ZSI_TERM_COMMIT, span,
                     txn->wcs, txn->wcsum_id);
 
     /* The span and its terminator leave in ONE write whenever the span is still
@@ -7521,7 +7622,12 @@ static int zsi_txn_terminate(struct zs_txn *txn, bool rollback,
              * and append, and a recovery that then rejects this span completes
              * the file below every later commit (F-22, F-24), including ones
              * whose own gate succeeded.  This flag is the only record that the
-             * question arose. */
+             * question arose -- for THIS handle.  C-7e puts the same fact on
+             * disk, unsynced, so it also reaches a handle that never saw the
+             * failure, including one in another process and this one after a
+             * restart.  Written before the error is reported and ignored either
+             * way: it may not change what this commit says happened. */
+            zsi_seal_marker_append(txn->wfd, txn->wcs, txn->wcsum_id);
             db->seal_before_write = true;
             return ZS_IOERROR;
         }
@@ -7690,7 +7796,17 @@ static int zsi_txn_begin(struct zs_db *db, bool shared, struct zs_txn **out)
          * what this handle admitted, which is exactly the discarded-pages state --
          * so it declines to launder unreadable bytes into a file carrying a fresh
          * valid checksum, and a reopen recovers instead (the file is unclean by
-         * then, so D-9a rolls over). */
+         * then, so D-9a rolls over).
+         *
+         * This flag is about THIS handle only, and deliberately does not consult
+         * the file's own SEAL (C-7e).  A handle that did not experience the
+         * failure learns it in exactly one place -- zsi_unordered_is_appendable,
+         * which D-9e requires be the single home for that question -- and reaches
+         * the identical file set by D-12b's route: the sealed generation is
+         * converted in place and the next one created, which is what this seal
+         * does too.  A second test here would be a second answer to a question
+         * D-9e says must have one, and it was measured as redundant rather than
+         * assumed: with it present, the mutant that defeats it is NOT CAUGHT. */
         if (db->seal_before_write) {
             r = zsi_seal_locked(db);
             if (r != ZS_OK) {
@@ -9380,9 +9496,15 @@ int zs_db_dump(struct zs_db *db, int detail)
                     if ((zsi_get16(b) >> ZSI_KEYLEN_SHIFT) == 0) {
                         struct zsi_term t;
                         if (zsi_term_decode(b, f->size - pos, &t) != ZS_OK) break;
+                        /* Three kinds now (F-12), and a SEAL must be
+                         * distinguishable from a torn tail here: an
+                         * implementation predating it reports the same bytes as
+                         * corruption, so "which is it" is a real question to ask
+                         * this tool. */
                         printf("SPAN %zu len=%llu term=%s records=%zu\n",
                                span_start, (unsigned long long)t.spanlen,
-                               zsi_term_is_rollback(&t) ? "ROLLBACK" : "COMMIT",
+                               zsi_term_is_rollback(&t) ? "ROLLBACK" :
+                               zsi_term_is_seal(&t)     ? "SEAL" : "COMMIT",
                                nrecs);
                         pos += t.len;
                         break;
@@ -10250,9 +10372,12 @@ int zs_db_sync(struct zs_db *db)
     act = zsi_snapshot_active(db->snap);
     if (!act) return ZS_OK;
 
-    int fd = open(act->fname, O_WRONLY);
+    /* O_APPEND so C-7e's marker below lands at the true end of the file, whatever
+     * a concurrent writer has done to it since. */
+    int fd = open(act->fname, O_WRONLY | O_APPEND);
     if (fd < 0) return ZS_IOERROR;
     int r = ZS_FDATASYNC(fd) < 0 ? ZS_IOERROR : ZS_OK;
+    if (r != ZS_OK) zsi_seal_marker_append(fd, act->csum, act->csum_id);
     close(fd);
     /* C-7d: the caller's own gate, and a failure means the same thing here as it
      * does inside a commit -- this file may hold bytes that are readable and not

@@ -1,0 +1,33 @@
+# A SEAL terminator ending the active file (F-21a, C-7e).
+#
+# The marker is injected as raw bytes, not produced by a writer: C-7e writes one
+# only after a durability gate has failed, and no driver subcommand can make that
+# happen.  What the case pins is the reader's and the next writer's side.
+#
+# A SEAL is an ordinary empty span -- zero records, span length 0, an F-19
+# checksum like any other terminator -- so the file remains CLEAN and every
+# record below it stays live.  The marker is not a truncation, which is what the
+# scan below asserts.
+#
+# What it changes is that the file MUST NOT be appended to (F-21a, D-9).  So the
+# store that follows cannot extend generation 1: a writer converts it to its
+# in-order form and starts generation 2, which is what the file list shows.  An
+# implementation that ignored the marker would leave one .current file and no
+# in-order file at all.
+uuid 4941da54-9406-4faa-a457-c4b65beae3eb
+engine 1
+comparator memcmp
+
+op store 61 3031
+op garbage 0a001000000000000000000016dd693933f6c2e8
+op store 62 3032
+
+expect files
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb-00000001-00000001
+zeroskip-4941da54-9406-4faa-a457-c4b65beae3eb.current
+
+expect scan
+61 3031
+62 3032
+
+expect check OK

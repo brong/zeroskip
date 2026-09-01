@@ -17,9 +17,9 @@ that scanning could not attribute were filled in by hand.
 
 | | |
 |---|---|
-| Requirements | 277 |
-| With an enforcing test | 266 |
-| Gaps, each with a reason | 11 |
+| Requirements | 301 |
+| With an enforcing test | 291 |
+| Gaps, each with a reason | 10 |
 
 Regenerate the citation scan with `./tests/conformance.sh`, which cross-checks
 this table against the spec and fails if a label here is missing from the spec or
@@ -86,6 +86,8 @@ a spec label is missing here.
 | `F-19a` | The span length is carried in the terminator's payload, so a terminator is always the small form | `terminator` |
 | `F-20` | Terminators are only ever found by scanning **forward** from the | `span_basic` |
 | `F-21` | A `COMMIT` makes its span's records live. A `ROLLBACK` is a commit | `span_rollback`, `write_abort` , `abort_of_a_flushed_span` |
+| `F-21a` | A `SEAL` ends the file: an empty span whose meaning is that the file MUST NOT be appended to | `span_seal`, `corpus`, `crash/seal_marker_is_written_and_not_synced` |
+| `F-21b` | A `SEAL` MUST NOT advance the boundary a pointer table may be seeded from | `span_seal` |
 | `F-22` | Because the checksum covers the span **and** the terminator, a | `crash/crash_nosync_mode`, `mp_reader_sees_torn_span`, `span_terminator_without_data`, +2 more |
 | `F-22a` | A span's terminator checksum is the only thing covering an unordered file's bytes | `span_checksum_is_the_only_witness` |
 | `F-23` | From the end of an unordered file's header onwards, the file is a flat | `span_basic`, `span_engine_zero` |
@@ -141,6 +143,7 @@ a spec label is missing here.
 | `D-8a` | Creating a database. With `ZS_CREATE` and no existing directory, or a | `fileset_ignores_foreign`, `open_create`, `snapshot_basic`, +1 more |
 | `D-9` | An active file is **clean** if it has a valid header and zero or more | `check_unclean_reported`, `crash/crash_after_invalid_terminator`, `crash/snapshot_gap_retry`, +4 more |
 | `D-9a` | A writer moves to a new file when the active file is not clean, or | `write_rollover` |
+| `D-9e` | Clean and appendable are different properties, and one place answers "may I append" | `span_seal`, `crash/seal_marker_survives_handle_death` |
 | `D-9b` | The next generation is one above the highest present in the directory. | `fileset_next_gen` |
 | `D-9c` | Generations are never reused and never reset, not even by a repack | `fileset_next_gen`, `header_roundtrip` |
 | `D-9d` | A writer MAY additionally treat the active file as due for rollover | `rollover_txns_seals_on_span_count`, `rollover_txns_counts_the_replay_window` , `idxcache_nspans_resets_at_publication` |
@@ -248,6 +251,7 @@ a spec label is missing here.
 | `C-7b` | The cost is one sync per commit. It is paid per | `zsbench (store, N per txn)` |
 | `C-7c` | `ZS_NOSYNC` omits the gate — and nothing else. The structural | `crash/crash_nosync_mode`, `crash/nosync_structural_syncs` |
 | `C-7d` | A failed gate seals the generation. After a gate failure the active | `crash/sync_failure_seals` |
+| `C-7e` | The failed gate leaves a `SEAL` behind, unsynced, so the rule outlives the writer | `crash/seal_marker_survives_handle_death`, `crash/seal_marker_is_written_and_not_synced`, `corpus` |
 | `C-8` | An aborted transaction whose records reached the file appends a | `write_abort`, `stream_abort_rollback_when_flushed` |
 | `C-8b` | An abort whose span never reached the file writes **nothing at all** — | `stream_abort_discards_unflushed_span`, `corpus` |
 | `C-8a` | The unsynced `ROLLBACK` costs no sync of its own and still cannot | `stream_abort_rollback_when_flushed`, `crash/sync_failure_gate` |

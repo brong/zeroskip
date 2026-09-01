@@ -1338,16 +1338,23 @@ static void test_header_bounds_and_ranges(void)
 static void test_flag_nibble_validity(void)
 {
     /* T-2b: every one of the 16 nibbles, in both roles, asserting exactly the
-     * six encodings in F-12's table are accepted.
+     * seven encodings in F-12's table are accepted.
      *
      * The nibble alone does not decide: keylen == 0 is what separates a
-     * terminator from a record (F-14), so three rows are legal only with a key
-     * and two only without.  zsi_flags_valid therefore takes both. */
+     * terminator from a record (F-14), so two rows are legal only with a key and
+     * one only without.  zsi_flags_valid therefore takes both.
+     *
+     * MustBeOne|IsDelete is the row to watch: it is legal BOTH ways and means
+     * something different in each -- a deletion with a key, a SEAL without one
+     * (F-21a).  A reader that tests the nibble without the keylen it is paired
+     * with reads a SEAL as a deletion and goes looking for a key that is not
+     * there, which is why it is asserted in both columns rather than once. */
     struct { uint8_t nibble; bool with_key; bool without_key; } expect[] = {
         /* MustBeOne alone: a record, or a COMMIT */
         { ZSI_MUSTBEONE,                                    true,  true  },
         { ZSI_MUSTBEONE | ZSI_ISBIG,                        true,  false },
-        { ZSI_MUSTBEONE | ZSI_ISDELETE,                     true,  false },
+        /* a deletion with a key, a SEAL without one */
+        { ZSI_MUSTBEONE | ZSI_ISDELETE,                     true,  true  },
         { ZSI_MUSTBEONE | ZSI_ISBIG | ZSI_ISDELETE,         true,  false },
         { ZSI_MUSTBEONE | ZSI_ISROLLBACK,                   false, true  },
     };
@@ -1376,9 +1383,9 @@ static void test_flag_nibble_validity(void)
         if (got_nokey) nlegal_nokey++;
     }
 
-    /* Four record shapes and two terminators: six encodings in total (F-12). */
+    /* Four record shapes and three terminators: seven encodings (F-12). */
     ASSERT_EQ(nlegal_key, 4);
-    ASSERT_EQ(nlegal_nokey, 2);
+    ASSERT_EQ(nlegal_nokey, 3);
 
     /* MustBeOne clear is malformed in every combination (F-12b), which is also
      * what makes byte 0 non-zero for every record and so what F-26d1's padding
@@ -1390,10 +1397,9 @@ static void test_flag_nibble_validity(void)
 
     /* The near-misses, each a plausible single flipped bit from a valid
      * encoding, and each rejected rather than half-interpreted.  IsRollback
-     * belongs only to a terminator; IsBig and IsDelete only to a record. */
+     * belongs only to a terminator; IsBig only to a record. */
     ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK, true));
     ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISBIG, false));
-    ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISDELETE, false));
     ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISDELETE, true));
     ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISDELETE, false));
     ASSERT(!zsi_flags_valid(ZSI_MUSTBEONE | ZSI_ISROLLBACK | ZSI_ISBIG, false));
@@ -1966,7 +1972,7 @@ static void test_terminator(void)
     ASSERT_EQU(zsi_term_encoded_len(), 20u);
 
     memset(buf, 0xAA, sizeof(buf));
-    zsi_term_encode(buf, 64, false, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
+    zsi_term_encode(buf, 64, ZSI_TERM_COMMIT, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
 
     /* keylen == 0 is what makes it a terminator (F-14), and vallen describes the
      * fixed payload.  A COMMIT is MustBeOne alone. */
@@ -1993,7 +1999,7 @@ static void test_terminator(void)
 
     /* A ROLLBACK differs from a COMMIT in exactly the IsRollback bit. */
     memset(buf, 0xAA, sizeof(buf));
-    zsi_term_encode(buf, 64, true, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
+    zsi_term_encode(buf, 64, ZSI_TERM_ROLLBACK, span, zsi_csum_xxhash, ZSI_CSUM_XXHASH);
     ASSERT_EQ((unsigned char)buf[0] & ZSI_FLAG_MASK,
               ZSI_MUSTBEONE | ZSI_ISROLLBACK);
     ASSERT_OK(zsi_term_decode(buf, 20, &t));
@@ -2003,7 +2009,7 @@ static void test_terminator(void)
      * which is the point of moving spanlen into the payload. */
     uint64_t bigspan = ((uint64_t)1 << 40) + 12345;
     memset(buf, 0xAA, sizeof(buf));
-    zsi_term_encode(buf, bigspan, false, span, zsi_csum_none, ZSI_CSUM_NONE);
+    zsi_term_encode(buf, bigspan, ZSI_TERM_COMMIT, span, zsi_csum_none, ZSI_CSUM_NONE);
     ASSERT_OK(zsi_term_decode(buf, 20, &t));
     ASSERT_EQU(t.spanlen, bigspan);
     ASSERT_EQU(t.len, 20u);
@@ -2012,7 +2018,7 @@ static void test_terminator(void)
      * the assertion that catches a symmetric encoder/decoder change, which is the
      * bug class that round-tripping cannot see (T-12a). */
     memset(buf, 0xAA, sizeof(buf));
-    zsi_term_encode(buf, 0x0102030405060708ull, true, span,
+    zsi_term_encode(buf, 0x0102030405060708ull, ZSI_TERM_ROLLBACK, span,
                     zsi_csum_none, ZSI_CSUM_NONE);
     static const unsigned char want[20] = {
         0x0C, 0x00,                                     /* nibble 0xC, keylen 0 */
@@ -2022,14 +2028,23 @@ static void test_terminator(void)
     };
     ASSERT_MEM_EQ(buf, want, 20);
 
-    /* Negatives (F-12): IsBig and IsDelete belong to a record, never to a
-     * terminator, and MustBeOne must be set. */
+    /* IsDelete on a terminator is the SEAL (F-21a) -- the one value taken back
+     * out of F-12's "malformed rather than reserved" sentence.  Asserted
+     * positively here, and as a decode rather than an encode, because that is
+     * the direction a peer's bytes arrive in. */
+    memset(buf, 0, sizeof(buf));
+    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISDELETE);
+    zsi_put16(buf + 2, 16);
+    ASSERT_OK(zsi_term_decode(buf, 20, &t));
+    ASSERT(zsi_term_is_seal(&t));
+    ASSERT(!zsi_term_is_rollback(&t));
+    ASSERT_EQU(t.spanlen, 0u);          /* F-21a: a SEAL holds no records */
+
+    /* Negatives (F-12): IsBig belongs to a record, never to a terminator, and
+     * MustBeOne must be set. */
     memset(buf, 0, sizeof(buf));
     zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISBIG);
     zsi_put16(buf + 2, 16);
-    ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
-
-    zsi_put16(buf, ZSI_MUSTBEONE | ZSI_ISDELETE);
     ASSERT_EQ(zsi_term_decode(buf, 20, &t), ZS_BADFORMAT);
 
     zsi_put16(buf, ZSI_ISROLLBACK);                 /* MustBeOne clear */
@@ -2101,8 +2116,23 @@ static void sb_term(struct sb *s, bool rollback)
     size_t datalen = s->len - s->span_start;
     size_t n = zsi_term_encoded_len();
     sb_reserve(s, n);
-    zsi_term_encode(s->buf + s->len, datalen, rollback,
+    zsi_term_encode(s->buf + s->len, datalen,
+                    rollback ? ZSI_TERM_ROLLBACK : ZSI_TERM_COMMIT,
                     s->buf + s->span_start,
+                    zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM), s->engine);
+    s->len += n;
+    s->span_start = s->len;
+}
+
+/* Append a SEAL (F-21a): an empty span, so it closes nothing and must follow a
+ * terminator.  Written through the real encoder so its checksum is the one a
+ * reader will demand. */
+static void sb_seal(struct sb *s)
+{
+    size_t n = zsi_term_encoded_len();
+    assert(s->len == s->span_start);            /* F-21a: no records of its own */
+    sb_reserve(s, n);
+    zsi_term_encode(s->buf + s->len, 0, ZSI_TERM_SEAL, s->buf + s->span_start,
                     zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM), s->engine);
     s->len += n;
     s->span_start = s->len;
@@ -2116,7 +2146,7 @@ static void sb_term_badlen(struct sb *s, uint64_t claim)
     size_t n = zsi_term_encoded_len();
     sb_reserve(s, n);
     /* checksum still computed over the real data, so only the length is wrong */
-    zsi_term_encode(s->buf + s->len, claim, false, s->buf + s->span_start,
+    zsi_term_encode(s->buf + s->len, claim, ZSI_TERM_COMMIT, s->buf + s->span_start,
                     zsi_csum_for_id(s->engine, TEST_EXTERNAL_CSUM), s->engine);
     (void)datalen;
     s->len += n;
@@ -2607,6 +2637,82 @@ static void test_span_rollback(void)
     ASSERT_STR_EQ(c.key[0], "k0");
     ASSERT_STR_EQ(c.key[1], "k2");
     ASSERT_STR_EQ(c.key[2], "k4");
+    zsi_file_release(&f);
+    sb_free(&s);
+}
+
+static void test_span_seal(void)
+{
+    struct sb s;
+    struct collected c;
+    struct zsi_file *f = NULL;
+
+    /* F-21a and D-9e together.  A SEAL is a valid empty span, so everything
+     * below it stays live and the file stays CLEAN -- the marker is not a
+     * truncation, and reading is completely unaffected.  What changes is the one
+     * thing C-7d needs: the file is no longer APPENDABLE.
+     *
+     * Asserting both halves is the point.  A reader that treated the marker as a
+     * tear would pass the appendability assertion while silently discarding every
+     * record in the file, which is the G-3 loss the whole "decoding accepts,
+     * never rejects" rule exists to prevent -- so `complete == s.len` and the
+     * record count are what separate a seal from a botched one. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_rec(&s, "b", 1, "2", 1);
+    sb_term(&s, false);
+    sb_seal(&s);
+
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 2u);                        /* the records are untouched */
+    ASSERT_STR_EQ(c.key[0], "a");
+    ASSERT_STR_EQ(c.key[1], "b");
+    ASSERT_EQU(f->complete, s.len);             /* the SEAL is a valid span */
+    ASSERT(zsi_unordered_is_clean(f));          /* ...so the file is clean */
+    ASSERT(f->sealed);
+    ASSERT(!zsi_unordered_is_appendable(f));    /* ...and only this differs */
+    zsi_file_release(&f);
+    sb_free(&s);
+
+    /* F-21b: the SEAL must not become the boundary a pointer table records.  If
+     * it did, a table could be published PAST the marker and a P-12 seeded
+     * reader would walk zero spans and never learn the file is sealed -- then
+     * append to a generation C-7d closed.  So last_term_off stays on the COMMIT
+     * below, which forces every seeded walk to re-cross the marker.
+     *
+     * The two offsets differ by exactly one terminator, which is what makes this
+     * assertion able to fail: `complete` and `last_term_off` are equal for every
+     * other file the suite builds. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_term(&s, false);
+    size_t commit_off = s.len - zsi_term_encoded_len();
+    sb_seal(&s);
+
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(f->last_term_off, commit_off);
+    ASSERT(f->last_term_off < f->complete);
+    zsi_file_release(&f);
+    sb_free(&s);
+
+    /* A TORN marker is ignored, exactly as a torn COMMIT is: it is an ordinary
+     * span with an ordinary checksum, which is the whole reason it was made a
+     * terminator rather than a distinguished record.  The file completes below
+     * it and is neither clean nor sealed -- so a writer still refuses to append,
+     * by D-9a's older route rather than this one. */
+    sb_init(&s, 1, ZSI_CSUM_XXHASH);
+    sb_rec(&s, "a", 1, "1", 1);
+    sb_term(&s, false);
+    size_t good = s.len;
+    sb_seal(&s);
+    s.buf[s.len - 1] ^= 0xFF;                   /* corrupt the marker's checksum */
+
+    ASSERT_EQ(replay_file(&s, 1, &c, &f), ZS_OK);
+    ASSERT_EQU(c.n, 1u);
+    ASSERT_EQU(f->complete, good);
+    ASSERT(!f->sealed);
+    ASSERT(!zsi_unordered_is_clean(f));
+    ASSERT(!zsi_unordered_is_appendable(f));
     zsi_file_release(&f);
     sb_free(&s);
 }
@@ -12588,7 +12694,7 @@ static void test_mp_reader_sees_torn_span(void)
         ASSERT_EQ(read(fd, data, datalen), (ssize_t)datalen);
         close(fd);
 
-        zsi_term_encode(term, datalen, false, data, zsi_csum_xxhash,
+        zsi_term_encode(term, datalen, ZSI_TERM_COMMIT, data, zsi_csum_xxhash,
                         ZSI_CSUM_XXHASH);
 
         /* ...but then the data is zeroed, as though it never landed. */
@@ -19157,6 +19263,7 @@ static struct test_entry tests[] = {
 
     { "test_span_basic",                test_span_basic },
     { "test_span_rollback",             test_span_rollback },
+    { "test_span_seal",                 test_span_seal },
     { "test_span_empty_file",           test_span_empty_file },
     { "test_span_torn_tail",            test_span_torn_tail },
     { "test_span_terminator_without_data", test_span_terminator_without_data },
