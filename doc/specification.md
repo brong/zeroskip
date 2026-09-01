@@ -356,12 +356,31 @@ Every legal encoding, and no others:
 | ≥ 1 | 0 | 1 | 0 | `0xA` | deletion | 4 |
 | ≥ 1 | 1 | 1 | 0 | `0xB` | big deletion | 16 |
 | 0 | 0 | 0 | 0 | `0x8` | `COMMIT` | 4 |
+| 0 | 0 | 1 | 0 | `0xA` | `SEAL` | 4 |
 | 0 | 0 | 0 | 1 | `0xC` | `ROLLBACK` | 4 |
 
 - **F-12** The table above is normative: any other combination is invalid. In
-  particular `IsRollback` with `keylen >= 1`, and `IsBig` or `IsDelete` on a
-  terminator, are **malformed rather than reserved** — there is no future
-  meaning waiting for them.
+  particular `IsRollback` with `keylen >= 1`, and `IsBig` on a terminator, are
+  **malformed rather than reserved** — there is no future meaning waiting for
+  them.
+
+  `IsDelete` on a terminator was in that sentence until `SEAL` took the one
+  value back out of it. Nothing should be read into the bit pattern: F-12a
+  makes this table an enumeration rather than an algebra, so `IsDelete` does not
+  "mean" anything on a terminator, and `0xA` was chosen because it was the
+  lowest free value. A future extension takes the next free value on the same
+  terms.
+
+  This did not bump `version_read`, which F-7a pins at exactly 4. An
+  implementation predating `SEAL` therefore opens the file and reads every
+  record in it correctly, and misreads only the marker: the nibble fails its
+  enumeration, F-24 completes the file below it, D-9 finds it unclean, and
+  D-12b converts it and starts a new generation. That is the same recovery a
+  `SEAL`-aware writer performs, one generation more expensive, so the extension
+  is safe against an old reader in **behaviour** while being visible to it as a
+  torn tail in `check`. Weigh that before spending the next free value: it holds
+  only because a terminator nobody understands ends the file, which is a
+  property of appending the marker last and not a general licence.
 - **F-12a** A reader MUST implement F-12 as an enumeration of the table, not as
   a computation over bit properties. A computed predicate is a second
   specification of the same thing and can drift from it.
@@ -460,7 +479,7 @@ A terminator is a record with `keylen == 0`, always in the small form, always 20
 bytes:
 
 ```
-COMMIT / ROLLBACK                     nibble 0x8 / 0xC
+COMMIT / SEAL / ROLLBACK              nibble 0x8 / 0xA / 0xC
   +0   2  flags:4 | keylen:12, keylen == 0
   +2   2  vallen == 16
   +4   8  span length
@@ -489,6 +508,36 @@ COMMIT / ROLLBACK                     nibble 0x8 / 0xC
   later commit's span would enclose the aborted records and make them live. An
   abort with no records in the file has nothing to void and appends nothing
   (C-8b).
+- **F-21a A `SEAL` ends the file.** It terminates a span that MUST hold zero
+  records, so its span length is 0 and its checksum is F-19's over an empty span
+  followed by its own first 12 bytes. It carries no data, changes nothing about
+  the records below it, and is a valid span for every purpose F-23 and F-24
+  define: a file ending in one is **clean**.
+
+  What it says is that the file MUST NOT be appended to. Clean and appendable
+  are therefore no longer the same property, which is D-9's split.
+
+  A writer reaches that through the route it already has. The writer whose own
+  gate failed seals the generation (C-7d, D-25), converting it in place. A writer
+  that learns it only from the marker finds the file un-appendable, and D-9a and
+  D-12b convert it and start a new generation — the same file set, one generation
+  more expensive. An implementation MUST NOT add a second place that answers
+  "may I append to this", which is D-9e.
+
+  Being a terminator rather than a distinguished record is what makes it cost no
+  new framing rule: it is an ordinary empty span, so a torn one fails its own
+  checksum and is ignored by F-22 with nothing added.
+- **F-21b A `SEAL` MUST NOT advance the pointer table's seeding boundary.** P-10
+  records the last terminator so that P-12 can seed an index build from a table
+  and skip the replay below it. If a `SEAL` were eligible, a table could be
+  published *past* the marker and a table-seeded reader would walk zero spans and
+  never learn the file is sealed — appending to a file C-7d closed. So the
+  boundary a table may record is the last `COMMIT` or `ROLLBACK`, and every
+  seeded walk re-crosses the `SEAL`.
+
+  This is a structural fix rather than a rule about publishing: an implementation
+  that instead forbade publishing over a sealed file would have to get that check
+  right at every publish site, where this cannot be got wrong at all.
 - **F-22** Because the checksum covers the span **and** the terminator, a
   terminator that reaches disk without its data fails validation and reads as
   absent. A torn tail is therefore always detectable, which recovery (F-24),
@@ -838,13 +887,24 @@ without opening a single file.
 ### 5.3 Writing
 
 - **D-9** An active file is **clean** if it has a valid header and zero or more
-  valid spans with nothing after the last. While holding the write lock, a
-  writer MUST either append spans to a clean active file, or create a new
+  valid spans with nothing after the last. It is **appendable** if it is clean
+  and does not end in a `SEAL` (F-21a). While holding the write lock, a writer
+  MUST either append spans to an appendable active file, or create a new
   unordered file whose generation is exactly one higher than the current active
   file, write a valid header, and append spans to that — making it the new
   active file.
-- **D-9a** A writer moves to a new file when the active file is not clean, or
-  when it exceeds `rollover_size` (default 2MB), or on D-9d's span condition.
+- **D-9e** Clean and appendable were the same property until `SEAL` existed, and
+  keeping them apart matters in both directions. A sealed file is clean, so
+  every record in it is live and a reader treats it exactly as before — the
+  marker is not a truncation. And it is not appendable, so the one thing that
+  changes is the writer's choice, which is the whole point of C-7d.
+
+  An implementation MUST decide "may I append to this" in **one** place. Two
+  sites that answer it separately can disagree, and the disagreement is silent:
+  the file is read correctly by both while one of them appends to a generation
+  the other has closed, which is the G-2 loss C-7d exists to prevent.
+- **D-9a** A writer moves to a new file when the active file is not appendable,
+  or when it exceeds `rollover_size` (default 2MB), or on D-9d's span condition.
   Rollover is cheap: a new header and nothing else, since no pointers are
   written (D-11).
 - **D-9b** The next generation is one above the highest present: the highest
@@ -1838,6 +1898,39 @@ any point.
 
   `ZS_NOSYNC` has no gate (C-7c), so nothing here applies to it. An explicit
   `zs_db_sync` failure engages it exactly as a commit gate does.
+- **C-7e The failed gate leaves a `SEAL` behind.** C-7d as stated reaches only
+  the handle that wrote the span: the knowledge that a gate failed lives in
+  memory, so a writer that exits — or is killed — takes it with it, and the next
+  writer finds a clean active file and appends. That is the same G-2 loss C-7d
+  describes, arriving through a second process instead of a second transaction.
+
+  So after a failed gate, and before reporting it, a writer MUST attempt to
+  append a `SEAL` (F-21a) to the active file, and:
+
+  1. it MUST NOT sync the marker;
+  2. it MUST NOT let the marker's own success or failure change what the commit
+     reports, which stays C-7a's unknown outcome;
+  3. it MUST set its in-memory C-7d state either way.
+
+  **The marker is deliberately not durable, and MUST NOT be made so.** Syncing it
+  is a retry of the sync that just failed, which C-7a forbids drawing any
+  conclusion from. What it is for is being *readable*, within the boot where the
+  ambiguity exists — because that is the only place the ambiguity exists. After a
+  reboot, what can be read is what is durable: either span *k* survived, in which
+  case appending to the file is genuinely safe, or it did not, in which case F-22
+  rejects its terminator, F-24 completes the file below it, D-9 finds it unclean
+  and D-12b converts it and starts a new generation. Both arms are already
+  correct with no marker, which is why losing it costs nothing.
+
+  It narrows the window rather than closing it: if the marker's own page is
+  discarded with the span's, the next writer sees a clean file and appends. The
+  thing that closes the window is still the seal C-7d requires. An implementation
+  MUST NOT treat the marker as making that seal optional.
+
+  A writer MUST NOT append a `SEAL` on any other occasion. An ordinary seal
+  (D-25d) converts in place while still holding the write lock, so it has no
+  window for anyone else to append into, and a marker there would be written and
+  immediately discarded with the file it was written to.
 - **C-7b** The cost is one sync per commit. It is paid per *transaction*, not per
   record, so a caller that batches many operations into one transaction amortises
   it — which is the reason `zs_txn_*` exists alongside the single-operation
@@ -2685,13 +2778,18 @@ gets wrong — and the empty-versus-one-byte case (F-11a); the exact bytes of th
 `memcmp` comparator name field (F-11b); and a generated filename for a known UUID
 and generation range, character for character (D-0, D-1).
 
-**T-2b Type byte validity.** All 256 byte values fed as a record type, asserting
-exactly the 10 in F-12's table are accepted and the other 246 rejected. A
-bitfield admits far more values than it defines, so the near-misses matter most:
-two family bits set at once, the reserved `0x08` set, `IsDelete` with
-`Pointers`, and either reserved bit set. Each is a plausible result of a single
-flipped bit in a valid type, and each MUST be rejected rather than
-half-interpreted.
+**T-2b Flag nibble validity.** All 16 nibble values fed with `keylen == 0` and
+again with `keylen >= 1`, asserting exactly the 7 combinations in F-12's table
+are accepted and the other 25 rejected. A nibble admits far more values than it
+defines, so the near-misses matter most: `MustBeOne` clear (F-12b), `IsRollback`
+on a record, `IsBig` on a terminator, and `IsDelete` on a record with a non-zero
+`vallen`. Each is a plausible result of a single flipped bit in a valid nibble,
+and each MUST be rejected rather than half-interpreted.
+
+`SEAL` is the case to check in both directions: `0xA` with `keylen == 0` is
+valid and `0xA` with `keylen >= 1` is a deletion, so a reader that tests the
+nibble without the `keylen` it is paired with accepts a `SEAL` where a deletion
+belongs and reads a key that is not there.
 
 **T-3 Malformed input.** Every golden file truncated at *every byte offset*,
 not merely record boundaries, and systematically bit-flipped. Each case asserts
