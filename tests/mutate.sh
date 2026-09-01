@@ -931,23 +931,36 @@ mutant "decode: reject non-canonical (data loss)" catch \
 echo
 echo "pointer table cache (spec section 8)"
 
-# RECLASSIFIED catch -> equivalent, 2026-08-27, together with the handle check
-# below.  P-11 compares the table's comparator name against BOTH the data file's
-# and the handle's -- and a file and a handle can never disagree, because open
-# refuses a database whose comparator differs from the caller's (F-11).  So a
-# doctored table trips whichever check survives, and neither mutant can be killed
-# alone.  The compound below is what proves the pair is load-bearing.
-mutant "idx: drops the file's comparator check" equivalent \
+# RECLASSIFIED equivalent -> catch, 2026-09-01, together with the handle check
+# below -- undoing the 2026-08-27 reclassification in the other direction, and
+# the reason is worth keeping because the argument for `equivalent` was CORRECT
+# WHEN WRITTEN and was falsified by a test rather than by a code change.
+#
+# P-11 compares the table's comparator name against BOTH the data file's field
+# and the handle's own.  Inside the database those can never disagree: F-11 makes
+# every file carry one name and open refuses a database whose name differs from
+# the caller's, so a doctored table tripped whichever check survived and neither
+# mutant could be killed alone.  Hence the compound that used to sit between
+# these two.
+#
+# 5672e84 added a test block for each half that reaches AROUND the database and
+# constructs the disagreement directly -- poking f->hdr.compar_name in memory
+# (zstest.c:13515) and passing a different name to zsi_idx_load (zstest.c:13588)
+# -- so each check is now individually killable.  The redundancy in the database
+# is unchanged; what changed is that the tests no longer go through it.  Both
+# halves of P-11's sentence deserve that, since a peer could implement one and
+# not the other.
+#
+# The compound is GONE rather than kept alongside: its whole justification was
+# the claim that is now false, it adds nothing over two individual catches, and
+# CLAUDE.md records that a compound pattern can half-rot and then read as a test
+# gap.  Restore it only if a future refactor makes the two checks inseparable
+# again.
+mutant "idx: drops the file's comparator check" catch \
   's/    if \(memcmp\(h\.compar_name, f->hdr\.compar_name, ZSI_COMPAR_NAME_LEN\) != 0\)\n        goto out;/    \/* P-11 file comparator check removed *\//'
 
-# P-11's comparator binding, as a compound BECAUSE the two checks are redundant
-# with each other and neither can be killed alone (see above).  A NOT CAUGHT here
-# means "check both halves landed" before it means "write a test".
-mutant "idx: drops BOTH comparator checks" catch \
-  's/    if \(memcmp\(h\.compar_name, f->hdr\.compar_name, ZSI_COMPAR_NAME_LEN\) != 0\)\n        goto out;/    \/* file comparator check removed *\//; s/    if \(memcmp\(h\.compar_name, compar_name, ZSI_COMPAR_NAME_LEN\) != 0\) goto out;/    \/* handle comparator check removed *\//'
-
-# The handle half of the same redundancy; see above.
-mutant "idx: drops our own comparator check" equivalent \
+# The handle half of the same pair; see above.
+mutant "idx: drops our own comparator check" catch \
   's/    if \(memcmp\(h\.compar_name, compar_name, ZSI_COMPAR_NAME_LEN\) != 0\) goto out;/    \/* P-11 handle comparator check removed *\//'
 
 mutant "idx: drops the engine agreement check" catch \
