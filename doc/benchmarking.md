@@ -577,6 +577,63 @@ readers, or a maintenance window, and not a permanent mode. And the catch-up has
 to actually be driven: `zs_db_should_repack` is the predicate, and a caller that
 disarms without scheduling it is choosing the pathology A-14's note describes.
 
+## The LSM merge-policy literature, and why selection and D-19 stay as they are
+
+Evaluated 2026-10-07 against Dayan & Idreos, *Dostoevsky* (SIGMOD 2018), which
+models every LSM merge policy by a size ratio T, a bound K on runs per smaller
+level and Z on the largest, and argues for Lazy Leveling (tier the small levels,
+level the largest) because merges at the small levels cost a lot and buy little.
+
+**Where D-16's selection sits.** Simulated on unit-sized generations, "merge from
+the oldest file the newer ones collectively outweigh" settles into sizes of
+2^k−1: a binary counter, which is leveling at **T=2, K=Z=1** — the point where the
+paper's leveling, tiering and Lazy Leveling all coincide. About 0.7·log₂(generations)
+rewrites per record (3.9 at 117 generations, against the ~3.2× measured on the
+2M-record load above) and about log₂ files. The A-16 cap is a Z, with
+`ZSI_REPACK_MAX_FROZEN` bounding it at 9.
+
+**Why Lazy Leveling does not transfer.** Its lookup argument rests on per-run
+Bloom filters with Monkey's allocation, which make probing a small run nearly
+free. Zeroskip has no filters, so a point lookup pays a binary search per file
+(D-14d) whatever the file's size, and our point lookups behave like the paper's
+*short range* lookups, which it concedes Lazy Leveling makes worse. More files is
+exactly what the 196-to-400-file and 103-file measurements show costing reads, and
+the Cyrus shape — one-record transactions, probe-then-insert misses, short-lived
+opens — wants few files. The update saving the paper is after is already available
+as "disarm and call" above. Filters are the only lever that would change this, and
+they are a format change; worth revisiting only if missing-key lookups become the
+bottleneck.
+
+**Weakening D-19 was measured and is worse.** D-19c permits retaining more
+tombstones than necessary, so the simplest conforming rule is "keep every
+tombstone unless the merge has nothing below it" (`first == 0`), which removes the
+history cursor entirely and never reads the files below a merge. Scratch copy of
+`zeroskip.c` with the rule switched at compile time; 1M permanent 80-byte records,
+then 2000 transactions each creating 500 short-lived keys, deleting those from 50
+transactions earlier, and deleting 5 permanent keys; 1MB `rollover_size`, cascade
+armed, `ZS_NOSYNC`, laptop:
+
+| `repack_max_size` 512 MB | exact D-19 | keep unless `first == 0` |
+|---|---|---|
+| tombstones written by repacks | 798k (11.8 MB) | 3.41M (51.9 MB) |
+| repack bytes | 361 MB | 518 MB (+43%) |
+| tombstones in the final layout | 28k | 691k (25×) |
+| final database | 99 MB | 116 MB (+16%) |
+| fetch of a deleted key | ~1180 ns | ~1810 ns |
+| load, 3 runs | 1.04–1.06s | 1.11–1.13s |
+
+At an 8 MB cap: 456 MB against 293 MB rewritten, 201k against 28k tombstones left.
+The loss is churn: a short-lived key's value and tombstone usually meet in the
+newer files, where exact D-19 drops both, and the weak rule carries the tombstone
+through every merge until one reaches the bottom.
+
+**The exact test is cheap.** 1.75M D-19 queries cost ~0.09s, about 52 ns each and
+~9% of the load, because tombstones arrive in ascending order and the history
+cursor only gallops forward. Walking the arms newest-first with an early exit
+produced byte-identical output and saved nothing measurable: most queries find no
+record below at all, and those visit every arm in any order. Which also removes
+most of the case for filters on the repack side.
+
 ## `rollover_size` sets how many files exist at all
 
 It is documented as bounding bytes, the index replay and one conversion. The
